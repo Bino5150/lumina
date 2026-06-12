@@ -1,0 +1,7 @@
+{
+  "name": "Chat",
+  "description": "Pure conversation. No tools at all — fastest response, lowest token overhead.",
+  "enabled": [
+    "get_time"
+  ]
+}

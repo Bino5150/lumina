@@ -1,0 +1,25 @@
+# Personal data
+memory/lumina.db
+memory/prefs.json
+projects/*/chats.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+*.bk
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (too large for git)
+*.gguf
+*.safetensors

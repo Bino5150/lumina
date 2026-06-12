@@ -1,0 +1,46 @@
+# Lumina — Python Dependencies
+# Last updated: Session 25 (June 2026)
+# Python 3.13 (miniconda3, `py` alias)
+# Install: pip install -r requirements.txt --break-system-packages
+# After install: playwright install chromium
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+PySide6
+
+# ── HTTP / Networking ─────────────────────────────────────────────────────────
+requests
+httpx                          # async HTTP (backends, streaming)
+
+# ── Browser Automation ────────────────────────────────────────────────────────
+playwright                     # + run: playwright install chromium
+
+# ── Web Scraping (web.py fallback) ────────────────────────────────────────────
+beautifulsoup4
+lxml                           # fast HTML parser for BS4
+
+# ── Audio / STT / TTS ────────────────────────────────────────────────────────
+sounddevice                    # audio I/O
+numpy                          # audio buffer handling
+scipy                          # audio resampling
+pyaudio                        # fallback audio I/O
+openwakeword                   # "Hey Lumina" wake word (wired in future session)
+
+# ── Speech Recognition ────────────────────────────────────────────────────────
+openai-whisper                 # STT (if used locally)
+
+# ── NLP / Text Processing ────────────────────────────────────────────────────
+tiktoken                       # token counting
+
+# ── Data / Storage ────────────────────────────────────────────────────────────
+# sqlite3 — stdlib, no install needed
+
+# ── Diff / Patch ─────────────────────────────────────────────────────────────
+# difflib — stdlib, no install needed
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dateutil                # robust datetime parsing
+psutil                         # system info (memory, CPU) for meta tools
+platformdirs                   # XDG-compliant app dirs (cross-platform prep)
+
+# ── Dev / Debug ───────────────────────────────────────────────────────────────
+# No test framework yet — add pytest when test suite is started

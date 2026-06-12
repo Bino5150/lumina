@@ -1,0 +1,9 @@
+{
+  "name": "Minimal",
+  "description": "Memory and palace only. Lightweight — no web, no files, no code execution.",
+  "enabled": [
+    "get_time", "list_tools",
+    "save_memory", "search_memory", "get_recent_memories",
+    "palace_remember", "palace_hall", "palace_recall", "palace_status"
+  ]
+}

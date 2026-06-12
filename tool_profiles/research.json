@@ -1,0 +1,12 @@
+{
+  "name": "Research",
+  "description": "Web search, knowledge base, memory, and file reading. No code execution or system commands.",
+  "enabled": [
+    "get_time", "list_tools",
+    "save_memory", "search_memory", "get_recent_memories",
+    "save_knowledge", "search_knowledge", "save_person", "search_people",
+    "web_search", "get_website", "get_wikipedia",
+    "read_file", "list_dir", "search_files",
+    "palace_remember", "palace_hall", "palace_recall", "palace_status"
+  ]
+}
