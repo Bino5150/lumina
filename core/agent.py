@@ -13,7 +13,7 @@ from core.backends.loader import get_llm_backend
 from core.context import ContextManager
 from tools.registry import ToolRegistry
 from tools.meta import register_meta_tools
-from tools.memory import register_memory_tools, init_memory_db
+from tools.memory import register_memory_tools, init_memory_db, init_chat_db
 from tools.knowledge import register_knowledge_tools
 from tools.web import register_web_tools
 from tools.filesystem import register_filesystem_tools
@@ -71,6 +71,7 @@ class LuminaAgent:
         self._skill_nudge_sent   = False   # only nudge once per session
 
         init_memory_db()
+        init_chat_db()
         register_meta_tools(self.registry, self.ctx)
         register_memory_tools(self.registry)
         register_knowledge_tools(self.registry)
