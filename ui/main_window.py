@@ -717,7 +717,7 @@ class LuminaWindow(QMainWindow):
                         "thinking": {"type": "disabled"},
                         "chat_template_kwargs": {"enable_thinking": False},
                     },
-                    timeout=10,
+                    timeout=60,
                 ).json()
                 print(f"[AUTO-NAME] got response: {str(response)[:200]}", flush=True)
             except Exception as e:

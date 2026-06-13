@@ -1697,7 +1697,7 @@ class PersonasTab(QWidget):
                     self.agent.registry.set_disabled(disabled)
                     break
         self.agent.apply_persona(data)
-        self.parent().persona_applied.emit(config.AGENT_NAME, data.get("avatar") or "")
+        self.window().persona_applied.emit(config.AGENT_NAME, data.get("avatar") or "")
         print(f"[PERSONA] Activated from settings: {data['name']}", flush=True)
 
     def _duplicate(self):

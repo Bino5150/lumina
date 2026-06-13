@@ -15,6 +15,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+import shiboken6
 
 
 # ── Markdown → HTML ────────────────────────────────────────────────────────────
@@ -278,6 +279,8 @@ class LiveResponseBubble(QFrame):
             self.stream_lbl.setText("▋" if self._cursor_visible else " ")
 
     def open_think_block(self, step: int):
+        if not shiboken6.isValid(self.bubble_layout):
+            return
         self._think_start_time = time.time()
         self._think_block = ThinkBlock(step, self.colors)
         idx = self.bubble_layout.indexOf(self.stream_lbl)
@@ -296,12 +299,16 @@ class LiveResponseBubble(QFrame):
         self._think_block = None
 
     def add_tool_call(self, name: str, args: dict):
+        if not shiboken6.isValid(self.bubble_layout):
+            return
         self._tool_calls += 1
         row = ToolRow(name, args, self.colors)
         idx = self.bubble_layout.indexOf(self.stream_lbl)
         self.bubble_layout.insertWidget(idx, row)
 
     def append_response_token(self, token: str):
+        if not shiboken6.isValid(self.stream_lbl):
+            return
         if not self._response_text:
             self._start_time = time.time()  # reset clock at first response token
         self._cursor_timer.stop()
@@ -311,6 +318,8 @@ class LiveResponseBubble(QFrame):
         
 
     def finalize(self):
+        if not shiboken6.isValid(self.bubble_layout):
+            return
         self._cursor_timer.stop()
         elapsed = time.time() - self._start_time
 
