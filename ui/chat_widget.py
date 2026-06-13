@@ -528,16 +528,16 @@ class ChatWidget(QWidget):
             av.setFixedSize(24, 24)
             header_row.addWidget(av)
 
-            fl.addLayout(header_row)
+        fl.addLayout(header_row)
 
-            content = QLabel(text)
-            content.setWordWrap(True)
-            content.setAlignment(Qt.AlignRight)
-            content.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-            content.setStyleSheet(f"background:{self.colors['user_bubble']};color:{self.colors['text_primary']};padding:10px 14px;border-radius:12px 4px 12px 12px;border:1px solid {self.colors['border']};font-size:13px;")
-            fl.addWidget(content)
-            self._insert(frame)
+        content = QLabel(text)
+        content.setWordWrap(True)
+        content.setAlignment(Qt.AlignRight)
+        content.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        content.setStyleSheet(f"background:{self.colors['user_bubble']};color:{self.colors['text_primary']};padding:10px 14px;border-radius:12px 4px 12px 12px;border:1px solid {self.colors['border']};font-size:13px;")
+        fl.addWidget(content)
+        self._insert(frame)
 
     def add_system_message(self, text: str):
         lbl = QLabel(text)
