@@ -365,6 +365,10 @@ class LuminaWindow(QMainWindow):
             self._apply_avatar(avatar)
 
     def _on_persona_applied(self, name: str, avatar_path: str):
+        if self.worker and self.worker.isRunning():
+            self.worker.quit()
+            self.worker.wait()
+            self.worker = None
         """Signal handler — SettingsPanel applied a persona."""
         resolved = avatar_path or self._prefs.get("avatar_path")
         self.chat_widget.set_persona(name, resolved)
@@ -472,7 +476,7 @@ class LuminaWindow(QMainWindow):
         else:
             self.persona_combo.addItem("No personas found", None)
             print("[PERSONA] No personas found in personas/ directory", flush=True)
-            self.persona_combo.currentIndexChanged.connect(self._on_persona_selected)
+        self.persona_combo.currentIndexChanged.connect(self._on_persona_selected)
         layout.addWidget(self.persona_combo)
 
         layout.addWidget(self._sep())
@@ -665,6 +669,7 @@ class LuminaWindow(QMainWindow):
             self._load_chat(chat_id)
             
     def _on_persona_selected(self, idx: int):
+        print(f"[PERSONA] combo selected idx={idx} path={self.persona_combo.itemData(idx)}", flush=True)
         path = self.persona_combo.itemData(idx)
         if path:
             self._prefs["last_persona"] = path
