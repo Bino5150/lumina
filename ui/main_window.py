@@ -279,7 +279,14 @@ class LuminaWindow(QMainWindow):
         self._current_chat_id = None
         self._prefs = persistence.load()
 
-        init_chat_db()
+        try:
+            init_chat_db()
+        except Exception as e:
+            print(f"[DB] Failed to initialize chat database: {e}", flush=True)
+            QMessageBox.critical(None, "Database Error",
+                f"Lumina couldn't initialize the chat database.\n\n{e}\n\nCheck that your ~/lumina/memory/ directory is accessible.")
+        
+        
         self._setup_window()
         self._build_ui()
         self._connect_signals()
@@ -345,36 +352,31 @@ class LuminaWindow(QMainWindow):
             print(f"[PERSONA] Failed to load {path}: {e}", flush=True)
             return
         self.agent.apply_persona(persona)
-        avatar = self.agent.persona_avatar or self._prefs.get("avatar_path")
-        self.chat_widget.set_persona(config.AGENT_NAME, avatar)
-        if avatar and os.path.exists(avatar):
-            self._apply_avatar(avatar)
-        
-    def _on_persona_applied(self, name: str, avatar_path: str):
-        resolved = avatar_path or self._prefs.get("avatar_path")
-        self.chat_widget.set_persona(name, resolved)
-        if resolved and os.path.exists(resolved):
-            self._apply_avatar(resolved)
-
-        # Update UI name labels
         name = persona.get("name", config.AGENT_NAME)
+        avatar = self.agent.persona_avatar or self._prefs.get("avatar_path")
+        self.chat_widget.set_persona(name, avatar)
         self.header_title.setText(name)
         self.name_lbl.setText(name)
         self.name_lbl.setStyleSheet(
             f"color:{COLORS['accent']};font-size:12px;font-weight:bold;"
             f"letter-spacing:1px;background:transparent;"
         )
+        if avatar and os.path.exists(avatar):
+            self._apply_avatar(avatar)
 
-        # Update avatar if persona specifies one
-        avatar = persona.get("avatar", "")
-        if avatar:
-            if not os.path.isabs(avatar):
-                avatar = os.path.join(os.path.dirname(os.path.dirname(
-                    os.path.abspath(__file__))), avatar)
-            if os.path.exists(avatar):
-                self._apply_avatar(avatar)
-
-        print(f"[PERSONA] UI updated: {name}", flush=True)        
+    def _on_persona_applied(self, name: str, avatar_path: str):
+        """Signal handler — SettingsPanel applied a persona."""
+        resolved = avatar_path or self._prefs.get("avatar_path")
+        self.chat_widget.set_persona(name, resolved)
+        self.header_title.setText(name)
+        self.name_lbl.setText(name)
+        self.name_lbl.setStyleSheet(
+            f"color:{COLORS['accent']};font-size:12px;font-weight:bold;"
+            f"letter-spacing:1px;background:transparent;"
+        )
+        if resolved and os.path.exists(resolved):
+            self._apply_avatar(resolved)
+        print(f"[PERSONA] UI updated via settings: {name}", flush=True)      
 
     def _build_ui(self):
         central = QWidget()
@@ -463,9 +465,14 @@ class LuminaWindow(QMainWindow):
         self.persona_combo.setFixedHeight(30)
         self.persona_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.persona_combo.addItem("— select —", None)
-        for p in list_personas():
-            self.persona_combo.addItem(p.get("name", "unnamed"), p["_file"])
-        self.persona_combo.currentIndexChanged.connect(self._on_persona_selected)
+        personas = list_personas()
+        if personas:
+            for p in personas:
+                self.persona_combo.addItem(p.get("name", "unnamed"), p["_file"])
+        else:
+            self.persona_combo.addItem("No personas found", None)
+            print("[PERSONA] No personas found in personas/ directory", flush=True)
+            self.persona_combo.currentIndexChanged.connect(self._on_persona_selected)
         layout.addWidget(self.persona_combo)
 
         layout.addWidget(self._sep())
@@ -564,6 +571,7 @@ class LuminaWindow(QMainWindow):
     def _apply_user_avatar(self, path: str):
         self._prefs["user_avatar_path"] = path
         persistence.save(self._prefs)
+        self.chat_widget.user_avatar_path = path
     def _pick_avatar(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Lumina Avatar", "", "Images (*.png *.jpg *.jpeg *.webp)")
         if path:
@@ -636,14 +644,17 @@ class LuminaWindow(QMainWindow):
         self.chat_widget.clear_messages()
         msgs = load_chat_messages(chat_id)
         for m in msgs:
+            content = m.get("content") or ""
+            if not content:
+                continue
             if m["role"] == "user":
-                self.chat_widget.add_user_message(m["content"])
-                self.agent.ctx.add_user(m["content"])
+                self.chat_widget.add_user_message(content)
+                self.agent.ctx.add_user(content)
             elif m["role"] == "assistant":
                 bubble = self.chat_widget.create_live_bubble()
-                bubble._response_text = m["content"]
+                bubble._response_text = content
                 bubble.finalize()
-                self.agent.ctx.add_assistant(m["content"])
+                self.agent.ctx.add_assistant(content)
         self._refresh_chat_list()
 
     def _on_chat_selected(self, idx: int):
@@ -706,7 +717,7 @@ class LuminaWindow(QMainWindow):
                         "thinking": {"type": "disabled"},
                         "chat_template_kwargs": {"enable_thinking": False},
                     },
-                    timeout=60,
+                    timeout=10,
                 ).json()
                 print(f"[AUTO-NAME] got response: {str(response)[:200]}", flush=True)
             except Exception as e:
@@ -779,13 +790,16 @@ class LuminaWindow(QMainWindow):
             model = result.replace("Connected — model: ", "")
             self.status_bar.set_connected(model)
         except Exception:
-            self.status_bar.set_error()
+            self.status_bar.set_error("No backend connected — go to Settings to configure")
 
     # ── Message handling ───────────────────────────────────────────────────────
 
     def _on_user_message(self, text: str):
-        if not text.strip() or (self.worker and self.worker.isRunning()):
+        if not text.strip():
             return
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.worker = None
 
         content = None
         display_text = text

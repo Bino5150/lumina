@@ -356,7 +356,7 @@ class SmartInput(QTextEdit):
         self.lumina_avatar_path = avatar_path
         self.user_avatar_path = user_avatar_path
         super().__init__(parent)
-        self.setPlaceholderText("Message Lumina...  (Shift+Enter for newline, drag & drop files)")
+        self.setPlaceholderText(f"Message {config.AGENT_NAME}...  (Shift+Enter for newline, drag & drop files)")
         self.setMaximumHeight(120)
         self.setMinimumHeight(44)
         self.setAcceptDrops(True)
@@ -366,6 +366,9 @@ class SmartInput(QTextEdit):
             QTextEdit:focus{{border:1px solid {colors['border_accent']};}}
         """)
 
+    def update_placeholder(self, name: str):
+        self.setPlaceholderText(f"Message {name}...  (Shift+Enter for newline, drag & drop files)")
+    
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Return and not (event.modifiers() & Qt.ShiftModifier):
             text = self.toPlainText().strip()
@@ -413,6 +416,8 @@ class ChatWidget(QWidget):
     def set_persona(self, name: str, avatar_path: str):
         self.avatar_path = avatar_path
         self._persona_name = name
+        self.input.update_placeholder(name)
+        
     def _build(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
