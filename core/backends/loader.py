@@ -18,6 +18,12 @@ from .deepseek import DeepSeekBackend
 from .groq import GroqBackend
 from .openai_backend import OpenAIBackend
 
+class CustomBackend(LMStudioBackend):
+    """Generic OpenAI-compatible endpoint. URL is required and set by the user."""
+    name = "custom"
+    display_name = "Custom (OpenAI-compatible)"
+    default_url = ""
+
 BACKENDS = {
     "lmstudio":   LMStudioBackend,
     "ollama":     OllamaBackend,
@@ -27,6 +33,7 @@ BACKENDS = {
     "deepseek":   DeepSeekBackend,
     "groq":       GroqBackend,
     "openai":     OpenAIBackend,
+    "custom":     CustomBackend,
 }
 
 def get_llm_backend(name: str = None, url: str = None):
