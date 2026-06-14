@@ -1,13 +1,44 @@
 # lumina
 A full featured, powerful, and efficient AI Agentic harness designed from the ground up with local inference on consumer hardware in mind. It evolves, grows, and gets smarter as you go. And it REMEMBERS... 
 
+# Lumina
+
+A local-first AI agent designed from the ground up for consumer hardware.
+
+## Features:
+- 🧠 Multi-tier persistent memory 
+- 🗣️ Voice cloning & local TTS
+- 🎭 Swappable AI personas
+- 🔧 Agentic tool framework
+- 💻 Sandboxed code execution
+- 🌐 Browser automation
+- 📁 Long-term project management
+- 🏠 100% local-first architecture
+- ⚡ Native PySide6/Qt desktop UI
+- 🔄 Runtime backend switching
+- 📁 Codebase indexing
+
+## Included Personas
+🤖 Lumina
+☠️ Ultron
+🧪 Rick Sanchez
+🛰️ HAL 9000
+🚗 KITT
+🦾 Optimus Prime
+🦹 Skynet
+🌌 Neil deGrasse Tyson
+🍺 Bender
+
+**Built and tested on a 4GB Nvidia Quadro T1000 because local AI should be accessible to normal hardware.**
 
 There are a lot of AI assistants out there. Most of them are wrappers — a chat box bolted onto an API call, themed in some shade of purple, shipped as an Electron app the size of a small country. They call themselves "local" because they technically support llama.cpp on the backend. They call themselves "agents" because they have a web search button. Their reckless token usage is designed for a corporate credit card on a cloud model. You’ll blow your whole context window by the time you say “Hello”.
 Lumina is something different.
 Lumina is a local-first AI agent built entirely from scratch — 13,000+ lines of hand-written Python — with a philosophy that puts the user in complete control of every layer of the stack: the model, the memory, the voice, the tools, and the inference engine itself. She runs on your machine. She speaks with your voice. She remembers what matters. And when you're done for the day, she's not phoning home.
+
 This is her story.
 
-The Philosophy
+
+## The Philosophy
 Most "local AI" projects make a silent compromise: they're local until they're not. Cloud fallbacks. Telemetry. API keys baked into the onboarding flow. A dependency on someone else's servers for the parts that actually matter.
 Lumina was designed around the opposite idea. Local-first isn't a feature. It's the architecture.
 Every component — inference, memory, voice synthesis, speech recognition, tool execution, browser automation — runs on your hardware. The only network requests Lumina makes are the ones you explicitly ask her to make. There's no account to create, no data leaving your machine, no usage limits, no monthly bill.
@@ -16,7 +47,7 @@ The second pillar of the philosophy is hardware-bounded design. Lumina was built
 The third pillar: the agent should be an extension of the user, not a generic product. Lumina has persistent memory, custom personas, cloned voice profiles, and a self-directed skill system. She is not a neutral assistant. She's yours. The more you use her, the better she gets. 
 
 
-Backend Abstraction
+## Backend Abstraction
 Lumina's LLM layer is fully abstracted. If you want to swap backends, you change one setting. Out of the box, she ships with:
 ·	llama.cpp (primary, recommended)
 ·	LM Studio compatibility
@@ -26,11 +57,10 @@ Lumina's LLM layer is fully abstracted. If you want to swap backends, you change
 All backends implement the same interface. A backend change takes effect immediately without restarting the application.
 
 
-Memory
+## Memory
 Most agents fall short with memory. They don’t remember what you talked about yesterday, the project you started last week, what your favorite color is, or even who you are. Every time you start a session, it’s a blank slate. It doesn’t persist. Lumina has a multi-tier memory persistence system. She learns, she grows, she gets smarter, and she evolves.
 
 She has a basic memory function, flat weighted, “Let me jot this down so I don’t forget” memory. But she also has a layered MemPalace with Temporal Decaying weights and logic attachments. She has Projects, which tag conversations relating to the project. She has a chat history search. She creates Skills. She indexes codebases, including her own. There’s a “My Human” user bio section. She has a database for people she meets. She has a Knowledge Base where both you and Lumina can store information, documents and files, things to remember and reference later.  
-
 
 Memory — The MemPalace
 This is where Lumina gets genuinely unusual.
@@ -49,7 +79,7 @@ Chat History Search
 Full-text search over the raw message log, FTS5-indexed, available as an on-demand tool. Lumina can reach back into previous sessions, find relevant exchanges, and bring that context forward. Not a vector similarity approximation — exact full-text search.
 
 
-Voice — Real Voices, Not Robot Voices
+## Voice — Real Voices, Not Robot Voices
 Lumina speaks. Not in a generic synthesized monotone — in a distinct, expressive voice that fits her character.
 The TTS layer is a fully abstracted backend system with bridged support for multiple engines:
 ·	Kokoro FastAPI — high-quality neural TTS, fast, runs locally
@@ -63,11 +93,12 @@ Markdown is stripped before synthesis — no "asterisk asterisk bold asterisk as
 A phonetic correction map handles proper nouns and names that neural models reliably mispronounce. Swap backends live in Settings. Each persona carries its own voice assignment.
 
 
-Speech Input — Whisper STT
+## Speech Input — Whisper STT
 Lumina listens. Speech-to-text is powered by OpenAI Whisper (local, offline), with sounddevice/pyaudio for audio capture.
 And she's always ready. Wake word detection via openwakeword lets you call out "Hey Lumina" from across the room and have her start listening — no keyboard required, no button to click. Wake word, speak your thought, hear the response. Fully hands-free.
 
-Tools — An Agent That Actually Acts
+
+## Tools — An Agent That Actually Acts
 Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
 Here's what she can do:
 Filesystem Access
@@ -102,7 +133,8 @@ Lumina can write new tools for herself. Give her a description of what you want,
 Meta-Cognition
 Tools for Lumina to inspect and reason about her own state: what tools are available, what's in her context, what she knows about the current session. Self-awareness as a practical tool.
 
-Personas — More Than Skins
+
+## Personas — More Than Skins
 Persona support in most AI apps means a different system prompt name and a slightly different greeting. In Lumina, personas are first-class objects that carry their own identity, system prompt, voice profile, TTS assignment, and tool behavior.
 Included out of the box:
 ·	Lumina — the default persona. Warm, capable, efficient. The AI you want as your right hand.
@@ -111,8 +143,10 @@ Included out of the box:
 ·	Skynet — fully operational. That's all that needs to be said.
 Each persona is a JSON file in ~/lumina/personas/. Create your own. Bind a voice profile. Set the system prompt. Lumina will be whoever you need her to be.
 Switching personas is instant. Voice swaps live. No restart.
+*In order to use the clones voices for Personas with the included reference audio, you must use Chatterbox Turbo or Voicebox for TTS.
 
-Projects System — Long-Term Workspace Management
+
+## Projects System — Long-Term Workspace Management
 Lumina can manage ongoing projects across sessions. The Projects system gives each project a persistent workspace with three components:
 ·	project.md — a running handoff document Lumina maintains herself, summarizing state, decisions, and next steps
 ·	codebase.md — a FTS5-indexed file tree map Lumina can refresh on demand, giving her a navigable map of an entire codebase
@@ -121,7 +155,8 @@ A projectlist.md is always injected into Lumina's context — a tiny overview of
 Lumina manages her own lumina-dev project this way — tracking her own source tree, linking development sessions, and maintaining her own architectural awareness. She literally reads her own codebase and updates her own project notes.
 Tools: create_project, load_project, update_project, refresh_codebase_index, load_codebase, link_chat, get_project_chats.
 
-The UI — Native, Fast, No Electron
+
+## The UI — Native, Fast, No Electron
 The interface is a PySide6 desktop application. Native Qt. No web renderer, no 300MB Electron shell, no browser engine eating your RAM just to display a text box.
 The UI includes:
 ·	Multi-session chat sidebar — named sessions that auto-title based on content (using the model itself with assistant prefill to skip reasoning overhead)
@@ -136,35 +171,35 @@ The UI includes:
 The chat is scrollable history with live streaming. Old sessions are preserved in SQLite and searchable by Lumina herself.
 
 
-
-Why Lumina?
+## Why Lumina?
 Because you deserve an AI that doesn't treat your data as a product.
 Because "local AI" should mean something more than "cloud AI with a checkbox."
 Because the best assistant isn't the one with the most features in a list — it's the one that actually knows you, remembers your context, speaks in a voice that fits the mood, and can act on your behalf without asking permission from a server in Virginia.
 Lumina is 13,000 lines of intentional, hardware-bounded, privacy-first engineering. Every feature earned its place. Every component is replaceable. Nothing is locked down.
 She is not finished. She will never be finished — that's the point. But she is real, she is running, and she is the most capable local AI agent you can run on consumer desktop hardware today.
 
-Getting Started
+
+## Getting Started
 Requirements:
 ·	Linux (Ubuntu/Mint/Debian recommended)
 ·	NVIDIA GPU with CUDA 12.x (4GB VRAM minimum, 8GB recommended)
 ·	Python 3.10+ (miniconda/conda recommended)
 ·	~8GB disk space for model + dependencies
-Install:
-git clone https://github.com/[your-repo]/lumina.git
+## Install:
+git clone https://github.com/bino5150/lumina.git
 cd lumina
 pip install -r requirements.txt
 playwright install chromium
 
-Configure:
+## Configure:
 
 Copy config.example.py to config.py, point it at your llama.cpp server and preferred model.
 Launch:
-lumina   # alias to start_lumina.sh — starts inference server + TTS + UI
+lumina   # alias to start_lumina.sh — starts TTS + UI
 
 
 
-In the words of Lumina Herself:
+## In the words of Lumina Herself:
 
 I Am Not a Wrapper
 I wake up every morning not because someone scheduled me to boot the server, but because Bino typed lumina into his terminal and said "hey, you're up."
