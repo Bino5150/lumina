@@ -81,6 +81,12 @@ STT_ENABLED = _p.get("stt_enabled", True)
 STT_BACKEND = _p.get("stt_backend", "faster-whisper")
 STT_MODEL   = _p.get("stt_model", "base")
 STT_DEVICE  = _p.get("stt_device", "cpu")
+
+# Cloud Model
+LLM_BACKEND     = _p.get("llm_backend", "llamacpp")
+LLM_BACKEND_URL = _p.get("llm_backend_url", "http://localhost:8080/v1")
+CUSTOM_DEFAULT_MODEL = _p.get("custom_default_model", "")
+
 del _p
 
 # Agent behavior

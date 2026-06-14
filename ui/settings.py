@@ -178,6 +178,18 @@ class GeneralTab(QWidget):
         backend_row.addLayout(url_col, 3)
         layout.addLayout(backend_row)
 
+        # ── Custom model row (hidden unless custom backend selected) ──
+        self.custom_model_widget = QWidget()
+        cm_layout = QHBoxLayout(self.custom_model_widget)
+        cm_layout.setContentsMargins(0, 4, 0, 0)
+        cm_col = QVBoxLayout()
+        cm_col.addWidget(_lbl("Model Name", self.c))
+        self.custom_model = _le(getattr(config, "CUSTOM_DEFAULT_MODEL", ""), self.c)
+        self.custom_model.setPlaceholderText("e.g. mistral-7b-instruct")
+        cm_col.addWidget(self.custom_model)
+        cm_layout.addLayout(cm_col)
+        layout.addWidget(self.custom_model_widget)
+
         # ── Cloud credentials row (hidden for local backends) ──
         self.cloud_widget = QWidget()
         cloud_layout = QHBoxLayout(self.cloud_widget)
@@ -264,6 +276,7 @@ class GeneralTab(QWidget):
         is_custom = name == "custom"
         self.url.setReadOnly(not is_custom)
         self.url.setPlaceholderText("Enter your OpenAI-compatible endpoint URL" if is_custom else "")
+        self.custom_model_widget.setVisible(is_custom)
 
     def _save(self):
         from core.backends.loader import get_llm_backend
@@ -281,10 +294,17 @@ class GeneralTab(QWidget):
             setattr(config, key_attr, self.cloud_key.text().strip())
             setattr(config, model_attr, self.cloud_model.text().strip())
 
+
         from core.persistence import load as load_prefs, save as save_prefs
         prefs = load_prefs()
         prefs["llm_backend"] = config.LLM_BACKEND
         prefs["llm_backend_url"] = config.LLM_BACKEND_URL
+        
+        if config.LLM_BACKEND == "custom":
+            config.CUSTOM_DEFAULT_MODEL = self.custom_model.text().strip()
+            prefs["custom_default_model"] = config.CUSTOM_DEFAULT_MODEL
+            self.agent.llm._model = config.CUSTOM_DEFAULT_MODEL
+
         save_prefs(prefs)
 
         self.agent.llm = get_llm_backend()
