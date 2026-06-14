@@ -287,7 +287,7 @@ class GeneralTab(QWidget):
         prefs["llm_backend_url"] = config.LLM_BACKEND_URL
         save_prefs(prefs)
 
-        self.agent.llm = get_llm_backend(force_reload=True)
+        self.agent.llm = get_llm_backend()
         self.agent.llm.base_url = config.LLM_BACKEND_URL
 
 
