@@ -182,12 +182,20 @@ class GeneralTab(QWidget):
         self.custom_model_widget = QWidget()
         cm_layout = QHBoxLayout(self.custom_model_widget)
         cm_layout.setContentsMargins(0, 4, 0, 0)
+        cm_layout.setSpacing(12)
         cm_col = QVBoxLayout()
         cm_col.addWidget(_lbl("Model Name", self.c))
         self.custom_model = _le(getattr(config, "CUSTOM_DEFAULT_MODEL", ""), self.c)
         self.custom_model.setPlaceholderText("e.g. mistral-7b-instruct")
         cm_col.addWidget(self.custom_model)
-        cm_layout.addLayout(cm_col)
+        cm_layout.addLayout(cm_col, 2)
+        cm_key_col = QVBoxLayout()
+        cm_key_col.addWidget(_lbl("API Key (optional)", self.c))
+        self.custom_api_key = _le(getattr(config, "CUSTOM_API_KEY", ""), self.c)
+        self.custom_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.custom_api_key.setPlaceholderText("Bearer token or leave blank")
+        cm_key_col.addWidget(self.custom_api_key)
+        cm_layout.addLayout(cm_key_col, 2)
         layout.addWidget(self.custom_model_widget)
 
         # ── Cloud credentials row (hidden for local backends) ──
@@ -302,7 +310,9 @@ class GeneralTab(QWidget):
         
         if config.LLM_BACKEND == "custom":
             config.CUSTOM_DEFAULT_MODEL = self.custom_model.text().strip()
+            config.CUSTOM_API_KEY = self.custom_api_key.text().strip()
             prefs["custom_default_model"] = config.CUSTOM_DEFAULT_MODEL
+            prefs["custom_api_key"] = config.CUSTOM_API_KEY
             self.agent.llm._model = config.CUSTOM_DEFAULT_MODEL
 
         save_prefs(prefs)

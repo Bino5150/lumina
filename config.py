@@ -86,6 +86,7 @@ STT_DEVICE  = _p.get("stt_device", "cpu")
 LLM_BACKEND     = _p.get("llm_backend", "llamacpp")
 LLM_BACKEND_URL = _p.get("llm_backend_url", "http://localhost:8080/v1")
 CUSTOM_DEFAULT_MODEL = _p.get("custom_default_model", "")
+CUSTOM_API_KEY       = _p.get("custom_api_key", "")
 
 del _p
 

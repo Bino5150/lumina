@@ -19,10 +19,18 @@ from .groq import GroqBackend
 from .openai_backend import OpenAIBackend
 
 class CustomBackend(LMStudioBackend):
-    """Generic OpenAI-compatible endpoint. URL is required and set by the user."""
+    """Generic OpenAI-compatible endpoint. URL and optional API key set by user."""
     name = "custom"
     display_name = "Custom (OpenAI-compatible)"
     default_url = ""
+
+    def __init__(self, base_url: str = None):
+        super().__init__(base_url=base_url)
+        key = getattr(config, "CUSTOM_API_KEY", "").strip()
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}" if key else "Bearer lumina",
+        }
 
 BACKENDS = {
     "lmstudio":   LMStudioBackend,
