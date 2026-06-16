@@ -1,6 +1,7 @@
 """
 DeepSeek backend — OpenAI-compatible API for DeepSeek models.
-Supports deepseek-chat (V3) and deepseek-reasoner (R1).
+Supports deepseek-v4-flash (non-thinking) and deepseek-v4-pro (thinking).
+Note: deepseek-chat and deepseek-reasoner are deprecated as of 2026-07-24.
 Set DEEPSEEK_API_KEY in config.py
 """
 
@@ -16,8 +17,10 @@ class DeepSeekBackend(LMStudioBackend):
     default_url = "https://api.deepseek.com/v1"
 
     KNOWN_MODELS = [
-        "deepseek-chat",        # DeepSeek-V3 — fast, cheap, great for tool calling
-        "deepseek-reasoner",    # DeepSeek-R1 — chain-of-thought, slower
+        "deepseek-v4-flash",    # DeepSeek-V4-Flash — fast, cheap, thinking mode default
+        "deepseek-v4-pro",      # DeepSeek-V4-Pro — higher quality, slower
+        "deepseek-chat",        # deprecated 2026-07-24 (alias for v4-flash non-thinking)
+        "deepseek-reasoner",    # deprecated 2026-07-24 (alias for v4-flash thinking)
     ]
 
     def __init__(self, base_url: Optional[str] = None):
@@ -27,7 +30,7 @@ class DeepSeekBackend(LMStudioBackend):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
-        self._model = getattr(config, "DEEPSEEK_DEFAULT_MODEL", "deepseek-chat")
+        self._model = getattr(config, "DEEPSEEK_DEFAULT_MODEL", "deepseek-v4-flash")
 
     def get_model(self) -> str:
         return self._model
