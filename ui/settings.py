@@ -144,7 +144,7 @@ def _db():
 # ── Tab: General ───────────────────────────────────────────────────────────────
 
 class GeneralTab(QWidget):
-    CLOUD_BACKENDS = {"openrouter", "deepseek", "groq", "openai"}
+    CLOUD_BACKENDS = {"openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen"}
 
     def __init__(self, agent, c: dict, parent=None):
         super().__init__(parent)
@@ -164,7 +164,7 @@ class GeneralTab(QWidget):
         be_col = QVBoxLayout()
         be_col.addWidget(_lbl("Backend", self.c))
         self.backend_combo = QComboBox()
-        self.backend_combo.addItems(["llamacpp", "lmstudio", "ollama", "vllm", "openrouter", "deepseek", "groq", "openai", "custom"])
+        self.backend_combo.addItems(["llamacpp", "lmstudio", "ollama", "vllm", "openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen", "custom"])
         self.backend_combo.setCurrentText(config.LLM_BACKEND)
         self.backend_combo.setFixedHeight(36)
         self.backend_combo.setStyleSheet(f"QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}QComboBox::drop-down{{border:none;width:20px;}}")

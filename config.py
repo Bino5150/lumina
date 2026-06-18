@@ -29,6 +29,18 @@ GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
 OPENAI_API_KEY = ""
 OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
 
+ANTHROPIC_API_KEY = ""
+ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
+
+GEMINI_API_KEY = ""
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
+
+KIMI_API_KEY = ""
+KIMI_DEFAULT_MODEL = "kimi-latest"
+
+QWEN_API_KEY = ""
+QWEN_DEFAULT_MODEL = "qwen3.5-plus"
+
 
 # Model — auto-detect if None
 DEFAULT_MODEL = None

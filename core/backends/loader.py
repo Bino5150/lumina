@@ -17,6 +17,10 @@ from .openrouter import OpenRouterBackend
 from .deepseek import DeepSeekBackend
 from .groq import GroqBackend
 from .openai_backend import OpenAIBackend
+from .anthropic_backend import AnthropicBackend
+from .gemini_backend import GeminiBackend
+from .kimi import KimiBackend
+from .qwen import QwenBackend
 
 class CustomBackend(LMStudioBackend):
     """Generic OpenAI-compatible endpoint. URL and optional API key set by user."""
@@ -41,6 +45,10 @@ BACKENDS = {
     "deepseek":   DeepSeekBackend,
     "groq":       GroqBackend,
     "openai":     OpenAIBackend,
+    "anthropic":  AnthropicBackend,
+    "gemini":     GeminiBackend,
+    "kimi":       KimiBackend,
+    "qwen":       QwenBackend,
     "custom":     CustomBackend,
 }
 
