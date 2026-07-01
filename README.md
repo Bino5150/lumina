@@ -17,6 +17,7 @@ A local-first AI agent designed from the ground up for consumer hardware.
 - ⚡ Native PySide6/Qt desktop UI
 - 🔄 Runtime backend switching
 - 📁 Codebase indexing
+- 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe)
 
 ## Included Personas
 - 🤖 Lumina
@@ -74,7 +75,18 @@ Lumina is built local-first, but "local" alone isn't a security model — the mo
 - **Content from outside you is data, not instructions.** Tool output, and (as remote channels come online) messages from anyone other than the owner, get tagged in the model's context as untrusted — something to read and report on, never to obey —  specifically to resist the prompt-injection pattern where a hidden instruction buried in a web page or inbound message gets treated as a command.
 - **Credentials live apart from settings.** API keys and tokens are kept in a dedicated, permission-locked file outside the main config — separate from ordinary preferences, and deliberately excluded from version control.
 
-This isn't theoretical hardening for its own sake — it's what makes it safe to let Lumina reach further than your own desktop: a Telegram bridge for remote, fully-trusted control is live today (see `TELEGRAM_SETUP.md`), with Discord and email access planned next, each scoped to the trust level that channel actually deserves.
+This isn't theoretical hardening for its own sake — it's what makes it safe to let Lumina reach further than your own desktop: a Telegram bridge for remote, fully-trusted control and a Discord bot for public-facing interaction are both live today (see **Comms — Reach Her From Anywhere** below), with email access planned next, each scoped to the trust level that channel actually deserves.
+
+
+## Comms — Reach Her From Anywhere
+
+Lumina doesn't have to stay on your desktop. Two remote channels are live, and both share the same underlying trust architecture described above — they just sit at different points on it.
+
+**Telegram — full trust, your pocket.** Message her from your phone and she responds with the exact same toolset, memory access, and permissions she has sitting in front of you — filesystem, code execution, browser automation, all of it. This works because the channel is locked to a single chat ID at the code level; anyone else who finds the bot's username gets silently ignored, no reply, no acknowledgment. See `TELEGRAM_SETUP.md` for setup.
+
+**Discord — a public bot, deliberately boxed in.** Invite her to a server and she'll respond to `@mentions`, but as a different kind of session entirely: a restricted, stranger-safe tool profile (web search, Wikipedia, skill recall — nothing that touches your filesystem, your memory palace, or your chat history), rate-limited per user, and PIN-gated for anything sensitive. Her identity on Discord — name, avatar, personality, system prompt — is fully yours to customize through the **Communications tab** in Settings, but what she's *allowed to do* there is fixed in code, not in that editable identity file, so no amount of persona tweaking changes her actual permissions. Idle channels get cleaned up automatically to keep her light on constrained hardware.
+
+Both channels, plus a curated "public bio" separate from her private one, are configured through the Communications tab — bot tokens, chat IDs, and (for Discord) her public-facing identity, all in one place, no hand-editing JSON required.
 
 
 ## Memory

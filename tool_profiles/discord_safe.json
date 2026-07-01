@@ -1,16 +1,11 @@
 {
   "name": "Discord-Safe",
-  "description": "Read-only + safe write-local tools only. Execute/self-modifying tiers excluded; toolmaker hard-excluded by owner=False regardless of this list. Review before Epic C ships.",
+  "description": "Read-only, stranger-safe tools only. Excludes search_chat_history/get_chat_session/list_recent_chats/palace_recall/palace_status - those read the owner's personal chat history and MemPalace, which is a data-exposure risk, not a 'safe read-only' tool, when handed to public Discord users. Execute/self-modifying tiers excluded; toolmaker hard-excluded by owner=False regardless of this list. Reviewed S35 - promoted from draft.",
   "enabled": [
     "get_time",
     "web_search",
     "get_website",
     "get_wikipedia",
-    "search_chat_history",
-    "get_chat_session",
-    "list_recent_chats",
-    "palace_recall",
-    "palace_status",
     "list_skills",
     "recall_skill",
     "submit_pin"

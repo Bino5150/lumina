@@ -44,6 +44,7 @@ platformdirs                   # XDG-compliant app dirs (cross-platform prep)
 
 # ── Communications (optional — beta) ──────────────────────────────────────────
 python-telegram-bot            # Telegram bridge — see TELEGRAM_SETUP.md for setup
+discord.py                      # Discord bridge — see README.md Comms section
 
 # ── Dev / Debug ───────────────────────────────────────────────────────────────
 # No test framework yet — add pytest when test suite is started

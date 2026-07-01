@@ -64,9 +64,9 @@ class LuminaAgent:
         channel_id: groups PIN verification/lockout state per channel.
         """
         self.llm = get_llm_backend()
-        self.ctx = ContextManager()
-        self.registry = ToolRegistry()
         self.owner = owner
+        self.ctx = ContextManager(owner=owner)
+        self.registry = ToolRegistry()
         self.channel_id = channel_id
 
         self.on_tool_call     = on_tool_call     or (lambda n, a: None)
@@ -99,10 +99,37 @@ class LuminaAgent:
         register_pin_tools(self.registry, channel_id)
 
         from core.persistence import load as load_prefs
-        _bio = load_prefs().get("human_bio", "").strip()
-        if _bio:
-            self.ctx.system_prompt += f"\n\n## About {config.USER_NAME}\n{_bio}"
+        if owner:
+            _bio = load_prefs().get("human_bio", "").strip()
+            if _bio:
+                self.ctx.system_prompt += f"\n\n## About {config.USER_NAME}\n{_bio}"
+        else:
+            # Deliberately a SEPARATE field from human_bio, not a filtered
+            # view of it. human_bio is private context the owner writes for
+            # themselves and edits freely; human_bio_public is a short blurb
+            # the owner explicitly curates for strangers. Coupling non-owner
+            # exposure to the same field owners edit unthinkingly is what
+            # caused the S35b leak in the first place — empty by default,
+            # nothing shown until the owner deliberately writes one.
+            _public_bio = load_prefs().get("human_bio_public", "").strip()
+            if _public_bio:
+                self.ctx.system_prompt += f"\n\n## About {config.USER_NAME}\n{_public_bio}"
 
+        init_skills_db()
+        register_skills_tools(self.registry)   
+        register_chat_history_tools(self.registry) 
+        init_projects()
+        register_projects_tools(self.registry)
+        register_diff_tools(self.registry)
+        register_browser_tools(self.registry)
+        register_telegram_tools(self.registry)
+
+        # Default-deny resolution runs LAST — after every register_*_tools()
+        # call above. Anything registered before this line and not restored
+        # by an explicit profile stays locked for non-owner sessions. Moving
+        # this earlier reopens the gap the S34 smoke test caught: tools
+        # registered after the snapshot were never added to _disabled and
+        # came up enabled by default.
         if owner:
             _disabled_tools = load_prefs().get("disabled_tools", [])
             if _disabled_tools:
@@ -123,14 +150,6 @@ class LuminaAgent:
                 return True, ""
             self.registry.set_gate(_gate)
 
-        init_skills_db()
-        register_skills_tools(self.registry)   
-        register_chat_history_tools(self.registry) 
-        init_projects()
-        register_projects_tools(self.registry)
-        register_diff_tools(self.registry)
-        register_browser_tools(self.registry)
-        register_telegram_tools(self.registry)
     def chat(self, user_input: str, source: str = "OWNER_DIRECT") -> str:
         """
         Main entry point. Runs tool loop with non-streaming,
@@ -256,11 +275,18 @@ class LuminaAgent:
 
         # 2. System prompt
         if "system_prompt" in persona:
-            from core.persistence import load as load_prefs
             new_prompt = persona["system_prompt"]
-            bio = load_prefs().get("human_bio", "").strip()
-            if bio:
-                new_prompt += f"\n\n## About {config.USER_NAME}\n{bio}"
+            from core.persistence import load as load_prefs
+            if self.owner:
+                bio = load_prefs().get("human_bio", "").strip()
+                if bio:
+                    new_prompt += f"\n\n## About {config.USER_NAME}\n{bio}"
+            else:
+                # See __init__ for why this is a separate field, not a
+                # filtered view of human_bio.
+                public_bio = load_prefs().get("human_bio_public", "").strip()
+                if public_bio:
+                    new_prompt += f"\n\n## About {config.USER_NAME}\n{public_bio}"
             self.ctx.update_system_prompt(new_prompt)
 
         # 3. Tool set — single source of truth, see core/tool_profiles.py.

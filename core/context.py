@@ -28,13 +28,14 @@ def _strip_image_blocks(content):
 
 
 class ContextManager:
-    def __init__(self):
+    def __init__(self, owner: bool = True):
         self.history = []
         self.system_prompt = config.SYSTEM_PROMPT
         self.max_tokens = config.MAX_CONTEXT_TOKENS
         self.reserve = config.RESPONSE_RESERVE_TOKENS
         self._ephemeral = ""   # per-turn injection, cleared after build_messages()
         self._untrusted_content_seen = False  # sticky once True — stays for the rest of the session
+        self.owner = owner  # gates passive context injection below — see _build_system_prompt()
 
     def add_user(self, content, source: str = "OWNER_DIRECT"):
         """Accept str (normal message) or list (multipart: image + text).
@@ -63,36 +64,53 @@ class ContextManager:
             "content": tagged
         })
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, tool_budget: int = 0) -> str:
         """
         Assemble the full system prompt.
         Palace injection cap is dynamic — uses whatever token budget remains
         after accounting for tools, response reserve, and base system prompt.
-        """
-        try:
-            from tools.palace import build_context_block, estimate_tokens
-            from tools.registry import registry
-            import config
-            base_tokens = estimate_tokens(self.system_prompt)
-            tool_tokens = registry.schema_token_estimate()
-            reserved = config.RESPONSE_RESERVE_TOKENS + config.TOOL_BUDGET_TOKENS
-            palace_budget = max(100, config.MAX_CONTEXT_TOKENS - base_tokens - tool_tokens - reserved)
-            palace_block = build_context_block(max_tokens=palace_budget)
-        except Exception:
-            palace_block = ""
 
-        # Inject projectlist.md if it exists
-        try:
-            import os
-            _pl_path = os.path.expanduser("~/lumina/projects/projectlist.md")
-            if os.path.exists(_pl_path):
-                with open(_pl_path, 'r', encoding='utf-8') as _f:
-                    _pl = _f.read().strip()
-                projects_block = f"## Projects\n{_pl}" if _pl else ""
-            else:
+        Palace memory, projectlist.md, and the human_bio appended in
+        core/agent.py are ALL owner-only. None of this goes through
+        registry.call(), so Epic A's tool-dispatch gating never touched it —
+        found live (S35b) when a Discord test session recited the owner's
+        hostname, username, and personal details from passive Palace
+        injection with zero tool calls. Every passive injection point below
+        must check self.owner explicitly; there is no other gate on this path.
+
+        Note: while fixing the above, found a SEPARATE pre-existing bug —
+        this method used to import a module-level `registry` from
+        tools.registry that has never existed (only the ToolRegistry class
+        does), silently swallowed by the broad except below. Palace
+        injection has therefore never actually fired for anyone, owner
+        included, until this fix. tool_budget is now passed in from
+        build_messages(), which already computes it correctly from the
+        real per-agent registry instance.
+        """
+        palace_block = ""
+        if self.owner:
+            try:
+                from tools.palace import build_context_block, estimate_tokens
+                import config
+                base_tokens = estimate_tokens(self.system_prompt)
+                reserved = config.RESPONSE_RESERVE_TOKENS + config.TOOL_BUDGET_TOKENS
+                palace_budget = max(100, config.MAX_CONTEXT_TOKENS - base_tokens - tool_budget - reserved)
+                palace_block = build_context_block(max_tokens=palace_budget)
+            except Exception:
+                palace_block = ""
+
+        # Inject projectlist.md if it exists — owner-only, same reasoning as above.
+        projects_block = ""
+        if self.owner:
+            try:
+                import os
+                _pl_path = os.path.expanduser("~/lumina/projects/projectlist.md")
+                if os.path.exists(_pl_path):
+                    with open(_pl_path, 'r', encoding='utf-8') as _f:
+                        _pl = _f.read().strip()
+                    projects_block = f"## Projects\n{_pl}" if _pl else ""
+            except Exception:
                 projects_block = ""
-        except Exception:
-            projects_block = ""
 
         parts = [self.system_prompt]
         if palace_block:
@@ -116,7 +134,7 @@ class ContextManager:
         Build the messages list for the API call.
         Trims oldest history if over budget, always keeps system prompt + palace block.
         """
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(tool_budget=tool_budget)
         self._ephemeral = ""   # consumed — clear for next turn
         available = self.max_tokens - self.reserve - tool_budget
         system_tokens = estimate_tokens(system_prompt) + 4

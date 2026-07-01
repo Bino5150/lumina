@@ -14,6 +14,7 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import config
 from core.headless import run_headless_turn
 from core.secrets import get_secret
+from core.persistence import load as load_prefs
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("telegram_bridge")
@@ -21,10 +22,21 @@ log = logging.getLogger("telegram_bridge")
 CHANNEL_ID = "telegram-owner"
 
 
+def _owner_chat_id():
+    """prefs.json (settable via the Communications tab) takes priority;
+    config.py is the fallback for anyone who set it there manually before
+    the UI field existed. Returns None if neither is set."""
+    from_prefs = load_prefs().get("telegram_owner_chat_id")
+    if from_prefs:
+        return from_prefs
+    return config.TELEGRAM_OWNER_CHAT_ID
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    owner_id = _owner_chat_id()
 
-    if chat_id != config.TELEGRAM_OWNER_CHAT_ID:
+    if not owner_id or str(chat_id) != str(owner_id):
         log.warning(f"[TELEGRAM] Rejected message from unauthorized chat_id={chat_id}")
         return  # silent drop — no reply, no acknowledgment
 
@@ -42,8 +54,9 @@ def main():
     if not token:
         log.error("telegram_bot_token not set — see core/secrets.py, set_secret().")
         return
-    if not config.TELEGRAM_OWNER_CHAT_ID:
-        log.error("TELEGRAM_OWNER_CHAT_ID not set in config.py — refusing to start unsafe.")
+    if not _owner_chat_id():
+        log.error("Owner chat ID not set (Communications tab, or TELEGRAM_OWNER_CHAT_ID "
+                   "in config.py) — refusing to start unsafe.")
         return
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

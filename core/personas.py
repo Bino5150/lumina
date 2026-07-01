@@ -7,10 +7,20 @@ import json
 import os
 
 PERSONAS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "personas")
+DISCORD_TEMPLATE_PATH = os.path.join(PERSONAS_DIR, "discord_template.json")
 
 
-def list_personas() -> list[dict]:
-    """Return list of persona dicts, sorted by name. Empty list if none found."""
+def list_personas(include_channel_bound: bool = False) -> list[dict]:
+    """Return list of persona dicts, sorted by name. Empty list if none found.
+
+    include_channel_bound: personas flagged "channel_bound": true (e.g.
+    personas/discord_template.json) are excluded by default. Those files
+    are identity templates for comms transports, edited from a dedicated
+    Communications tab screen via load_persona()/save_persona() directly
+    on their fixed path - not selectable in the normal desktop Persona
+    sidebar. Pass True only if a caller genuinely needs the full set
+    (e.g. an admin/debug view), which the sidebar itself never should.
+    """
     if not os.path.isdir(PERSONAS_DIR):
         return []
     results = []
@@ -20,6 +30,8 @@ def list_personas() -> list[dict]:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                if data.get("channel_bound") and not include_channel_bound:
+                    continue
                 data["_file"] = path
                 results.append(data)
             except Exception as e:
