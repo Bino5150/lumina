@@ -42,5 +42,8 @@ python-dateutil                # robust datetime parsing
 psutil                         # system info (memory, CPU) for meta tools
 platformdirs                   # XDG-compliant app dirs (cross-platform prep)
 
+# ── Communications (optional — beta) ──────────────────────────────────────────
+python-telegram-bot            # Telegram bridge — see TELEGRAM_SETUP.md for setup
+
 # ── Dev / Debug ───────────────────────────────────────────────────────────────
 # No test framework yet — add pytest when test suite is started

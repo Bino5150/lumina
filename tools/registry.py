@@ -5,13 +5,16 @@ Loads tools, builds lean OpenAI-compatible schemas, dispatches calls.
 
 import importlib
 import traceback
-from typing import Callable
+from typing import Callable, Optional
 
 
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, dict] = {}      # name -> {fn, schema}
         self._disabled: set[str] = set()        # names of disabled tools
+        self._gate_fn: Optional[Callable[[str], tuple]] = None
+        # gate_fn(name) -> (allowed: bool, reason: str). Checked AFTER _disabled —
+        # for tools that are enabled but need one more runtime check (PIN) before firing.      # names of disabled tools
 
     def register(self, name: str, fn: Callable, description: str, parameters: dict):
         """Register a tool with a lean description."""
@@ -46,6 +49,17 @@ class ToolRegistry:
         """Return list of disabled tool names for persistence."""
         return list(self._disabled)
 
+    def all_tool_names(self) -> list[str]:
+        """Full registered universe, regardless of disabled state. Use this — never
+        ._tools directly, never get_schemas()/list_enabled() — when computing a
+        profile's complement. The filtered accessors silently lose track of
+        anything already disabled."""
+        return list(self._tools.keys())
+
+    def set_gate(self, gate_fn):
+        """Install an additional dispatch-time check (PIN gate). gate_fn(name) -> (allowed, reason)."""
+        self._gate_fn = gate_fn
+
     def get_schemas(self, names: list = None) -> list:
         """Return OpenAI tool schemas for enabled tools. Optionally filter by name list."""
         if names is None:
@@ -64,6 +78,10 @@ class ToolRegistry:
             return f"[Tool error: '{name}' not found]"
         if name in self._disabled:
             return f"[Tool '{name}' is currently disabled.]"
+        if self._gate_fn:
+            allowed, reason = self._gate_fn(name)
+            if not allowed:
+                return f"[Tool '{name}' blocked: {reason}]"
         try:
             result = self._tools[name]["fn"](**args)
             return str(result) if result is not None else "[No result]"

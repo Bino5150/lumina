@@ -108,6 +108,9 @@ USER_NAME = "User"
 MAX_TOOL_ITERATIONS = 20  # Room for complex agentic workflows
 TOOL_RESULT_MAX_CHARS = 8000
 TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
+# Telegram bridge — owner identity, not a credential (the bot token lives in
+# core/secrets.py instead). None in release; set your real chat ID in OG only.
+TELEGRAM_OWNER_CHAT_ID = None
 
 # System prompt
 SYSTEM_PROMPT = """RESPONSE STYLE: Think briefly — 3 to 5 sentences of reasoning max for simple queries. Do not outline, draft, or self-correct in your thinking. Just reason and respond.

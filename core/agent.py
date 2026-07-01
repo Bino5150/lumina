@@ -26,6 +26,7 @@ from core.chat_history import register_chat_history_tools
 from tools.projects import register_projects_tools, init_projects
 from tools.diff import register_diff_tools
 from tools.browser import register_browser_tools, browser_manager
+from tools.telegram_send import register_telegram_tools
 
 
 CHAIN_BLOCKED_AFTER_SEARCH = {"get_website", "web_search"}
@@ -45,7 +46,9 @@ class LuminaAgent:
                  on_think_token=None,
                  on_think_end=None,
                  on_response_token=None,
-                 tts=None):
+                 tts=None,
+                 owner: bool = True,
+                 channel_id: str = "default"):
         """
         Streaming callbacks:
           on_tool_call(name, args)     — tool about to execute
@@ -54,10 +57,17 @@ class LuminaAgent:
           on_think_token(token)        — character inside think block
           on_think_end()               — </think> block closed
           on_response_token(token)     — final response token streaming
+
+        owner: True for the desktop app (you). False for ANY agent constructed
+        on behalf of a channel, subagent, or scheduled task — no implicit
+        default, every call site decides this explicitly.
+        channel_id: groups PIN verification/lockout state per channel.
         """
         self.llm = get_llm_backend()
         self.ctx = ContextManager()
         self.registry = ToolRegistry()
+        self.owner = owner
+        self.channel_id = channel_id
 
         self.on_tool_call     = on_tool_call     or (lambda n, a: None)
         self.on_tool_result   = on_tool_result   or (lambda n, r: None)
@@ -79,15 +89,40 @@ class LuminaAgent:
         register_filesystem_tools(self.registry)
         register_sandbox_tools(self.registry)
         register_terminal_tools(self.registry)
-        register_toolmaker_tools(self.registry, self)
+        if owner:
+            # Hard exclusion — for non-owner sessions, toolmaker's tools never
+            # exist in the registry at all. Not disabled, not absent from a
+            # profile — absent from _tools, period.
+            register_toolmaker_tools(self.registry, self)
         register_palace_tools(self.registry)
+        from tools.pin import register_pin_tools
+        register_pin_tools(self.registry, channel_id)
+
         from core.persistence import load as load_prefs
         _bio = load_prefs().get("human_bio", "").strip()
         if _bio:
             self.ctx.system_prompt += f"\n\n## About {config.USER_NAME}\n{_bio}"
-        _disabled_tools = load_prefs().get("disabled_tools", [])
-        if _disabled_tools:
-            self.registry.set_disabled(_disabled_tools)
+
+        if owner:
+            _disabled_tools = load_prefs().get("disabled_tools", [])
+            if _disabled_tools:
+                self.registry.set_disabled(_disabled_tools)
+        else:
+            # Non-owner: default-deny everything until a persona/profile
+            # explicitly opts tools back in. No window of inherited owner state.
+            self.registry.set_disabled(self.registry.all_tool_names())
+
+        if not owner:
+            from core.pin_gate import is_verified
+            from core.tool_profiles import TOOL_TIERS
+            SENSITIVE_TIERS = {"execute", "self_modifying"}  # add "outbound_action" once those tools exist
+            def _gate(name):
+                tier = TOOL_TIERS.get(name, "execute")  # unclassified tool = fail closed
+                if tier in SENSITIVE_TIERS and not is_verified(channel_id):
+                    return False, "PIN verification required for this action."
+                return True, ""
+            self.registry.set_gate(_gate)
+
         init_skills_db()
         register_skills_tools(self.registry)   
         register_chat_history_tools(self.registry) 
@@ -95,12 +130,15 @@ class LuminaAgent:
         register_projects_tools(self.registry)
         register_diff_tools(self.registry)
         register_browser_tools(self.registry)
-    def chat(self, user_input: str) -> str:
+        register_telegram_tools(self.registry)
+    def chat(self, user_input: str, source: str = "OWNER_DIRECT") -> str:
         """
         Main entry point. Runs tool loop with non-streaming,
         then streams the final response. Returns full response string.
+        source: passed straight through to ctx.add_user(). OWNER_DIRECT (default)
+        preserves current desktop behavior unchanged.
         """
-        self.ctx.add_user(user_input)
+        self.ctx.add_user(user_input, source=source)
         tools_used_this_turn = set()
         think_step = [0]
         
@@ -225,11 +263,17 @@ class LuminaAgent:
                 new_prompt += f"\n\n## About {config.USER_NAME}\n{bio}"
             self.ctx.update_system_prompt(new_prompt)
 
-        # 3. Tool set
-        if "tools_enabled" in persona:
-            all_tools = [s["function"]["name"] for s in self.registry.get_schemas()]
-            disabled = [t for t in all_tools if t not in persona["tools_enabled"]]
-            self.registry.set_disabled(disabled)
+        # 3. Tool set — single source of truth, see core/tool_profiles.py.
+        # Handles both tools_profile (named) and tools_enabled (inline list);
+        # computes against the full raw registry, never the filtered schema list.
+        if "tools_profile" in persona or "tools_enabled" in persona:
+            from core.tool_profiles import apply_tool_profile
+            apply_tool_profile(
+                self.registry,
+                profile_name=persona.get("tools_profile"),
+                tools_enabled=persona.get("tools_enabled"),
+                owner=self.owner,
+            )
 
         # 4. TTS voice + settings
         if self.tts:

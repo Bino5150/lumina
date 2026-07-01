@@ -875,11 +875,8 @@ class ToolsTab(QWidget):
             return
         profile = self._profiles[idx]
         self._current_profile_path = profile["_file"]
-        enabled_set = set(profile.get("enabled", []))
-        # Apply to agent registry immediately
-        all_tools = list(self.agent.registry._tools.keys())
-        disabled = [t for t in all_tools if t not in enabled_set]
-        self.agent.registry.set_disabled(disabled)
+        from core.tool_profiles import apply_tool_profile
+        apply_tool_profile(self.agent.registry, profile_name=profile.get("name"), owner=True)
         self._save_state()
         self._load_tools()
 
@@ -1721,6 +1718,7 @@ class PersonasTab(QWidget):
         if not self._current_persona:
             return
         data = self._collect_persona_data()
+        self.agent.apply_persona(data)
         # Apply tool profile first
         if data.get("tools_profile"):
             from core.tool_profiles import list_profiles

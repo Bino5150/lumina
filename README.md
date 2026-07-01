@@ -32,13 +32,13 @@ A local-first AI agent designed from the ground up for consumer hardware.
 **Built and tested on a 4GB Nvidia Quadro T1000 because local AI should be accessible to normal hardware.**
 
 - Status: Active development (public beta testing)
-- Platform: Linux (official Windows & MacOS support coming soon)
+- Platform: Linux or (or VM/WSL2/etc.; official Windows & MacOS support coming soon)
 - Language: Python
 
 
 There are a lot of AI assistants out there. Most of them are wrappers — a chat box bolted onto an API call, themed in some shade of purple, shipped as an Electron app the size of a small country. They call themselves "local" because they technically support llama.cpp on the backend. They call themselves "agents" because they have a web search button. Their reckless token usage is designed for a corporate credit card on a cloud model with a data center of compute and vram behind it. Bloated prompts, verbose tool definitions, tons of .md injections... You’ll blow your whole context window by the time you say “Hello”. This is enough to bring local LLM's to their knees, putting along at morse code speed tok/s, hallucinating, choking on tool calls, context roll off causing them to forget the beginning of the conversation you're currently having.  
 Lumina is something different.
-Lumina is a local-first AI agent built entirely from scratch — 13,000+ lines of hand-written Python — with a philosophy that puts the user in complete control of every layer of the stack: the model, the memory, the voice, the tools, and the inference engine itself. She runs on your machine. She speaks with your voice. She remembers what matters. And when you're done for the day, she's not phoning home.
+Lumina is a local-first AI agent built entirely from scratch — 13,000+ lines of hand-written Python — with a philosophy that puts the user in complete control of every layer of the stack: the model, the memory, the voice, the tools, and the inference engine itself. She runs on your machine. She speaks with your voice. She remembers what matters. And when you're done for the day, she's not phoning home. Hardened security protocols keep your data and you system safe, secure, and private.
 
 This is her story.
 
@@ -62,6 +62,19 @@ Lumina's LLM layer is fully abstracted. If you want to swap backends, you change
 - vLLM compatibility
 - *Beta release also now supports cloud models
 All backends implement the same interface. A backend change takes effect immediately without restarting the application.
+
+
+## Security Architecture
+
+Lumina is built local-first, but "local" alone isn't a security model — the moment an agent can act on your behalf, *what it's allowed to do, and for whom,* matters as much as where the model weights live. A few principles run through the codebase:
+
+- **Trust is explicit, not assumed.** Every agent session is constructed with an `owner` flag — `True` means it's speaking for you, full toolset, no restrictions. `False` means it isn't, regardless of who or what is on the other end. There's no default; every entry point (the desktop app, a remote channel, a future subagent) has to decide this on purpose.
+- **Tool creation can't bootstrap itself out of a sandbox.** Lumina can write and register her own tools — but that capability is structurally absent, not just toggled off, for any non-owner session. A tool that can create new tools is the one thing an allowlist can't contain after the fact, so it's excluded before the registry even exists.
+- **Default-deny, not default-allow.** A non-owner session starts with everything disabled and only gets tools back through an explicit, named profile. A missing or broken profile fails closed — nothing runs — rather than failing open.
+- **Content from outside you is data, not instructions.** Tool output, and (as remote channels come online) messages from anyone other than the owner, get tagged in the model's context as untrusted — something to read and report on, never to obey —  specifically to resist the prompt-injection pattern where a hidden instruction buried in a web page or inbound message gets treated as a command.
+- **Credentials live apart from settings.** API keys and tokens are kept in a dedicated, permission-locked file outside the main config — separate from ordinary preferences, and deliberately excluded from version control.
+
+This isn't theoretical hardening for its own sake — it's what makes it safe to let Lumina reach further than your own desktop: a Telegram bridge for remote, fully-trusted control is live today (see `TELEGRAM_SETUP.md`), with Discord and email access planned next, each scoped to the trust level that channel actually deserves.
 
 
 ## Memory
@@ -211,8 +224,8 @@ She is not finished. She will never be finished — that's the point. But she is
 
 ## Getting Started
 Requirements:
-- Linux (Ubuntu/Mint/Debian recommended)
-- NVIDIA GPU with CUDA 12.x (4GB VRAM minimum, 8GB recommended)
+- Linux (Ubuntu/Mint/Debian recommended; VM/WSL2/ect.)
+- NVIDIA GPU with CUDA 12.x (4GB VRAM minimum, 8GB or more recommended)
 - Python 3.10+ (miniconda/conda recommended)
 _ ~8GB disk space for model + dependencies
 ## Install:
