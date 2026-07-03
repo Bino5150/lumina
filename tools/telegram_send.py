@@ -5,11 +5,17 @@ API directly. Independent of the polling bridge process.
 import requests
 import config
 from core.secrets import get_secret
+from core.idempotency import make_request_id, check, record
 
 API_BASE = "https://api.telegram.org/bot{token}"
 
 
 def send_telegram_file(path: str, caption: str = "") -> str:
+    request_id = make_request_id("send_telegram_file", path, caption)
+    cached = check(request_id)
+    if cached:
+        return f"[Duplicate suppressed — already sent: {cached}]"
+
     token = get_secret("telegram_bot_token")
     chat_id = config.TELEGRAM_OWNER_CHAT_ID
     if not token or not chat_id:
@@ -22,7 +28,9 @@ def send_telegram_file(path: str, caption: str = "") -> str:
                 files={"document": f}, timeout=30,
             )
         resp.raise_for_status()
-        return f"[Sent '{path}' to Telegram.]"
+        result = f"[Sent '{path}' to Telegram.]"
+        record(request_id, result)
+        return result
     except FileNotFoundError:
         return f"[File not found: {path}]"
     except Exception as e:
@@ -31,6 +39,11 @@ def send_telegram_file(path: str, caption: str = "") -> str:
 
 def send_telegram_message(text: str) -> str:
     """Proactive notification — e.g. a completed task alert."""
+    request_id = make_request_id("send_telegram_message", text)
+    cached = check(request_id)
+    if cached:
+        return f"[Duplicate suppressed — already sent: {cached}]"
+
     token = get_secret("telegram_bot_token")
     chat_id = config.TELEGRAM_OWNER_CHAT_ID
     if not token or not chat_id:
@@ -41,7 +54,9 @@ def send_telegram_message(text: str) -> str:
             data={"chat_id": chat_id, "text": text[:4096]}, timeout=15,
         )
         resp.raise_for_status()
-        return "[Message sent.]"
+        result = "[Message sent.]"
+        record(request_id, result)
+        return result
     except Exception as e:
         return f"[Telegram send error: {e}]"
 

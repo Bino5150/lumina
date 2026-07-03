@@ -4,12 +4,6 @@ This connects Lumina to Telegram so you can message her from your phone — chec
 things, ask her to send you a file, whatever you'd normally do sitting at the desktop,
 just from wherever you are.
 
-**This is a beta feature.** Right now it runs as a separate script you start by hand in
-a terminal, and a couple of settings need to be edited directly in `config.py`. A future
-update will fold all of this into the Settings UI — bot token, chat ID, and which persona
-answers you, all in one tab, no terminal required. Until then, this guide gets you
-running today.
-
 **A note on trust:** Telegram is treated as a fully trusted channel — same as sitting at
 your own keyboard. Lumina will act on whatever you send her with no extra confirmation
 step. That's by design (it's what makes this useful for quick remote requests), but it
@@ -52,88 +46,64 @@ On the machine running Lumina, in the same Python environment Lumina normally ru
 pip install python-telegram-bot --break-system-packages
 ```
 
-## Step 4 — Save your bot token
+## Step 4 — Enter your token and chat ID
 
-From your `lumina` directory, run:
+Open Lumina, go to **Settings → Communications → Telegram**, and paste in:
+- Your **bot token** from Step 1
+- Your **chat ID** from Step 2
 
-```bash
-python -c "from core.secrets import set_secret; set_secret('telegram_bot_token', 'PASTE_YOUR_TOKEN_HERE')"
-```
+Hit Save. That's it — the token is stored securely in
+`~/.config/lumina/credentials.json` (not in your regular settings file), and your chat
+ID is saved to your preferences.
 
-Replace `PASTE_YOUR_TOKEN_HERE` with the actual token from Step 1 (keep the quotes
-around it). This saves the token to `~/.config/lumina/credentials.json`, kept separate
-from your other settings on purpose — it's a real credential, not a regular preference,
-so it's deliberately not stored alongside config.py.
+*(Prefer the terminal? See [Advanced / Manual Setup](#advanced--manual-setup) below.)*
 
-## Step 5 — Set your chat ID
+## Step 5 — Start the bridge
 
-Open `config.py` in your Lumina directory and find this line near the bottom of the
-"Agent behavior" section:
+Right below the token/chat ID fields is a **Bridge** toggle. Click **Start** — it flips
+to "● Running" and Lumina starts listening for your messages immediately, right from
+the Settings tab. No terminal required.
 
-```python
-TELEGRAM_OWNER_CHAT_ID = None
-```
+The bridge stays off by default every time Lumina launches — you turn it on when you
+want it, same as before. If you'd rather not touch the GUI, running it from a terminal
+still works exactly the same too (see [Advanced](#advanced--manual-setup)).
 
-Change `None` to your actual numeric chat ID from Step 2 — no quotes, just the number:
-
-```python
-TELEGRAM_OWNER_CHAT_ID = 987654321
-```
-
-Save the file.
-
-## Step 6 — Start the bridge
-
-In a terminal, from your `lumina` directory:
-
-```bash
-python -m comms.telegram_bridge
-```
-
-You should see it log that it's started and is polling. Leave this terminal window open
-— this is what's actually listening for your messages. (Your main Lumina desktop app
-doesn't need to be running for this to work; they're independent.)
-
-## Step 7 — Test it
+## Step 6 — Test it
 
 Open Telegram, find the bot you created in Step 1, and send it a message — something
 simple like "hey, you there?"
 
 You should get a real response back within a few seconds. If you don't hear back at all,
-double check Steps 4 and 5 — a missing token or unset chat ID is the most common cause,
-and the terminal log from Step 6 will usually tell you which one.
+double check Step 4 and that the toggle actually shows "Running" — a missing token,
+unset chat ID, or a bridge that's still off is the most common cause.
 
 ---
 
 ## Stopping the bridge
 
-Press `Ctrl+C` in the terminal where it's running. There's no harm in leaving it running
-continuously if you want always-on access, but it's not required to be on for the rest
-of Lumina to work normally.
+Click **Stop** in the Communications tab. If you started it from a terminal instead,
+press `Ctrl+C` there. There's no harm in leaving it running continuously if you want
+always-on access, but it's not required to be on for the rest of Lumina to work
+normally.
 
 ## Known limitations (beta)
 
-- Setup currently requires editing `config.py` and running a one-line Python command —
-  this moves into Settings UI in a future update.
 - Telegram doesn't yet respect whichever persona is active on your desktop, or let you
   pick a different one for this channel — you'll always get the default Lumina
   configuration for now. Per-channel persona selection is planned.
-- The bridge runs as a separate process you start manually — it doesn't yet auto-start
-  alongside the main app.
 
 ## Troubleshooting
 
-**"telegram_bot_token not set"** — Step 4 didn't save correctly, or you're running the
-bridge from a different Python environment than the one you ran `set_secret` in. Try:
+**"telegram_bot_token not set"** — Step 4 didn't save correctly. Confirm with:
 ```bash
 cat ~/.config/lumina/credentials.json
 ```
-to confirm the token actually saved.
 
-**"TELEGRAM_OWNER_CHAT_ID not set in config.py — refusing to start unsafe"** — Step 5
-wasn't saved, or you're still on `None`. The bridge deliberately won't start without a
-real chat ID set — this is intentional, not a bug.
+**"Owner chat ID not set — configure it above first"** (shown when clicking Start) —
+your chat ID isn't saved yet. Go back to Step 4.
 
-**Bot doesn't respond, no error in terminal** — most likely your chat ID doesn't match
-what's in `config.py`. Double-check Step 2's number against what you entered in Step 5,
-digit for digit.
+**Bot doesn't respond, no error shown** — most likely your chat ID doesn't match what
+you entered in Step 2 or 4. Double-check it digit for digit.
+
+**Bridge toggle shows an import error** — `python-telegram-bot` isn't installed in the
+environment Lumina's running in.

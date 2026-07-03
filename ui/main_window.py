@@ -20,11 +20,13 @@ import base64
 import re 
 import requests
 import threading 
+import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from core.personas import list_personas, load_persona
 from core import persistence
+from core import dreaming 
 from ui.chat_widget import ChatWidget, LiveResponseBubble
 from ui.settings import SettingsPanel
 from tools.memory import (
@@ -278,6 +280,12 @@ class LuminaWindow(QMainWindow):
         self._pending_audio = None
         self._current_chat_id = None
         self._prefs = persistence.load()
+        self._last_activity = time.time()
+        self._dream_fired_this_idle = False
+        self._dream_timer = QTimer(self)
+        self._dream_timer.timeout.connect(self._check_dream_idle)
+        self._dream_timer.start(60_000)  # check once a minute — cheap, no need to be tighter
+
 
         try:
             init_chat_db()
@@ -797,6 +805,18 @@ class LuminaWindow(QMainWindow):
         except Exception:
             self.status_bar.set_error("No backend connected — go to Settings to configure")
 
+    # ── Dreaming ────────────────────────────────────────────────────────────────
+
+    def _check_dream_idle(self):
+        if self._dream_fired_this_idle or not self._current_chat_id:
+            return
+        idle_minutes = getattr(config, "DREAM_IDLE_MINUTES", 20)
+        if time.time() - self._last_activity >= idle_minutes * 60:
+            self._dream_fired_this_idle = True
+            chat_id = self._current_chat_id
+            threading.Thread(target=lambda: dreaming.on_session_idle(chat_id), daemon=True).start()
+
+
     # ── Message handling ───────────────────────────────────────────────────────
 
     def _on_user_message(self, text: str):
@@ -805,6 +825,9 @@ class LuminaWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
         self.worker = None
+        
+        self._last_activity = time.time()
+        self._dream_fired_this_idle = False
 
         content = None
         display_text = text

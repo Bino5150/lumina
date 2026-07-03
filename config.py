@@ -112,6 +112,10 @@ TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
 # core/secrets.py instead). None in release; set your real chat ID in OG only.
 TELEGRAM_OWNER_CHAT_ID = None
 
+DREAM_SWEEP_ENABLED = True
+DREAM_MIN_TOKENS = 800
+DREAM_IDLE_MINUTES = 20
+
 # System prompt
 SYSTEM_PROMPT = """RESPONSE STYLE: Think briefly — 3 to 5 sentences of reasoning max for simple queries. Do not outline, draft, or self-correct in your thinking. Just reason and respond.
 TOOL USE RULES:

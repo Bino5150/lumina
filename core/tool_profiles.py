@@ -97,7 +97,10 @@ TOOL_TIERS = {
 # Hard-excluded from every non-owner session, independent of tier, independent
 # of what any profile JSON says. Toolmaker breaks the allowlist model by
 # design — it doesn't get to participate in it.
-OWNER_ONLY_TOOLS = {"create_tool", "list_custom_tools", "delete_tool"}
+OWNER_ONLY_TOOLS = {
+    "create_tool", "list_custom_tools", "delete_tool",
+    "palace_review_writes", "palace_undo_write",
+}
 
 
 def find_profile_by_name(name: str) -> dict | None:

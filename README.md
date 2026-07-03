@@ -1,12 +1,12 @@
 # lumina
-A full featured, powerful, and efficient AI Agentic harness designed from the ground up with local inference on consumer hardware in mind. It evolves, grows, and gets smarter as you go. And it REMEMBERS... 
+A full featured, powerful, and efficient AI agentic harness designed from the ground up with local inference on consumer hardware in mind. It evolves, grows, and gets smarter as you go. And it REMEMBERS... 
 
 # Lumina
 
 A local-first AI agent designed from the ground up for consumer hardware.
 
 ## Features:
-- 🧠 Multi-tier persistent memory 
+- 🧠 Multi-tier persistent memory - including dreaming
 - 🗣️ Voice cloning & local TTS
 - 🎭 Swappable AI personas
 - 🔧 Agentic tool framework
@@ -34,6 +34,7 @@ A local-first AI agent designed from the ground up for consumer hardware.
 
 - Status: Active development (public beta testing)
 - Platform: Linux or (or VM/WSL2/etc.; official Windows & MacOS support coming soon)
+- MacOS and Windows compatible; still in the testing phase. Beta testers needed
 - Language: Python
 
 
@@ -61,7 +62,7 @@ Lumina's LLM layer is fully abstracted. If you want to swap backends, you change
 - LM Studio compatibility
 - Ollama compatibility
 - vLLM compatibility
-- *Beta release also now supports cloud models
+- Now supports cloud models and custom endpoints 
 All backends implement the same interface. A backend change takes effect immediately without restarting the application.
 
 
@@ -80,9 +81,9 @@ This isn't theoretical hardening for its own sake — it's what makes it safe to
 
 ## Comms — Reach Her From Anywhere
 
-Lumina doesn't have to stay on your desktop. Two remote channels are live, and both share the same underlying trust architecture described above — they just sit at different points on it.
+Lumina doesn't have to stay on your desktop. Two remote channels are cuuently live, and both share the same underlying trust architecture described above — they just sit at different points on it.
 
-**Telegram — full trust, your pocket.** Message her from your phone and she responds with the exact same toolset, memory access, and permissions she has sitting in front of you — filesystem, code execution, browser automation, all of it. This works because the channel is locked to a single chat ID at the code level; anyone else who finds the bot's username gets silently ignored, no reply, no acknowledgment. See `TELEGRAM_SETUP.md` for setup.
+**Telegram — full trust, your pocket.** Message her from your phone and she responds with the exact same toolset, memory access, and permissions she has sitting in front of you — filesystem, code execution, browser automation, all of it. This works because the channel is locked to a single chat ID at the code level; anyone else who finds the bot's username gets silently ignored, no reply, no acknowledgment. Set up through the Communications tab in Settings — bot token, chat ID, done. TELEGRAM_SETUP.md covers the manual/legacy path (BotFather token creation, config.py fallback) if you'd rather not use the GUI. See `TELEGRAM_SETUP.md` for manual setup.
 
 **Discord — a public bot, deliberately boxed in.** Invite her to a server and she'll respond to `@mentions`, but as a different kind of session entirely: a restricted, stranger-safe tool profile (web search, Wikipedia, skill recall — nothing that touches your filesystem, your memory palace, or your chat history), rate-limited per user, and PIN-gated for anything sensitive. Her identity on Discord — name, avatar, personality, system prompt — is fully yours to customize through the **Communications tab** in Settings, but what she's *allowed to do* there is fixed in code, not in that editable identity file, so no amount of persona tweaking changes her actual permissions. Idle channels get cleaned up automatically to keep her light on constrained hardware.
 
@@ -109,6 +110,14 @@ The base layers hold information that never expires: core identity facts, critic
 L2 holds recent, session-based knowledge — ongoing projects, recent decisions, active context. It uses a temporal decay algorithm (λ=0.05) that ranks memories by recency. Old L2 entries don't disappear suddenly; they fade gracefully, like actual human memory. The decay constant is tunable — push it to 0.1 if you want faster cycling, drop it to 0.02 for slower fade.
 
 The MemPalace uses AAAK compression to fit more meaningful content in fewer tokens, and is stored in SQLite with a FTS5 full-text search index. All three layers are automatically injected into the system prompt on every turn. Lumina always knows who you are, what you've been working on, and what matters.
+
+**Dreaming** 
+Most agents only remember what you explicitly tell them to remember. Lumina does that too — but she also dreams.
+
+When a session goes idle, Lumina quietly reviews what was actually said and worked on, distills it into a compact summary, and writes it to a dedicated nightstand — a memory space that's deliberately separate from her curated MemPalace wings. Nothing gets promoted to her permanent identity or critical-fact layers automatically. Ever. A dream is a first draft of a memory, not a fact — it's tagged with its own provenance (dream-sweep), fully reviewable, and fully undoable, so nothing she synthesizes on her own quietly becomes something she "just knows" without you ever having seen it.
+
+This isn't passive logging. It's the same synthesis mechanism her context-compaction system uses under memory pressure, fired proactively instead of reactively — one mechanism, two triggers, same discipline about never letting unattended writes outrank things you told her directly.
+
 
 ## Chat History Search
 Full-text search over the raw message log, FTS5-indexed, available as an on-demand tool. Lumina can reach back into previous sessions, find relevant exchanges, and bring that context forward. Not a vector similarity approximation — exact full-text search.
@@ -237,14 +246,19 @@ She is not finished. She will never be finished — that's the point. But she is
 ## Getting Started
 Requirements:
 - Linux (Ubuntu/Mint/Debian recommended; VM/WSL2/ect.)
+- Windows & MacOS compatible, but still in the testing phase. Beta testers needed.
 - NVIDIA GPU with CUDA 12.x (4GB VRAM minimum, 8GB or more recommended)
 - Python 3.10+ (miniconda/conda recommended)
-_ ~8GB disk space for model + dependencies
+- ~10GB disk space for Lumina + model + dependencies
 ## Install:
 - git clone https://github.com/bino5150/lumina.git
 - cd lumina
 - pip install -r requirements.txt
 - playwright install chromium
+
+## MacOS:
+- brew install portaudio
+- pip install -r requirements.txt --break-system-packages
 
 ## Configure:
 

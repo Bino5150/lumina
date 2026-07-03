@@ -1291,6 +1291,17 @@ class CommunicationsTab(QWidget):
         tg_save.clicked.connect(self._save_telegram)
         tg_token_row.addWidget(tg_save)
         layout.addLayout(tg_token_row)
+        
+        # ── Telegram bridge on/off ──
+        tg_bridge_row = QHBoxLayout()
+        self.tg_bridge_status = _lbl("Bridge: checking...", c)
+        tg_bridge_row.addWidget(self.tg_bridge_status)
+        tg_bridge_row.addStretch()
+        self.tg_bridge_toggle = _btn("Start", c, accent=True)
+        self.tg_bridge_toggle.clicked.connect(self._toggle_telegram_bridge)
+        tg_bridge_row.addWidget(self.tg_bridge_toggle)
+        layout.addLayout(tg_bridge_row)
+        self._refresh_telegram_bridge_status()
 
         # ── Discord ──
         layout.addWidget(_sec("DISCORD", c))
@@ -1376,6 +1387,32 @@ class CommunicationsTab(QWidget):
             set_secret("telegram_bot_token", token)
             self.tg_token.clear()
             self.tg_token.setPlaceholderText("•••• configured")
+    
+    def _refresh_telegram_bridge_status(self):
+        try:
+            from comms.telegram_bridge import is_running
+            running = is_running()
+        except Exception:
+            running = False
+        if running:
+            self.tg_bridge_status.setText("Bridge: ● Running")
+            self.tg_bridge_toggle.setText("Stop")
+        else:
+            self.tg_bridge_status.setText("Bridge: ○ Stopped")
+            self.tg_bridge_toggle.setText("Start")
+
+    def _toggle_telegram_bridge(self):
+        try:
+            from comms.telegram_bridge import start_bridge, stop_bridge, is_running
+        except Exception as e:
+            self.tg_bridge_status.setText(f"Bridge: import error — {e}")
+            return
+        if is_running():
+            success, msg = stop_bridge()
+        else:
+            success, msg = start_bridge()
+        self.tg_bridge_status.setText(f"Bridge: {msg}")
+        self._refresh_telegram_bridge_status()
 
     # ── Discord: token ──
     def _save_discord_token(self):
@@ -2188,6 +2225,8 @@ class AboutTab(QWidget):
         linkedin_btn.clicked.connect(
             lambda: __import__("webbrowser").open("https://www.linkedin.com/in/jason-malik-a97b07412/")  # ← swap handle
         )
+        layout.addWidget(gh_btn)
+        layout.addWidget(discord_btn)
         layout.addWidget(linkedin_btn)
 
         layout.addStretch()

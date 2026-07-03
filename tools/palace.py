@@ -472,6 +472,58 @@ def palace_status() -> str:
         f"{drawers} drawers | {halls} hall entries | ~{total_tok} ctx tokens loaded"
     )
 
+def list_flagged_writes(tag: str = "dream-sweep", limit: int = 20) -> list[dict]:
+    """List recent auto-writes by tag, for review before deciding to undo."""
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT d.id as drawer_id, d.content, d.tags, d.created_at, d.closet_id,
+               r.name as room, w.name as wing
+        FROM palace_drawers d
+        JOIN palace_rooms r ON d.room_id = r.id
+        JOIN palace_wings w ON r.wing_id = w.id
+        WHERE d.tags LIKE ?
+        ORDER BY d.created_at DESC LIMIT ?
+    """, (f'%"{tag}"%', limit)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def palace_undo_write(drawer_id: int) -> dict:
+    """
+    Delete a single auto-write and rebuild its parent closet from
+    whatever drawers are still linked to it — repairs the rolling
+    merge instead of nuking the whole closet. Safe by construction
+    for nightstand-wing writes, since only nightstand drawers ever
+    feed a nightstand closet.
+    """
+    conn = get_db()
+    drawer = conn.execute("SELECT * FROM palace_drawers WHERE id=?", (drawer_id,)).fetchone()
+    if not drawer:
+        conn.close()
+        return {"ok": False, "error": "drawer not found"}
+
+    closet_id = drawer["closet_id"]
+    conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+
+    if closet_id:
+        remaining = conn.execute(
+            "SELECT content FROM palace_drawers WHERE closet_id=? ORDER BY created_at",
+            (closet_id,)
+        ).fetchall()
+
+        if remaining:
+            rebuilt = " | ".join(aaak_compress(r["content"]) for r in remaining)
+            token_est = estimate_tokens(rebuilt)
+            conn.execute(
+                "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=? WHERE id=?",
+                (rebuilt, token_est, datetime.now().isoformat(), closet_id)
+            )
+        else:
+            conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
+
+    conn.commit()
+    conn.close()
+    return {"ok": True, "closet_id": closet_id, "drawer_id": drawer_id}
 
 # ── Tool Registration ──────────────────────────────────────────────────────────
 
@@ -532,4 +584,38 @@ def register_palace_tools(registry):
         fn=palace_status,
         description="Show palace memory stats — wings, rooms, closets, drawers, total tokens.",
         parameters={"type": "object", "properties": {}, "required": []}
+    )
+
+    registry.register(
+        name="palace_review_writes",
+        fn=lambda tag="dream-sweep": (
+            lambda writes: "\n".join(
+                f"[{w['drawer_id']}] {w['created_at']} ({w['wing']}/{w['room']}): {w['content'][:120]}"
+                for w in writes
+            ) if writes else f"No entries tagged '{tag}' found."
+        )(list_flagged_writes(tag)),
+        description="List recent auto-written memory entries (dream-sweeps or compactions) for review before deciding whether to undo one.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "tag": {"type": "string", "description": "Which auto-write type to review: 'dream-sweep' or 'auto-compaction'.", "default": "dream-sweep"}
+            },
+            "required": []
+        }
+    )
+
+    registry.register(
+        name="palace_undo_write",
+        fn=lambda drawer_id: (
+            lambda r: f"Undone — drawer {r['drawer_id']} removed, closet {r['closet_id']} rebuilt." if r["ok"]
+            else f"[Error: {r.get('error')}]"
+        )(palace_undo_write(drawer_id)),
+        description="Delete a single flagged auto-write (by drawer_id from palace_review_writes) and safely rebuild its parent closet. Owner-only — touches the nightstand wing, isolated from curated memory.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "drawer_id": {"type": "integer", "description": "The drawer_id shown in brackets from palace_review_writes output."}
+            },
+            "required": ["drawer_id"]
+        }
     )
