@@ -17,6 +17,7 @@ A local-first AI agent designed from the ground up for consumer hardware.
 - ⚡ Native PySide6/Qt desktop UI
 - 🔄 Runtime backend switching
 - 📁 Codebase indexing
+- 🔧 60+ pre-installed tools, plus the ability to create more
 - 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe)
 
 ## Included Personas
@@ -142,7 +143,7 @@ Lumina manages her own lumina-dev project this way — tracking her own source t
 Tools: create_project, load_project, update_project, refresh_codebase_index, load_codebase, link_chat, get_project_chats.
 
 ## Tools — An Agent That Actually Acts
-Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has over 40 pre-installed tools, and a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
+Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has over 60 pre-installed tools, and a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
 
 Here's what she can do:
 

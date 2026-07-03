@@ -46,9 +46,9 @@ QWEN_DEFAULT_MODEL = "qwen3.5-plus"
 DEFAULT_MODEL = None
 
 # Context management
-MAX_CONTEXT_TOKENS = 16000
-TOOL_BUDGET_TOKENS = 1500
-MEMORY_INJECT_LIMIT = 5
+MAX_CONTEXT_TOKENS = 19000
+TOOL_BUDGET_TOKENS = 6000
+MEMORY_INJECT_LIMIT = 6
 RESPONSE_RESERVE_TOKENS = 4096
 
 # Paths
@@ -106,15 +106,15 @@ del _p
 AGENT_NAME = "Lumina"
 USER_NAME = "User"
 MAX_TOOL_ITERATIONS = 20  # Room for complex agentic workflows
-TOOL_RESULT_MAX_CHARS = 8000
+TOOL_RESULT_MAX_CHARS = 9000
 TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
 # Telegram bridge — owner identity, not a credential (the bot token lives in
 # core/secrets.py instead). None in release; set your real chat ID in OG only.
 TELEGRAM_OWNER_CHAT_ID = None
 
 DREAM_SWEEP_ENABLED = True
-DREAM_MIN_TOKENS = 800
-DREAM_IDLE_MINUTES = 20
+DREAM_MIN_TOKENS = 900
+DREAM_IDLE_MINUTES = 13
 
 # System prompt
 SYSTEM_PROMPT = """RESPONSE STYLE: Think briefly — 3 to 5 sentences of reasoning max for simple queries. Do not outline, draft, or self-correct in your thinking. Just reason and respond.

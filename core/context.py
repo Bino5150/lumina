@@ -93,7 +93,7 @@ class ContextManager:
                 from tools.palace import build_context_block, estimate_tokens
                 import config
                 base_tokens = estimate_tokens(self.system_prompt)
-                reserved = config.RESPONSE_RESERVE_TOKENS + config.TOOL_BUDGET_TOKENS
+                reserved = config.RESPONSE_RESERVE_TOKENS
                 palace_budget = max(100, config.MAX_CONTEXT_TOKENS - base_tokens - tool_budget - reserved)
                 palace_block = build_context_block(max_tokens=palace_budget)
             except Exception:
