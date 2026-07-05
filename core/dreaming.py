@@ -24,6 +24,29 @@ DREAM_PROMPT = (
 )
 
 _last_dream_sweep: dict[int, str] = {}  # chat_id -> ISO timestamp of last sweep
+_resolved_model_cache: dict[str, str | None] = {"model": None}
+
+
+def _resolve_model() -> str | None:
+    """Ask the backend what's actually loaded instead of trusting
+    config.DEFAULT_MODEL. F-62 quick fix: DEFAULT_MODEL is None by default,
+    so the old code sent "model": None straight into the OpenAI-shape
+    request body — a guaranteed 400 on every dream sweep on the default
+    llama.cpp/LM Studio backend. Cached after first success since the
+    loaded model doesn't change mid-session; falls back to DEFAULT_MODEL
+    (still possibly None) only if the backend can't be reached at all,
+    so a transient network hiccup doesn't wipe the cache."""
+    if _resolved_model_cache["model"]:
+        return _resolved_model_cache["model"]
+    try:
+        resp = requests.get(f"{config.LLM_BACKEND_URL}/models", timeout=5)
+        data = resp.json().get("data", [])
+        if data:
+            _resolved_model_cache["model"] = data[0]["id"]
+            return _resolved_model_cache["model"]
+    except Exception as e:
+        print(f"[DREAMING] model resolution failed: {e}", flush=True)
+    return config.DEFAULT_MODEL
 
 
 def run_summarization_call(raw_text: str) -> str | None:
@@ -31,7 +54,7 @@ def run_summarization_call(raw_text: str) -> str | None:
         resp = requests.post(
             f"{config.LLM_BACKEND_URL}/chat/completions",
             json={
-                "model": config.DEFAULT_MODEL,
+                "model": _resolve_model(),
                 "messages": [
                     {"role": "user", "content": f"{DREAM_PROMPT}\n\n{raw_text[:6000]}"},
                     {"role": "assistant", "content": "SUMMARY:"},   # non-empty prefill — S23 fix for thinking bleed

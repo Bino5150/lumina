@@ -6,8 +6,21 @@ import requests
 import config
 from core.secrets import get_secret
 from core.idempotency import make_request_id, check, record
+from core.persistence import load as load_prefs
 
 API_BASE = "https://api.telegram.org/bot{token}"
+
+
+def _owner_chat_id():
+    """prefs.json (settable via the Communications tab) takes priority;
+    config.py is the fallback for anyone who set it there manually before
+    the UI field existed. Mirrors comms/telegram_bridge.py's resolution —
+    duplicated rather than imported so this module doesn't pull in
+    python-telegram-bot (an optional dep) just to send a file."""
+    from_prefs = load_prefs().get("telegram_owner_chat_id")
+    if from_prefs:
+        return from_prefs
+    return config.TELEGRAM_OWNER_CHAT_ID
 
 
 def send_telegram_file(path: str, caption: str = "") -> str:
@@ -17,7 +30,7 @@ def send_telegram_file(path: str, caption: str = "") -> str:
         return f"[Duplicate suppressed — already sent: {cached}]"
 
     token = get_secret("telegram_bot_token")
-    chat_id = config.TELEGRAM_OWNER_CHAT_ID
+    chat_id = _owner_chat_id()
     if not token or not chat_id:
         return "[Telegram not configured — missing bot token or owner chat id.]"
     try:
@@ -45,7 +58,7 @@ def send_telegram_message(text: str) -> str:
         return f"[Duplicate suppressed — already sent: {cached}]"
 
     token = get_secret("telegram_bot_token")
-    chat_id = config.TELEGRAM_OWNER_CHAT_ID
+    chat_id = _owner_chat_id()
     if not token or not chat_id:
         return "[Telegram not configured.]"
     try:

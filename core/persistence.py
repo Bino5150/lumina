@@ -27,13 +27,29 @@ def load() -> dict:
     except Exception:
         return dict(_defaults)
 
-def save(prefs: dict):
-    os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
+def save(prefs: dict) -> bool:
+    """Returns True on success, False on failure (and logs why — this used
+    to be a bare `except: pass`, so a failed save vanished with zero trace).
+    Writes to a temp file in the same directory then os.replace()s it into
+    place, so a crash mid-write can never leave prefs.json half-written —
+    the swap is atomic at the filesystem level; the old file stays intact
+    until the new one is fully flushed and ready."""
+    tmp_path = PREFS_PATH + ".tmp"
     try:
-        with open(PREFS_PATH, "w") as f:
+        os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
+        with open(tmp_path, "w") as f:
             json.dump(prefs, f, indent=2)
-    except Exception:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, PREFS_PATH)
+        return True
+    except Exception as e:
+        print(f"[PERSISTENCE] save failed: {e}", flush=True)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
 
 def get(key: str):
     return load().get(key, _defaults.get(key))

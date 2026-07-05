@@ -99,6 +99,7 @@ TOOL_TIERS = {
 # design — it doesn't get to participate in it.
 OWNER_ONLY_TOOLS = {
     "create_tool", "list_custom_tools", "delete_tool",
+    "list_pending_tools", "show_pending_tool_source", "reject_pending_tool",
     "palace_review_writes", "palace_undo_write",
 }
 

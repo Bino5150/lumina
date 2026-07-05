@@ -3,6 +3,11 @@ memory/lumina.db
 memory/prefs.json
 projects/*/chats.json
 
+# Claude Code intern context — local scratch, not project source
+.claude/
+CLAUDE_CONTEXT.md
+
+
 # Python
 __pycache__/
 *.py[cod]

@@ -1,35 +1,41 @@
 # Lumina — Python Dependencies
-# Last updated: Session 25 (June 2026)
+# Pinned: Session 40 (July 2026), resolved against live PyPI at pin time.
 # Python 3.13 (miniconda3, `py` alias)
 # Install: pip install -r requirements.txt --break-system-packages
 # After install: playwright install chromium
+#
+# F-11 fix: previously fully unpinned — a fresh install months from now could
+# silently pull a breaking major version of anything here. Pinned to exact
+# versions (this is an app, not a library — reproducibility beats flexibility).
+# Bump deliberately, one package at a time, and re-test rather than letting
+# `pip install -U` drift the whole tree at once.
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-PySide6
+PySide6==6.11.1
 
 # ── HTTP / Networking ─────────────────────────────────────────────────────────
-requests
-httpx                          # async HTTP (backends, streaming)
+requests==2.34.2
+httpx==0.28.1                 # async HTTP (backends, streaming)
 
 # ── Browser Automation ────────────────────────────────────────────────────────
-playwright                     # + run: playwright install chromium
+playwright==1.61.0             # + run: playwright install chromium
 
 # ── Web Scraping (web.py fallback) ────────────────────────────────────────────
-beautifulsoup4
-lxml                           # fast HTML parser for BS4
+beautifulsoup4==4.15.0
+lxml==6.1.1                    # fast HTML parser for BS4
 
 # ── Audio / STT / TTS ────────────────────────────────────────────────────────
-sounddevice                    # audio I/O
-numpy                          # audio buffer handling
-scipy                          # audio resampling
-pyaudio                        # fallback audio I/O
-openwakeword                   # "Hey Lumina" wake word (wired in future session)
+sounddevice==0.5.5             # audio I/O
+numpy==2.5.1                   # audio buffer handling
+scipy==1.18.0                  # audio resampling
+pyaudio==0.2.14                # fallback audio I/O
+openwakeword==0.6.0            # "Hey Lumina" wake word (wired in future session)
 
 # ── Speech Recognition ────────────────────────────────────────────────────────
-openai-whisper                 # STT (if used locally)
+openai-whisper==20250625       # STT (if used locally)
 
 # ── NLP / Text Processing ────────────────────────────────────────────────────
-tiktoken                       # token counting
+tiktoken==0.13.0                # token counting
 
 # ── Data / Storage ────────────────────────────────────────────────────────────
 # sqlite3 — stdlib, no install needed
@@ -38,13 +44,13 @@ tiktoken                       # token counting
 # difflib — stdlib, no install needed
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
-python-dateutil                # robust datetime parsing
-psutil                         # system info (memory, CPU) for meta tools
-platformdirs                   # XDG-compliant app dirs (cross-platform prep)
+python-dateutil==2.9.0.post0    # robust datetime parsing
+psutil==7.2.2                   # system info (memory, CPU) for meta tools
+platformdirs==4.10.0            # XDG-compliant app dirs (cross-platform prep)
 
 # ── Communications (optional — beta) ──────────────────────────────────────────
-python-telegram-bot            # Telegram bridge — see TELEGRAM_SETUP.md for setup
-discord.py                      # Discord bridge — see README.md Comms section
+python-telegram-bot==22.8       # Telegram bridge — see TELEGRAM_SETUP.md for setup
+discord.py==2.7.1               # Discord bridge — see README.md Comms section
 
 # ── Dev / Debug ───────────────────────────────────────────────────────────────
-# No test framework yet — add pytest when test suite is started
+pytest==9.1.1                   # F-13: minimal test harness — see tests/

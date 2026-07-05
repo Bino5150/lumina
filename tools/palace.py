@@ -26,11 +26,8 @@ from tools.temporal_decay import decay_engine
 # ── DB Setup ───────────────────────────────────────────────────────────────────
 
 def get_db():
-    os.makedirs(os.path.dirname(config.DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    from core.db import connect
+    return connect()
 
 
 def init_palace_db():

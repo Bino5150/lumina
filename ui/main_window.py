@@ -810,6 +810,16 @@ class LuminaWindow(QMainWindow):
     def _check_dream_idle(self):
         if self._dream_fired_this_idle or not self._current_chat_id:
             return
+        if self.worker is not None and self.worker.isRunning():
+            # Agent is actively mid-turn — _last_activity only updates when a
+            # NEW message is sent, so a long-running turn (retries, a slow
+            # tool call, anything) is otherwise invisible to this timer.
+            # Without this check, a dream sweep can fire while the model is
+            # still busy generating, queue behind the live turn on
+            # llama-server's single inference slot, and hit a read timeout.
+            # Don't mark _dream_fired_this_idle here — let it check again
+            # next tick once the turn actually finishes.
+            return
         idle_minutes = getattr(config, "DREAM_IDLE_MINUTES", 20)
         if time.time() - self._last_activity >= idle_minutes * 60:
             self._dream_fired_this_idle = True

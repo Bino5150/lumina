@@ -14,8 +14,8 @@ LEDGER_PATH = os.path.join(config.BASE_DIR, "memory", "ledger.db")
 
 
 def _init_db():
-    os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)
-    conn = sqlite3.connect(LEDGER_PATH)
+    from core.db import connect
+    conn = connect(path=LEDGER_PATH, row_factory=False, foreign_keys=False)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ledger (
             request_id TEXT PRIMARY KEY,
@@ -35,8 +35,9 @@ def make_request_id(*args) -> str:
 
 def check(request_id: str):
     """Returns cached result if this request_id already succeeded, else None."""
+    from core.db import connect
     _init_db()
-    conn = sqlite3.connect(LEDGER_PATH)
+    conn = connect(path=LEDGER_PATH, row_factory=False, foreign_keys=False)
     row = conn.execute("SELECT result FROM ledger WHERE request_id = ?", (request_id,)).fetchone()
     conn.close()
     return row[0] if row else None
@@ -44,8 +45,9 @@ def check(request_id: str):
 
 def record(request_id: str, result: str):
     """Store a successful result so a retry short-circuits instead of re-sending."""
+    from core.db import connect
     _init_db()
-    conn = sqlite3.connect(LEDGER_PATH)
+    conn = connect(path=LEDGER_PATH, row_factory=False, foreign_keys=False)
     conn.execute(
         "INSERT OR REPLACE INTO ledger (request_id, result) VALUES (?, ?)",
         (request_id, result),
