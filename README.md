@@ -41,7 +41,7 @@ A local-first AI agent designed from the ground up for consumer hardware.
 
 There are a lot of AI assistants out there. Most of them are wrappers — a chat box bolted onto an API call, themed in some shade of purple, shipped as an Electron app the size of a small country. They call themselves "local" because they technically support llama.cpp on the backend. They call themselves "agents" because they have a web search button. Their reckless token usage is designed for a corporate credit card on a cloud model with a data center of compute and vram behind it. Bloated prompts, verbose tool definitions, tons of .md injections... You’ll blow your whole context window by the time you say “Hello”. This is enough to bring local LLM's to their knees, putting along at morse code speed tok/s, hallucinating, choking on tool calls, context roll off causing them to forget the beginning of the conversation you're currently having.  
 Lumina is something different.
-Lumina is a local-first AI agent built entirely from scratch — 13,000+ lines of hand-written Python — with a philosophy that puts the user in complete control of every layer of the stack: the model, the memory, the voice, the tools, and the inference engine itself. She runs on your machine. She speaks with your voice. She remembers what matters. And when you're done for the day, she's not phoning home. Hardened security protocols keep your data and you system safe, secure, and private.
+Lumina is a local-first AI agent built entirely from scratch — 13,000+ lines of hand-written Python — with a philosophy that puts the user in complete control of every layer of the stack: the model, the memory, the voice, the tools, and the inference engine itself. Lumina is essentially a complete agentic AI operating system. She runs on your machine. She speaks with your voice. She remembers what matters. And when you're done for the day, she's not phoning home. Hardened security protocols keep your data and you system safe, secure, and private.
 
 This is her story.
 
@@ -129,7 +129,7 @@ Not quite the same as memory — this is for explicit reference material you wan
 ## The Skills System — Procedural Memory
 Beyond episodic facts, Lumina has a skills layer: a directory of procedural .md documents she can write, update, and retrieve herself. Skills are indexed via FTS5 and automatically injected into the system prompt when relevant to the current conversation.
 
-When Lumina completes a complex task — say, a multi-step build process for a CUDA project — she can write a skill documenting exactly how it was done: the flags, the gotchas, the sequence. The next time you ask about that kind of task, she surfaces it automatically before you even finish typing.
+When Lumina completes a complex task — say, a multi-step build process for a CUDA project — she can write a skill documenting exactly how it was done: the flags, the gotchas, the sequence. The next time you ask about that kind of task, she surfaces it automatically before you even finish typing. Repeated workflows become more efficient.
 
 After 5 tool calls in a session, Lumina is nudged to consider whether a skill should be saved. She can also self-direct skill creation at any time. This is a memory system that gets smarter as you use it.
 
