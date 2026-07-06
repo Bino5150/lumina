@@ -365,10 +365,18 @@ def load_halls(layer_max: int = 1) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def build_context_block(max_tokens: int = 400) -> str:
+def build_context_block(max_tokens: int = 400, inject_limit: int = None) -> str:
     """
     Build the memory injection block for the system prompt.
-    Always loads L0 + L1. Loads L2 if tokens allow.
+    Always loads L0 + L1 in full. Loads L2 (recent/episodic) up to two caps:
+    token budget (max_tokens) and count (inject_limit) — whichever hits first.
+    inject_limit only applies to L2: L0 identity and L1 critical facts are
+    small, curated, and meant to always be present regardless of this knob.
+    A low inject_limit on a small local context window keeps a handful of the
+    most relevant recent memories instead of diluting a tight budget across
+    many low-value fragments; raising it (e.g. on a large cloud context) lets
+    substantially more episodic history ride along even when token budget
+    isn't the binding constraint.
     Returns a compact string ready to append to system prompt.
     """
     lines = ["## Memory Palace"]
@@ -383,6 +391,8 @@ def build_context_block(max_tokens: int = 400) -> str:
         # Apply temporal decay ordering to L2 — most recently updated closets first
         if layer == 2:
             closets = decay_engine.sort_by_recency(closets)
+            if inject_limit is not None:
+                closets = closets[:inject_limit]
 
         for c in closets:
             tok = c["token_est"] or estimate_tokens(c["compressed"])

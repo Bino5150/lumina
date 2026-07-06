@@ -3,12 +3,11 @@ Dreaming — idle-triggered memory sweep for the main build.
 Fires on session idle, summarizes what's happened since the last sweep,
 writes to the nightstand wing (isolated from curated Palace content).
 """
-import re
-import requests
-from datetime import datetime
 from tools.memory import load_chat_messages
 from tools.palace import palace_store
 from core.context import estimate_tokens
+from core.backends.loader import get_llm_backend
+from datetime import datetime
 import config
 
 DREAM_PROMPT = (
@@ -24,61 +23,30 @@ DREAM_PROMPT = (
 )
 
 _last_dream_sweep: dict[int, str] = {}  # chat_id -> ISO timestamp of last sweep
-_resolved_model_cache: dict[str, str | None] = {"model": None}
-
-
-def _resolve_model() -> str | None:
-    """Ask the backend what's actually loaded instead of trusting
-    config.DEFAULT_MODEL. F-62 quick fix: DEFAULT_MODEL is None by default,
-    so the old code sent "model": None straight into the OpenAI-shape
-    request body — a guaranteed 400 on every dream sweep on the default
-    llama.cpp/LM Studio backend. Cached after first success since the
-    loaded model doesn't change mid-session; falls back to DEFAULT_MODEL
-    (still possibly None) only if the backend can't be reached at all,
-    so a transient network hiccup doesn't wipe the cache."""
-    if _resolved_model_cache["model"]:
-        return _resolved_model_cache["model"]
-    try:
-        resp = requests.get(f"{config.LLM_BACKEND_URL}/models", timeout=5)
-        data = resp.json().get("data", [])
-        if data:
-            _resolved_model_cache["model"] = data[0]["id"]
-            return _resolved_model_cache["model"]
-    except Exception as e:
-        print(f"[DREAMING] model resolution failed: {e}", flush=True)
-    return config.DEFAULT_MODEL
 
 
 def run_summarization_call(raw_text: str) -> str | None:
+    """
+    S41 / F-62 real fix: this used to be a bespoke requests.post() straight
+    to config.LLM_BACKEND_URL with its own hand-rolled model resolution and
+    a hardcoded timeout=30 — completely bypassing the backend abstraction
+    every real chat turn goes through. That's what caused the dream-sweep
+    timeout bug (30s tied to nothing, vs config.TOOL_CALL_TIMEOUT everywhere
+    else) and meant this only ever worked against a local OpenAI-compatible
+    server — pointing LLM_BACKEND at a cloud provider would have silently
+    broken dreaming entirely. get_llm_backend() returns whichever backend is
+    actually active right now, so this correctly follows backend switches,
+    real auth headers, and the real timeout config, same as every other
+    call in the app.
+    """
     try:
-        resp = requests.post(
-            f"{config.LLM_BACKEND_URL}/chat/completions",
-            json={
-                "model": _resolve_model(),
-                "messages": [
-                    {"role": "user", "content": f"{DREAM_PROMPT}\n\n{raw_text[:6000]}"},
-                    {"role": "assistant", "content": "SUMMARY:"},   # non-empty prefill — S23 fix for thinking bleed
-                ],
-                "max_tokens": 500,
-                "temperature": 0.3,
-                "thinking": {"type": "disabled"},
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-            timeout=30,
+        backend = get_llm_backend()
+        return backend.complete_utility(
+            prompt=f"{DREAM_PROMPT}\n\n{raw_text[:6000]}",
+            prefill="SUMMARY:",
+            max_tokens=500,
+            temperature=0.3,
         )
-        if not resp.ok:
-            print(f"[DREAMING] error body: {resp.text}", flush=True)
-        resp.raise_for_status()
-        msg = resp.json()["choices"][0]["message"]
-        content = (msg.get("content") or "").strip()
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
-        content = re.sub(r'<think>.*', '', content, flags=re.DOTALL)  # unclosed — truncated mid-think
-        content = content.strip()
-        content = re.sub(r'^SUMMARY:\s*', '', content, flags=re.IGNORECASE)
-        if not content:
-            print("[DREAMING] response was empty after stripping — skipping write", flush=True)
-            return None
-        return content
     except Exception as e:
         print(f"[DREAMING] summarization call failed: {e}", flush=True)
         return None

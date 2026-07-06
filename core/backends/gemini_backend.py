@@ -222,7 +222,12 @@ class GeminiBackend(BaseLLMBackend):
     # Non-streaming chat
     # ------------------------------------------------------------------
 
-    def chat(self, messages, tools=None, temperature=0.7, max_tokens=1024):
+    def chat(self, messages, tools=None, temperature=0.7, max_tokens=1024,
+             disable_thinking: bool = False):
+        # disable_thinking accepted for interface consistency with
+        # complete_utility() but not acted on here — same reasoning as
+        # AnthropicBackend: this backend doesn't enable Gemini's thinking
+        # mode by default, so the conflict doesn't apply today.
         payload = self._build_payload(messages, tools, max_tokens, temperature)
         url = f"{API_ROOT}/models/{self.default_model}:generateContent"
         try:

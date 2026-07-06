@@ -53,7 +53,8 @@ class LMStudioBackend(BaseLLMBackend):
             return False, str(e)
 
     def chat(self, messages: list, tools: Optional[list] = None,
-             temperature: float = 0.7, max_tokens: int = 4096) -> dict:
+             temperature: float = 0.7, max_tokens: int = 4096,
+             disable_thinking: bool = False) -> dict:
         payload = {
             "model": self.get_model(),
             "messages": messages,
@@ -65,6 +66,21 @@ class LMStudioBackend(BaseLLMBackend):
         if tools and not has_vision:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+
+        # S41 correction: complete_utility() briefly dropped these when it
+        # replaced dreaming.py/auto-naming's old bespoke requests.post()
+        # calls, on the assumption that assistant-prefill alone (the S23
+        # anti-bleed fix) was sufficient on its own. It wasn't — this
+        # server explicitly 400s ("Assistant response prefill is
+        # incompatible with enable_thinking") when a prefilled assistant
+        # turn is sent while thinking is still enabled. The prefill and
+        # this flag were never redundant; they were always working
+        # together. Restored as an explicit opt-in param instead of
+        # silently baked into every call, so normal tool-calling turns
+        # (which never prefill) are unaffected.
+        if disable_thinking:
+            payload["thinking"] = {"type": "disabled"}
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         try:
             resp = requests.post(

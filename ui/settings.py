@@ -218,24 +218,37 @@ class GeneralTab(QWidget):
         self.url.setReadOnly(config.LLM_BACKEND != "custom")
 
         layout.addWidget(_sec("CONTEXT WINDOW", self.c))
-        row = QHBoxLayout()
-        row.setSpacing(16)
-        left = QVBoxLayout()
-        left.addWidget(_lbl("Max Context Tokens", self.c))
-        self.ctx_spin = _spin(config.MAX_CONTEXT_TOKENS, 1024, 32768, 1024, self.c)
-        left.addWidget(self.ctx_spin)
-        right = QVBoxLayout()
-        right.addWidget(_lbl("Max Tool Iterations", self.c))
+        layout.addWidget(_lbl(
+            "Max Context Tokens and Memory Inject Limit are saved per-backend — "
+            "switching backends above recalls that backend's own values.", self.c
+        ))
+        row1 = QHBoxLayout()
+        row1.setSpacing(16)
+        ctx_col = QVBoxLayout()
+        ctx_col.addWidget(_lbl("Max Context Tokens", self.c))
+        self.ctx_spin = _spin(config.MAX_CONTEXT_TOKENS, 1024, 1048576, 1024, self.c)
+        ctx_col.addWidget(self.ctx_spin)
+        mem_col = QVBoxLayout()
+        mem_col.addWidget(_lbl("Memory Inject Limit", self.c))
+        self.mem_spin = _spin(config.MEMORY_INJECT_LIMIT, 1, 200, 1, self.c)
+        mem_col.addWidget(self.mem_spin)
+        row1.addLayout(ctx_col)
+        row1.addLayout(mem_col)
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(16)
+        iter_col = QVBoxLayout()
+        iter_col.addWidget(_lbl("Max Tool Iterations", self.c))
         self.iter_spin = _spin(config.MAX_TOOL_ITERATIONS, 1, 20, 1, self.c)
-        right.addWidget(self.iter_spin)
-        right2 = QVBoxLayout()
-        right2.addWidget(_lbl("Response Tokens", self.c))
+        iter_col.addWidget(self.iter_spin)
+        resp_col = QVBoxLayout()
+        resp_col.addWidget(_lbl("Response Tokens", self.c))
         self.resp_spin = _spin(config.RESPONSE_RESERVE_TOKENS, 256, 4096, 256, self.c)
-        right2.addWidget(self.resp_spin)
-        row.addLayout(left)
-        row.addLayout(right)
-        row.addLayout(right2)
-        layout.addLayout(row)
+        resp_col.addWidget(self.resp_spin)
+        row2.addLayout(iter_col)
+        row2.addLayout(resp_col)
+        layout.addLayout(row2)
         layout.addWidget(_sec("GLOBAL AGENT BEHAVIOR PROMPT", self.c))
         layout.addWidget(_lbl("Global agentic system prompt that works in conjunction with all Persona prompts.", self.c))
         self.prompt = _te(config.SYSTEM_PROMPT, self.c, height=140)
@@ -283,10 +296,24 @@ class GeneralTab(QWidget):
         self.url.setReadOnly(not is_custom)
         self.url.setPlaceholderText("Enter your OpenAI-compatible endpoint URL" if is_custom else "")
         self.custom_model_widget.setVisible(is_custom)
+        self._refresh_context_row(name)
+
+    def _refresh_context_row(self, backend: str):
+        """Recall this backend's saved Max Context Tokens / Memory Inject
+        Limit, or fall back to config.BACKEND_CONTEXT_DEFAULTS if this
+        backend has never been saved before. Only these two are per-backend —
+        Max Tool Iterations and Response Tokens stay global (set once below,
+        not touched here)."""
+        prefs = persistence.load()
+        saved = prefs.get("backend_context", {}).get(backend, {})
+        default = config.BACKEND_CONTEXT_DEFAULTS.get(backend, config.BACKEND_CONTEXT_DEFAULTS["llamacpp"])
+        self.ctx_spin.setValue(saved.get("max_context_tokens", default["max_context_tokens"]))
+        self.mem_spin.setValue(saved.get("memory_inject_limit", default["memory_inject_limit"]))
 
     def _save(self):
         from core.backends.loader import get_llm_backend
         config.MAX_CONTEXT_TOKENS = self.ctx_spin.value()
+        config.MEMORY_INJECT_LIMIT = self.mem_spin.value()
         config.MAX_TOOL_ITERATIONS = self.iter_spin.value()
         config.RESPONSE_RESERVE_TOKENS = self.resp_spin.value()
         config.LLM_BACKEND = self.backend_combo.currentText()
@@ -305,6 +332,31 @@ class GeneralTab(QWidget):
         prefs = load_prefs()
         prefs["llm_backend"] = config.LLM_BACKEND
         prefs["llm_backend_url"] = config.LLM_BACKEND_URL
+
+        # Context/memory settings — max_tool_iterations and
+        # response_reserve_tokens are global; max_context_tokens and
+        # memory_inject_limit are saved per-backend so switching backends
+        # recalls each one's own values instead of clobbering the other.
+        prefs["max_tool_iterations"] = config.MAX_TOOL_ITERATIONS
+        prefs["response_reserve_tokens"] = config.RESPONSE_RESERVE_TOKENS
+        backend_context = prefs.get("backend_context", {})
+        backend_context[config.LLM_BACKEND] = {
+            "max_context_tokens": config.MAX_CONTEXT_TOKENS,
+            "memory_inject_limit": config.MEMORY_INJECT_LIMIT,
+        }
+        prefs["backend_context"] = backend_context
+
+        # S41 fix: cloud API key/model used to only live in the running
+        # config module (setattr above) and revert to "" on restart — same
+        # bug class the context settings had. Only write an entry when this
+        # is actually a cloud backend; local/custom backends don't have one.
+        if config.LLM_BACKEND in self.CLOUD_BACKENDS:
+            cloud_creds = prefs.get("cloud_credentials", {})
+            cloud_creds[config.LLM_BACKEND] = {
+                "api_key": self.cloud_key.text().strip(),
+                "default_model": self.cloud_model.text().strip(),
+            }
+            prefs["cloud_credentials"] = cloud_creds
         
         if config.LLM_BACKEND == "custom":
             config.CUSTOM_DEFAULT_MODEL = self.custom_model.text().strip()
@@ -317,6 +369,14 @@ class GeneralTab(QWidget):
 
         self.agent.llm = get_llm_backend()
         self.agent.llm.base_url = config.LLM_BACKEND_URL
+
+        # Apply context/memory settings to the live agent immediately — no
+        # restart needed, matching the backend-swap precedent above.
+        # ContextManager captured these at construction time (max_tokens,
+        # reserve); update the instance directly, not just the config module,
+        # or a hot-reload gap opens up (see F-09: from-import snapshotting).
+        self.agent.ctx.max_tokens = config.MAX_CONTEXT_TOKENS
+        self.agent.ctx.reserve = config.RESPONSE_RESERVE_TOKENS
 
 
 # ── Tab: Profile ───────────────────────────────────────────────────────────────
@@ -775,8 +835,10 @@ class ToolsTab(QWidget):
         self.c = c
         self._prefs = persistence.load()
         self._current_profile_path = None
+        self._pending_names = []
         self._build()
         self._load_profiles()
+        self._load_pending_tools()
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -824,6 +886,73 @@ class ToolsTab(QWidget):
 
         layout.addWidget(profile_frame)
 
+        # ── Pending tools review (S41) ──────────────────────────────────
+        # The only thing this replaces is scripts/approve_tool.py's ROLE of
+        # "run against the live agent, no restart" — not its safety property.
+        # Approve still requires a human to have actually looked at the
+        # source (enforced below: Approve stays disabled until a pending
+        # tool is selected, which populates the read-only preview showing
+        # exactly what would run), and this button lives only in the desktop
+        # Settings UI — nothing an agent says over chat, Telegram, or Discord
+        # can reach it. create_tool() still only stages; this is still the
+        # only place untrusted code actually executes.
+        layout.addWidget(_sec("PENDING TOOLS — AWAITING REVIEW", self.c))
+        pending_row = QHBoxLayout()
+        pending_row.setSpacing(10)
+
+        pending_list_col = QVBoxLayout()
+        self.pending_list = QTableWidget(0, 1)
+        self.pending_list.setFixedHeight(110)
+        self.pending_list.horizontalHeader().setVisible(False)
+        self.pending_list.verticalHeader().setVisible(False)
+        self.pending_list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.pending_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.pending_list.horizontalHeader().setStretchLastSection(True)
+        self.pending_list.setStyleSheet(f"""
+            QTableWidget{{background:{self.c['bg_card']};color:{self.c['text_primary']};
+            border:1px solid {self.c['border']};border-radius:8px;gridline-color:{self.c['border']};font-size:12px;}}
+            QTableWidget::item{{padding:6px 10px;border:none;}}
+            QTableWidget::item:selected{{background:{self.c['accent_glow']};color:{self.c['accent']};}}
+        """)
+        self.pending_list.itemSelectionChanged.connect(self._on_pending_selected)
+        pending_list_col.addWidget(self.pending_list)
+        pending_row.addLayout(pending_list_col, 1)
+
+        pending_preview_col = QVBoxLayout()
+        pending_preview_col.addWidget(_lbl("Source (read this before approving)", self.c))
+        self.pending_preview = QTextEdit()
+        self.pending_preview.setReadOnly(True)
+        self.pending_preview.setFixedHeight(110)
+        self.pending_preview.setStyleSheet(f"""
+            QTextEdit{{background:{self.c['bg_input']};color:{self.c['text_primary']};
+            border:1px solid {self.c['border']};border-radius:7px;padding:6px 10px;
+            font-family:'JetBrains Mono',monospace;font-size:11px;}}
+        """)
+        pending_preview_col.addWidget(self.pending_preview)
+        pending_row.addLayout(pending_preview_col, 2)
+        layout.addLayout(pending_row)
+
+        pending_btn_row = QHBoxLayout()
+        pending_btn_row.addStretch()
+        pending_refresh_btn = _btn("⟳ Refresh", self.c)
+        pending_refresh_btn.setFixedHeight(30)
+        pending_refresh_btn.clicked.connect(self._load_pending_tools)
+        pending_btn_row.addWidget(pending_refresh_btn)
+        self.pending_reject_btn = _btn("✕ Reject", self.c, danger=True)
+        self.pending_reject_btn.setFixedHeight(30)
+        self.pending_reject_btn.setEnabled(False)
+        self.pending_reject_btn.clicked.connect(self._reject_pending)
+        pending_btn_row.addWidget(self.pending_reject_btn)
+        self.pending_approve_btn = _btn("✓ Approve & Load", self.c, accent=True)
+        self.pending_approve_btn.setFixedHeight(30)
+        self.pending_approve_btn.setEnabled(False)
+        self.pending_approve_btn.clicked.connect(self._approve_pending)
+        pending_btn_row.addWidget(self.pending_approve_btn)
+        layout.addLayout(pending_btn_row)
+
+        self.pending_status_lbl = _lbl("", self.c)
+        layout.addWidget(self.pending_status_lbl)
+
         # ── Tool table header ──
         top = QHBoxLayout()
         top.addStretch()
@@ -855,6 +984,87 @@ class ToolsTab(QWidget):
         note = QLabel("Select a profile to load its tool set. Save to write changes back to the profile file.")
         note.setStyleSheet(f"color:{self.c['text_dim']};font-size:11px;font-style:italic;background:transparent;")
         layout.addWidget(note)
+
+    def _load_pending_tools(self):
+        """List whatever's staged in tools/_pending/ — same directory
+        create_tool() writes to and scripts/approve_tool.py --list reads."""
+        from tools.toolmaker import PENDING_DIR
+        os.makedirs(PENDING_DIR, exist_ok=True)
+        self._pending_names = sorted(
+            f[:-3] for f in os.listdir(PENDING_DIR) if f.endswith(".py")
+        )
+        self.pending_list.setRowCount(len(self._pending_names))
+        for row, name in enumerate(self._pending_names):
+            self.pending_list.setItem(row, 0, QTableWidgetItem(name))
+        self.pending_preview.clear()
+        self.pending_approve_btn.setEnabled(False)
+        self.pending_reject_btn.setEnabled(False)
+        self.pending_status_lbl.setText(
+            "" if self._pending_names else "Nothing pending review."
+        )
+
+    def _on_pending_selected(self):
+        rows = self.pending_list.selectionModel().selectedRows()
+        has_selection = bool(rows)
+        self.pending_approve_btn.setEnabled(has_selection)
+        self.pending_reject_btn.setEnabled(has_selection)
+        if not has_selection:
+            self.pending_preview.clear()
+            return
+        name = self._pending_names[rows[0].row()]
+        from tools.toolmaker import PENDING_DIR
+        path = os.path.join(PENDING_DIR, f"{name}.py")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.pending_preview.setPlainText(f.read())
+        except Exception as e:
+            self.pending_preview.setPlainText(f"[Could not read source: {e}]")
+
+    def _selected_pending_name(self):
+        rows = self.pending_list.selectionModel().selectedRows()
+        if not rows:
+            return None
+        return self._pending_names[rows[0].row()]
+
+    def _approve_pending(self):
+        name = self._selected_pending_name()
+        if not name:
+            return
+        reply = QMessageBox.question(
+            self, "Approve Tool",
+            f"Approve and load '{name}' into the live tool registry now?\n\n"
+            "This runs the source shown in the preview — make sure you've "
+            "actually read it.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        from tools.toolmaker import approve_pending_tool
+        result = approve_pending_tool(name, self.agent.registry)
+        self.pending_status_lbl.setText(result)
+        self._load_pending_tools()
+        self._load_tools()  # refresh the enabled-tools table below — new tool is now live
+
+    def _reject_pending(self):
+        name = self._selected_pending_name()
+        if not name:
+            return
+        reply = QMessageBox.question(
+            self, "Reject Tool",
+            f"Discard pending tool '{name}' without ever loading it? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        from tools.toolmaker import PENDING_DIR, _append_audit_log
+        path = os.path.join(PENDING_DIR, f"{name}.py")
+        try:
+            os.remove(path)
+            _append_audit_log("rejected", name)
+            self.pending_status_lbl.setText(f"Discarded '{name}'.")
+        except Exception as e:
+            self.pending_status_lbl.setText(f"Error rejecting '{name}': {e}")
+        self._load_pending_tools()
 
     def _load_profiles(self):
         """Populate the profile dropdown from tool_profiles/ directory."""

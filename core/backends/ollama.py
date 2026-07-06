@@ -52,7 +52,8 @@ class OllamaBackend(BaseLLMBackend):
             return False, str(e)
 
     def chat(self, messages: list, tools: Optional[list] = None,
-             temperature: float = 0.7, max_tokens: int = 1024) -> dict:
+             temperature: float = 0.7, max_tokens: int = 1024,
+             disable_thinking: bool = False) -> dict:
         payload = {
             "model": self.get_model(),
             "messages": messages,
@@ -63,6 +64,13 @@ class OllamaBackend(BaseLLMBackend):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        # disable_thinking accepted for interface consistency with
+        # complete_utility() but not yet acted on here — Ollama has its own
+        # newer "think": false option for supporting models, but this
+        # hasn't been verified against Lumina's actual Ollama usage. Not a
+        # live bug today since llamacpp is the active local backend; worth
+        # revisiting if/when Ollama becomes the daily driver and utility
+        # calls start hitting the same prefill-vs-thinking conflict there.
 
         try:
             resp = requests.post(

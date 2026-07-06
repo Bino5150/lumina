@@ -45,11 +45,9 @@ QWEN_DEFAULT_MODEL = "qwen3.5-plus"
 # Model — auto-detect if None
 DEFAULT_MODEL = None
 
-# Context management
-MAX_CONTEXT_TOKENS = 19000
-TOOL_BUDGET_TOKENS = 6000
-MEMORY_INJECT_LIMIT = 6
-RESPONSE_RESERVE_TOKENS = 4096
+# Context management — see the "Context management (per-backend)" block below,
+# after prefs are loaded and LLM_BACKEND is resolved. Moved there in S41 so
+# these can be per-backend and Settings-UI-editable instead of hand-edit-only.
 
 # Paths
 import os
@@ -100,12 +98,63 @@ LLM_BACKEND_URL = _p.get("llm_backend_url", "http://localhost:8080/v1")
 CUSTOM_DEFAULT_MODEL = _p.get("custom_default_model", "")
 CUSTOM_API_KEY       = _p.get("custom_api_key", "")
 
+# Context management (per-backend) — local backends are hard-capped by
+# whatever -c value the server was actually launched with; cloud backends
+# have far more real headroom. Each backend remembers its own values in
+# prefs["backend_context"][<backend>], written by Settings UI on Save.
+# First time a backend is used, falls back to a conservative default below
+# rather than crashing or silently reusing another backend's number.
+BACKEND_CONTEXT_DEFAULTS = {
+    "llamacpp":   {"max_context_tokens": 16384,   "memory_inject_limit": 6},
+    "lmstudio":   {"max_context_tokens": 16384,   "memory_inject_limit": 6},
+    "ollama":     {"max_context_tokens": 16384,   "memory_inject_limit": 6},
+    "vllm":       {"max_context_tokens": 16384,   "memory_inject_limit": 6},
+    "custom":     {"max_context_tokens": 16384,   "memory_inject_limit": 6},
+    "openrouter": {"max_context_tokens": 32000,   "memory_inject_limit": 12},
+    "deepseek":   {"max_context_tokens": 64000,   "memory_inject_limit": 16},
+    "groq":       {"max_context_tokens": 32000,   "memory_inject_limit": 12},
+    "openai":     {"max_context_tokens": 128000,  "memory_inject_limit": 24},
+    "anthropic":  {"max_context_tokens": 180000,  "memory_inject_limit": 40},
+    "gemini":     {"max_context_tokens": 1000000, "memory_inject_limit": 60},
+    "kimi":       {"max_context_tokens": 128000,  "memory_inject_limit": 24},
+    "qwen":       {"max_context_tokens": 128000,  "memory_inject_limit": 24},
+}
+_ctx_default = BACKEND_CONTEXT_DEFAULTS.get(LLM_BACKEND, BACKEND_CONTEXT_DEFAULTS["llamacpp"])
+_backend_ctx = _p.get("backend_context", {}).get(LLM_BACKEND, {})
+MAX_CONTEXT_TOKENS  = _backend_ctx.get("max_context_tokens", _ctx_default["max_context_tokens"])
+MEMORY_INJECT_LIMIT = _backend_ctx.get("memory_inject_limit", _ctx_default["memory_inject_limit"])
+
+# Not per-backend — tool-call depth and response length are agent-behavior
+# choices, not something that varies by which model is answering.
+TOOL_BUDGET_TOKENS      = _p.get("tool_budget_tokens", 6000)
+RESPONSE_RESERVE_TOKENS = _p.get("response_reserve_tokens", 4096)
+MAX_TOOL_ITERATIONS     = _p.get("max_tool_iterations", 20)
+
+# S41 fix: cloud API keys/models saved via Settings UI used to only live in
+# the running config module (setattr in ui/settings.py._save()) and silently
+# reverted to the hardcoded "" defaults above on every restart — same root
+# bug class as MAX_CONTEXT_TOKENS had. The hardcoded defaults above remain a
+# valid manual-edit path (comment at top of file still applies); this only
+# overrides when Settings UI has actually saved something for that provider.
+_cloud_creds = _p.get("cloud_credentials", {})
+def _cloud_override(provider: str, key_default: str, model_default: str):
+    saved = _cloud_creds.get(provider, {})
+    return saved.get("api_key", key_default), saved.get("default_model", model_default)
+
+OPENROUTER_API_KEY, OPENROUTER_DEFAULT_MODEL = _cloud_override("openrouter", OPENROUTER_API_KEY, OPENROUTER_DEFAULT_MODEL)
+DEEPSEEK_API_KEY, DEEPSEEK_DEFAULT_MODEL     = _cloud_override("deepseek", DEEPSEEK_API_KEY, DEEPSEEK_DEFAULT_MODEL)
+GROQ_API_KEY, GROQ_DEFAULT_MODEL             = _cloud_override("groq", GROQ_API_KEY, GROQ_DEFAULT_MODEL)
+OPENAI_API_KEY, OPENAI_DEFAULT_MODEL         = _cloud_override("openai", OPENAI_API_KEY, OPENAI_DEFAULT_MODEL)
+ANTHROPIC_API_KEY, ANTHROPIC_DEFAULT_MODEL   = _cloud_override("anthropic", ANTHROPIC_API_KEY, ANTHROPIC_DEFAULT_MODEL)
+GEMINI_API_KEY, GEMINI_DEFAULT_MODEL         = _cloud_override("gemini", GEMINI_API_KEY, GEMINI_DEFAULT_MODEL)
+KIMI_API_KEY, KIMI_DEFAULT_MODEL             = _cloud_override("kimi", KIMI_API_KEY, KIMI_DEFAULT_MODEL)
+QWEN_API_KEY, QWEN_DEFAULT_MODEL             = _cloud_override("qwen", QWEN_API_KEY, QWEN_DEFAULT_MODEL)
+
 del _p
 
 # Agent behavior
 AGENT_NAME = "Lumina"
 USER_NAME = "User"
-MAX_TOOL_ITERATIONS = 20  # Room for complex agentic workflows
 TOOL_RESULT_MAX_CHARS = 9000
 TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
 # Telegram bridge — owner identity, not a credential (the bot token lives in

@@ -18,7 +18,6 @@ import os
 import sys
 import base64
 import re 
-import requests
 import threading 
 import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -702,54 +701,34 @@ class LuminaWindow(QMainWindow):
             self._new_chat()
             
     def _auto_name_chat(self, chat_id: int, user_msg: str, assistant_msg: str):
-        """Fire-and-forget: generate a 3-5 word title for a new chat."""
+        """Fire-and-forget: generate a 3-5 word title for a new chat.
+
+        S41 / F-62 real fix: this used to be its own requests.post() straight
+        to config.LLM_BACKEND_URL with a hardcoded timeout=60 (dreaming.py had
+        the exact same pattern with timeout=30 — see that file's history) and
+        no auth headers at all, meaning it silently only ever worked against
+        a local OpenAI-compatible server. self.agent.llm is whatever backend
+        is actually active right now — local or cloud — so this now follows
+        backend switches correctly instead of hardcoding the URL directly.
+        """
 
         def _run():
             print(f"[AUTO-NAME] thread started", flush=True)
 
-            messages = [
-                {"role": "user", "content": (
-                    f"Generate a 3-5 word title for this conversation:\n\n"
-                    f"User: {user_msg[:200]}\n"
-                    f"Assistant: {assistant_msg[:100]}\n\n"
-                    f"Reply with the title only. No explanation."
-                )},
-                {"role": "assistant", "content": "TITLE:"},
-            ]
+            prompt = (
+                f"Generate a 3-5 word title for this conversation:\n\n"
+                f"User: {user_msg[:200]}\n"
+                f"Assistant: {assistant_msg[:100]}\n\n"
+                f"Reply with the title only. No explanation."
+            )
 
-            try:
-                response = requests.post(
-                    f"{config.LLM_BACKEND_URL}/chat/completions",
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "model": self.agent.llm.get_model(),
-                        "messages": messages,
-                        "max_tokens": 30,
-                        "temperature": 0.3,
-                        "stream": False,
-                        "thinking": {"type": "disabled"},
-                        "chat_template_kwargs": {"enable_thinking": False},
-                    },
-                    timeout=60,
-                ).json()
-                print(f"[AUTO-NAME] got response: {str(response)[:200]}", flush=True)
-            except Exception as e:
-                import traceback
-                print(f"[AUTO-NAME] requests failed: {e}", flush=True)
-                traceback.print_exc()
+            raw = self.agent.llm.complete_utility(
+                prompt=prompt, prefill="TITLE:", max_tokens=30, temperature=0.3,
+            )
+            print(f"[AUTO-NAME] cleaned result: {repr(raw)}", flush=True)
+            if not raw:
+                print("[AUTO-NAME] complete_utility returned nothing — skipping", flush=True)
                 return
-
-            try:
-                msg = response["choices"][0]["message"]
-                raw = msg.get("content", "").strip()
-                if not raw:
-                    raw = msg.get("reasoning_content", "").strip()
-            except Exception as e:
-                print(f"[AUTO-NAME] extract failed: {e}", flush=True)
-                raw = ""
-
-            print(f"[AUTO-NAME] raw repr: {repr(raw[:200])}", flush=True)
-            raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
 
             title = ""
             for line in raw.splitlines():

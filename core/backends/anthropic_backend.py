@@ -206,7 +206,15 @@ class AnthropicBackend(BaseLLMBackend):
     # Non-streaming chat
     # ------------------------------------------------------------------
 
-    def chat(self, messages, tools=None, temperature=0.7, max_tokens=1024):
+    def chat(self, messages, tools=None, temperature=0.7, max_tokens=1024,
+             disable_thinking: bool = False):
+        # disable_thinking accepted for interface consistency with
+        # complete_utility() but not acted on here — this backend doesn't
+        # enable Anthropic's extended-thinking mode by default (see
+        # _build_payload), so the prefill-vs-thinking conflict this param
+        # exists for doesn't apply. Worth a real look if extended thinking
+        # ever gets wired in here — Anthropic's API has a similar
+        # constraint around prefill and extended thinking.
         payload = self._build_payload(messages, tools, max_tokens, temperature, stream=False)
         try:
             resp = requests.post(API_BASE, headers=self.headers, json=payload, timeout=self.timeout)

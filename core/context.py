@@ -95,7 +95,10 @@ class ContextManager:
                 base_tokens = estimate_tokens(self.system_prompt)
                 reserved = config.RESPONSE_RESERVE_TOKENS
                 palace_budget = max(100, config.MAX_CONTEXT_TOKENS - base_tokens - tool_budget - reserved)
-                palace_block = build_context_block(max_tokens=palace_budget)
+                palace_block = build_context_block(
+                    max_tokens=palace_budget,
+                    inject_limit=config.MEMORY_INJECT_LIMIT,
+                )
             except Exception:
                 palace_block = ""
 
@@ -147,6 +150,23 @@ class ContextManager:
             if total <= available:
                 break
             history_copy.pop(0)
+
+        # F-61 fix: self.history itself used to grow unbounded — only the
+        # local copy above was ever trimmed. Harmless for the desktop
+        # session (cleared on chat switch/restart) but a real slow leak for
+        # long-lived headless agents (Telegram is owner=True, deliberately
+        # never reaped by core/headless.py's idle timer — see that file's
+        # comment). A weeks-long process meant an ever-growing list that got
+        # fully re-copied and re-estimated on every single turn and never
+        # shrank. Everything survives in chat_messages (SQLite) regardless
+        # of what's kept in this in-memory working set, so nothing is lost
+        # by capping it. Cap scales with whatever actually fits right now —
+        # 4x the current trim horizon — rather than a fixed number, so a
+        # large cloud context window naturally gets a larger live cap
+        # instead of being clipped by a constant sized for local models.
+        cap = max(len(history_copy) * 4, 40)
+        if len(self.history) > cap:
+            self.history = self.history[-cap:]
 
         # Strip image blocks from tool results — causes HTTP 400 on replay
         sanitized = []
