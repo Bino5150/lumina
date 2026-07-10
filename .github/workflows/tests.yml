@@ -1,0 +1,31 @@
+name: tests
+
+# F-13: minimal CI harness. Runs the core-logic test suite (db, persistence,
+# idempotency, sandbox, terminal, toolmaker, telegram_send, dreaming) on
+# every push and PR. Deliberately does NOT install the full requirements.txt
+# (PySide6, playwright+browsers, whisper) — those need system-level deps
+# (Qt libs, browser binaries) that would make this slow and flaky for what
+# is currently a backend-logic test suite. Everything under tests/ only
+# needs `requests` beyond the stdlib. A GUI/integration tier can be added
+# later if the test suite grows to actually need PySide6.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install test dependencies
+        run: pip install pytest==9.1.1 requests==2.34.2
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
