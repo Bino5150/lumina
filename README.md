@@ -94,7 +94,7 @@ Both channels, plus a curated "public bio" separate from her private one, are co
 ## Memory
 Most agents fall short with memory. They don’t remember what you talked about yesterday, the project you started last week, what your favorite color is, or even who you are. Every time you start a session, it’s a blank slate. It doesn’t persist. Lumina has a multi-tier memory persistence system. She learns, she grows, she gets smarter, and she evolves.
 
-She has a basic memory function for facts, events, people, etc. But she also has a layered MemPalace with Temporal Decaying weights and logic attachments. She has Chat History Search. She has Projects, which tag conversations relating to the project. She creates Skills. She indexes codebases, including her own. There’s a “My Human” user bio section. She has a database for people she meets. She has a Knowledge Base where both you and Lumina can store information, documents and files, things to remember and reference later.  
+Her multi-tier framework is a series of different related memory functions that operate together in unison as a whole. She has a basic memory function for facts, events, people, etc. But she also has a layered MemPalace with Temporal Decaying weights and logic attachments. She has Chat History Search. She has Projects, which tag conversations relating to the project. She creates Skills. She indexes codebases, including her own. There’s a “My Human” user bio section. She has a database for people she meets. She has a Knowledge Base where both you and Lumina can store information, documents and files, things to remember and reference later.  
 
 ### Basic Agent Memory
 She has a basic memory function, flat weighted, “Let me jot this down so I don’t forget” memory. 
@@ -198,6 +198,8 @@ Each persona is a JSON file in ~/lumina/personas/. Create your own. Bind a voice
 
 Import/Export functionality makes Personas community swappable. Like Pokemon, except useful. 
 **In order to use the cloned voices for Personas with the included reference audio, you must use Chatterbox Turbo or Voicebox for TTS.**
+
+**Third party character Personas and their respective avatars and cloned voices have been removed from the public release moving forward to prevent issues with copyrights. If you are interested in acquiring these Personas for non-profit educational and research purposes that fall under Fair Use, please feel free to contact the dev team and they can be provided to you free of charge for testing. In the meanwhile, we are working on creating some new original default Persona profiles aside from Lumina's original Persona to be included in future releases. Note that once you have Lumina installed on your machine, you are free to create whatever type of Persona you wish for your own personal use.**
 
 
 ## Voice — Real Voices, Not Robot Voices

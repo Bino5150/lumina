@@ -354,12 +354,17 @@ def load_layer(layer: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def load_halls(layer_max: int = 1) -> list[dict]:
-    """Load hall facts up to a given layer."""
+def load_halls(layer: int) -> list[dict]:
+    """Load hall facts at a specific layer — mirrors load_layer()'s
+    exact-layer model rather than a cumulative layer_max. (FE-03: the old
+    layer_max<=N semantics duplicated L0 halls into the L1 injection block,
+    since layer_max=1 matches layer 0 AND layer 1 rows. Exact-layer matching
+    can't double-count across the build_context_block() loop the way a
+    cumulative filter silently did.)"""
     conn = get_db()
     rows = conn.execute(
-        "SELECT hall, compressed FROM palace_halls WHERE layer <= ? ORDER BY created_at DESC LIMIT 30",
-        (layer_max,)
+        "SELECT hall, compressed FROM palace_halls WHERE layer = ? ORDER BY created_at DESC LIMIT 30",
+        (layer,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -384,7 +389,7 @@ def build_context_block(max_tokens: int = 400, inject_limit: int = None) -> str:
 
     for layer in [0, 1, 2]:
         closets = load_layer(layer)
-        halls   = load_halls(layer_max=layer) if layer <= 1 else []
+        halls   = load_halls(layer)
 
         layer_label = ["L0:Identity", "L1:Critical", "L2:Recent"][layer]
         layer_lines = []
@@ -558,7 +563,9 @@ def register_palace_tools(registry):
 
     registry.register(
         name="palace_hall",
-        fn=lambda content, hall="facts", layer=2: f"Hall entry stored: {aaak_compress(content, hall)}",
+        fn=lambda content, hall="facts", layer=2: (
+            lambda hall_id: f"Hall entry stored: {hall}/#{hall_id}"
+        )(palace_store_hall(content, hall, layer)),
         description="Store a cross-cutting fact in a Hall: facts|events|preferences|discoveries|advice.",
         parameters={
             "type": "object",

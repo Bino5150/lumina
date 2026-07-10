@@ -53,7 +53,17 @@ MAX_TIMEOUT = 30
 MAX_CPU_SECONDS = 30
 MAX_MEMORY_BYTES = 512 * 1024 * 1024   # 512MB address space
 MAX_OPEN_FILES = 64
-MAX_PROCESSES = 16                      # caps fork-bomb blast radius
+PROCESS_HEADROOM = 32   # FE-01: added to the CURRENT user's live process
+                        # count at spawn time, not a fixed absolute cap.
+                        # RLIMIT_NPROC caps the whole user's total process
+                        # count, not "children of this sandboxed script" — a
+                        # fixed MAX_PROCESSES=16 is already exceeded before
+                        # the tool even runs on any real desktop (100-300+
+                        # processes from a browser session alone), so
+                        # sandboxed code could never spawn a subprocess at
+                        # all. Racy (process count can shift between the
+                        # check and the fork) but sufficient against an
+                        # actual fork bomb, and never starts underwater.
 
 
 def register_sandbox_tools(registry):
@@ -88,7 +98,7 @@ def register_sandbox_tools(registry):
                 f"ulimit -t {MAX_CPU_SECONDS}; "
                 f"ulimit -v {MAX_MEMORY_BYTES // 1024}; "
                 f"ulimit -n {MAX_OPEN_FILES}; "
-                f"ulimit -u {MAX_PROCESSES}; "
+                f'ulimit -u $(( $(ps -u "$(id -un)" --no-headers | wc -l) + {PROCESS_HEADROOM} )); '
                 f"{shlex.quote(sys.executable)} -I {shlex.quote(script_path)}"
             )
 

@@ -40,6 +40,47 @@ import config
 PROTECTED = {"registry", "meta", "memory", "knowledge", "web",
              "filesystem", "sandbox", "terminal", "toolmaker"}
 
+# FE-02: this hand list drifted 9 modules stale (missing palace, browser, pin,
+# projects, diff, telegram_send, get_weather, temporal_decay,
+# temporal_decay_engine) — delete_tool("palace") could delete the entire
+# MemPalace layer from disk, callable from any owner chat turn. A hand list
+# only ever drifts one direction: more wrong over time as new modules ship.
+#
+# Fix: gate deletion on "was this tool ever actually approved through the
+# toolmaker review pipeline" instead of maintaining a name list at all.
+# Fail-closed, same as the rest of the security spine's default-deny
+# philosophy — a name can only become deletable by going through
+# create_tool() -> approve_pending_tool(), which is the one path that
+# produces an "approved" audit log entry. Every core framework module and
+# every shipped file that was added straight to the repo (get_weather.py,
+# temporal_decay.py, any future addition) is protected by construction,
+# with no list to keep in sync.
+def _deletable_tool_names() -> set:
+    approved = set()
+    if not os.path.exists(AUDIT_LOG_PATH):
+        return approved
+    try:
+        with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                name = entry.get("name")
+                event = entry.get("event")
+                if not name:
+                    continue
+                if event == "approved":
+                    approved.add(name)
+                elif event == "deleted":
+                    approved.discard(name)
+    except Exception:
+        return set()  # any read failure -> nothing deletable, fail closed
+    return approved
+
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 PENDING_DIR = os.path.join(TOOLS_DIR, "_pending")
 AUDIT_LOG_PATH = os.path.join(config.BASE_DIR, "memory", "tool_audit.log")
@@ -76,6 +117,9 @@ def approve_pending_tool(name: str, registry) -> str:
     """
     if name in PROTECTED:
         return f"[Error: '{name}' is a protected tool name.]"
+    live_path_check = os.path.join(TOOLS_DIR, f"{name}.py")
+    if os.path.exists(live_path_check):
+        return f"[Error: '{name}' already exists as a live tool — cannot overwrite via approval.]"
 
     pending_path = os.path.join(PENDING_DIR, f"{name}.py")
     if not os.path.exists(pending_path):
@@ -120,8 +164,12 @@ def register_toolmaker_tools(registry, agent):
         anyone with the Settings terminal) must explicitly run
         scripts/approve_tool.py before this becomes a callable tool.
         """
-        if name in PROTECTED:
-            return f"[Error: '{name}' is a protected tool name.]"
+        # FE-02: block on PROTECTED (hand list, kept only as a name-clash
+        # belt-and-suspenders) OR a real collision with any live file in
+        # tools/ — the latter can't drift, since it checks what's actually
+        # on disk rather than a maintained set.
+        if name in PROTECTED or os.path.exists(os.path.join(TOOLS_DIR, f"{name}.py")):
+            return f"[Error: '{name}' is protected or already exists as a live tool.]"
 
         try:
             compile(code, f"<pending:{name}>", "exec")
@@ -171,22 +219,21 @@ def register_toolmaker_tools(registry, agent):
             return f"[Error rejecting tool: {e}]"
 
     def list_custom_tools() -> str:
-        """List all live custom tools written by Lumina."""
-        protected = PROTECTED | {"__init__", "_pending"}
-        custom = []
-        for f in os.listdir(TOOLS_DIR):
-            if f.endswith(".py"):
-                stem = f[:-3]
-                if stem not in protected:
-                    custom.append(stem)
+        """List all live custom tools written by Lumina — i.e. tools that
+        actually went through create_tool() -> approve_pending_tool(), not
+        just any .py file sitting in tools/ that isn't hand-listed as core."""
+        deletable = _deletable_tool_names()
+        custom = [f[:-3] for f in os.listdir(TOOLS_DIR)
+                  if f.endswith(".py") and f[:-3] in deletable]
         if not custom:
             return "[No custom tools yet.]"
         return f"[Custom tools: {', '.join(sorted(custom))}]"
 
     def delete_tool(name: str) -> str:
         """Delete a live custom tool file and unregister it."""
-        if name in PROTECTED:
-            return f"[Error: '{name}' is protected and cannot be deleted.]"
+        if name not in _deletable_tool_names():
+            return (f"[Error: '{name}' was not created and approved through "
+                     f"the toolmaker pipeline, so it cannot be deleted.]")
 
         filepath = os.path.join(TOOLS_DIR, f"{name}.py")
 

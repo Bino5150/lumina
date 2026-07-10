@@ -15,10 +15,22 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright, Browser, Page, Playwright
 
+import config
+
 logger = logging.getLogger(__name__)
 
-# Screenshot output directory
-SCREENSHOT_DIR = Path.home() / "lumina" / "browser_screenshots"
+# Screenshot output directory — FE-04-class fix: was Path.home() / "lumina" /
+# "browser_screenshots", the identical hardcoded-folder-name bug as
+# tools/projects.py (works by accident only if the clone happens to be named
+# exactly ~/lumina, breaks for any other clone location/name).
+#
+# Anchored under memory/ (config.BASE_DIR-relative, gitignored), matching the
+# existing convention for runtime-only data like sandbox_tmp/ and lumina.db —
+# deliberately NOT the same folder as the repo-tracked browser_screenshots/
+# at the project root (the promo screenshots kept per FE-10). Putting live
+# runtime screenshots in that tracked folder would risk them getting swept
+# into a future `git add .` alongside the promo images.
+SCREENSHOT_DIR = Path(config.BASE_DIR) / "memory" / "browser_screenshots"
 
 
 class BrowserManager:

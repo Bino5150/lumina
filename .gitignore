@@ -1,6 +1,7 @@
 # Personal data
 memory/lumina.db
 memory/prefs.json
+memory/browser_screenshots/
 projects/*/chats.json
 
 # Claude Code intern context — local scratch, not project source

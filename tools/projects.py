@@ -4,13 +4,14 @@ Projects Tools — lightweight project workspace management.
 
 import os
 import json
+import config
 
-PROJECTS_DIR = os.path.expanduser("~/lumina/projects")
+PROJECTS_DIR = os.path.join(config.BASE_DIR, "projects")
 PROJECTLIST  = os.path.join(PROJECTS_DIR, "projectlist.md")
 
 
 def init_projects():
-    """Create ~/lumina/projects/ and projectlist.md if they don't exist."""
+    """Create PROJECTS_DIR and projectlist.md if they don't exist."""
     os.makedirs(PROJECTS_DIR, exist_ok=True)
     if not os.path.exists(PROJECTLIST):
         with open(PROJECTLIST, 'w', encoding='utf-8') as f:

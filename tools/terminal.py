@@ -34,9 +34,6 @@ import subprocess
 import os
 import signal
 
-MAX_PROCESSES = 128  # fork-bomb ceiling, not a workflow limit — real builds/test
-                      # suites need headroom, this just stops runaway forking
-
 
 def register_terminal_tools(registry):
 
@@ -44,14 +41,21 @@ def register_terminal_tools(registry):
         """Execute a shell command and return stdout/stderr."""
         cwd = os.path.expanduser(cwd) if cwd else os.path.expanduser("~")
 
-        # ulimit is a shell builtin — it applies to this shell and everything
-        # it subsequently runs, with no Python code executing between fork
-        # and exec (see CORRECTION above for why that matters).
-        wrapped_command = f"ulimit -u {MAX_PROCESSES}; {command}"
-
+        # FE-01: no ulimit -u here. RLIMIT_NPROC caps the WHOLE USER's process
+        # count, not "children of this shell" — with normal desktop usage
+        # (100-300+ processes from a browser session alone) a fixed ceiling
+        # like 128 leaves single-digit fork headroom, so any pipeline,
+        # subshell, && chain, build script, or git hook fails sporadically
+        # with "fork: Resource temporarily unavailable." Empirically confirmed
+        # breaking real commands on a live desktop (S42/FE-01).
+        #
+        # The group-kill-on-timeout below already contains runaways (a fork
+        # bomb here is the same trust tier as rm -rf, which this owner-trust
+        # tool also permits) — a limit that breaks legitimate builds isn't
+        # buying real protection.
         try:
             proc = subprocess.Popen(
-                wrapped_command,
+                command,
                 shell=True,
                 executable="/bin/bash",   # /bin/sh may be dash, whose ulimit
                                            # builtin doesn't reliably support

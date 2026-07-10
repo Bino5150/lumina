@@ -107,7 +107,7 @@ class ContextManager:
         if self.owner:
             try:
                 import os
-                _pl_path = os.path.expanduser("~/lumina/projects/projectlist.md")
+                from tools.projects import PROJECTLIST as _pl_path
                 if os.path.exists(_pl_path):
                     with open(_pl_path, 'r', encoding='utf-8') as _f:
                         _pl = _f.read().strip()
