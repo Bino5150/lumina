@@ -115,19 +115,31 @@ def find_profile_by_name(name: str) -> dict | None:
     return None
 
 
-def resolve_enabled_set(profile_name: str = None, tools_enabled: list = None, owner: bool = True):
+def resolve_enabled_set(profile_name: str = None, tools_enabled: list = None, owner: bool = True,
+                         all_tools: list = None):
     """
     Single source of truth for 'what should be enabled.'
     - profile_name: looks up a named tool_profiles/*.json (the tools_profile field)
     - tools_enabled: an inline list (legacy persona field) — used if profile_name absent
     - owner: if False, OWNER_ONLY_TOOLS are stripped no matter what's in the input.
+    - all_tools: the live registry's full tool universe (registry.all_tool_names()).
+      FE-11: the "All Tools" profile's enabled set is computed from THIS, live,
+      every time — never read from all_tools.json's own "enabled" list. That
+      file was a hand-maintained snapshot that drifted stale (missing 5+ tools
+      as of S38) every time a new tool shipped and nobody remembered to
+      regenerate it. Every other named profile (Research, Coding, Minimal...)
+      is unaffected — those are deliberately curated, hand-picked sets, not
+      "everything," so their JSON stays the source of truth for them.
     Returns None if neither input is given.
     """
     enabled = None
     if profile_name:
         profile = find_profile_by_name(profile_name)
         if profile is not None:
-            enabled = set(profile.get("enabled", []))
+            if profile.get("name", "").strip().lower() == "all tools" and all_tools is not None:
+                enabled = set(all_tools)
+            else:
+                enabled = set(profile.get("enabled", []))
     if enabled is None and tools_enabled is not None:
         enabled = set(tools_enabled)
 
@@ -151,7 +163,7 @@ def apply_tool_profile(registry, profile_name: str = None, tools_enabled: list =
     not everything. A missing/typo'd/broken profile fails closed.
     """
     all_tools = registry.all_tool_names()
-    enabled = resolve_enabled_set(profile_name, tools_enabled, owner=owner)
+    enabled = resolve_enabled_set(profile_name, tools_enabled, owner=owner, all_tools=all_tools)
 
     if enabled is None:
         if owner:

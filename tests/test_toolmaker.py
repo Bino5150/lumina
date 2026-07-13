@@ -128,3 +128,104 @@ def test_audit_log_records_full_lifecycle(toolmaker_env):
     # full source should be recoverable from the audit log even after approval
     staged_entry = next(e for e in events if e["event"] == "staged")
     assert "def hello_world" in staged_entry["code"]
+
+
+# ── FE-11: startup loader for tools approved in a PAST session ─────────────
+# approve_pending_tool() only ever hot-loads into that call's live registry.
+# Nothing about it persisted across a restart, so every approved custom tool
+# silently vanished the next time the app launched. These tests simulate a
+# restart with a fresh registry rather than reusing the one create/approve
+# already touched.
+
+def _write_tool_file(tools_dir: str, name: str, code: str):
+    with open(os.path.join(tools_dir, f"{name}.py"), "w") as f:
+        f.write(code)
+
+
+def _append_fake_audit(audit_path: str, event: str, name: str):
+    with open(audit_path, "a") as f:
+        f.write(json.dumps({"ts": "2026-01-01T00:00:00", "event": event, "name": name}) + "\n")
+
+
+BROKEN_ARITY_CODE = """
+class _Engine:
+    pass
+
+engine = _Engine()
+
+def register_broken_arity_tool(registry):
+    registry.register("broken_arity", engine)  # missing description/parameters
+"""
+
+MISSING_REGISTER_FN_CODE = "value = 42\n"
+
+
+def test_startup_loader_reloads_approved_tool_after_restart(toolmaker_env):
+    reg = toolmaker_env
+    reg.fns["create_tool"]("hello_world", "says hi", VALID_TOOL_CODE)
+    toolmaker.approve_pending_tool("hello_world", reg)
+
+    # Simulate a restart: brand new registry, nothing statically wired yet.
+    fresh_reg = _CapturingRegistry()
+    loaded = toolmaker.load_approved_custom_tools(fresh_reg)
+
+    assert "hello_world" in loaded
+    assert "hello_world" in fresh_reg._tools
+    assert fresh_reg._tools["hello_world"]() == "hi from custom tool"
+
+
+def test_startup_loader_skips_deleted_tool(toolmaker_env):
+    reg = toolmaker_env
+    reg.fns["create_tool"]("hello_world", "says hi", VALID_TOOL_CODE)
+    toolmaker.approve_pending_tool("hello_world", reg)
+    reg.fns["delete_tool"]("hello_world")
+
+    fresh_reg = _CapturingRegistry()
+    loaded = toolmaker.load_approved_custom_tools(fresh_reg)
+
+    assert "hello_world" not in loaded
+    assert "hello_world" not in fresh_reg._tools
+
+
+def test_startup_loader_survives_broken_tool_and_still_loads_good_one(toolmaker_env, tmp_path):
+    """Mirrors the real temporal_decay_engine.py bug found while building
+    this: a custom tool whose register function calls registry.register()
+    with the wrong arity. It must not block boot, and it must not take a
+    sibling tool down with it."""
+    reg = toolmaker_env
+    reg.fns["create_tool"]("hello_world", "says hi", VALID_TOOL_CODE)
+    toolmaker.approve_pending_tool("hello_world", reg)
+
+    _write_tool_file(str(tmp_path), "broken_arity", BROKEN_ARITY_CODE)
+    _append_fake_audit(toolmaker.AUDIT_LOG_PATH, "approved", "broken_arity")
+
+    fresh_reg = _CapturingRegistry()
+    loaded = toolmaker.load_approved_custom_tools(fresh_reg)
+
+    assert "hello_world" in loaded
+    assert "broken_arity" not in loaded
+    assert "broken_arity" not in fresh_reg._tools
+
+
+def test_startup_loader_skips_tool_with_no_register_function(toolmaker_env, tmp_path):
+    _write_tool_file(str(tmp_path), "no_register_fn", MISSING_REGISTER_FN_CODE)
+    _append_fake_audit(toolmaker.AUDIT_LOG_PATH, "approved", "no_register_fn")
+
+    fresh_reg = _CapturingRegistry()
+    loaded = toolmaker.load_approved_custom_tools(fresh_reg)
+
+    assert loaded == []
+    assert "no_register_fn" not in fresh_reg._tools
+
+
+def test_startup_loader_ignores_files_never_approved(toolmaker_env, tmp_path):
+    """A bare .py file sitting in tools/ with no matching 'approved' audit
+    log entry must never be picked up — same fail-closed posture as the
+    delete_tool gate this loader reuses."""
+    _write_tool_file(str(tmp_path), "hello_world", VALID_TOOL_CODE)  # file exists, never approved
+
+    fresh_reg = _CapturingRegistry()
+    loaded = toolmaker.load_approved_custom_tools(fresh_reg)
+
+    assert loaded == []
+    assert "hello_world" not in fresh_reg._tools

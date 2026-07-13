@@ -155,6 +155,69 @@ def approve_pending_tool(name: str, registry) -> str:
     return f"[Tool '{name}' approved, loaded, and live.]"
 
 
+def load_approved_custom_tools(registry) -> list:
+    """
+    FE-11 startup loader. approve_pending_tool() moves a staged file into
+    tools/ and hot-loads it into *that session's* live registry — nothing
+    about that call persists the load across a restart. Every custom tool
+    Lumina ever wrote and had approved (get_weather, temporal_decay, or
+    whatever comes next) silently vanished the next time the app launched,
+    with no error and no log line, until someone noticed it missing from
+    the tool list.
+
+    Walks the exact same audit-log-derived "approved" set that
+    _deletable_tool_names() already uses for the delete_tool gate — so this
+    only ever re-loads a tool that genuinely went through
+    create_tool() -> approve_pending_tool() in the past. A bare .py file
+    someone drops into tools/ by hand, without a matching "approved" audit
+    log entry, is never picked up here, same fail-closed posture as the
+    deletion gate.
+
+    Each tool loads inside its own try/except. One broken or half-written
+    custom tool (see: temporal_decay_engine.py's mismatched register-call
+    arity) must never be able to block the rest of boot — it gets logged
+    and skipped, not raised.
+
+    Returns the list of tool names actually loaded, for anyone who wants to
+    log/print it at startup.
+    """
+    loaded = []
+    approved = _deletable_tool_names()
+    for name in sorted(approved):
+        live_path = os.path.join(TOOLS_DIR, f"{name}.py")
+        if not os.path.exists(live_path):
+            # Approved once, but the file is gone now (manually removed
+            # outside the delete_tool path) — nothing to load.
+            continue
+
+        register_fn_name = f"register_{name}_tool"
+        try:
+            spec = importlib.util.spec_from_file_location(name, live_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        except Exception:
+            print(f"[TOOLMAKER] startup load FAILED (import) for '{name}':\n"
+                  f"{traceback.format_exc()}", flush=True)
+            continue
+
+        if not hasattr(module, register_fn_name):
+            print(f"[TOOLMAKER] startup load skipped '{name}': "
+                  f"module has no {register_fn_name}(registry).", flush=True)
+            continue
+
+        try:
+            getattr(module, register_fn_name)(registry)
+        except Exception:
+            print(f"[TOOLMAKER] startup load FAILED (register) for '{name}':\n"
+                  f"{traceback.format_exc()}", flush=True)
+            continue
+
+        loaded.append(name)
+
+    return loaded
+
+
 def register_toolmaker_tools(registry, agent):
 
     def create_tool(name: str, description: str, code: str) -> str:

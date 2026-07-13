@@ -19,7 +19,7 @@ from tools.web import register_web_tools
 from tools.filesystem import register_filesystem_tools
 from tools.sandbox import register_sandbox_tools
 from tools.terminal import register_terminal_tools
-from tools.toolmaker import register_toolmaker_tools
+from tools.toolmaker import register_toolmaker_tools, load_approved_custom_tools
 from tools.palace import register_palace_tools
 from core.skills import register_skills_tools, build_skills_block, init_skills_db
 from core.chat_history import register_chat_history_tools
@@ -130,6 +130,16 @@ class LuminaAgent:
         register_diff_tools(self.registry)
         register_browser_tools(self.registry)
         register_telegram_tools(self.registry)
+
+        # FE-11: reload any custom tool that was approved through the
+        # toolmaker review pipeline in a past session. Not owner-gated —
+        # a tool like get_weather is an ordinary tool once approved, not a
+        # toolmaker-management tool, so it follows the same visibility path
+        # as everything else below (default-deny for non-owner, restored
+        # only by an explicit profile).
+        _loaded_custom = load_approved_custom_tools(self.registry)
+        if _loaded_custom:
+            print(f"[AGENT] Loaded approved custom tools: {', '.join(_loaded_custom)}", flush=True)
 
         # Default-deny resolution runs LAST — after every register_*_tools()
         # call above. Anything registered before this line and not restored
