@@ -59,6 +59,12 @@ def on_session_idle(chat_id: int):
 
     msgs = load_chat_messages(chat_id)
     last = _last_dream_sweep.get(chat_id)
+    # FE-29: last is datetime.now().isoformat() — local time, no tz offset —
+    # compared straight against msgs' created_at strings. Fine today because
+    # the same local clock writes both sides of the comparison. This breaks
+    # silently (under-or-over-filters instead of erroring) the moment either
+    # side moves to UTC — flagging for the compaction build, which reuses
+    # this exact watermark pattern.
     if last:
         msgs = [m for m in msgs if m.get("created_at", "") > last]
     if not msgs:

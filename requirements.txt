@@ -20,7 +20,10 @@ httpx==0.28.1                 # async HTTP (backends, streaming)
 # ── Browser Automation ────────────────────────────────────────────────────────
 playwright==1.61.0             # + run: playwright install chromium
 
-# ── Web Scraping (web.py fallback) ────────────────────────────────────────────
+# ── Web Search / Scraping (web.py) ────────────────────────────────────────────
+ddgs==9.14.4                    # primary web_search path — FE-24: was missing
+                                 # entirely, every fresh install silently fell
+                                 # back to the regex HTML scraper without it
 beautifulsoup4==4.15.0
 lxml==6.1.1                    # fast HTML parser for BS4
 

@@ -1,8 +1,6 @@
 """
 Lumina — Entry Point
 Run with GUI:  python main.py
-from stt.whisper_bridge import WhisperBridge
-stt = WhisperBridge(model_size="base", device="cpu")
 Run CLI only:  python main.py --cli
 """
 
@@ -24,8 +22,8 @@ def run_cli():
         print(f"  ✓ {preview}{'...' if len(result) > 120 else ''}", flush=True)
 
     print(f"\n{'='*52}")
-    print(f"  LUMINA v0.1 — CLI Mode")
-    print(f"  LM Studio: {config.LM_STUDIO_BASE_URL}")
+    print(f"  LUMINA v0.1.9-beta.1 — CLI Mode")
+    print(f"  Backend: {config.LLM_BACKEND} ({config.LLM_BACKEND_URL})")
     print(f"{'='*52}\n")
 
     agent = LuminaAgent(on_tool_call=on_tool_call, on_tool_result=on_tool_result)
@@ -70,7 +68,7 @@ def run_gui():
 
     app = QApplication(sys.argv)
     app.setApplicationName("Lumina")
-    app.setApplicationVersion("0.1")
+    app.setApplicationVersion("0.1.9-beta.1")
 
     # Set default font — prefer monospace
     for font_name in ["JetBrains Mono", "Fira Code", "Cascadia Code", "Monospace"]:

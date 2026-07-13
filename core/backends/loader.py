@@ -1,5 +1,5 @@
 """
-ackend loader — returns the active LLM backend instance based on config.
+Backend loader — returns the active LLM backend instance based on config.
 Import this everywhere instead of importing a specific backend class.
 
 Usage:

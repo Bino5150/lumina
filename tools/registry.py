@@ -14,7 +14,7 @@ class ToolRegistry:
         self._disabled: set[str] = set()        # names of disabled tools
         self._gate_fn: Optional[Callable[[str], tuple]] = None
         # gate_fn(name) -> (allowed: bool, reason: str). Checked AFTER _disabled —
-        # for tools that are enabled but need one more runtime check (PIN) before firing.      # names of disabled tools
+        # for tools that are enabled but need one more runtime check (PIN) before firing.
 
     def register(self, name: str, fn: Callable, description: str, parameters: dict):
         """Register a tool with a lean description."""

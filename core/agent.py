@@ -231,11 +231,18 @@ class LuminaAgent:
                 self.ctx.add_tool_result(tool_id, name, result)
                 self._session_tool_calls += 1
                 
-                # Nudge skill creation after threshold — once per session
+                # Nudge skill creation after threshold — once per session.
+                # FE-26: this used to be ctx.add_user(...), which injected a
+                # synthetic USER message that persisted in history forever —
+                # every later turn showed "you said" a line the person never
+                # typed. push_ephemeral() surfaces the same nudge to the model
+                # for its next completion this turn, then it's gone; nothing
+                # fake is ever written into the conversation record.
             if (not self._skill_nudge_sent
                     and self._session_tool_calls >= config.SKILLS_TRIGGER_THRESHOLD):
                 self._skill_nudge_sent = True
-                self.ctx.add_user(
+                self.ctx.push_ephemeral(
+                    "## Skill reminder\n"
                     "That workflow involved several tool calls. "
                     "If this procedure is reusable, consider calling save_skill() "
                     "to save it for future sessions — before giving your final answer."
