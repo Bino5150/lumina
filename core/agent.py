@@ -69,6 +69,13 @@ class LuminaAgent:
         self.registry = ToolRegistry()
         self.channel_id = channel_id
 
+        if owner:
+            # FE-09: one-time, idempotent — moves any cloud API keys still
+            # sitting in prefs.json (from before secrets.py handled them)
+            # into proper credential storage. No-op after the first run.
+            from core.secrets import migrate_legacy_cloud_keys
+            migrate_legacy_cloud_keys()
+
         self.on_tool_call     = on_tool_call     or (lambda n, a: None)
         self.on_tool_result   = on_tool_result   or (lambda n, r: None)
         self.on_think_start   = on_think_start   or (lambda step: None)

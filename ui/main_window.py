@@ -944,17 +944,17 @@ class LuminaWindow(QMainWindow):
 
     def _on_think_start(self, step: int):
         self.status_lbl.setText(f"thinking (step {step})...")
-        if self._live_bubble:
+        if self._live_bubble and config.SHOW_THINK_BLOCKS:
             self._live_bubble.open_think_block(step)
 
     def _on_think_chunk(self, chunk: str):
-        if self._live_bubble:
+        if self._live_bubble and config.SHOW_THINK_BLOCKS:
             self._live_bubble.append_think_token(chunk)
             
 
     def _on_think_end(self):
         self.status_lbl.setText("responding...")
-        if self._live_bubble:
+        if self._live_bubble and config.SHOW_THINK_BLOCKS:
             self._live_bubble.close_think_block()
 
     def _on_response_chunk(self, chunk: str):

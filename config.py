@@ -9,8 +9,13 @@ LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
 LM_STUDIO_API_KEY = "lm-studio"
 
 # Backend selection — "lmstudio" | "ollama" | "llamacpp"
-LLM_BACKEND = "llamacpp"
-LLM_BACKEND_URL = "http://localhost:8080/v1"   # None = use backend's default URL
+# FE-06: the real, live values are set below (search "Cloud Model"), loaded
+# from prefs.json via _p.get() so Settings UI changes actually persist.
+# These two lines used to also assign LLM_BACKEND/LLM_BACKEND_URL directly,
+# but that assignment always got silently overwritten by the prefs-backed
+# one further down — dead code that only cost future readers time figuring
+# out which one actually took effect. If you want to hand-edit these without
+# touching prefs.json, edit the real ones under "Cloud Model" below instead.
 LLAMACPP_DRAFT_MODEL = None  # Path to draft model GGUF for speculative decoding
 
 # ─── Cloud Backend API Keys ───────────────────────────────────────────────────
@@ -96,7 +101,9 @@ STT_DEVICE  = _p.get("stt_device", "cpu")
 LLM_BACKEND     = _p.get("llm_backend", "llamacpp")
 LLM_BACKEND_URL = _p.get("llm_backend_url", "http://localhost:8080/v1")
 CUSTOM_DEFAULT_MODEL = _p.get("custom_default_model", "")
-CUSTOM_API_KEY       = _p.get("custom_api_key", "")
+# FE-09: same secrets.py-first pattern as the cloud provider keys above.
+from core import secrets as _secrets
+CUSTOM_API_KEY = _secrets.get_secret("custom_api_key") or _p.get("custom_api_key", "")
 
 # Context management (per-backend) — local backends are hard-capped by
 # whatever -c value the server was actually launched with; cloud backends
@@ -138,8 +145,18 @@ MAX_TOOL_ITERATIONS     = _p.get("max_tool_iterations", 20)
 # overrides when Settings UI has actually saved something for that provider.
 _cloud_creds = _p.get("cloud_credentials", {})
 def _cloud_override(provider: str, key_default: str, model_default: str):
+    # FE-09: keys now live in secrets.py (~/.config/lumina/credentials.json),
+    # not prefs.json — prefs.json gets dragged into Project uploads and the
+    # (genericized) public repo, secrets.py never does. Checks secrets.py
+    # first; falls back to whatever's still sitting in prefs.json's
+    # cloud_credentials for anyone mid-migration (migrate_legacy_cloud_keys()
+    # runs at owner-session startup and moves it over on the next save, but
+    # this fallback means nothing breaks on the very first run before that
+    # migration has fired).
     saved = _cloud_creds.get(provider, {})
-    return saved.get("api_key", key_default), saved.get("default_model", model_default)
+    key = _secrets.get_secret(f"{provider}_api_key") or saved.get("api_key", key_default)
+    model = saved.get("default_model", model_default)
+    return key, model
 
 OPENROUTER_API_KEY, OPENROUTER_DEFAULT_MODEL = _cloud_override("openrouter", OPENROUTER_API_KEY, OPENROUTER_DEFAULT_MODEL)
 DEEPSEEK_API_KEY, DEEPSEEK_DEFAULT_MODEL     = _cloud_override("deepseek", DEEPSEEK_API_KEY, DEEPSEEK_DEFAULT_MODEL)
@@ -149,6 +166,23 @@ ANTHROPIC_API_KEY, ANTHROPIC_DEFAULT_MODEL   = _cloud_override("anthropic", ANTH
 GEMINI_API_KEY, GEMINI_DEFAULT_MODEL         = _cloud_override("gemini", GEMINI_API_KEY, GEMINI_DEFAULT_MODEL)
 KIMI_API_KEY, KIMI_DEFAULT_MODEL             = _cloud_override("kimi", KIMI_API_KEY, KIMI_DEFAULT_MODEL)
 QWEN_API_KEY, QWEN_DEFAULT_MODEL             = _cloud_override("qwen", QWEN_API_KEY, QWEN_DEFAULT_MODEL)
+
+# Dreaming — prefs-backed like everything else in this block, so a Settings
+# UI toggle actually survives a restart instead of reverting to these
+# hardcoded defaults every time (was defined below `del _p`, so it never
+# even had the option to load from prefs before now).
+DREAM_SWEEP_ENABLED = _p.get("dream_sweep_enabled", True)
+DREAM_MIN_TOKENS    = _p.get("dream_min_tokens", 900)
+DREAM_IDLE_MINUTES  = _p.get("dream_idle_minutes", 13)
+
+# Chat UI — show/hide the model's <think> reasoning block in the chat
+# window. Purely a display toggle: the model still reasons and those tokens
+# still stream in either case, this just controls whether the UI renders
+# them. Not the same as actually disabling thinking at the model/backend
+# level (a bigger change, deferred — chat_stream() doesn't support
+# disable_thinking in any backend yet, only the non-streaming chat() path
+# used by complete_utility() does).
+SHOW_THINK_BLOCKS = _p.get("show_think_blocks", True)
 
 del _p
 
@@ -160,10 +194,6 @@ TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
 # Telegram bridge — owner identity, not a credential (the bot token lives in
 # core/secrets.py instead). None in release; set your real chat ID in OG only.
 TELEGRAM_OWNER_CHAT_ID = None
-
-DREAM_SWEEP_ENABLED = True
-DREAM_MIN_TOKENS = 900
-DREAM_IDLE_MINUTES = 13
 
 # System prompt
 SYSTEM_PROMPT = """RESPONSE STYLE: Think briefly — 3 to 5 sentences of reasoning max for simple queries. Do not outline, draft, or self-correct in your thinking. Just reason and respond.

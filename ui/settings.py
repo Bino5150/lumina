@@ -249,6 +249,38 @@ class GeneralTab(QWidget):
         row2.addLayout(iter_col)
         row2.addLayout(resp_col)
         layout.addLayout(row2)
+
+        # ── Dreaming ──
+        layout.addWidget(_sec("DREAMING", self.c))
+        layout.addWidget(_lbl(
+            "Idle-sweep background summarization — writes brief session recaps "
+            "into memory after a chat sits idle. Was previously only "
+            "configurable by editing config.py directly.", self.c
+        ))
+        row3 = QHBoxLayout()
+        row3.setSpacing(16)
+        self.dream_enabled_cb = QCheckBox("Enable Dream Sweeps")
+        self.dream_enabled_cb.setChecked(config.DREAM_SWEEP_ENABLED)
+        self.dream_enabled_cb.toggled.connect(self._on_dream_toggled)
+        idle_col = QVBoxLayout()
+        idle_col.addWidget(_lbl("Idle Minutes Before Sweep", self.c))
+        self.dream_idle_spin = _spin(config.DREAM_IDLE_MINUTES, 1, 180, 1, self.c)
+        idle_col.addWidget(self.dream_idle_spin)
+        row3.addWidget(self.dream_enabled_cb)
+        row3.addLayout(idle_col)
+        layout.addLayout(row3)
+        self._on_dream_toggled(config.DREAM_SWEEP_ENABLED)  # set initial enabled state
+
+        # ── Thinking display ──
+        layout.addWidget(_sec("THINKING DISPLAY", self.c))
+        self.show_think_cb = QCheckBox("Show reasoning (think blocks) in chat")
+        self.show_think_cb.setChecked(config.SHOW_THINK_BLOCKS)
+        self.show_think_cb.setToolTip(
+            "Display-only — the model still reasons either way; this just "
+            "controls whether that reasoning is rendered in the chat window."
+        )
+        layout.addWidget(self.show_think_cb)
+
         layout.addWidget(_sec("GLOBAL AGENT BEHAVIOR PROMPT", self.c))
         layout.addWidget(_lbl("Global agentic system prompt that works in conjunction with all Persona prompts.", self.c))
         self.prompt = _te(config.SYSTEM_PROMPT, self.c, height=140)
@@ -266,6 +298,9 @@ class GeneralTab(QWidget):
         self.setLayout(QVBoxLayout())
         self.layout().setContentsMargins(0, 0, 0, 0)
         self.layout().addWidget(_scroll_wrap(outer, self.c))
+
+    def _on_dream_toggled(self, checked: bool):
+        self.dream_idle_spin.setEnabled(checked)
 
     def _refresh_cloud_row(self, backend: str):
         is_cloud = backend in self.CLOUD_BACKENDS
@@ -316,6 +351,9 @@ class GeneralTab(QWidget):
         config.MEMORY_INJECT_LIMIT = self.mem_spin.value()
         config.MAX_TOOL_ITERATIONS = self.iter_spin.value()
         config.RESPONSE_RESERVE_TOKENS = self.resp_spin.value()
+        config.DREAM_SWEEP_ENABLED = self.dream_enabled_cb.isChecked()
+        config.DREAM_IDLE_MINUTES = self.dream_idle_spin.value()
+        config.SHOW_THINK_BLOCKS = self.show_think_cb.isChecked()
         config.LLM_BACKEND = self.backend_combo.currentText()
         config.LLM_BACKEND_URL = self.url.text().strip()
         config.LM_STUDIO_BASE_URL = config.LLM_BACKEND_URL
@@ -339,6 +377,9 @@ class GeneralTab(QWidget):
         # recalls each one's own values instead of clobbering the other.
         prefs["max_tool_iterations"] = config.MAX_TOOL_ITERATIONS
         prefs["response_reserve_tokens"] = config.RESPONSE_RESERVE_TOKENS
+        prefs["dream_sweep_enabled"] = config.DREAM_SWEEP_ENABLED
+        prefs["dream_idle_minutes"] = config.DREAM_IDLE_MINUTES
+        prefs["show_think_blocks"] = config.SHOW_THINK_BLOCKS
         backend_context = prefs.get("backend_context", {})
         backend_context[config.LLM_BACKEND] = {
             "max_context_tokens": config.MAX_CONTEXT_TOKENS,
@@ -350,10 +391,14 @@ class GeneralTab(QWidget):
         # config module (setattr above) and revert to "" on restart — same
         # bug class the context settings had. Only write an entry when this
         # is actually a cloud backend; local/custom backends don't have one.
+        # FE-09: the key itself now goes to secrets.py, not prefs.json —
+        # prefs.json gets dragged into Project uploads and the public repo,
+        # secrets.py never does. Only default_model stays in prefs.
         if config.LLM_BACKEND in self.CLOUD_BACKENDS:
+            from core import secrets as _secrets
+            _secrets.set_secret(f"{config.LLM_BACKEND}_api_key", self.cloud_key.text().strip())
             cloud_creds = prefs.get("cloud_credentials", {})
             cloud_creds[config.LLM_BACKEND] = {
-                "api_key": self.cloud_key.text().strip(),
                 "default_model": self.cloud_model.text().strip(),
             }
             prefs["cloud_credentials"] = cloud_creds
@@ -361,8 +406,9 @@ class GeneralTab(QWidget):
         if config.LLM_BACKEND == "custom":
             config.CUSTOM_DEFAULT_MODEL = self.custom_model.text().strip()
             config.CUSTOM_API_KEY = self.custom_api_key.text().strip()
+            from core import secrets as _secrets
+            _secrets.set_secret("custom_api_key", config.CUSTOM_API_KEY)
             prefs["custom_default_model"] = config.CUSTOM_DEFAULT_MODEL
-            prefs["custom_api_key"] = config.CUSTOM_API_KEY
             self.agent.llm._model = config.CUSTOM_DEFAULT_MODEL
 
         save_prefs(prefs)
