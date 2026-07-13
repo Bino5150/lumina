@@ -7,7 +7,9 @@ Falls back to direct HTML scraping if library unavailable.
 import requests
 import re
 import warnings
-from urllib.parse import quote_plus
+import ipaddress
+import socket
+from urllib.parse import quote_plus, urlparse, urljoin
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -124,6 +126,60 @@ def _ddg_html_search(query: str, max_results: int = 5) -> str:
         return f"[Search error: {e}]"
 
 
+def _is_safe_public_url(url: str) -> bool:
+    """FE-08: reject URLs that resolve to private/loopback/link-local/reserved
+    addresses. Without this, a Discord-Safe stranger could ask get_website to
+    fetch http://localhost:8080/v1/models or http://192.168.1.1/ and get the
+    response body handed back to them — service fingerprinting and content
+    disclosure of unauthenticated local services, from a stranger, via chat.
+
+    Applies to ALL callers, owner included — registry.call() has no session/
+    owner context threaded through to individual tool functions today, so a
+    real owner-vs-guest split here would mean a much bigger dispatch-layer
+    refactor than this warrants. Owner loses nothing real: terminal/sandbox
+    already cover any legitimate local-network fetch need.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        # Resolve to an actual IP — blocks literal private IPs AND hostnames
+        # that resolve to one (e.g. a DNS record pointing at 127.0.0.1 or a
+        # LAN address), not just a string-match on "localhost".
+        addr = socket.gethostbyname(host)
+        ip = ipaddress.ip_address(addr)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+        return True
+    except Exception:
+        return False  # can't resolve/parse it -> fail closed, don't fetch
+
+
+def _safe_get(url: str, **kwargs):
+    """requests.get() with manual redirect-hop validation. requests follows
+    redirects by default (FE-08's own note) — without this, a public URL
+    that 302s to a private one would sail straight past _is_safe_public_url
+    and fetch the private target anyway."""
+    if not _is_safe_public_url(url):
+        raise ValueError(f"refusing to fetch — resolves to a private/internal address: {url}")
+
+    resp = requests.get(url, allow_redirects=False, **kwargs)
+    hops = 0
+    while resp.is_redirect and hops < 5:
+        location = resp.headers.get("Location")
+        if not location:
+            break
+        url = urljoin(url, location)
+        if not _is_safe_public_url(url):
+            raise ValueError(f"refusing to follow redirect — target resolves to a private/internal address: {url}")
+        resp = requests.get(url, allow_redirects=False, **kwargs)
+        hops += 1
+    return resp
+
+
 def get_website(url: str, max_chars: int = 3000) -> str:
     """Fetch readable text from a URL. Do not use on PDF URLs."""
     if _is_pdf(url):
@@ -135,7 +191,7 @@ def get_website(url: str, max_chars: int = 3000) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
         }
-        resp = requests.get(url, timeout=15, headers=headers)
+        resp = _safe_get(url, timeout=15, headers=headers)
         resp.raise_for_status()
 
         text = resp.text
