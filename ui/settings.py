@@ -162,7 +162,7 @@ class GeneralTab(QWidget):
         be_col = QVBoxLayout()
         be_col.addWidget(_lbl("Backend", self.c))
         self.backend_combo = QComboBox()
-        self.backend_combo.addItems(["llamacpp", "lmstudio", "ollama", "vllm", "openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen", "custom"])
+        self.backend_combo.addItems(["llamacpp", "lmstudio", "ollama", "vllm", "openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen", "custom", "omniroute"])
         self.backend_combo.setCurrentText(config.LLM_BACKEND)
         self.backend_combo.setFixedHeight(36)
         self.backend_combo.setStyleSheet(f"QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}QComboBox::drop-down{{border:none;width:20px;}}")
@@ -176,20 +176,29 @@ class GeneralTab(QWidget):
         backend_row.addLayout(url_col, 3)
         layout.addLayout(backend_row)
 
-        # ── Custom model row (hidden unless custom backend selected) ──
+        # ── Model Name / API Key row — shared between "custom" and
+        # "omniroute", since both are freeform OpenAI-compatible endpoints.
+        # Kept as two independently-configured backend slots (own model,
+        # own key) — this widget just repopulates from whichever one is
+        # currently selected, in _on_backend_changed() below, so choosing
+        # one never clobbers the other's saved values.
         self.custom_model_widget = QWidget()
         cm_layout = QHBoxLayout(self.custom_model_widget)
         cm_layout.setContentsMargins(0, 4, 0, 0)
         cm_layout.setSpacing(12)
         cm_col = QVBoxLayout()
         cm_col.addWidget(_lbl("Model Name", self.c))
-        self.custom_model = _le(getattr(config, "CUSTOM_DEFAULT_MODEL", ""), self.c)
+        _initial_model = (config.OMNIROUTE_DEFAULT_MODEL if config.LLM_BACKEND == "omniroute"
+                          else getattr(config, "CUSTOM_DEFAULT_MODEL", ""))
+        self.custom_model = _le(_initial_model, self.c)
         self.custom_model.setPlaceholderText("e.g. mistral-7b-instruct")
         cm_col.addWidget(self.custom_model)
         cm_layout.addLayout(cm_col, 2)
         cm_key_col = QVBoxLayout()
         cm_key_col.addWidget(_lbl("API Key (optional)", self.c))
-        self.custom_api_key = _le(getattr(config, "CUSTOM_API_KEY", ""), self.c)
+        _initial_key = (config.OMNIROUTE_API_KEY if config.LLM_BACKEND == "omniroute"
+                        else getattr(config, "CUSTOM_API_KEY", ""))
+        self.custom_api_key = _le(_initial_key, self.c)
         self.custom_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.custom_api_key.setPlaceholderText("Bearer token or leave blank")
         cm_key_col.addWidget(self.custom_api_key)
@@ -215,7 +224,7 @@ class GeneralTab(QWidget):
         cloud_layout.addLayout(model_col, 2)
         layout.addWidget(self.cloud_widget)
         self._refresh_cloud_row(config.LLM_BACKEND)  # set initial state
-        self.url.setReadOnly(config.LLM_BACKEND != "custom")
+        self.url.setReadOnly(config.LLM_BACKEND not in ("custom", "omniroute"))
 
         layout.addWidget(_sec("CONTEXT WINDOW", self.c))
         layout.addWidget(_lbl(
@@ -317,20 +326,29 @@ class GeneralTab(QWidget):
             self.agent.ctx.update_system_prompt(p)
             
     _BACKEND_URLS = {
-        "llamacpp": "http://localhost:8080/v1",
-        "lmstudio": "http://localhost:1234/v1",
-        "ollama":   "http://localhost:11434/v1",
-        "vllm":     "http://localhost:8000/v1",
-        "custom":   "",
+        "llamacpp":  "http://localhost:8080/v1",
+        "lmstudio":  "http://localhost:1234/v1",
+        "ollama":    "http://localhost:11434/v1",
+        "vllm":      "http://localhost:8000/v1",
+        "custom":    "",
+        "omniroute": "http://localhost:20128/v1",
     }
 
     def _on_backend_changed(self, name: str):
         self._refresh_cloud_row(name)
         self.url.setText(self._BACKEND_URLS.get(name, ""))
-        is_custom = name == "custom"
-        self.url.setReadOnly(not is_custom)
-        self.url.setPlaceholderText("Enter your OpenAI-compatible endpoint URL" if is_custom else "")
-        self.custom_model_widget.setVisible(is_custom)
+        is_freeform = name in ("custom", "omniroute")
+        self.url.setReadOnly(not is_freeform)
+        self.url.setPlaceholderText("Enter your OpenAI-compatible endpoint URL" if is_freeform else "")
+        self.custom_model_widget.setVisible(is_freeform)
+        if name == "omniroute":
+            self.custom_model.setText(config.OMNIROUTE_DEFAULT_MODEL)
+            self.custom_api_key.setText(config.OMNIROUTE_API_KEY)
+            self.custom_model.setPlaceholderText("e.g. kr/glm-5, if/kimi-k2-thinking")
+        elif name == "custom":
+            self.custom_model.setText(getattr(config, "CUSTOM_DEFAULT_MODEL", ""))
+            self.custom_api_key.setText(getattr(config, "CUSTOM_API_KEY", ""))
+            self.custom_model.setPlaceholderText("e.g. mistral-7b-instruct")
         self._refresh_context_row(name)
 
     def _refresh_context_row(self, backend: str):
@@ -410,6 +428,13 @@ class GeneralTab(QWidget):
             _secrets.set_secret("custom_api_key", config.CUSTOM_API_KEY)
             prefs["custom_default_model"] = config.CUSTOM_DEFAULT_MODEL
             self.agent.llm._model = config.CUSTOM_DEFAULT_MODEL
+        elif config.LLM_BACKEND == "omniroute":
+            config.OMNIROUTE_DEFAULT_MODEL = self.custom_model.text().strip()
+            config.OMNIROUTE_API_KEY = self.custom_api_key.text().strip()
+            from core import secrets as _secrets
+            _secrets.set_secret("omniroute_api_key", config.OMNIROUTE_API_KEY)
+            prefs["omniroute_default_model"] = config.OMNIROUTE_DEFAULT_MODEL
+            self.agent.llm._model = config.OMNIROUTE_DEFAULT_MODEL
 
         save_prefs(prefs)
 

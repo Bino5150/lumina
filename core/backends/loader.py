@@ -21,6 +21,7 @@ from .anthropic_backend import AnthropicBackend
 from .gemini_backend import GeminiBackend
 from .kimi import KimiBackend
 from .qwen import QwenBackend
+from .omniroute import OmniRouteBackend
 
 class CustomBackend(LMStudioBackend):
     """Generic OpenAI-compatible endpoint. URL and optional API key set by user."""
@@ -50,6 +51,7 @@ BACKENDS = {
     "kimi":       KimiBackend,
     "qwen":       QwenBackend,
     "custom":     CustomBackend,
+    "omniroute":  OmniRouteBackend,
 }
 
 def get_llm_backend(name: str = None, url: str = None):

@@ -101,9 +101,15 @@ STT_DEVICE  = _p.get("stt_device", "cpu")
 LLM_BACKEND     = _p.get("llm_backend", "llamacpp")
 LLM_BACKEND_URL = _p.get("llm_backend_url", "http://localhost:8080/v1")
 CUSTOM_DEFAULT_MODEL = _p.get("custom_default_model", "")
+# OmniRoute (github.com/diegosouzapw/OmniRoute) — a separate slot from
+# "custom" on purpose: both are OpenAI-compatible endpoints under the hood,
+# but kept independently configured so switching between them never
+# overwrites the other's saved model/key.
+OMNIROUTE_DEFAULT_MODEL = _p.get("omniroute_default_model", "")
 # FE-09: same secrets.py-first pattern as the cloud provider keys above.
 from core import secrets as _secrets
 CUSTOM_API_KEY = _secrets.get_secret("custom_api_key") or _p.get("custom_api_key", "")
+OMNIROUTE_API_KEY = _secrets.get_secret("omniroute_api_key") or _p.get("omniroute_api_key", "")
 
 # Context management (per-backend) — local backends are hard-capped by
 # whatever -c value the server was actually launched with; cloud backends
@@ -117,6 +123,7 @@ BACKEND_CONTEXT_DEFAULTS = {
     "ollama":     {"max_context_tokens": 16384,   "memory_inject_limit": 6},
     "vllm":       {"max_context_tokens": 16384,   "memory_inject_limit": 6},
     "custom":     {"max_context_tokens": 16384,   "memory_inject_limit": 6},
+    "omniroute":  {"max_context_tokens": 32000,   "memory_inject_limit": 12},
     "openrouter": {"max_context_tokens": 32000,   "memory_inject_limit": 12},
     "deepseek":   {"max_context_tokens": 64000,   "memory_inject_limit": 16},
     "groq":       {"max_context_tokens": 32000,   "memory_inject_limit": 12},

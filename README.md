@@ -197,9 +197,9 @@ A different Persona for different moods and tasks:
 Each persona is a JSON file in ~/lumina/personas/. Create your own. Bind a voice profile. Set the system prompt. Lumina will be whoever you need her to be. Switching personas is instant. Voice swaps live. No restart.
 
 Import/Export functionality makes Personas community swappable. Like Pokemon, except useful. 
-**In order to use the cloned voices for Personas with the included reference audio, you must use Chatterbox Turbo or Voicebox for TTS.**
+**In order to use cloned voices with reference audio for Personas, you must use Chatterbox Turbo or Voicebox for TTS.**
 
-**Third party character Personas and their respective avatars and cloned voices have been removed from the public release moving forward to prevent issues with copyrights. If you are interested in acquiring these Personas for non-profit educational and research purposes that fall under Fair Use, please feel free to contact the dev team and they can be provided to you free of charge for testing. In the meanwhile, we are working on creating some new original default Persona profiles aside from Lumina's original Persona to be included in future releases. Note that once you have Lumina installed on your machine, you are free to create whatever type of Persona you wish for your own personal use.**
+**Third party character Personas and their respective avatars and cloned voices have been removed from the public release moving forward to prevent issues with copyrights. If you are interested in acquiring these Personas for non-profit personal, educational, and research purposes believed in good faith to fall under Fair Use, please feel free to contact the dev team and they can be provided to you free of charge for testing. In the meanwhile, we are working on creating some new original default Persona profiles aside from Lumina's original Persona to be included in future releases. Note that once you have Lumina installed on your machine, you are free to create whatever type of Persona you wish for your own personal use.**
 
 
 ## Voice — Real Voices, Not Robot Voices
@@ -283,6 +283,7 @@ This is a list of some of the new features that are in some stage of development
 - IoT/Home Assistant/Smart Home management 
 - Klipper remote management for your 3D printer
 - Home security system monitoring and notifications
+- Fully functional CLI mode with Persona flags
 
 
 
