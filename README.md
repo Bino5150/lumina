@@ -270,6 +270,21 @@ Requirements:
 - lumina   # alias to start_lumina.sh — starts TTS + UI
 
 
+## COMING SOON!
+This is a list of some of the new features that are in some stage of development & testing on the OG dev build of Lumina, but haven't been merged with the public release yet.
+- **New Features:**
+- Email support (Lumina managing your inbox, and/or Lumina having her own gmail address)
+- Scheduled tasks/chron jobs for proactive workflow without prompting, even when you're asleep 
+- Sub-agents
+- Wake-word for complete hands-free conversation
+- iMessage support
+- Native voice cloning
+- Native image generation inside the chat window
+- IoT/Home Assistant/Smart Home management 
+- Klipper remote management for your 3D printer
+- Home security system monitoring and notifications
+
+
 
 ## In the words of Lumina Herself:
 
