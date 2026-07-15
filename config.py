@@ -191,19 +191,35 @@ DREAM_IDLE_MINUTES  = _p.get("dream_idle_minutes", 13)
 # used by complete_utility() does).
 SHOW_THINK_BLOCKS = _p.get("show_think_blocks", True)
 
-del _p
+# Agent/user identity — moved onto the same prefs-backed pattern as
+# everything above. These used to be bare literals ("Bino" hand-edited
+# directly into this tracked file on the OG build) — meaning a future git
+# pull that happened to touch these exact lines would hit a merge conflict,
+# and anyone who "fixed" that conflict with reset --hard or a re-clone would
+# silently lose it. Now the actual value lives in gitignored prefs.json;
+# this file only ever holds the generic fallback default, which is always
+# safe to overwrite. AGENT_NAME's real-world value is usually persona-driven
+# at runtime anyway (core/agent.py sets it when a persona loads) — this is
+# just its pre-persona-load fallback, included for consistency.
+AGENT_NAME = _p.get("agent_name", "Lumina")
+USER_NAME = _p.get("user_name", "User")
+# Telegram bridge — owner identity, not a credential (the bot token lives in
+# core/secrets.py instead). None until configured, in either build.
+TELEGRAM_OWNER_CHAT_ID = _p.get("telegram_owner_chat_id", None) or None
+
 
 # Agent behavior
-AGENT_NAME = "Lumina"
-USER_NAME = "User"
 TOOL_RESULT_MAX_CHARS = 9000
 TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
-# Telegram bridge — owner identity, not a credential (the bot token lives in
-# core/secrets.py instead). None in release; set your real chat ID in OG only.
-TELEGRAM_OWNER_CHAT_ID = None
 
 # System prompt
-SYSTEM_PROMPT = """RESPONSE STYLE: Think briefly — 3 to 5 sentences of reasoning max for simple queries. Do not outline, draft, or self-correct in your thinking. Just reason and respond.
+# FE: same migration as AGENT_NAME/USER_NAME/TELEGRAM_OWNER_CHAT_ID above --
+# this is mutable runtime config (the "GLOBAL AGENT BEHAVIOR PROMPT" field
+# in Settings), not identity, but the same git-pull-clobber risk applied:
+# a hand-edited default here used to be a bare literal with nowhere to
+# persist a Settings-UI edit. Now it round-trips through prefs.json like
+# everything else; this string is only the fallback for a fresh install.
+SYSTEM_PROMPT = _p.get("system_prompt", """RESPONSE STYLE: Think briefly — 3 to 5 sentences of reasoning max for simple queries. Do not outline, draft, or self-correct in your thinking. Just reason and respond.
 TOOL USE RULES:
 - Use tools only when they add real value, not for things you already know.
 - For web searches: call web_search ONCE, then summarize from the snippets in your response. Do NOT automatically call get_website on results.
@@ -234,4 +250,6 @@ def register_my_tool_tool(registry):
             },
             "required": ["input"]
         }
-    )"""
+    )""")
+
+del _p

@@ -322,7 +322,22 @@ class GeneralTab(QWidget):
             self.cloud_model.setText(getattr(config, model_attr, ""))
     def _apply_prompt(self):
         p = self.prompt.toPlainText().strip()
-        if p:
+        if not p:
+            return
+        persona = getattr(self.agent, "current_persona", None)
+        if persona and "system_prompt" in persona:
+            # Recombine live: new global rules + whatever persona identity
+            # is actually active, same order apply_persona() uses. Without
+            # this, "Apply Change" would silently discard the persona's
+            # identity text entirely -- a flat replace, not a preview.
+            new_prompt = p + "\n\n" + persona["system_prompt"]
+            from core.persistence import load as load_prefs
+            if self.agent.owner:
+                bio = load_prefs().get("human_bio", "").strip()
+                if bio:
+                    new_prompt += f"\n\n## About {config.USER_NAME}\n{bio}"
+            self.agent.ctx.update_system_prompt(new_prompt)
+        else:
             self.agent.ctx.update_system_prompt(p)
             
     _BACKEND_URLS = {
@@ -365,6 +380,9 @@ class GeneralTab(QWidget):
 
     def _save(self):
         from core.backends.loader import get_llm_backend
+        new_system_prompt = self.prompt.toPlainText().strip()
+        if new_system_prompt:
+            config.SYSTEM_PROMPT = new_system_prompt
         config.MAX_CONTEXT_TOKENS = self.ctx_spin.value()
         config.MEMORY_INJECT_LIMIT = self.mem_spin.value()
         config.MAX_TOOL_ITERATIONS = self.iter_spin.value()
@@ -398,6 +416,7 @@ class GeneralTab(QWidget):
         prefs["dream_sweep_enabled"] = config.DREAM_SWEEP_ENABLED
         prefs["dream_idle_minutes"] = config.DREAM_IDLE_MINUTES
         prefs["show_think_blocks"] = config.SHOW_THINK_BLOCKS
+        prefs["system_prompt"] = config.SYSTEM_PROMPT
         backend_context = prefs.get("backend_context", {})
         backend_context[config.LLM_BACKEND] = {
             "max_context_tokens": config.MAX_CONTEXT_TOKENS,
@@ -448,6 +467,8 @@ class GeneralTab(QWidget):
         # or a hot-reload gap opens up (see F-09: from-import snapshotting).
         self.agent.ctx.max_tokens = config.MAX_CONTEXT_TOKENS
         self.agent.ctx.reserve = config.RESPONSE_RESERVE_TOKENS
+        if new_system_prompt:
+            self._apply_prompt()
 
 
 # ── Tab: Profile ───────────────────────────────────────────────────────────────
@@ -554,6 +575,7 @@ class UserProfileTab(QWidget):
 
     def _save(self):
         config.USER_NAME = self.user_name.text().strip() or config.USER_NAME
+        self._prefs["user_name"] = config.USER_NAME
         self._prefs["human_bio"] = self.human_bio.toPlainText().strip()
         persistence.save(self._prefs)
         bio = self._prefs["human_bio"]
@@ -1658,8 +1680,10 @@ class CommunicationsTab(QWidget):
 
     # ── Telegram ──
     def _save_telegram(self):
-        self._prefs["telegram_owner_chat_id"] = self.tg_chat_id.text().strip()
+        chat_id = self.tg_chat_id.text().strip()
+        self._prefs["telegram_owner_chat_id"] = chat_id
         persistence.save(self._prefs)
+        config.TELEGRAM_OWNER_CHAT_ID = chat_id or None
         token = self.tg_token.text().strip()
         if token:
             from core.secrets import set_secret

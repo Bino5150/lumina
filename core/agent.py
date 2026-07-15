@@ -84,6 +84,7 @@ class LuminaAgent:
         self.on_response_token = on_response_token or (lambda t: None)
         self.tts = tts
         self.persona_avatar = None  # set by apply_persona()
+        self.current_persona = None  # set by apply_persona() -- lets Settings recombine the global prompt + persona identity when the global prompt is live-edited
         self._session_tool_calls = 0       # total tool calls this session
         self._skill_nudge_sent   = False   # only nudge once per session
 
@@ -297,9 +298,20 @@ class LuminaAgent:
             config.AGENT_NAME = persona["name"]
             self.persona_avatar = persona.get("avatar")
 
-        # 2. System prompt
+        # 2. System prompt — global behavior rules FIRST, persona identity
+        # layered after. This used to be `new_prompt = persona["system_prompt"]`,
+        # a full replace that silently discarded config.SYSTEM_PROMPT (the
+        # RESPONSE STYLE / TOOL USE RULES instructions) the instant ANY
+        # persona loaded — which happens on every single startup, since
+        # main_window loads the last-used persona immediately. The Settings
+        # UI label already claimed this prompt "works in conjunction with
+        # all Persona prompts"; this is what actually makes that true.
+        # Order matters: the operating-discipline rules anchor first, so the
+        # model isn't several paragraphs into character voice before hitting
+        # them.
         if "system_prompt" in persona:
-            new_prompt = persona["system_prompt"]
+            self.current_persona = persona  # so Settings can recombine on a live prompt edit
+            new_prompt = config.SYSTEM_PROMPT + "\n\n" + persona["system_prompt"]
             from core.persistence import load as load_prefs
             if self.owner:
                 bio = load_prefs().get("human_bio", "").strip()

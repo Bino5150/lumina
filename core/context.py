@@ -99,7 +99,8 @@ class ContextManager:
                     max_tokens=palace_budget,
                     inject_limit=config.MEMORY_INJECT_LIMIT,
                 )
-            except Exception:
+            except Exception as e:
+                print(f"[PALACE] injection failed: {e}", flush=True)
                 palace_block = ""
 
         # Inject projectlist.md if it exists — owner-only, same reasoning as above.
@@ -112,7 +113,8 @@ class ContextManager:
                     with open(_pl_path, 'r', encoding='utf-8') as _f:
                         _pl = _f.read().strip()
                     projects_block = f"## Projects\n{_pl}" if _pl else ""
-            except Exception:
+            except Exception as e:
+                print(f"[PROJECTS] injection failed: {e}", flush=True)
                 projects_block = ""
 
         parts = [self.system_prompt]
