@@ -34,7 +34,7 @@ def register_hello_world_tool(registry):
 
 @pytest.fixture
 def toolmaker_env(tmp_path, monkeypatch):
-    monkeypatch.setattr(toolmaker, "TOOLS_DIR", str(tmp_path))
+    monkeypatch.setattr(toolmaker, "CUSTOM_TOOLS_DIR", str(tmp_path))
     monkeypatch.setattr(toolmaker, "PENDING_DIR", str(tmp_path / "_pending"))
     monkeypatch.setattr(toolmaker, "AUDIT_LOG_PATH", str(tmp_path / "tool_audit.log"))
     reg = _CapturingRegistry()

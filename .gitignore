@@ -1,6 +1,8 @@
-# Personal data
-memory/lumina.db
-memory/prefs.json
+# Personal/runtime data — most of this now lives outside the repo tree
+# entirely (see migrate_state_dir.py / FE-13), these entries are belt-and-
+# suspenders for anything left behind by a pre-migration install or a
+# skipped migration.
+memory/
 browser_screenshots/
 projects/*/chats.json
 

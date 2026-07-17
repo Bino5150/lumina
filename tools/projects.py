@@ -9,6 +9,12 @@ import config
 PROJECTS_DIR = os.path.join(config.BASE_DIR, "projects")
 PROJECTLIST  = os.path.join(PROJECTS_DIR, "projectlist.md")
 
+# FE-13: chats.json is the only piece of projects/ that was ever gitignored
+# personal state -- project.md/codebase.md/projectlist.md stay tracked in
+# the repo on purpose (shareable project journals, same category as the
+# tracked skills/*.md files). Only the chat-linkage file moves.
+PROJECT_CHATS_DIR = os.path.join(config.DATA_DIR, "projects")
+
 
 def init_projects():
     """Create PROJECTS_DIR and projectlist.md if they don't exist."""
@@ -44,9 +50,10 @@ def register_projects_tools(registry):
             if not os.path.exists(project_md):
                 with open(project_md, 'w', encoding='utf-8') as f:
                     f.write(f"# {name}\n\n**Description:** {description}\n**Root:** {root_path}\n\n## Status\n\n## Notes\n")
-            # Create chats.json
-            chats_json = os.path.join(project_dir, "chats.json")
+            # Create chats.json — lives in the data dir, not project_dir (FE-13)
+            chats_json = os.path.join(PROJECT_CHATS_DIR, name, "chats.json")
             if not os.path.exists(chats_json):
+                os.makedirs(os.path.dirname(chats_json), exist_ok=True)
                 with open(chats_json, 'w', encoding='utf-8') as f:
                     json.dump([], f, indent=2)
             # Create codebase.md placeholder
@@ -154,7 +161,7 @@ def register_projects_tools(registry):
         project_dir = os.path.join(PROJECTS_DIR, name)
         if not os.path.exists(project_dir):
             return f"[Error: no project named '{name}'. Create it first.]"
-        chats_path = os.path.join(project_dir, "chats.json")
+        chats_path = os.path.join(PROJECT_CHATS_DIR, name, "chats.json")
         try:
             if os.path.exists(chats_path):
                 with open(chats_path, 'r', encoding='utf-8') as f:
@@ -168,6 +175,7 @@ def register_projects_tools(registry):
                     break
             else:
                 chats.append({"chat_id": chat_id, "summary": summary})
+            os.makedirs(os.path.dirname(chats_path), exist_ok=True)
             with open(chats_path, 'w', encoding='utf-8') as f:
                 json.dump(chats, f, indent=2)
             return f"[Chat {chat_id} linked to project '{name}']"
@@ -176,7 +184,7 @@ def register_projects_tools(registry):
 
     def get_project_chats(name: str) -> str:
         """List all chats linked to a project."""
-        chats_path = os.path.join(PROJECTS_DIR, name, "chats.json")
+        chats_path = os.path.join(PROJECT_CHATS_DIR, name, "chats.json")
         if not os.path.exists(chats_path):
             return f"[Error: no project named '{name}' or no chats linked yet.]"
         try:

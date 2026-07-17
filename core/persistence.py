@@ -5,7 +5,7 @@ Uses a simple JSON file so nothing is lost between sessions.
 import json, os
 import config
 
-PREFS_PATH = os.path.join(config.BASE_DIR, "memory", "prefs.json")
+PREFS_PATH = os.path.join(config.DATA_DIR, "memory", "prefs.json")
 
 _defaults = {
     "avatar_path": None,

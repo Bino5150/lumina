@@ -10,7 +10,7 @@ import json
 import os
 import config
 
-LEDGER_PATH = os.path.join(config.BASE_DIR, "memory", "ledger.db")
+LEDGER_PATH = os.path.join(config.DATA_DIR, "memory", "ledger.db")
 
 
 def _init_db():

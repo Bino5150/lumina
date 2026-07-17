@@ -38,7 +38,15 @@ from datetime import datetime
 import config
 
 PROTECTED = {"registry", "meta", "memory", "knowledge", "web",
-             "filesystem", "sandbox", "terminal", "toolmaker"}
+             "filesystem", "sandbox", "terminal", "toolmaker",
+             # temporal_decay graduated from "custom tool" to a genuine,
+             # statically-imported dependency: tools/palace.py does
+             # `from tools.temporal_decay import decay_engine` at module
+             # load time. delete_tool("temporal_decay") would currently
+             # succeed and break MemPalace boot on next launch -- found
+             # while scoping the FE-13 custom-tool migration, which would
+             # have hit the identical problem by relocating the file.
+             "temporal_decay"}
 
 # FE-02: this hand list drifted 9 modules stale (missing palace, browser, pin,
 # projects, diff, telegram_send, get_weather, temporal_decay,
@@ -81,9 +89,9 @@ def _deletable_tool_names() -> set:
         return set()  # any read failure -> nothing deletable, fail closed
     return approved
 
-TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
-PENDING_DIR = os.path.join(TOOLS_DIR, "_pending")
-AUDIT_LOG_PATH = os.path.join(config.BASE_DIR, "memory", "tool_audit.log")
+CUSTOM_TOOLS_DIR = os.path.join(config.DATA_DIR, "custom_tools")
+PENDING_DIR = os.path.join(CUSTOM_TOOLS_DIR, "_pending")
+AUDIT_LOG_PATH = os.path.join(config.DATA_DIR, "memory", "tool_audit.log")
 
 
 def _append_audit_log(event: str, name: str, description: str = "", code: str = ""):
@@ -117,7 +125,7 @@ def approve_pending_tool(name: str, registry) -> str:
     """
     if name in PROTECTED:
         return f"[Error: '{name}' is a protected tool name.]"
-    live_path_check = os.path.join(TOOLS_DIR, f"{name}.py")
+    live_path_check = os.path.join(CUSTOM_TOOLS_DIR, f"{name}.py")
     if os.path.exists(live_path_check):
         return f"[Error: '{name}' already exists as a live tool — cannot overwrite via approval.]"
 
@@ -125,7 +133,7 @@ def approve_pending_tool(name: str, registry) -> str:
     if not os.path.exists(pending_path):
         return f"[Error: no pending tool named '{name}'.]"
 
-    live_path = os.path.join(TOOLS_DIR, f"{name}.py")
+    live_path = os.path.join(CUSTOM_TOOLS_DIR, f"{name}.py")
     with open(pending_path, "r", encoding="utf-8") as f:
         code = f.read()
 
@@ -184,7 +192,7 @@ def load_approved_custom_tools(registry) -> list:
     loaded = []
     approved = _deletable_tool_names()
     for name in sorted(approved):
-        live_path = os.path.join(TOOLS_DIR, f"{name}.py")
+        live_path = os.path.join(CUSTOM_TOOLS_DIR, f"{name}.py")
         if not os.path.exists(live_path):
             # Approved once, but the file is gone now (manually removed
             # outside the delete_tool path) — nothing to load.
@@ -231,7 +239,7 @@ def register_toolmaker_tools(registry, agent):
         # belt-and-suspenders) OR a real collision with any live file in
         # tools/ — the latter can't drift, since it checks what's actually
         # on disk rather than a maintained set.
-        if name in PROTECTED or os.path.exists(os.path.join(TOOLS_DIR, f"{name}.py")):
+        if name in PROTECTED or os.path.exists(os.path.join(CUSTOM_TOOLS_DIR, f"{name}.py")):
             return f"[Error: '{name}' is protected or already exists as a live tool.]"
 
         try:
@@ -286,7 +294,7 @@ def register_toolmaker_tools(registry, agent):
         actually went through create_tool() -> approve_pending_tool(), not
         just any .py file sitting in tools/ that isn't hand-listed as core."""
         deletable = _deletable_tool_names()
-        custom = [f[:-3] for f in os.listdir(TOOLS_DIR)
+        custom = [f[:-3] for f in os.listdir(CUSTOM_TOOLS_DIR)
                   if f.endswith(".py") and f[:-3] in deletable]
         if not custom:
             return "[No custom tools yet.]"
@@ -298,7 +306,7 @@ def register_toolmaker_tools(registry, agent):
             return (f"[Error: '{name}' was not created and approved through "
                      f"the toolmaker pipeline, so it cannot be deleted.]")
 
-        filepath = os.path.join(TOOLS_DIR, f"{name}.py")
+        filepath = os.path.join(CUSTOM_TOOLS_DIR, f"{name}.py")
 
         if not os.path.exists(filepath):
             return f"[Error: tool file '{name}.py' not found.]"

@@ -57,7 +57,19 @@ DEFAULT_MODEL = None
 # Paths
 import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "memory", "lumina.db")
+
+# FE-13: personal/runtime state (db, prefs, tool audit log, approved custom
+# tools) now lives outside the tracked repo tree, in a platformdirs-managed
+# data dir instead of BASE_DIR-relative paths. A fresh `git clone` no longer
+# mixes runtime-generated content into source. LUMINA_DATA_DIR env var
+# overrides for testing/portable setups; unset in normal use. Migration is
+# safe to call every startup -- no-op after the first real move.
+from platformdirs import user_data_dir
+from migrate_state_dir import migrate_legacy_state
+DATA_DIR = os.environ.get("LUMINA_DATA_DIR") or user_data_dir("lumina", appauthor=False)
+migrate_legacy_state(BASE_DIR, DATA_DIR)
+
+DB_PATH = os.path.join(DATA_DIR, "memory", "lumina.db")
 PERSONAS_DIR = os.path.join(BASE_DIR, "personas")
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 SKILLS_DIR               = os.path.join(BASE_DIR, "skills")
@@ -67,7 +79,7 @@ SKILLS_MAX_INJECT        = 2   # max skill docs injected per turn
 # TTS — load from prefs if available
 def _load_tts_prefs():
     import json
-    path = os.path.join(BASE_DIR, "memory", "prefs.json")
+    path = os.path.join(DATA_DIR, "memory", "prefs.json")
     try:
         with open(path) as f:
             return json.load(f)
