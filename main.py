@@ -81,7 +81,9 @@ def run_gui():
     from tts.loader import get_tts_backend
     from stt.whisper_bridge import WhisperBridge
     tts = get_tts_backend()
-    stt = WhisperBridge(model_size="base", device="cpu")
+    # FE-16: this used to hardcode base/cpu regardless of what the Settings
+    # tab persisted (STT_MODEL/STT_DEVICE), and never checked STT_ENABLED.
+    stt = WhisperBridge(model_size=config.STT_MODEL, device=config.STT_DEVICE) if config.STT_ENABLED else None
     agent = LuminaAgent(tts=tts)
 
     window = LuminaWindow(agent, stt=stt)

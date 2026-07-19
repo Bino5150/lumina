@@ -43,3 +43,27 @@ def test_record_is_idempotent_on_retry(isolated_ledger):
     request_id_2 = isolated_ledger.make_request_id("send_telegram_message", "hi")
     assert request_id_1 == request_id_2
     assert isolated_ledger.check(request_id_2) == "[Sent]"
+
+
+def test_check_still_suppresses_within_ttl(isolated_ledger):
+    """FE-17 regression: a real retry inside the window must still dedupe."""
+    request_id = isolated_ledger.make_request_id("send_telegram_message", "reminder")
+    isolated_ledger.record(request_id, "[Sent]")
+    assert isolated_ledger.check(request_id) == "[Sent]"
+
+
+def test_check_expires_after_ttl(isolated_ledger):
+    """FE-17 regression: dedupe must NOT be permanent — a proactive/recurring
+    send with identical text (e.g. a daily notification) should go through
+    again once the TTL window has passed."""
+    from core.db import connect
+    request_id = isolated_ledger.make_request_id("send_telegram_message", "reminder")
+    isolated_ledger.record(request_id, "[Sent]")
+    conn = connect(path=isolated_ledger.LEDGER_PATH, row_factory=False, foreign_keys=False)
+    conn.execute(
+        "UPDATE ledger SET created_at = datetime('now', '-25 hours') WHERE request_id = ?",
+        (request_id,),
+    )
+    conn.commit()
+    conn.close()
+    assert isolated_ledger.check(request_id) is None

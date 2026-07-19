@@ -33,14 +33,33 @@ def make_request_id(*args) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def check(request_id: str):
-    """Returns cached result if this request_id already succeeded, else None."""
+def check(request_id: str, ttl_hours: float = 24):
+    """Returns cached result if this request_id succeeded within the last
+    `ttl_hours`, else None. FE-17: dedupe used to be permanent (no TTL),
+    which silently blocked any proactive/recurring send with identical
+    text (e.g. a daily notification) forever after the first success. A
+    stale row isn't deleted here — record() on the next successful call
+    REPLACEs it and refreshes created_at naturally."""
     from core.db import connect
+    from datetime import datetime, timedelta, timezone
     _init_db()
     conn = connect(path=LEDGER_PATH, row_factory=False, foreign_keys=False)
-    row = conn.execute("SELECT result FROM ledger WHERE request_id = ?", (request_id,)).fetchone()
+    row = conn.execute(
+        "SELECT result, created_at FROM ledger WHERE request_id = ?", (request_id,)
+    ).fetchone()
     conn.close()
-    return row[0] if row else None
+    if row is None:
+        return None
+    result, created_at = row
+    try:
+        recorded = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        # Unexpected timestamp format — fail open to the old (permanent
+        # dedupe) behavior rather than silently disabling protection.
+        return result
+    if datetime.now(timezone.utc) - recorded > timedelta(hours=ttl_hours):
+        return None
+    return result
 
 
 def record(request_id: str, result: str):

@@ -4,6 +4,7 @@ Token-aware conversation history. Keeps Lumina inside budget.
 Palace memory is auto-injected at L0+L1+L2 on every build_messages() call.
 """
 
+import json
 import config
 
 
@@ -16,7 +17,15 @@ def estimate_message_tokens(msg: dict) -> int:
     content = msg.get("content") or ""
     if isinstance(content, list):
         content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-    return estimate_tokens(content) + 4  # 4 overhead per message
+    tokens = estimate_tokens(content) + 4  # 4 overhead per message
+    tool_calls = msg.get("tool_calls")
+    if tool_calls:
+        # FE-19: an assistant message carrying tool_calls was previously
+        # counted as ~4 tokens regardless of payload size (often
+        # 200-1000+ chars of JSON), systematically undercounting
+        # tool-heavy conversations and eating into the response reserve.
+        tokens += len(json.dumps(tool_calls)) // 4
+    return tokens
 
 def _strip_image_blocks(content):
     """Remove image content blocks from tool result messages before API serialization."""
