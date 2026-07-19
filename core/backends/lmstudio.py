@@ -10,6 +10,22 @@ from .base import BaseLLMBackend
 import config
 
 
+def _iter_lines_safe(resp):
+    """FE-15: requests.exceptions.RequestException (e.g. ChunkedEncodingError
+    from a mid-stream disconnect) raises from *inside* iter_lines(), outside
+    the connect-time try/except in chat_stream(). It's also not a subclass
+    of the builtin ConnectionError/TimeoutError that core/agent.py's
+    _stream_final() catches, so it used to escape both layers -- the turn's
+    partial content got dropped from history and a raw exception surfaced
+    instead of the graceful "[Stream error: ...]" path. Converting here
+    keeps chat_stream()'s main loop untouched.
+    """
+    try:
+        yield from resp.iter_lines()
+    except requests.exceptions.RequestException as e:
+        raise ConnectionError(f"LM Studio stream interrupted: {e}")
+
+
 class LMStudioBackend(BaseLLMBackend):
 
     name = "lmstudio"
@@ -119,11 +135,13 @@ class LMStudioBackend(BaseLLMBackend):
             raise ConnectionError(f"LM Studio not reachable at {self.base_url}.")
         except requests.exceptions.Timeout:
             raise TimeoutError("LM Studio request timed out.")
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(f"LM Studio HTTP error: {e}")
 
         buffer = ""
         in_think = False
 
-        for line in resp.iter_lines():
+        for line in _iter_lines_safe(resp):
             if not line:
                 continue
             line = line.decode("utf-8")

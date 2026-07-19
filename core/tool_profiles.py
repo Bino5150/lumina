@@ -84,14 +84,19 @@ TOOL_TIERS = {
     "browser_navigate": "write_local", "browser_click": "write_local",
     "browser_type": "write_local", "browser_scroll": "write_local",
     "browser_close": "write_local",
-    "send_telegram_file": "write_local", "send_telegram_message": "write_local",
 
 
     "run_python": "execute", "run_command": "execute",
 
     "create_tool": "self_modifying", "delete_tool": "self_modifying",
-    # Outbound action tier intentionally empty — populate the moment any
-    # send_telegram_message / post_discord / send_email tool is built.
+
+    # FE-14: outbound_action now actually has members. send_telegram_file/
+    # send_telegram_message moved here from write_local -- today this is
+    # mostly latent (sends go to the owner's own chat ID, and Discord-Safe
+    # doesn't include these tools), but the moment any profile hands a
+    # non-owner session these tools, this tier is what PIN-gates them
+    # instead of letting them fire free.
+    "send_telegram_file": "outbound_action", "send_telegram_message": "outbound_action",
 }
 
 # Hard-excluded from every non-owner session, independent of tier, independent

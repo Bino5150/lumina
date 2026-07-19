@@ -94,11 +94,21 @@ def _reap_idle():
             if not _is_owner.get(cid, True) and now - ts > IDLE_TIMEOUT_SECONDS
         ]
         for cid in stale:
-            if _on_idle_callback:
-                _on_idle_callback(cid)
             _agents.pop(cid, None)
             _last_used.pop(cid, None)
             _is_owner.pop(cid, None)
+
+    # FE-18: callback invocation moved OUTSIDE the lock. _on_idle_callback is
+    # designed to do real work (Discord-Lite's planned summarization LLM
+    # call) -- firing it per-cid while holding _lock (the original
+    # behavior) would freeze every channel's cache access for the full
+    # duration of that work, since get_headless_agent() takes this same
+    # lock on every single inbound message. Stale-detection and cache
+    # cleanup above stay atomic under the lock; only the (currently inert)
+    # callback call itself happens after release.
+    if _on_idle_callback:
+        for cid in stale:
+            _on_idle_callback(cid)
 
 
 def get_headless_agent(channel_id: str, owner: bool,

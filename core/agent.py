@@ -160,7 +160,7 @@ class LuminaAgent:
         if not owner:
             from core.pin_gate import is_verified
             from core.tool_profiles import TOOL_TIERS
-            SENSITIVE_TIERS = {"execute", "self_modifying"}  # add "outbound_action" once those tools exist
+            SENSITIVE_TIERS = {"execute", "self_modifying", "outbound_action"}
             def _gate(name):
                 tier = TOOL_TIERS.get(name, "execute")  # unclassified tool = fail closed
                 if tier in SENSITIVE_TIERS and not is_verified(channel_id):
@@ -278,7 +278,7 @@ class LuminaAgent:
                     self.on_response_token(chunk)
                     full_response.append(chunk)
 
-        except (ConnectionError, TimeoutError) as e:
+        except (ConnectionError, TimeoutError, RuntimeError) as e:
             err = f"[Stream error: {e}]"
             self.on_response_token(err)
             return err
