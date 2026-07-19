@@ -264,7 +264,6 @@ class LuminaAgent:
                 messages=messages,
                 max_tokens=config.RESPONSE_RESERVE_TOKENS
             ):
-                print(f"[STREAM] {repr(chunk)}", flush=True)
                 if chunk == "__THINK_START__":
                     in_think = True
                     think_step[0] += 1
