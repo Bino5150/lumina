@@ -5,6 +5,7 @@ typing, form filling, and screenshots. Complements (not replaces) web.py.
 
 Requires: pip install playwright && playwright install chromium
 """
+from __future__ import annotations
 
 import base64
 import logging
@@ -12,8 +13,21 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from playwright.sync_api import sync_playwright, Browser, Page, Playwright
+# Import deferred to ensure_running() below (where it's actually first
+# used) rather than at module level. core.agent imports this module
+# unconditionally at startup, so a top-level `from playwright.sync_api
+# import ...` meant playwright had to be installed just to import
+# core.agent/core.headless at all -- not just to actually drive a
+# browser. Broke test collection in CI, which deliberately runs against
+# a minimal dependency set (pytest/requests/platformdirs only, no
+# playwright/PySide6) for exactly this kind of backend-logic test suite.
+# TYPE_CHECKING import + `from __future__ import annotations` keeps the
+# type hints below working for static analysis without needing the
+# names bound at runtime.
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser, Page, Playwright
 
 import config
 
@@ -71,6 +85,7 @@ class BrowserManager:
             self._page = None
 
         logger.info("Starting Playwright browser (headless=%s)", self._headless())
+        from playwright.sync_api import sync_playwright
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(headless=self._headless())
         context = self._browser.new_context(
