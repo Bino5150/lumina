@@ -27,6 +27,7 @@ from tools.projects import register_projects_tools, init_projects
 from tools.diff import register_diff_tools
 from tools.browser import register_browser_tools, browser_manager
 from tools.telegram_send import register_telegram_tools
+from tools.updates import register_update_tools
 
 
 CHAIN_BLOCKED_AFTER_SEARCH = {"get_website", "web_search"}
@@ -131,6 +132,7 @@ class LuminaAgent:
         register_diff_tools(self.registry)
         register_browser_tools(self.registry)
         register_telegram_tools(self.registry)
+        register_update_tools(self.registry)
 
         # FE-11: reload any custom tool that was approved through the
         # toolmaker review pipeline in a past session. Not owner-gated —

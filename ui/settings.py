@@ -2439,6 +2439,14 @@ class PersonasTab(QWidget):
             return fallback
         
         
+class _UpdateCheckWorker(QThread):
+    result_ready = Signal(str)
+
+    def run(self):
+        from tools.updates import check_for_updates
+        self.result_ready.emit(check_for_updates())
+
+
 class AboutTab(QWidget):
     def __init__(self, c: dict, parent=None):
         super().__init__(parent)
@@ -2532,7 +2540,33 @@ class AboutTab(QWidget):
         layout.addWidget(discord_btn)
         layout.addWidget(linkedin_btn)
 
+        layout.addSpacing(12)
+
+        self.update_btn = QPushButton("⟳  Check for Updates")
+        self.update_btn.setStyleSheet(btn_style)
+        self.update_btn.clicked.connect(self._check_updates)
+        layout.addWidget(self.update_btn)
+
+        self.update_status = QLabel("")
+        self.update_status.setAlignment(Qt.AlignCenter)
+        self.update_status.setWordWrap(True)
+        self.update_status.setStyleSheet(f"color:{c['text_muted']};font-size:10px;background:transparent;")
+        layout.addWidget(self.update_status)
+
         layout.addStretch()
+
+    def _check_updates(self):
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("⟳  Checking...")
+        self.update_status.setText("")
+        self._update_worker = _UpdateCheckWorker()
+        self._update_worker.result_ready.connect(self._on_update_result)
+        self._update_worker.start()
+
+    def _on_update_result(self, result: str):
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("⟳  Check for Updates")
+        self.update_status.setText(result)
 
 # ── Main Settings Panel ────────────────────────────────────────────────────────
 
