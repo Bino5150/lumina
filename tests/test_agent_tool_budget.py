@@ -31,6 +31,7 @@ def _fake_self(schema_tokens):
 
 def test_prints_warning_when_over_budget(monkeypatch, capsys):
     monkeypatch.setattr(config, "TOOL_BUDGET_TOKENS", 6000)
+    monkeypatch.setattr("core.agent.build_skills_block", lambda query: "")
     fake_self = _fake_self(schema_tokens=6001)
 
     LuminaAgent.chat(fake_self, "hello")
@@ -42,6 +43,7 @@ def test_prints_warning_when_over_budget(monkeypatch, capsys):
 
 def test_no_warning_when_within_budget(monkeypatch, capsys):
     monkeypatch.setattr(config, "TOOL_BUDGET_TOKENS", 6000)
+    monkeypatch.setattr("core.agent.build_skills_block", lambda query: "")
     fake_self = _fake_self(schema_tokens=6000)
 
     LuminaAgent.chat(fake_self, "hello")
