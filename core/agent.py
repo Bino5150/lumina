@@ -184,6 +184,15 @@ class LuminaAgent:
         if skills_block:
             self.ctx.push_ephemeral(skills_block)
 
+        # MB-03 — soft ceiling, warning only. No mechanism yet exists to narrow
+        # tool schemas to fit (that's MB-10's job); this just turns "we don't know
+        # if schema bloat is a problem" into a real, visible signal.
+        _schema_tokens = self.registry.schema_token_estimate()
+        if _schema_tokens > config.TOOL_BUDGET_TOKENS:
+            print(f"[TOOLS] schema budget exceeded: {_schema_tokens} tokens > "
+                  f"{config.TOOL_BUDGET_TOKENS} configured ceiling "
+                  f"({len(self.registry.list_enabled())} enabled tools)", flush=True)
+
         for iteration in range(config.MAX_TOOL_ITERATIONS):
             tool_schemas = self.registry.get_schemas()
             tool_token_estimate = self.registry.schema_token_estimate()

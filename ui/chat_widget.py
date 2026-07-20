@@ -125,6 +125,27 @@ class ThinkBlock(QFrame):
         self._content += token
         self.text_lbl.setText(self._content[-2000:])  # cap display at 2k chars
 
+    def finalize_content(self):
+        """Swap the capped QLabel for a QTextBrowser holding the FULL _content —
+        mirrors the exact pattern LiveResponseBubble.finalize() uses for response text."""
+        if not self._content:
+            return
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        browser.setReadOnly(True)
+        browser.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        browser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        browser.setStyleSheet(
+            f"QTextBrowser{{background:transparent;border:none;"
+            f"color:{self.colors['think_text']};font-size:12px;font-style:italic;}}"
+        )
+        browser.setPlainText(self._content)
+        layout = self.body.layout()
+        layout.replaceWidget(self.text_lbl, browser)
+        self.text_lbl.deleteLater()
+        self.text_lbl = browser
+
 
 # ── Tool Row ───────────────────────────────────────────────────────────────────
 
@@ -163,6 +184,13 @@ class MetricsBar(QFrame):
         self.replay_btn.setVisible(False)
         self.replay_btn.clicked.connect(self._replay)
         layout.addWidget(self.replay_btn)
+        self.copy_btn = QPushButton("⧉")
+        self.copy_btn.setFixedSize(22, 22)
+        self.copy_btn.setToolTip("Copy response")
+        self.copy_btn.setStyleSheet(f"QPushButton{{background:transparent;border:none;font-size:13px;color:{colors['text_dim']};}}QPushButton:hover{{color:{colors['text_primary']};}}")
+        self.copy_btn.setVisible(False)
+        self.copy_btn.clicked.connect(self._copy)
+        layout.addWidget(self.copy_btn)
         self.setStyleSheet("background:transparent;border:none;")
 
     def _replay(self):
@@ -177,7 +205,13 @@ class MetricsBar(QFrame):
 
     def _reset_replay_btn(self):
         self.replay_btn.setText("🔊")
-        self.replay_btn.setEnabled(True)        
+        self.replay_btn.setEnabled(True)
+
+    def _copy(self):
+        from PySide6.QtWidgets import QApplication
+        if self._response_text:
+            QApplication.clipboard().setText(self._response_text)
+
     def set_metrics(self, elapsed: float, tok_in: int, tok_out: int, tool_calls: int, think_time: float):
         tok_s = tok_out / elapsed if elapsed > 0 else 0
         parts = [
@@ -189,7 +223,8 @@ class MetricsBar(QFrame):
             parts.append(f"{tool_calls} tool calls")
         if think_time > 0:
             parts.append(f"think: {think_time:.1f}s")
-        self.lbl.setText("  ·  ".join(parts))    
+        self.lbl.setText("  ·  ".join(parts))
+        self.copy_btn.setVisible(True)
         if self._tts:
             self.replay_btn.setVisible(True)
 
@@ -296,6 +331,8 @@ class LiveResponseBubble(QFrame):
         if self._think_start_time:
             self._think_time += time.time() - self._think_start_time
             self._think_start_time = 0.0
+        if self._think_block:
+            self._think_block.finalize_content()
         self._think_block = None
 
     def add_tool_call(self, name: str, args: dict):
