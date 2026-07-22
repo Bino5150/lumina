@@ -250,7 +250,7 @@ She is not finished. She will never be finished — that's the point. But she is
 Requirements:
 - Linux (Ubuntu/Mint/Debian recommended; VM/WSL2/ect.)
 - Windows & MacOS compatible, but still in the testing phase. Beta testers needed.
-- NVIDIA GPU with CUDA 12.x (4GB VRAM minimum, 8GB or more recommended)
+- NVIDIA GPU with CUDA 12.x (4GB VRAM minimum, 8GB or more recommended for local inference)
 - Python 3.10+ (miniconda/conda recommended)
 - ~10GB disk space for Lumina + model + dependencies
 ## Install:
@@ -268,6 +268,8 @@ Requirements:
 - Copy config.example.py to config.py, point it at your llama.cpp server and preferred model.
 - **Launch:**
 - lumina   # alias to start_lumina.sh — starts TTS + UI
+
+**IMPORTANT SETUP/UPDATE NOTICE:** If you're doing a fresh install, or updating from a build prior to commit 2407d29 (system prompt / identity migration off tracked source), open Settings → General and click the "Save All Settings" button at the bottom right corner of the UI once. This writes the current "Global Agent Behavior Prompt system_prompt, dreaming, and think-block values into prefs.json so they persist across restarts and future git pulls — otherwise they silently fall back to whatever default ships in the new config.py upon relaunch. The "Apply Changes" button to the bottom left allows you to test out different settings in your current session, but is set up as a safety fallback; Changes applied not write to prefs or persist past relaunch. Be sure to use the "Save All Settings" button to lock in your preferences.  
 
 
 ## COMING SOON!
