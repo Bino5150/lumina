@@ -31,3 +31,7 @@ Thumbs.db
 # Models (too large for git)
 *.gguf
 *.safetensors
+
+# Eval harness scratch/output (MB-06)
+eval/results/
+eval/_scratch_data/

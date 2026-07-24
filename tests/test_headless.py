@@ -9,6 +9,7 @@ happens correctly.
 """
 import threading
 import time
+import types
 import core.headless as headless
 
 
@@ -57,3 +58,49 @@ def test_reap_idle_skips_owner_true_channels(monkeypatch):
 
     # owner=True channels (Telegram) are never reaped on a timer.
     assert "telegram-owner" in headless._agents
+
+
+# MB-06: run_headless_turn(trace=True) captures structured tool-call data
+# instead of only console-logging it. Monkeypatches get_headless_agent
+# itself (rather than building a fake `self` and calling LuminaAgent.chat
+# unbound, as test_agent_tool_budget.py does) so this exercises
+# run_headless_turn exactly as production callers do, without constructing
+# a real LuminaAgent.
+def _fake_agent(response="fake response"):
+    ns = types.SimpleNamespace()
+    ns.registry = types.SimpleNamespace(all_tool_names=lambda: ["tool_a", "tool_b"])
+    ns.on_tool_call = lambda name, args: None
+    ns.on_tool_result = lambda name, result: None
+
+    def _chat(task, source="OWNER_DIRECT"):
+        # Drive the callbacks the same way LuminaAgent.chat() really does,
+        # around a single simulated tool call.
+        ns.on_tool_call("tool_a", {"x": 1})
+        ns.on_tool_result("tool_a", "ok")
+        return response
+
+    ns.chat = _chat
+    return ns
+
+
+def test_trace_false_is_byte_identical_to_pre_mb06_shape(monkeypatch):
+    fake = _fake_agent()
+    monkeypatch.setattr(headless, "get_headless_agent", lambda *a, **k: fake)
+
+    result = headless.run_headless_turn("hi", "chan-1", owner=True)
+
+    assert result == {"success": True, "response": "fake response"}
+    assert "tool_calls" not in result
+    assert "available_tools" not in result
+
+
+def test_trace_true_captures_tool_calls_and_available_tools(monkeypatch):
+    fake = _fake_agent()
+    monkeypatch.setattr(headless, "get_headless_agent", lambda *a, **k: fake)
+
+    result = headless.run_headless_turn("hi", "chan-1", owner=True, trace=True)
+
+    assert result["success"] is True
+    assert result["response"] == "fake response"
+    assert result["tool_calls"] == [{"name": "tool_a", "args": {"x": 1}, "result": "ok"}]
+    assert result["available_tools"] == ["tool_a", "tool_b"]

@@ -154,14 +154,39 @@ def get_headless_agent(channel_id: str, owner: bool,
 def run_headless_turn(task: str, channel_id: str, owner: bool,
                        persona: dict = None, tools_profile: str = None,
                        tools_enabled: list = None,
-                       force_tools_profile: str = None) -> dict:
+                       force_tools_profile: str = None,
+                       trace: bool = False) -> dict:
     """Never raises — a bot listener should always get something to relay
-    back, even on failure."""
+    back, even on failure.
+
+    trace: MB-06 addition. When True, captures structured tool-call data
+    (name, args, result) instead of only console-logging it, and includes
+    it in the return dict under "tool_calls". Also includes "available_tools"
+    -- the full registered tool universe for this agent at call time -- so a
+    scorer can distinguish a hallucinated tool name (not in this list) from
+    one that's merely disabled for this profile. Every existing caller that
+    doesn't pass trace=True gets byte-identical behavior to before this change.
+    """
     try:
         agent = get_headless_agent(channel_id, owner, persona=persona,
                                     tools_profile=tools_profile,
                                     tools_enabled=tools_enabled,
                                     force_tools_profile=force_tools_profile)
+
+        tool_trace = []
+        if trace:
+            def _trace_call(name, args):
+                tool_trace.append({"name": name, "args": args})
+                _log_tool_call(channel_id)(name, args)  # keep existing console logging
+
+            def _trace_result(name, result):
+                if tool_trace and tool_trace[-1]["name"] == name and "result" not in tool_trace[-1]:
+                    tool_trace[-1]["result"] = result
+                _log_tool_result(channel_id)(name, result)
+
+            agent.on_tool_call = _trace_call
+            agent.on_tool_result = _trace_result
+
         # Deliberately outside _lock — agent.chat() is the slow part (LLM
         # inference) and holding the cache lock across it would serialize
         # every channel's conversation behind whichever one is currently
@@ -171,7 +196,12 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
         source = "OWNER_DIRECT" if owner else "EXTERNAL_CHANNEL_INBOUND"
         response = agent.chat(task, source=source)
         response = _sanitize_response(response, owner)
-        return {"success": True, "response": response}
+
+        result = {"success": True, "response": response}
+        if trace:
+            result["tool_calls"] = tool_trace
+            result["available_tools"] = agent.registry.all_tool_names()
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
