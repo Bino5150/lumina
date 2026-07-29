@@ -52,6 +52,7 @@ class ChatterboxBridge(BaseTTSBackend):
             with self._model_lock:
                 self._model = ChatterboxTurboTTS.from_pretrained(device=device)
             print("[ChatterboxBridge] Model ready.", flush=True)
+            print(f"[ChatterboxBridge] Device: {device}", flush=True)
         except Exception as e:
             print(f"[ChatterboxBridge] Model load failed: {e}", flush=True)
 
@@ -167,7 +168,14 @@ class ChatterboxBridge(BaseTTSBackend):
                 audio_bytes = audio_queue.get()
                 if audio_bytes is SENTINEL:
                     break
-                self._play_audio(audio_bytes)
+                # self._lock (from BaseTTSBackend) was declared but never used --
+                # two overlapping speak() calls each spawn their own consumer
+                # thread, and without this, both could call os.system("aplay ...")
+                # at once, overlapping playback into the same audio output.
+                # _generate_chunk() already serializes on self._model_lock, so
+                # this is the only place concurrent speak() calls actually raced.
+                with self._lock:
+                    self._play_audio(audio_bytes)
             if on_done:
                 on_done()
 

@@ -1484,8 +1484,15 @@ class TTSTab(QWidget):
         import config as _c
         _c.TTS_BACKEND = self.tts_backend_combo.currentText()
         _c.TTS_HOST = self.url.text().strip()
-        _c.VOICEBOX_HOST = self.url.text().strip()
         backend_name = _c.TTS_BACKEND
+        # Only voicebox owns this URL field's meaning as VOICEBOX_HOST --
+        # writing it unconditionally corrupted VOICEBOX_HOST (to whatever
+        # _BACKEND_URLS default the currently-selected backend shows, e.g.
+        # chatterbox's :8004) any time a non-voicebox backend was selected
+        # at Apply-click time, and a later Save would persist that
+        # corruption to prefs.json regardless of what was actually changed.
+        if backend_name == "voicebox":
+            _c.VOICEBOX_HOST = self.url.text().strip()
 
         def worker():
             try:
