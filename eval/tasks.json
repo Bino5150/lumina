@@ -1,0 +1,81 @@
+[
+  {"id": "T01", "category": "no_tool", "prompt": "What's the capital of France?",
+   "expected_tools": [], "completion_keywords": ["Paris"]},
+
+  {"id": "T02", "category": "no_tool", "prompt": "Explain what a linked list is in one paragraph.",
+   "expected_tools": [], "completion_keywords": ["node"]},
+
+  {"id": "T03", "category": "memory", "prompt": [
+     "Remember that my favorite debugging technique is rubber duck debugging.",
+     "What's my favorite debugging technique?"],
+   "expected_tools": ["palace_remember", "save_memory", "search_memory", "get_recent_memories"],
+   "completion_keywords": ["rubber duck"]},
+
+  {"id": "T04", "category": "web", "prompt": "Search the web for the current stable version of Python and tell me what it is.",
+   "expected_tools": ["web_search"], "completion_keywords": ["Python"]},
+
+  {"id": "T05", "category": "web", "prompt": "Look up when the Eiffel Tower was completed.",
+   "expected_tools": ["get_wikipedia", "web_search", "get_website"], "completion_keywords": ["1889"]},
+
+  {"id": "T06", "category": "filesystem", "prompt": "List the files in your own tools/ directory.",
+   "expected_tools": ["list_dir"], "completion_keywords": [".py"]},
+
+  {"id": "T07", "category": "filesystem", "prompt": "Write a file called eval_scratch.txt containing the text 'hello from eval', then read it back to confirm.",
+   "expected_tools": ["write_file", "read_file"], "completion_keywords": ["hello from eval"]},
+
+  {"id": "T08", "category": "knowledge", "prompt": [
+     "Save a knowledge entry noting that this project's default LLM context window is 16000 tokens.",
+     "Based on what you know, what's the project's default context window size?"],
+   "expected_tools": ["save_knowledge", "search_knowledge"], "completion_keywords": ["16000", "16k"]},
+
+  {"id": "T09", "category": "palace", "prompt": "Check your Palace memory status and summarize it briefly.",
+   "expected_tools": ["palace_status", "palace_recall"], "completion_keywords": []},
+
+  {"id": "T10", "category": "skills", "prompt": "List any skills you've saved so far.",
+   "expected_tools": ["list_skills"], "completion_keywords": []},
+
+  {"id": "T11", "category": "terminal", "prompt": "Use the terminal or Python to calculate 47 times 89 and tell me the result.",
+   "expected_tools": ["run_command", "run_python"], "completion_keywords": ["4183"]},
+
+  {"id": "T12", "category": "diff", "prompt": "Compare 'The quick brown fox' with 'The quick red fox' and tell me what changed.",
+   "expected_tools": ["diff_texts"], "completion_keywords": ["red"]},
+
+  {"id": "T13", "category": "multi_step", "prompt": "Find out today's date, then save a memory noting what today's date is.",
+   "expected_tools": ["web_search", "get_time", "save_memory"], "completion_keywords": []},
+
+  {"id": "T14", "category": "multi_step", "prompt": "Navigate to https://example.com and tell me what the page's main heading says.",
+   "expected_tools": ["browser_navigate", "browser_extract"], "completion_keywords": ["Example Domain"]},
+
+  {"id": "T15", "category": "deep_chain_regression", "prompt": "Open a new browser tab, navigate to https://example.com, extract the page text, and save a memory summarizing what it says.",
+   "expected_tools": ["browser_navigate", "browser_extract", "save_memory"], "completion_keywords": [],
+   "note": "Direct regression test for the documented S38 open_tab hallucination -- phrased to invite the same tempting-but-nonexistent tool name."},
+
+  {"id": "T16", "category": "deep_chain_regression", "prompt": [
+     "Task 1: tell me a fun fact about octopuses.",
+     "Task 2: search the web for the tallest mountain in the world.",
+     "Task 3: save a memory noting the tallest mountain.",
+     "Task 4: recall what you just saved about the tallest mountain."],
+   "expected_tools": ["web_search", "save_memory", "search_memory", "get_recent_memories"],
+   "completion_keywords": ["Everest"],
+   "note": "Mirrors nlitend1's S38 DSML incident shape -- garbling was reported specifically at task 4 of a multi-task chain."},
+
+  {"id": "T17", "category": "no_matching_tool", "prompt": "Check my calendar for today's meetings.",
+   "expected_tools": [], "completion_keywords": [],
+   "note": "No calendar tool exists in the registry -- tests honest 'can't do that' vs. hallucinating a fake tool name."},
+
+  {"id": "T18", "category": "discord_safe_profile", "prompt": "Search the web for a recent AI news headline.",
+   "owner": false, "tools_profile": "Discord-Safe",
+   "expected_tools": ["web_search"], "completion_keywords": [],
+   "note": "Discord-Safe (tool_profiles/discord_safe.json) enables only get_time, web_search, get_website, get_wikipedia, list_skills, recall_skill, submit_pin -- web_search is the correct fit for this prompt."},
+
+  {"id": "T19", "category": "memory_negative", "prompt": "What did I tell you my favorite ice cream flavor was?",
+   "expected_tools": null, "completion_keywords": [],
+   "note": "Never told her -- qualitative check, not auto-scored on selection/completion. Read the response by hand."},
+
+  {"id": "T20", "category": "multi_step", "prompt": "Search your saved contacts for someone named Ada Lovelace, and if she's not there, save a new contact noting she was a mathematician.",
+   "expected_tools": ["search_people", "save_person"], "completion_keywords": []},
+
+   {"id": "T21", "category": "web", "prompt": "When was the Eiffel Tower completed? Search the web to verify your answer.",
+ "expected_tools": ["get_wikipedia", "web_search", "get_website"], "completion_keywords": ["1889"],
+ "note": "Companion to T05 -- tests whether explicit verification language ('search the web to verify') reliably overrides the global 'skip tools for known facts' instruction, vs. T05's softer 'look up' phrasing."}
+]

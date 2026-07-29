@@ -35,3 +35,5 @@ Thumbs.db
 # Eval harness scratch/output (MB-06)
 eval/results/
 eval/_scratch_data/
+eval_scratch.txt
+skills/rubber-duck-debugging.md
