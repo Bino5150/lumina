@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QThread
 
-import os, sys, json, sqlite3
+import os, sys, json, sqlite3, threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from core import persistence
@@ -1309,10 +1309,21 @@ class ToolsTab(QWidget):
 
 class TTSTab(QWidget):
     backend_changed = Signal(str)
+    # Backend construction (get_tts_backend(force_reload=True)) now runs on a
+    # worker thread -- loader.py may block it joining a previous in-flight
+    # load thread, and _test_tts()/_save() run on the Qt main thread with no
+    # existing worker dispatch, so a raw join() there would freeze the window.
+    # These signals marshal the result back to the main thread for the
+    # status label update, per Qt's cross-thread widget rule.
+    _tts_test_result = Signal(bool, str)
+    _tts_swap_done = Signal(str)
+
     def __init__(self, agent, c: dict, parent=None):
         super().__init__(parent)
         self.agent = agent
         self.c = c
+        self._tts_test_result.connect(self._on_tts_test_result)
+        self._tts_swap_done.connect(self._on_tts_swap_done)
         self._build()
 
     def _build(self):
@@ -1470,21 +1481,29 @@ class TTSTab(QWidget):
 
     def _test_tts(self):
         self.status_lbl.setText("Testing...")
-        try:
-            from tts.loader import get_tts_backend
-            import config as _c
-            _c.TTS_BACKEND = self.tts_backend_combo.currentText()
-            _c.TTS_HOST = self.url.text().strip()
-            _c.VOICEBOX_HOST = self.url.text().strip()
-            bridge = get_tts_backend(force_reload=True)
-            bridge.enabled = True
-            if bridge.test():
-                bridge.speak("Lumina TTS test successful.", blocking=False)
-                self.status_lbl.setText("✓ TTS server reachable — playing test audio.")
-            else:
-                self.status_lbl.setText(f"✗ TTS server not reachable. Is {_c.TTS_BACKEND} running?")
-        except Exception as e:
-            self.status_lbl.setText(f"✗ Error: {e}")
+        import config as _c
+        _c.TTS_BACKEND = self.tts_backend_combo.currentText()
+        _c.TTS_HOST = self.url.text().strip()
+        _c.VOICEBOX_HOST = self.url.text().strip()
+        backend_name = _c.TTS_BACKEND
+
+        def worker():
+            try:
+                from tts.loader import get_tts_backend
+                bridge = get_tts_backend(force_reload=True)
+                bridge.enabled = True
+                if bridge.test():
+                    bridge.speak("Lumina TTS test successful.", blocking=False)
+                    self._tts_test_result.emit(True, "✓ TTS server reachable — playing test audio.")
+                else:
+                    self._tts_test_result.emit(False, f"✗ TTS server not reachable. Is {backend_name} running?")
+            except Exception as e:
+                self._tts_test_result.emit(False, f"✗ Error: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_tts_test_result(self, ok: bool, message: str):
+        self.status_lbl.setText(message)
     def _save(self):
         config.TTS_ENABLED = self.enabled_cb.isChecked()
         config.TTS_HOST = self.url.text().strip()
@@ -1508,10 +1527,19 @@ class TTSTab(QWidget):
 
         if self.agent.tts:
             self.agent.tts.enabled = config.TTS_ENABLED
-            from tts.loader import get_tts_backend
-            self.agent.tts = get_tts_backend(force_reload=True)
 
-        self.status_lbl.setText("Settings saved.")
+            def worker():
+                from tts.loader import get_tts_backend
+                self.agent.tts = get_tts_backend(force_reload=True)
+                self._tts_swap_done.emit("Settings saved.")
+
+            self.status_lbl.setText("Settings saved (finishing TTS backend swap...)")
+            threading.Thread(target=worker, daemon=True).start()
+        else:
+            self.status_lbl.setText("Settings saved.")
+
+    def _on_tts_swap_done(self, message: str):
+        self.status_lbl.setText(message)
 
 # ── Tab: Communications ──────────────────────────────────────────────────────
 # Config for "who the world talks to" — separate from PersonasTab, which is

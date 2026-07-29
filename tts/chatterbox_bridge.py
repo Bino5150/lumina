@@ -48,8 +48,9 @@ class ChatterboxBridge(BaseTTSBackend):
         try:
             from chatterbox.tts_turbo import ChatterboxTurboTTS
             print("[ChatterboxBridge] Loading Turbo model...", flush=True)
+            device = getattr(config, "CHATTERBOX_DEVICE", "cpu")
             with self._model_lock:
-                self._model = ChatterboxTurboTTS.from_pretrained(device="cpu")
+                self._model = ChatterboxTurboTTS.from_pretrained(device=device)
             print("[ChatterboxBridge] Model ready.", flush=True)
         except Exception as e:
             print(f"[ChatterboxBridge] Model load failed: {e}", flush=True)
@@ -97,12 +98,23 @@ class ChatterboxBridge(BaseTTSBackend):
     # Internal
     # ------------------------------------------------------------------
 
+    def _normalize_voice_name(self, name: str) -> str:
+        """lowercase + collapse whitespace/hyphens to one separator, so persona
+        display names ("Rick Sanchez") match filename slugs ("rick-sanchez")."""
+        return re.sub(r'[\s-]+', '-', name.strip().lower())
+
     def _get_ref_path(self, voice: str) -> str | None:
-        """Resolve voice name to reference audio path."""
+        """Resolve voice name to reference audio path, case/delimiter-insensitive."""
+        target = self._normalize_voice_name(voice)
+        try:
+            entries = os.listdir(self.reference_dir)
+        except OSError:
+            entries = []
         for ext in (".wav", ".mp3"):
-            path = os.path.join(self.reference_dir, voice + ext)
-            if os.path.exists(path):
-                return path
+            for fname in entries:
+                stem, fext = os.path.splitext(fname)
+                if fext.lower() == ext and self._normalize_voice_name(stem) == target:
+                    return os.path.join(self.reference_dir, fname)
         print(f"[ChatterboxBridge] No reference audio for '{voice}'", flush=True)
         return None
 
