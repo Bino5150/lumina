@@ -228,8 +228,9 @@ class GeneralTab(QWidget):
 
         layout.addWidget(_sec("CONTEXT WINDOW", self.c))
         layout.addWidget(_lbl(
-            "Max Context Tokens and Memory Inject Limit are saved per-backend — "
-            "switching backends above recalls that backend's own values.", self.c
+            "Max Context Tokens, Memory Inject Limit, and Tool Result Max Chars "
+            "are saved per-backend — switching backends above recalls that "
+            "backend's own values.", self.c
         ))
         row1 = QHBoxLayout()
         row1.setSpacing(16)
@@ -241,8 +242,13 @@ class GeneralTab(QWidget):
         mem_col.addWidget(_lbl("Memory Inject Limit", self.c))
         self.mem_spin = _spin(config.MEMORY_INJECT_LIMIT, 1, 200, 1, self.c)
         mem_col.addWidget(self.mem_spin)
+        result_col = QVBoxLayout()
+        result_col.addWidget(_lbl("Tool Result Max Chars", self.c))
+        self.result_spin = _spin(config.TOOL_RESULT_MAX_CHARS, 500, 500000, 500, self.c)
+        result_col.addWidget(self.result_spin)
         row1.addLayout(ctx_col)
         row1.addLayout(mem_col)
+        row1.addLayout(result_col)
         layout.addLayout(row1)
 
         row2 = QHBoxLayout()
@@ -368,15 +374,16 @@ class GeneralTab(QWidget):
 
     def _refresh_context_row(self, backend: str):
         """Recall this backend's saved Max Context Tokens / Memory Inject
-        Limit, or fall back to config.BACKEND_CONTEXT_DEFAULTS if this
-        backend has never been saved before. Only these two are per-backend —
-        Max Tool Iterations and Response Tokens stay global (set once below,
-        not touched here)."""
+        Limit / Tool Result Max Chars, or fall back to
+        config.BACKEND_CONTEXT_DEFAULTS if this backend has never been saved
+        before. Only these three are per-backend — Max Tool Iterations and
+        Response Tokens stay global (set once below, not touched here)."""
         prefs = persistence.load()
         saved = prefs.get("backend_context", {}).get(backend, {})
         default = config.BACKEND_CONTEXT_DEFAULTS.get(backend, config.BACKEND_CONTEXT_DEFAULTS["llamacpp"])
         self.ctx_spin.setValue(saved.get("max_context_tokens", default["max_context_tokens"]))
         self.mem_spin.setValue(saved.get("memory_inject_limit", default["memory_inject_limit"]))
+        self.result_spin.setValue(saved.get("tool_result_max_chars", default["tool_result_max_chars"]))
 
     def _save(self):
         from core.backends.loader import get_llm_backend
@@ -385,6 +392,7 @@ class GeneralTab(QWidget):
             config.SYSTEM_PROMPT = new_system_prompt
         config.MAX_CONTEXT_TOKENS = self.ctx_spin.value()
         config.MEMORY_INJECT_LIMIT = self.mem_spin.value()
+        config.TOOL_RESULT_MAX_CHARS = self.result_spin.value()
         config.MAX_TOOL_ITERATIONS = self.iter_spin.value()
         config.RESPONSE_RESERVE_TOKENS = self.resp_spin.value()
         config.DREAM_SWEEP_ENABLED = self.dream_enabled_cb.isChecked()
@@ -408,9 +416,10 @@ class GeneralTab(QWidget):
         prefs["llm_backend_url"] = config.LLM_BACKEND_URL
 
         # Context/memory settings — max_tool_iterations and
-        # response_reserve_tokens are global; max_context_tokens and
-        # memory_inject_limit are saved per-backend so switching backends
-        # recalls each one's own values instead of clobbering the other.
+        # response_reserve_tokens are global; max_context_tokens,
+        # memory_inject_limit, and tool_result_max_chars are saved per-backend
+        # so switching backends recalls each one's own values instead of
+        # clobbering the other.
         prefs["max_tool_iterations"] = config.MAX_TOOL_ITERATIONS
         prefs["response_reserve_tokens"] = config.RESPONSE_RESERVE_TOKENS
         prefs["dream_sweep_enabled"] = config.DREAM_SWEEP_ENABLED
@@ -421,6 +430,7 @@ class GeneralTab(QWidget):
         backend_context[config.LLM_BACKEND] = {
             "max_context_tokens": config.MAX_CONTEXT_TOKENS,
             "memory_inject_limit": config.MEMORY_INJECT_LIMIT,
+            "tool_result_max_chars": config.TOOL_RESULT_MAX_CHARS,
         }
         prefs["backend_context"] = backend_context
 

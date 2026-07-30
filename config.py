@@ -131,25 +131,31 @@ OMNIROUTE_API_KEY = _secrets.get_secret("omniroute_api_key") or _p.get("omnirout
 # First time a backend is used, falls back to a conservative default below
 # rather than crashing or silently reusing another backend's number.
 BACKEND_CONTEXT_DEFAULTS = {
-    "llamacpp":   {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "lmstudio":   {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "ollama":     {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "vllm":       {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "custom":     {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "omniroute":  {"max_context_tokens": 32000,   "memory_inject_limit": 12},
-    "openrouter": {"max_context_tokens": 32000,   "memory_inject_limit": 12},
-    "deepseek":   {"max_context_tokens": 64000,   "memory_inject_limit": 16},
-    "groq":       {"max_context_tokens": 32000,   "memory_inject_limit": 12},
-    "openai":     {"max_context_tokens": 128000,  "memory_inject_limit": 24},
-    "anthropic":  {"max_context_tokens": 180000,  "memory_inject_limit": 40},
-    "gemini":     {"max_context_tokens": 1000000, "memory_inject_limit": 60},
-    "kimi":       {"max_context_tokens": 128000,  "memory_inject_limit": 24},
-    "qwen":       {"max_context_tokens": 128000,  "memory_inject_limit": 24},
+    "llamacpp":   {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "lmstudio":   {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "ollama":     {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "vllm":       {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "custom":     {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "omniroute":  {"max_context_tokens": 32000,   "memory_inject_limit": 12, "tool_result_max_chars": 20000},
+    "openrouter": {"max_context_tokens": 32000,   "memory_inject_limit": 12, "tool_result_max_chars": 20000},
+    "deepseek":   {"max_context_tokens": 64000,   "memory_inject_limit": 16, "tool_result_max_chars": 30000},
+    "groq":       {"max_context_tokens": 32000,   "memory_inject_limit": 12, "tool_result_max_chars": 20000},
+    "openai":     {"max_context_tokens": 128000,  "memory_inject_limit": 24, "tool_result_max_chars": 40000},
+    "anthropic":  {"max_context_tokens": 180000,  "memory_inject_limit": 40, "tool_result_max_chars": 50000},
+    "gemini":     {"max_context_tokens": 1000000, "memory_inject_limit": 60, "tool_result_max_chars": 100000},
+    "kimi":       {"max_context_tokens": 128000,  "memory_inject_limit": 24, "tool_result_max_chars": 40000},
+    "qwen":       {"max_context_tokens": 128000,  "memory_inject_limit": 24, "tool_result_max_chars": 40000},
 }
 _ctx_default = BACKEND_CONTEXT_DEFAULTS.get(LLM_BACKEND, BACKEND_CONTEXT_DEFAULTS["llamacpp"])
 _backend_ctx = _p.get("backend_context", {}).get(LLM_BACKEND, {})
-MAX_CONTEXT_TOKENS  = _backend_ctx.get("max_context_tokens", _ctx_default["max_context_tokens"])
-MEMORY_INJECT_LIMIT = _backend_ctx.get("memory_inject_limit", _ctx_default["memory_inject_limit"])
+MAX_CONTEXT_TOKENS    = _backend_ctx.get("max_context_tokens", _ctx_default["max_context_tokens"])
+MEMORY_INJECT_LIMIT   = _backend_ctx.get("memory_inject_limit", _ctx_default["memory_inject_limit"])
+# Per-backend like the two above — a document-heavy tool result on a
+# 1M-context backend (Gemini) shouldn't be truncated to the same ceiling as
+# a 16k-context local model. Used to be a flat literal in the "Agent
+# behavior" section below; moved up here so it resolves off the same
+# _backend_ctx/_ctx_default lookup while both are still in scope.
+TOOL_RESULT_MAX_CHARS = _backend_ctx.get("tool_result_max_chars", _ctx_default["tool_result_max_chars"])
 
 # Not per-backend — tool-call depth and response length are agent-behavior
 # choices, not something that varies by which model is answering.
@@ -222,7 +228,6 @@ TELEGRAM_OWNER_CHAT_ID = _p.get("telegram_owner_chat_id", None) or None
 
 
 # Agent behavior
-TOOL_RESULT_MAX_CHARS = 9000
 TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
 
 # System prompt
