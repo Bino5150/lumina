@@ -30,6 +30,37 @@ else
 fi
 echo "[Lumina] TTS backend: $TTS_BACKEND"
 
+# ── Voicebox lifecycle cleanup ──────────────────────────────────────────────
+# Ported from ~/lumina (S46, MB-21) -- Skynet hit real OOM kills on
+# llama-server with Kokoro + Voicebox + browser + IDE all resident at once.
+# Voicebox's own restart policy was separately hardened to restart:"no" in
+# ~/voicebox/docker-compose.yml -- ONE physical container shared by both
+# builds, so that fix already covers this build too. But restart:"no" only
+# stops it from auto-restarting after an *unclean* shutdown; it does nothing
+# on a clean exit, and until now nothing in this script ever stopped
+# Voicebox on the way out either.
+#
+# Mirrors the OG build's decision exactly: whenever Voicebox is the
+# configured backend, stop it on exit -- regardless of whether this
+# particular launch found it already running or the user started it
+# manually per the instructions below. The goal is "Voicebox doesn't linger
+# after you're done with Lumina," not "only clean up what this exact
+# process launched." `stop`, not `down`, so the container is still there
+# for a fast restart next launch. Silently no-ops if `docker` or
+# ~/voicebox isn't present -- this script also runs on other people's
+# machines who may not have Voicebox set up at all.
+#
+# NOTE: assumes ~/voicebox as the compose project directory, inferred from
+# the S46 handoff, not independently confirmed against this machine -- flag
+# if that's not the real path.
+cleanup() {
+    if [ "$TTS_BACKEND" = "voicebox" ]; then
+        echo "[Lumina] Stopping Voicebox..."
+        (cd "$HOME/voicebox" 2>/dev/null && docker compose stop) 2>/dev/null
+    fi
+}
+trap cleanup EXIT
+
 # ── Start TTS backend ──────────────────────────────────────────────────────
 if [ "$TTS_BACKEND" = "voicebox" ]; then
     if ! curl -s http://localhost:17493/health > /dev/null 2>&1; then
