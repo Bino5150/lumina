@@ -42,12 +42,42 @@ Inherits BaseLLMBackend directly and implements the contract natively.
 """
 
 import json
+import re
 import requests
 
 import config
 from core.backends.base import BaseLLMBackend
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def normalize_gemini_tool_result(value):
+    """
+    Normalize a tool result into the dict shape Gemini's functionResponse.response
+    field requires -- Gemini rejects a bare string/list/None/number/bool there,
+    it always wants an object. dict passes through as-is (already the right
+    shape); everything else gets wrapped under a "result" key.
+    """
+    if isinstance(value, dict):
+        return value
+    if value is None or isinstance(value, (list, str, int, float, bool)):
+        return {"result": value}
+    return {"result": str(value)}
+
+
+_THOUGHT_SIG_RE = re.compile(r'("thoughtSignature"\s*:\s*")[^"]*(")')
+
+
+def _redact_thought_signatures(text: str) -> str:
+    """
+    Scrub opaque thoughtSignature values out of raw Gemini response text before
+    any log/print -- same treatment as an API key. Never appears in routine
+    logs; it's an opaque token Gemini requires we round-trip, not diagnostic
+    content, and has no reason to ever be human-visible.
+    """
+    if not text:
+        return text
+    return _THOUGHT_SIG_RE.sub(r'\1[REDACTED]\2', text)
 
 
 class GeminiBackend(BaseLLMBackend):
@@ -149,58 +179,136 @@ class GeminiBackend(BaseLLMBackend):
         """
         Convert OpenAI-shaped conversation history into Gemini's "contents" array.
 
-          - role="tool" -> role="user" content with a functionResponse part.
+          - role="tool" -> role="user" content with functionResponse part(s).
             context.py's add_tool_result() shape is {"role": "tool", "tool_call_id",
             "name", "content"} — Gemini's functionResponse wants {"name", "response"}
-            where response is a dict, so the plain string content gets wrapped.
-            NOTE: Gemini's functionResponse has no id/tool_call_id field at all —
-            matching is implicitly by name + turn order, not an explicit call id.
-            This is a real structural difference from both OpenAI and Anthropic,
-            which both thread an explicit id through. If a single assistant turn
-            ever issues two parallel calls to the *same* tool name, Gemini has no
-            built-in way to disambiguate which result pairs with which call beyond
-            sequence — noting this since it's a real (if narrow) limitation of the
-            wire format itself, not a gap in this translation layer.
-          - role="assistant" with tool_calls -> role="model" content with one or
-            more functionCall parts (plus a text part if there's also plain text).
+            where response is a dict, so the (already-stringified, by context.py)
+            content gets wrapped via normalize_gemini_tool_result(). NOTE: Gemini's
+            functionResponse has no id/tool_call_id field at all — matching is
+            implicitly by name + turn order, not an explicit call id. This is a
+            real structural difference from both OpenAI and Anthropic, which both
+            thread an explicit id through. If a single assistant turn ever issues
+            two parallel calls to the *same* tool name, Gemini has no built-in way
+            to disambiguate which result pairs with which call beyond sequence —
+            noting this since it's a real (if narrow) limitation of the wire
+            format itself, not a gap in this translation layer.
+            Consecutive "tool" messages (i.e. every result from one assistant
+            turn's parallel tool calls) are merged into ONE user Content with
+            multiple functionResponse parts — Gemini expects parallel function
+            responses batched together in a single turn (FC1,FC2 -> one turn with
+            FR1+FR2), not interleaved as separate back-to-back user turns
+            (FC1,FR1,FC2,FR2), which is what naive one-message-at-a-time
+            translation would otherwise produce.
+          - role="assistant" with tool_calls -> role="model" content.
+            THOUGHT-SIGNATURE PRESERVATION (Bug B): if this message carries
+            provider_metadata.gemini_content (stashed by extract_message() from
+            Gemini's own response), that exact Content object — parts, ordering,
+            and any opaque thoughtSignature — is re-sent unmodified. Gemini
+            requires the thoughtSignature it attached to a functionCall part to
+            come back byte-for-byte on the next request, or it 400s with
+            "Function call is missing a thought_signature in functionCall parts."
+            Reconstructing a fresh functionCall part here (the old behavior) can
+            never carry that opaque value, since it never exists anywhere in the
+            OpenAI-neutral tool_calls record agent.py/context.py operate on —
+            those are shared by every backend and have no room for a
+            Gemini-specific opaque field, so the raw Content object is smuggled
+            through as an extra provider_metadata key instead (see
+            extract_message()). Falls back to reconstructing from tool_calls only
+            if provider_metadata is absent (history that predates this fix, or a
+            non-Gemini origin) — not expected to fire in normal operation, kept
+            only so an odd history shape degrades instead of crashing.
           - role="user"/"assistant" plain text -> role="user"/"model" with a single
             text part.
         """
         out = []
-        for m in messages:
+        i = 0
+        n = len(messages)
+        while i < n:
+            m = messages[i]
             role = m.get("role")
 
             if role == "tool":
-                out.append({
-                    "role": "user",
-                    "parts": [{
+                parts = []
+                while i < n and messages[i].get("role") == "tool":
+                    tm = messages[i]
+                    parts.append({
                         "functionResponse": {
-                            "name": m.get("name"),
-                            "response": {"result": str(m.get("content", ""))},
+                            "name": tm.get("name"),
+                            "response": normalize_gemini_tool_result(tm.get("content", "")),
                         }
-                    }],
-                })
+                    })
+                    i += 1
+                out.append({"role": "user", "parts": parts})
                 continue
 
             if role == "assistant" and m.get("tool_calls"):
+                gemini_content = (m.get("provider_metadata") or {}).get("gemini_content")
+                if gemini_content is not None:
+                    out.append(gemini_content)
+                    i += 1
+                    continue
+
+                # Fallback reconstruction — loses thoughtSignature. See docstring.
                 parts = []
                 text = m.get("content")
                 if text:
                     parts.append({"text": text})
                 for tc in m["tool_calls"]:
                     fn = tc.get("function", tc)
-                    try:
-                        args = json.loads(fn.get("arguments", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
+                    raw_args = fn.get("arguments", "{}")
+                    if isinstance(raw_args, str):
+                        try:
+                            args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            args = {}
+                    else:
+                        # Already a dict (some clients emit parsed args) — do not
+                        # swallow them; the old `except TypeError: args = {}` path
+                        # silently executed every tool with empty arguments.
+                        args = raw_args or {}
                     parts.append({"functionCall": {"name": fn.get("name"), "args": args}})
                 out.append({"role": "model", "parts": parts})
+                i += 1
                 continue
 
             gemini_role = "model" if role == "assistant" else "user"
-            out.append({"role": gemini_role, "parts": [{"text": m.get("content", "") or ""}]})
+            out.append({"role": gemini_role, "parts": cls._parts_from_content(m.get("content"))})
+            i += 1
 
         return out
+
+    @staticmethod
+    def _parts_from_content(content):
+        # Convert an OpenAI-shaped content value into Gemini Part dicts.
+        # Plain string -> [{"text": ...}].
+        # Multipart list (vision turn) -> text blocks become {"text": ...},
+        # image_url blocks become {"inline_data": {mime_type, data}} — Gemini's
+        # inline image format. Only data: URLs are handled; remote http(s) URLs
+        # are skipped (fetching them would need extra machinery + a MIME guess).
+        if not isinstance(content, list):
+            return [{"text": content or ""}]
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text", "")
+                if text:
+                    parts.append({"text": text})
+            elif btype == "image_url":
+                iu = block.get("image_url")
+                url = iu.get("url", "") if isinstance(iu, dict) else ""
+                if url and url.startswith("data:"):
+                    try:
+                        meta, _, b64 = url.partition(",")
+                        mime = meta[len("data:"):].split(";")[0] or "image/png"
+                        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+                    except Exception:
+                        continue
+        if not parts:
+            parts.append({"text": ""})
+        return parts
 
     def _build_payload(self, messages, tools=None, max_tokens=1024, temperature=0.7):
         system_instruction, convo = self._split_system(messages)
@@ -239,7 +347,13 @@ class GeminiBackend(BaseLLMBackend):
         except requests.exceptions.Timeout:
             raise TimeoutError("Gemini API request timed out.")
         except requests.exceptions.HTTPError as e:
-            print(f"[HTTP ERROR BODY] {resp.text}", flush=True)
+            # Bounded, redacted snippet -- never the raw unbounded body. Same
+            # posture as never logging an API key: this can contain a
+            # thoughtSignature in some error-echo shapes, so redact before
+            # truncating, not after (truncating first could cut a signature in
+            # half and leave a partial value visible).
+            body = _redact_thought_signatures(resp.text)[:500]
+            print(f"[HTTP ERROR BODY] model={self.default_model} status={resp.status_code} body={body}", flush=True)
             raise RuntimeError(f"Gemini API HTTP error: {e}")
 
     def extract_message(self, response):
@@ -249,7 +363,8 @@ class GeminiBackend(BaseLLMBackend):
         or omitted} — same target shape anthropic_backend.py produces.
         """
         try:
-            parts = response["candidates"][0]["content"]["parts"]
+            candidate = response["candidates"][0]
+            parts = candidate["content"]["parts"]
         except (KeyError, IndexError):
             return {"role": "assistant", "content": ""}
 
@@ -280,6 +395,16 @@ class GeminiBackend(BaseLLMBackend):
         message = {"role": "assistant", "content": "".join(text_parts)}
         if tool_calls:
             message["tool_calls"] = tool_calls
+            # Stash Gemini's own Content object (all parts, in original order,
+            # including any opaque thoughtSignature) so _translate_messages can
+            # re-send it unmodified on the next turn instead of reconstructing a
+            # fresh functionCall part that would be missing the signature —
+            # Bug B. Carried as a whole unit, not per-tool-call, because Gemini
+            # may attach the signature to only the first part of a parallel
+            # response; splitting it up here and reattaching later per-call
+            # would risk copying that signature onto parts it was never issued
+            # for. See _translate_messages' docstring for the read side.
+            message["provider_metadata"] = {"gemini_content": candidate["content"]}
         return message
 
     # ------------------------------------------------------------------

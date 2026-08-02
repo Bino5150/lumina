@@ -37,7 +37,15 @@ import json
 # decay_engine`) for L2 recency sorting -- found while building this
 # migration, by checking for static imports before assuming "approved in
 # the audit log" meant "safe to move."
-NEVER_MIGRATE = {"temporal_decay"}
+#
+# git_status/git_diff/git_log/git_branches: same class of problem, hit
+# immediately after promoting them from custom_tools/ to tracked tools/ with
+# static `from tools.git_status import register_git_status_tool`-style
+# imports in core/agent.py. Without this, every startup's unconditional
+# migrate_legacy_state() call would see they still match an "approved" audit
+# log entry and silently shutil.move() them straight back out of tools/ into
+# custom_tools/, breaking agent.py's static imports the very next import.
+NEVER_MIGRATE = {"temporal_decay", "git_status", "git_diff", "git_log", "git_branches"}
 
 
 def _approved_tool_names(audit_log_path: str) -> set:

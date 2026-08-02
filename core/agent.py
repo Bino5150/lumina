@@ -28,6 +28,10 @@ from tools.diff import register_diff_tools
 from tools.browser import register_browser_tools, browser_manager
 from tools.telegram_send import register_telegram_tools
 from tools.updates import register_update_tools
+from tools.git_status import register_git_status_tool
+from tools.git_diff import register_git_diff_tool
+from tools.git_log import register_git_log_tool
+from tools.git_branches import register_git_branches_tool
 
 
 CHAIN_BLOCKED_AFTER_SEARCH = {"get_website", "web_search"}
@@ -37,6 +41,40 @@ def strip_think_blocks(text: str) -> str:
     if not text:
         return text
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+
+# Sentinel prefixes chat()'s tool-loop except-block and _stream_final()'s
+# except-block use to report a failed turn as plain response text instead
+# of raising (see docstrings on both). Centralized here rather than
+# duplicated as string-matching in the UI layer, which used to have no way
+# to tell a failed turn from a real assistant reply — see Bug C fix,
+# LUMINA_HANDOFF_OMNIROUTE_TO_PROVIDER_FIXES_2026-08-02.md section 8.3:
+# "Suppress auto-name when the main turn fails."
+ERROR_RESPONSE_PREFIXES = ("[Lumina error:", "[Stream error:")
+
+# A third failure sentinel — a tool call succeeds, then the *next* provider
+# call in the same turn fails during continuation (Bug B / section 8.2.1's
+# observability fix, added to the tool loop's except-block last session).
+# That fix isn't in the public repo this module's tests run against, so its
+# exact bracket/prefix formatting can't be verified here — only the
+# templated wording itself, quoted verbatim in both
+# LUMINA_HANDOFF_OMNIROUTE_TO_PROVIDER_FIXES_2026-08-02.md section 8.2.1
+# and the Bug C patch-review report that found this gap. Anchoring on that
+# substring instead of guessing the surrounding prefix: if the actual
+# wording differs, update this rather than trust it silently.
+ERROR_RESPONSE_SUBSTRINGS = ("rejected the continuation",)
+
+
+def is_error_response(text: str) -> bool:
+    """True if `text` is one of chat()/_stream_final()'s sentinel failure
+    strings rather than a genuine assistant reply. Callers (e.g. the UI's
+    auto-name trigger) should check this before treating `response` as
+    real conversational content."""
+    if not text:
+        return False
+    if text.startswith(ERROR_RESPONSE_PREFIXES):
+        return True
+    return any(s in text for s in ERROR_RESPONSE_SUBSTRINGS)
 
 
 class LuminaAgent:
@@ -133,6 +171,15 @@ class LuminaAgent:
         register_browser_tools(self.registry)
         register_telegram_tools(self.registry)
         register_update_tools(self.registry)
+        # Promoted from the toolmaker custom-tool pipeline (was approved via
+        # create_tool -> approve_pending_tool, then hand-promoted into tracked
+        # source once reviewed and hardened) — same as get_weather's history,
+        # but these are wired statically here rather than left to the FE-11
+        # loader below, since they're now genuine built-ins, not custom tools.
+        register_git_status_tool(self.registry)
+        register_git_diff_tool(self.registry)
+        register_git_log_tool(self.registry)
+        register_git_branches_tool(self.registry)
 
         # FE-11: reload any custom tool that was approved through the
         # toolmaker review pipeline in a past session. Not owner-gated —
@@ -181,8 +228,15 @@ class LuminaAgent:
         tools_used_this_turn = set()
         think_step = [0]
         
-        # Inject relevant skill docs into system prompt for this turn
-        skills_block = build_skills_block(user_input)
+        # Inject relevant skill docs into system prompt for this turn.
+        # Skill injection is a nice-to-have — never allowed to kill the turn.
+        # (Image turns pass multipart list content in; build_skills_block is
+        # type-safe now, but a failure here must not brick the session.)
+        try:
+            skills_block = build_skills_block(user_input)
+        except Exception as e:
+            print(f"[SKILLS] build_skills_block skipped: {e}", flush=True)
+            skills_block = ""
         if skills_block:
             self.ctx.push_ephemeral(skills_block)
 
@@ -207,8 +261,38 @@ class LuminaAgent:
                     max_tokens=config.RESPONSE_RESERVE_TOKENS,
                 )
             except Exception as e:
-                print(f"[AGENT ERROR] {type(e).__name__}: {e}", flush=True)
-                return f"[Lumina error: {e}]"
+                provider = getattr(self.llm, "display_name", None) or getattr(self.llm, "name", "the provider")
+                get_model = getattr(self.llm, "get_model", None)
+                model = get_model() if callable(get_model) else "unknown"
+                stage = "tool_continuation" if tools_used_this_turn else "initial_request"
+                print(f"[AGENT ERROR] provider={provider} model={model} "
+                      f"stage={stage} {type(e).__name__}: {e}", flush=True)
+                if tools_used_this_turn:
+                    # A tool already ran successfully this turn — the failure is
+                    # the PROVIDER rejecting the continuation request, not a
+                    # silent hang. Name it explicitly so this doesn't read as
+                    # "the model just stopped responding" — the actual symptom
+                    # Bug B produced before the thoughtSignature-preservation
+                    # fix in gemini_backend.py. Streamed via on_response_token
+                    # (the same path _stream_final's own error handler already
+                    # uses below) rather than just returned, because agent.chat()
+                    # deliberately never raises — main.py's CLI loop calls it
+                    # with no try/except around the call, relying on that
+                    # contract — so the only way to make this visible in the
+                    # GUI without touching that contract is to push it through
+                    # the token-streaming callback the GUI already renders live
+                    # (AgentWorker → _on_response_chunk → the live bubble),
+                    # rather than routing through the separate signals.error /
+                    # _on_error path, which only fires on a raised exception and
+                    # is never reached from inside this try/except at all.
+                    just_ran = ", ".join(f"`{n}`" for n in sorted(tools_used_this_turn))
+                    err = f"[Tool {just_ran} completed, but {provider} rejected the continuation: {e}]"
+                else:
+                    err = f"[Lumina error: {e}]"
+                on_response_token = getattr(self, "on_response_token", None)
+                if callable(on_response_token):
+                    on_response_token(err)
+                return err
 
             message = self.llm.extract_message(response)
 
@@ -288,7 +372,14 @@ class LuminaAgent:
                     self.on_response_token(chunk)
                     full_response.append(chunk)
 
-        except (ConnectionError, TimeoutError, RuntimeError) as e:
+        except (ConnectionError, TimeoutError, RuntimeError, ValueError) as e:
+            # ValueError added alongside Bug C's base_url validation
+            # (core/backends/lmstudio.py validate_base_url()) — an
+            # unconfigured/schemeless endpoint is a real, expected failure
+            # mode here, not a programming bug, and deserves the same
+            # graceful "[Stream error: ...]" + persisted-history treatment
+            # as the other backend failure types instead of falling through
+            # to AgentWorker's cruder top-level handler.
             err = f"[Stream error: {e}]"
             self.on_response_token(err)
             return err

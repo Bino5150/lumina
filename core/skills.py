@@ -156,7 +156,7 @@ def search_skills(query: str, limit: int = None) -> list[dict]:
     if limit is None:
         limit = getattr(config, 'SKILLS_MAX_INJECT', 2)
 
-    if not query or not query.strip():
+    if not isinstance(query, str) or not query.strip():
         return []
 
     conn = get_db()
@@ -227,6 +227,14 @@ def build_skills_block(query: str) -> str:
     Search for relevant skills and return an injection block for the system prompt.
     Returns empty string if no relevant skills found.
     """
+    if isinstance(query, list):
+        # Multipart content (image turn) — search on the text portion only.
+        query = " ".join(
+            b.get("text", "") for b in query
+            if isinstance(b, dict) and isinstance(b.get("text"), str)
+        ).strip()
+    if not query:
+        return ""
     matches = search_skills(query)
     if not matches:
         return ""

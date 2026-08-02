@@ -6,6 +6,16 @@ Run CLI only:  python main.py --cli
 
 import sys
 import os
+
+# Data-dir isolation — this build's own main.py only (NOT shared with
+# ~/lumina's identical-looking main.py). Covers every launch path that goes
+# straight through this file (start_lumina.sh, an IDE debugger pointed at
+# main.py, or a bare `python main.py`) without depending on start_lumina.sh
+# having run first. config.py reads LUMINA_DATA_DIR at import time, so this
+# must be set before the first `import config` below. setdefault so an
+# already-exported value (e.g. from start_lumina.sh) always wins.
+os.environ.setdefault("LUMINA_DATA_DIR", os.path.join(os.path.expanduser("~"), ".local", "share", "lumina-release"))
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 

@@ -3,8 +3,24 @@
 # Start your LLM backend (llama.cpp, Ollama, LM Studio, etc.) before running
 # this script. See README for recommended setup and configuration.
 
+# ── Data-dir isolation ──────────────────────────────────────────────────────
+# This build is the disposable release copy — it must NEVER read or write
+# ~/lumina's (the dev build's) shared memory/chat/prefs state. config.py
+# resolves DATA_DIR from this env var if set, falling back to a shared
+# platformdirs path otherwise (see config.py's DATA_DIR line) — so this must
+# be exported before config.py is ever imported, i.e. before anything else
+# in this script runs. Same pattern eval/run_eval.py (MB-23) already proved
+# out for isolating eval runs from the real data dir.
+export LUMINA_DATA_DIR="$HOME/.local/share/lumina-release"
+
 LUMINA_DIR="$(dirname "$0")"
-PREFS="$LUMINA_DIR/memory/prefs.json"
+# Was "$LUMINA_DIR/memory/prefs.json" — a stale pre-FE-13, BASE_DIR-relative
+# path that never matched where prefs.json actually lives (DATA_DIR, not
+# BASE_DIR, since the platformdirs migration). That meant this check almost
+# always fell through to the "chatterbox" default regardless of the real
+# configured backend — plausible root cause of prior backend-switching
+# weirdness. Now points at this build's own isolated data dir.
+PREFS="$LUMINA_DATA_DIR/memory/prefs.json"
 
 # ── Detect active TTS backend from prefs.json ──────────────────────────────
 if [ -f "$PREFS" ]; then

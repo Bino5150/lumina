@@ -23,6 +23,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+from core.agent import is_error_response
 from core.personas import list_personas, load_persona
 from core import persistence
 from core import dreaming 
@@ -976,6 +977,15 @@ class LuminaWindow(QMainWindow):
         if self._current_chat_id and response:
             save_chat_message(self._current_chat_id, "assistant", response)
             self._refresh_chat_list()
+            # A failed turn returns its error as plain response text instead
+            # of raising (see core/agent.py chat()/_stream_final()) — it's
+            # still saved above so the failure is visible in history, but it
+            # must not trigger auto-naming, which would fire a second doomed
+            # complete_utility() call against the same broken provider/
+            # endpoint (duplicate noise, potentially duplicate paid traffic
+            # against a metered provider).
+            if is_error_response(response):
+                return
             # ── Auto-name if still has default timestamp name ──
             current_name = get_chat_name(self._current_chat_id)
             if current_name.startswith("Chat "):
