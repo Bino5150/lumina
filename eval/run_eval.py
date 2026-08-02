@@ -11,6 +11,18 @@ import os
 import sys
 
 EVAL_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_scratch_data")
+
+# MB-23: every run must start from a genuinely empty scratch dir, not an
+# assumption that the last run cleaned up after itself -- see
+# eval/scratch_dir.py's docstring for the historical contamination bug this
+# fixes (a stale prefs.json silently leaked into two cited eval runs before
+# anyone noticed). Bare import works here because Python auto-prepends a
+# directly-run script's own directory to sys.path -- this file's sibling,
+# not a package import, since running `python eval/run_eval.py` directly
+# (not `python -m eval.run_eval`) means relative imports aren't available.
+from scratch_dir import reset_scratch_dir
+reset_scratch_dir(EVAL_DATA_DIR)
+
 os.environ["LUMINA_DATA_DIR"] = EVAL_DATA_DIR
 
 import json
