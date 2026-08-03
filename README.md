@@ -1,9 +1,6 @@
-# lumina
-A full featured, powerful, and efficient AI agentic harness designed from the ground up with local inference on consumer hardware in mind. It evolves, grows, and gets smarter as you go. And it REMEMBERS... 
+## Lumina
 
-# Lumina
-
-A local-first AI agent designed from the ground up for consumer hardware.
+A full featured, powerful, and efficient local-first AI Agentic Harness/Desktop Agent app designed from the ground up with local inference on consumer hardware in mind. It evolves, adapts, grows, and gets smarter as you go. And it REMEMBERS... 
 
 ## Features:
 - 🧠 Multi-tier persistent memory - including dreaming
