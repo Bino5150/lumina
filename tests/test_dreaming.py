@@ -149,3 +149,73 @@ def test_on_session_idle_writes_to_nightstand_wing_on_success(monkeypatch):
     assert stored["layer"] == 2
     assert stored["content"] == "- Did a thing"
     assert "dream-sweep" in stored["tags"]
+
+
+# ── MB-08 Part 1: human profile curation ────────────────────────────────
+
+def test_curate_human_profile_calls_backend_with_expected_prompt_shape(monkeypatch):
+    fake = FakeBackend(response_text="- Likes tea\n- Working on MB-08")
+    monkeypatch.setattr(dreaming, "get_llm_backend", lambda: fake)
+    monkeypatch.setattr(dreaming.config, "USER_NAME", "Bino")
+
+    result = dreaming.curate_human_profile(
+        raw_text="user: I've been drinking a lot of tea lately",
+        bio="Bino is a software engineer.",
+        existing_profile="- Likes coffee",
+    )
+
+    assert result == fake.response_text
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["prefill"] == "NOTES:"
+    assert call["max_tokens"] == 400
+    assert call["temperature"] == 0.3
+    assert "Bino is a software engineer." in call["prompt"]
+    assert "- Likes coffee" in call["prompt"]
+    assert "I've been drinking a lot of tea lately" in call["prompt"]
+    assert "Bino" in call["prompt"]
+
+
+def test_curate_human_profile_fills_placeholders_when_bio_and_existing_empty(monkeypatch):
+    fake = FakeBackend()
+    monkeypatch.setattr(dreaming, "get_llm_backend", lambda: fake)
+
+    dreaming.curate_human_profile(raw_text="user: hi", bio="", existing_profile="")
+
+    call = fake.calls[0]
+    assert "(none written yet)" in call["prompt"]
+    assert "(none yet)" in call["prompt"]
+
+
+def test_curate_human_profile_returns_none_on_backend_exception(monkeypatch):
+    class ExplodingBackend:
+        def complete_utility(self, *a, **k):
+            raise RuntimeError("backend unreachable")
+
+    monkeypatch.setattr(dreaming, "get_llm_backend", lambda: ExplodingBackend())
+
+    result = dreaming.curate_human_profile("some text", "bio", "existing")
+    assert result is None
+
+
+def test_on_session_idle_does_not_curate_profile_when_flag_disabled(monkeypatch):
+    """Regression guard: HUMAN_PROFILE_CURATION_ENABLED defaults False --
+    curate_human_profile() must not fire (and therefore never touches
+    prefs.json) unless the flag is explicitly on."""
+    monkeypatch.setattr(dreaming.config, "DREAM_SWEEP_ENABLED", True)
+    monkeypatch.setattr(dreaming.config, "DREAM_MIN_TOKENS", 1)
+    monkeypatch.setattr(dreaming.config, "HUMAN_PROFILE_CURATION_ENABLED", False)
+    monkeypatch.setattr(
+        dreaming, "load_chat_messages",
+        lambda cid: [{"role": "user", "content": "x" * 50, "created_at": "2026-07-09T00:00:00"}],
+    )
+    fake = FakeBackend(response_text="- Did a thing")
+    monkeypatch.setattr(dreaming, "get_llm_backend", lambda: fake)
+    monkeypatch.setattr(dreaming, "palace_store", lambda **kw: None)
+
+    curate_calls = []
+    monkeypatch.setattr(dreaming, "curate_human_profile", lambda *a, **k: curate_calls.append(a))
+
+    dreaming.on_session_idle(chat_id=42)
+
+    assert curate_calls == []

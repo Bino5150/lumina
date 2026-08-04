@@ -200,6 +200,7 @@ QWEN_API_KEY, QWEN_DEFAULT_MODEL             = _cloud_override("qwen", QWEN_API_
 DREAM_SWEEP_ENABLED = _p.get("dream_sweep_enabled", True)
 DREAM_MIN_TOKENS    = _p.get("dream_min_tokens", 900)
 DREAM_IDLE_MINUTES  = _p.get("dream_idle_minutes", 13)
+HUMAN_PROFILE_CURATION_ENABLED = _p.get("human_profile_curation_enabled", False)
 
 # Chat UI — show/hide the model's <think> reasoning block in the chat
 # window. Purely a display toggle: the model still reasons and those tokens

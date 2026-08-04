@@ -79,8 +79,8 @@ class ContextManager:
         Palace injection cap is dynamic — uses whatever token budget remains
         after accounting for tools, response reserve, and base system prompt.
 
-        Palace memory, projectlist.md, and the human_bio appended in
-        core/agent.py are ALL owner-only. None of this goes through
+        Palace memory, projectlist.md, and the human_bio/human_profile_curated
+        block assembled below (human_block) are ALL owner-only. None of this goes through
         registry.call(), so Epic A's tool-dispatch gating never touched it —
         found live (S35b) when a Discord test session recited the owner's
         hostname, username, and personal details from passive Palace
@@ -127,6 +127,48 @@ class ContextManager:
                 projects_block = ""
 
         parts = [self.system_prompt]
+
+        # Human profile block -- bio (user-authored, authoritative) + curated
+        # profile (Lumina-authored, resynthesized by dreaming.py's idle-sweep).
+        # Moved out of apply_persona()'s static bake into this per-turn
+        # reconstruction, same pattern as palace_block/projects_block below --
+        # closes the staleness gap where a baked-once bio and a fresh-every-turn
+        # palace memory had no precedence rule if they disagreed.
+        human_block = ""
+        if self.owner:
+            try:
+                from core.persistence import load as load_prefs
+                import config
+                prefs = load_prefs()
+                bio = prefs.get("human_bio", "").strip()
+                curated = prefs.get("human_profile_curated", "").strip()
+                lines = []
+                if bio:
+                    lines.append(bio)
+                if curated:
+                    lines.append(f"Additional notes (Lumina's own observations, refined over time):\n{curated}")
+                if lines:
+                    human_block = (
+                        f"## About {config.USER_NAME}\n" + "\n\n".join(lines) +
+                        "\n\nThe above is authoritative. If anything recalled from "
+                        "memory below conflicts with it, trust this instead."
+                    )
+            except Exception as e:
+                print(f"[HUMAN_PROFILE] injection failed: {e}", flush=True)
+                human_block = ""
+        else:
+            try:
+                from core.persistence import load as load_prefs
+                import config
+                public_bio = load_prefs().get("human_bio_public", "").strip()
+                if public_bio:
+                    human_block = f"## About {config.USER_NAME}\n{public_bio}"
+            except Exception as e:
+                print(f"[HUMAN_PROFILE] injection failed: {e}", flush=True)
+                human_block = ""
+
+        if human_block:
+            parts.append(human_block)
         if palace_block:
             parts.append(palace_block)
         if projects_block:

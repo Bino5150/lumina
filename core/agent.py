@@ -145,23 +145,6 @@ class LuminaAgent:
         from tools.pin import register_pin_tools
         register_pin_tools(self.registry, channel_id)
 
-        from core.persistence import load as load_prefs
-        if owner:
-            _bio = load_prefs().get("human_bio", "").strip()
-            if _bio:
-                self.ctx.system_prompt += f"\n\n## About {config.USER_NAME}\n{_bio}"
-        else:
-            # Deliberately a SEPARATE field from human_bio, not a filtered
-            # view of it. human_bio is private context the owner writes for
-            # themselves and edits freely; human_bio_public is a short blurb
-            # the owner explicitly curates for strangers. Coupling non-owner
-            # exposure to the same field owners edit unthinkingly is what
-            # caused the S35b leak in the first place — empty by default,
-            # nothing shown until the owner deliberately writes one.
-            _public_bio = load_prefs().get("human_bio_public", "").strip()
-            if _public_bio:
-                self.ctx.system_prompt += f"\n\n## About {config.USER_NAME}\n{_public_bio}"
-
         init_skills_db()
         register_skills_tools(self.registry)   
         register_chat_history_tools(self.registry) 
@@ -198,6 +181,7 @@ class LuminaAgent:
         # registered after the snapshot were never added to _disabled and
         # came up enabled by default.
         if owner:
+            from core.persistence import load as load_prefs
             _disabled_tools = load_prefs().get("disabled_tools", [])
             if _disabled_tools:
                 self.registry.set_disabled(_disabled_tools)
@@ -413,17 +397,6 @@ class LuminaAgent:
         if "system_prompt" in persona:
             self.current_persona = persona  # so Settings can recombine on a live prompt edit
             new_prompt = config.SYSTEM_PROMPT + "\n\n" + persona["system_prompt"]
-            from core.persistence import load as load_prefs
-            if self.owner:
-                bio = load_prefs().get("human_bio", "").strip()
-                if bio:
-                    new_prompt += f"\n\n## About {config.USER_NAME}\n{bio}"
-            else:
-                # See __init__ for why this is a separate field, not a
-                # filtered view of human_bio.
-                public_bio = load_prefs().get("human_bio_public", "").strip()
-                if public_bio:
-                    new_prompt += f"\n\n## About {config.USER_NAME}\n{public_bio}"
             self.ctx.update_system_prompt(new_prompt)
 
         # 3. Tool set — single source of truth, see core/tool_profiles.py.

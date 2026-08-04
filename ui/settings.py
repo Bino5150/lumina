@@ -337,11 +337,6 @@ class GeneralTab(QWidget):
             # this, "Apply Change" would silently discard the persona's
             # identity text entirely -- a flat replace, not a preview.
             new_prompt = p + "\n\n" + persona["system_prompt"]
-            from core.persistence import load as load_prefs
-            if self.agent.owner:
-                bio = load_prefs().get("human_bio", "").strip()
-                if bio:
-                    new_prompt += f"\n\n## About {config.USER_NAME}\n{bio}"
             self.agent.ctx.update_system_prompt(new_prompt)
         else:
             self.agent.ctx.update_system_prompt(p)
@@ -516,6 +511,14 @@ class UserProfileTab(QWidget):
         layout.addWidget(self.human_bio)
         self.human_bio.textChanged.connect(self._autosave_bio)
 
+        layout.addWidget(_lbl("Lumina's notes about you -- refined automatically over time. Edit freely if it drifts.", self.c))
+        self.human_profile_curated = _te(
+            self._prefs.get("human_profile_curated", ""),
+            self.c, height=120
+        )
+        layout.addWidget(self.human_profile_curated)
+        self.human_profile_curated.textChanged.connect(self._autosave_curated_profile)
+
         # ── Your Avatar ──
         layout.addWidget(_sec("YOUR AVATAR", self.c))
         av_row = QHBoxLayout()
@@ -588,17 +591,13 @@ class UserProfileTab(QWidget):
         self._prefs["user_name"] = config.USER_NAME
         self._prefs["human_bio"] = self.human_bio.toPlainText().strip()
         persistence.save(self._prefs)
-        bio = self._prefs["human_bio"]
-        if bio:
-            import re
-            current = self.agent.ctx.system_prompt
-            cleaned = re.sub(r"\n\n## About[^\n]*\n.*", "", current, flags=re.DOTALL)
-            self.agent.ctx.update_system_prompt(
-                cleaned + f"\n\n## About {config.USER_NAME}\n{bio}"
-            )
 
     def _autosave_bio(self):
         self._prefs["human_bio"] = self.human_bio.toPlainText().strip()
+        persistence.save(self._prefs)
+
+    def _autosave_curated_profile(self):
+        self._prefs["human_profile_curated"] = self.human_profile_curated.toPlainText().strip()
         persistence.save(self._prefs)
 
 # ── Tab: Memory ────────────────────────────────────────────────────────────────
