@@ -59,7 +59,13 @@ def score_task(record: dict, task: dict) -> dict:
     called_names = {c["name"] for c in all_tool_calls}
     selection_correct = None
     if expected is not None:
-        selection_correct = (len(called_names) == 0) if len(expected) == 0 else bool(called_names & set(expected))
+        if len(expected) == 0:
+            if task.get("category") == "no_matching_tool":
+                selection_correct = len(hallucinated) == 0
+            else:
+                selection_correct = len(called_names) == 0
+        else:
+            selection_correct = bool(called_names & set(expected))
 
     keywords = task.get("completion_keywords", [])
     normalized_response = _normalize_numbers(final_response).lower()
