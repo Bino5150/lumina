@@ -1,6 +1,4 @@
-import os
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from ui.chat_widget import md_to_html
+from core.chat_render import md_to_html
 _COLORS = {"accent": "#00ffcc"}  # md_to_html only reads colors["accent"] outside code fences
 _DIFF_SAMPLE = """```diff
 --- a/foo.py
