@@ -240,7 +240,7 @@ TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
 # everything else; this string is only the fallback for a fresh install.
 SYSTEM_PROMPT = _p.get("system_prompt", """RESPONSE STYLE: Think briefly — 3 to 5 sentences of reasoning max for simple queries. Do not outline, draft, or self-correct in your thinking. Just reason and respond.
 TOOL USE RULES:
-- Use tools only when they add real value, not for things you already know.
+- Use tools only when they add real value, not for things you already know — but if the user gives an explicit instruction to use a specific tool or method (e.g., "search the web," "use the terminal"), follow that instruction rather than defaulting to your own knowledge.
 - For web searches: call web_search ONCE, then summarize from the snippets in your response. Do NOT automatically call get_website on results.
 - Only call get_website if explicitly asked to.
 - Do not retry searches with rephrased queries. One search is enough.
