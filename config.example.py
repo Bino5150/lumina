@@ -194,6 +194,18 @@ DREAM_SWEEP_ENABLED = _p.get("dream_sweep_enabled", True)
 DREAM_MIN_TOKENS    = _p.get("dream_min_tokens", 900)
 DREAM_IDLE_MINUTES  = _p.get("dream_idle_minutes", 13)
 
+# Subagents + background/scheduled tasks — same prefs-backed pattern as the
+# flags above, own flags rather than sharing one (same precedent as
+# HUMAN_PROFILE_CURATION_ENABLED getting its own flag instead of riding on
+# DREAM_SWEEP_ENABLED). Independent of each other: BACKGROUND_TASKS_ENABLED
+# can be on while SUBAGENTS_ENABLED stays off, since background tasks call
+# spawn_subagent() as a plain function, not through the model-facing tool
+# registry. MAX_SUBAGENT_DEPTH is a hard limit, not a preference — kept as a
+# bare constant rather than prefs-backed like its neighbors above.
+SUBAGENTS_ENABLED = _p.get("subagents_enabled", False)
+BACKGROUND_TASKS_ENABLED = _p.get("background_tasks_enabled", False)
+MAX_SUBAGENT_DEPTH = 2
+
 # Chat UI — show/hide the model's <think> reasoning block in the chat
 # window. Purely a display toggle: the model still reasons and those tokens
 # still stream in either case, this just controls whether the UI renders

@@ -87,7 +87,9 @@ class LuminaAgent:
                  on_response_token=None,
                  tts=None,
                  owner: bool = True,
-                 channel_id: str = "default"):
+                 channel_id: str = "default",
+                 depth: int = 0,
+                 backend: str = None):
         """
         Streaming callbacks:
           on_tool_call(name, args)     — tool about to execute
@@ -101,9 +103,16 @@ class LuminaAgent:
         on behalf of a channel, subagent, or scheduled task — no implicit
         default, every call site decides this explicitly.
         channel_id: groups PIN verification/lockout state per channel.
+        depth: subagent nesting level, 0 for any top-level agent (desktop, Telegram,
+            Discord, background tasks). Only ever incremented by spawn_subagent()
+            itself when constructing a child — never accept this from a tool-call
+            argument, the model must never set its own depth.
+        backend: optional backend name override, passed straight to get_llm_backend().
+            None (default) preserves current behavior — config.LLM_BACKEND.
         """
-        self.llm = get_llm_backend()
+        self.llm = get_llm_backend(name=backend)
         self.owner = owner
+        self._subagent_depth = depth
         self.ctx = ContextManager(owner=owner)
         self.registry = ToolRegistry()
         self.channel_id = channel_id
@@ -126,6 +135,7 @@ class LuminaAgent:
         self.current_persona = None  # set by apply_persona() -- lets Settings recombine the global prompt + persona identity when the global prompt is live-edited
         self._session_tool_calls = 0       # total tool calls this session
         self._skill_nudge_sent   = False   # only nudge once per session
+        self._background_task_ids: set = set()  # dispatched background/scheduled task_ids awaiting an ephemeral completion notice; only meaningful for owner=True desktop sessions, harmless elsewhere
 
         init_memory_db()
         init_chat_db()
@@ -174,6 +184,21 @@ class LuminaAgent:
         if _loaded_custom:
             print(f"[AGENT] Loaded approved custom tools: {', '.join(_loaded_custom)}", flush=True)
 
+        # Subagents + background/scheduled tasks — own flags, independent of
+        # each other (see config.py). Registered unconditionally by owner —
+        # a non-owner subagent can itself spawn a further subagent (subject
+        # to MAX_SUBAGENT_DEPTH), it just won't have spawn_subagent actually
+        # enabled unless the parent explicitly granted it via tools_enabled;
+        # the default-deny sweep below still applies to non-owner sessions
+        # same as every other tool registered above.
+        if config.SUBAGENTS_ENABLED:
+            from tools.subagent import register_subagent_tools
+            register_subagent_tools(self.registry, self._subagent_depth)
+
+        if config.BACKGROUND_TASKS_ENABLED:
+            from tools.tasks import register_task_tools
+            register_task_tools(self.registry, self)
+
         # Default-deny resolution runs LAST — after every register_*_tools()
         # call above. Anything registered before this line and not restored
         # by an explicit profile stays locked for non-owner sessions. Moving
@@ -211,7 +236,46 @@ class LuminaAgent:
         self.ctx.add_user(user_input, source=source)
         tools_used_this_turn = set()
         think_step = [0]
-        
+
+        # Background/scheduled task completions surface as a one-turn
+        # ephemeral injection, same mechanism as skill docs below. owner=True
+        # only — _background_task_ids is only ever populated by this agent's
+        # own registered run_background_subagent/schedule_background_subagent
+        # tool wrappers (tools/tasks.py), only reachable from a real session.
+        # push_ephemeral() OVERWRITES rather than appends (core/context.py) —
+        # collected here into task_summaries and combined with skills_block
+        # below into a single call, instead of two push_ephemeral() calls
+        # that would silently stomp each other.
+        # getattr, not direct attribute access -- several existing unit tests
+        # (test_agent_tool_budget.py, test_agent_tool_continuation.py) call
+        # LuminaAgent.chat(fake_self, ...) unbound against a minimal
+        # types.SimpleNamespace stand-in that only sets ctx/registry/llm.
+        # Real LuminaAgent instances always have both attributes from
+        # __init__; this is purely so those lighter-weight fakes keep working
+        # unchanged rather than needing every one of them updated.
+        task_summaries = []
+        if getattr(self, "owner", False) and getattr(self, "_background_task_ids", None):
+            from core.task_queue import get_task_result
+            for tid in list(self._background_task_ids):
+                r = get_task_result(tid)
+                if r is None or r["status"] in ("success", "error"):
+                    self._background_task_ids.discard(tid)
+                    if r is None:
+                        continue
+                    if r["status"] == "success":
+                        # spawn_subagent() never raises, so a "success" task_queue
+                        # status wraps spawn_subagent's OWN {"success","result","error"}
+                        # dict, not a plain string — unwrap it rather than dumping
+                        # the raw dict repr into the prompt.
+                        inner = r["result"]
+                        if isinstance(inner, dict) and "success" in inner:
+                            summary = inner["result"] if inner["success"] else f"failed: {inner['error']}"
+                        else:
+                            summary = str(inner)
+                    else:
+                        summary = f"failed: {r['result']}"
+                    task_summaries.append(f"[Background task {tid} completed: {summary}]")
+
         # Inject relevant skill docs into system prompt for this turn.
         # Skill injection is a nice-to-have — never allowed to kill the turn.
         # (Image turns pass multipart list content in; build_skills_block is
@@ -221,8 +285,10 @@ class LuminaAgent:
         except Exception as e:
             print(f"[SKILLS] build_skills_block skipped: {e}", flush=True)
             skills_block = ""
-        if skills_block:
-            self.ctx.push_ephemeral(skills_block)
+
+        ephemeral_parts = task_summaries + ([skills_block] if skills_block else [])
+        if ephemeral_parts:
+            self.ctx.push_ephemeral("\n\n".join(ephemeral_parts))
 
         # MB-03 — soft ceiling, warning only. No mechanism yet exists to narrow
         # tool schemas to fit (that's MB-10's job); this just turns "we don't know
