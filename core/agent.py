@@ -321,9 +321,17 @@ class LuminaAgent:
                         # chance to surface it at all -- nothing to retry.
                         self._background_task_ids.discard(tid)
                         continue
-                    if r["status"] not in ("success", "error"):
+                    if r["status"] not in ("success", "error", "cancelled"):
                         continue  # still running/scheduled
-                    if r["status"] == "success":
+                    if r["status"] == "cancelled":
+                        # S51 Part C — cancel_task() (core/task_queue.py) lets
+                        # the Scheduled Tasks Settings tab cancel a task this
+                        # agent doesn't otherwise hear about. Terminal, same
+                        # as success/error -- must not sit here silently
+                        # until task_queue's own RESULT_TTL_SECONDS expiry
+                        # eventually cleans it up unsurfaced.
+                        summary = "cancelled before it started"
+                    elif r["status"] == "success":
                         # spawn_subagent() never raises, so a "success" task_queue
                         # status wraps spawn_subagent's OWN {"success","result","error"}
                         # dict, not a plain string — unwrap it rather than dumping

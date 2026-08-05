@@ -71,7 +71,7 @@ def schedule_task(run_at: float, fn, *args, task_id: str = None, **kwargs) -> st
 
 def get_task_result(task_id: str):
     """Returns {"status", "result", "completed_at"} or None if unknown/expired.
-    status is one of: "scheduled", "running", "success", "error"."""
+    status is one of: "scheduled", "running", "success", "error", "cancelled"."""
     with _results_lock:
         entry = _results.get(task_id)
         if entry is None:
@@ -86,6 +86,36 @@ def list_active_tasks() -> list:
     """task_ids currently running or scheduled (not yet fired)."""
     with _results_lock:
         return [tid for tid, e in _results.items() if e["status"] in ("running", "scheduled")]
+
+
+def list_all_tasks() -> list:
+    """task_ids in any status still tracked -- scheduled, running, or a
+    completed success/error result not yet past RESULT_TTL_SECONDS. Used
+    by the Scheduled Tasks UI tab (S51 Part C) to show a full recent-tasks
+    view, not just what's still active like list_active_tasks() above."""
+    with _results_lock:
+        return list(_results.keys())
+
+
+def cancel_task(task_id: str) -> bool:
+    """Cancel a task that hasn't started running yet -- i.e. still sitting
+    in the scheduled heap, never dispatched to the executor. Returns True if
+    cancelled, False if task_id isn't in the scheduled heap (already
+    running, already completed, or never existed). Once dispatched to
+    ThreadPoolExecutor there's no way to interrupt a thread already
+    executing arbitrary work -- deliberately no "cancel a running task"
+    path, only "not yet started" as scoped."""
+    with _scheduled_lock:
+        for i, (run_at, tid, fn, args, kwargs) in enumerate(_scheduled):
+            if tid == task_id:
+                del _scheduled[i]
+                heapq.heapify(_scheduled)
+                break
+        else:
+            return False
+    with _results_lock:
+        _results[task_id] = {"status": "cancelled", "result": None, "completed_at": time.time()}
+    return True
 
 
 def _ensure_scheduler_running():

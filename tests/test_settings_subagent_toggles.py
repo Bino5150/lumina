@@ -74,6 +74,33 @@ def test_toggling_subagents_off_disables_without_unregistering(tab):
     assert persistence.load()["subagents_enabled"] is False
 
 
+def test_toggling_on_off_on_does_not_duplicate_registration(tab):
+    """The live-apply handlers call register_subagent_tools()/
+    register_task_tools() again on every re-enable, on the assumption that
+    re-registering an already-registered name is a harmless overwrite, not
+    a duplicate entry. Verified directly here, not just inferred from
+    ToolRegistry.register()'s dict-keyed-by-name implementation -- toggle
+    on, off, on again, and confirm the tool count and callability are
+    unaffected by having gone through registration twice."""
+    tab.subagents_enabled_cb.setChecked(True)
+    count_after_first_on = len(tab.agent.registry.all_tool_names())
+
+    tab.subagents_enabled_cb.setChecked(False)
+    tab.subagents_enabled_cb.setChecked(True)
+
+    assert len(tab.agent.registry.all_tool_names()) == count_after_first_on
+    assert tab.agent.registry.is_enabled("spawn_subagent")
+
+    # Same check for the three background-task tools.
+    tab.background_tasks_enabled_cb.setChecked(True)
+    count_after_bg_on = len(tab.agent.registry.all_tool_names())
+    tab.background_tasks_enabled_cb.setChecked(False)
+    tab.background_tasks_enabled_cb.setChecked(True)
+    assert len(tab.agent.registry.all_tool_names()) == count_after_bg_on
+    for name in ("run_background_subagent", "check_background_task", "schedule_background_subagent"):
+        assert tab.agent.registry.is_enabled(name)
+
+
 def test_toggling_background_tasks_on_registers_all_three_tools(tab):
     tab.background_tasks_enabled_cb.setChecked(True)
 

@@ -239,3 +239,20 @@ def test_task_queue_result_persistence_untouched_by_retry_discard(monkeypatch):
     assert r_after is not None
     assert r_after["status"] == "success"
     assert r_after["result"] == "a real result"
+
+
+def test_cancelled_task_is_treated_as_terminal(monkeypatch):
+    """S51 Part C added cancel_task() (core/task_queue.py), which a user can
+    trigger from the Scheduled Tasks Settings tab without this agent
+    otherwise hearing about it. "cancelled" must be treated as terminal the
+    same as success/error -- not left to sit in _background_task_ids
+    indefinitely (until task_queue's own RESULT_TTL_SECONDS eventually
+    expires it, unsurfaced)."""
+    monkeypatch.setattr(task_queue, "get_task_result", lambda tid: _fake_result(status="cancelled", result=None))
+    fake_self = _fake_agent(response_text="some unrelated reply",
+                             background_task_ids={"tid1"})
+
+    LuminaAgent.chat(fake_self, "hello")
+
+    assert "tid1" in fake_self._background_task_ids  # first injection, same as success/error
+    assert "cancelled" in fake_self._background_task_notifications["tid1"]["summary"].lower()
