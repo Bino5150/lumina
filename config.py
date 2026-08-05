@@ -208,11 +208,15 @@ HUMAN_PROFILE_CURATION_ENABLED = _p.get("human_profile_curation_enabled", False)
 # DREAM_SWEEP_ENABLED). Independent of each other: BACKGROUND_TASKS_ENABLED
 # can be on while SUBAGENTS_ENABLED stays off, since background tasks call
 # spawn_subagent() as a plain function, not through the model-facing tool
-# registry. MAX_SUBAGENT_DEPTH is a hard limit, not a preference — kept as a
-# bare constant rather than prefs-backed like its neighbors above.
+# registry. MAX_SUBAGENT_DEPTH shipped as a bare constant (S51 Part A) on
+# the reasoning that a hard limit shouldn't be a preference — revisited in
+# S51 Part B: the Settings UI needs it to actually persist across restarts
+# once it's user-editable there, so it's prefs-backed now too. Still a hard
+# limit in the sense that the code always enforces whatever value is set —
+# this only changes where the number itself lives.
 SUBAGENTS_ENABLED = _p.get("subagents_enabled", False)
 BACKGROUND_TASKS_ENABLED = _p.get("background_tasks_enabled", False)
-MAX_SUBAGENT_DEPTH = 2
+MAX_SUBAGENT_DEPTH = _p.get("max_subagent_depth", 2)
 
 # Chat UI — show/hide the model's <think> reasoning block in the chat
 # window. Purely a display toggle: the model still reasons and those tokens

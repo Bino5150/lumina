@@ -988,6 +988,44 @@ class ToolsTab(QWidget):
 
         layout.addWidget(profile_frame)
 
+        # ── Subagents & Background Tasks (S51 Part B) ────────────────────
+        # A human-owner config surface, not a model-controllable one — the
+        # model can never set its own SUBAGENTS_ENABLED/BACKGROUND_TASKS_ENABLED/
+        # MAX_SUBAGENT_DEPTH regardless of what these widgets are set to.
+        # Placed here rather than GeneralTab: these two toggles gate TOOL
+        # REGISTRATION (spawn_subagent / run_background_subagent /
+        # check_background_task / schedule_background_subagent) the same way
+        # everything else in this tab manages tool availability — checked
+        # immediately on toggle, same as the per-tool checkboxes in the table
+        # below, not batched behind a separate Save button.
+        layout.addWidget(_sec("SUBAGENTS & BACKGROUND TASKS", self.c))
+        layout.addWidget(_lbl(
+            "Gates the model-facing spawn_subagent tool and the background/"
+            "scheduled task queue. Both default off. Independent of each "
+            "other — background tasks call spawn_subagent() as a plain "
+            "function, not through this tool registry.", self.c
+        ))
+        subagent_row = QHBoxLayout()
+        subagent_row.setSpacing(20)
+        self.subagents_enabled_cb = QCheckBox("Enable subagent spawning")
+        self.subagents_enabled_cb.setChecked(config.SUBAGENTS_ENABLED)
+        self.subagents_enabled_cb.toggled.connect(self._on_subagents_toggled)
+        subagent_row.addWidget(self.subagents_enabled_cb)
+        self.background_tasks_enabled_cb = QCheckBox("Enable background/scheduled tasks")
+        self.background_tasks_enabled_cb.setChecked(config.BACKGROUND_TASKS_ENABLED)
+        self.background_tasks_enabled_cb.toggled.connect(self._on_background_tasks_toggled)
+        subagent_row.addWidget(self.background_tasks_enabled_cb)
+        depth_col = QVBoxLayout()
+        depth_col.addWidget(_lbl(
+            "Max Subagent Depth — recursion limit for subagents spawning "
+            "further subagents. Shipped default: 2.", self.c
+        ))
+        self.subagent_depth_spin = _spin(config.MAX_SUBAGENT_DEPTH, 1, 5, 1, self.c)
+        self.subagent_depth_spin.editingFinished.connect(self._on_subagent_depth_changed)
+        depth_col.addWidget(self.subagent_depth_spin)
+        subagent_row.addLayout(depth_col)
+        layout.addLayout(subagent_row)
+
         # ── Pending tools review (S41) ──────────────────────────────────
         # The only thing this replaces is scripts/approve_tool.py's ROLE of
         # "run against the live agent, no restart" — not its safety property.
@@ -1223,6 +1261,58 @@ class ToolsTab(QWidget):
             self.agent.registry.disable(name)
         self._save_state()
         self._update_count()
+
+    def _on_subagents_toggled(self, checked: bool):
+        """SUBAGENTS_ENABLED — config.py value, persisted to prefs.json like
+        DREAM_SWEEP_ENABLED, applied to the live agent immediately (no
+        restart) rather than only taking effect on next launch. Tool
+        registration is a one-time decision baked into the registry at
+        LuminaAgent.__init__, so flipping the config flag alone wouldn't
+        retroactively register/unregister spawn_subagent on an already-
+        constructed agent — re-run the same registration call __init__
+        uses, then explicitly enable/disable so a prior disable() from an
+        earlier off-toggle this session doesn't linger."""
+        config.SUBAGENTS_ENABLED = checked
+        prefs = persistence.load()
+        prefs["subagents_enabled"] = checked
+        persistence.save(prefs)
+        if checked:
+            from tools.subagent import register_subagent_tools
+            register_subagent_tools(self.agent.registry, self.agent._subagent_depth)
+            self.agent.registry.enable("spawn_subagent")
+        else:
+            self.agent.registry.disable("spawn_subagent")
+        self._load_tools()
+
+    def _on_background_tasks_toggled(self, checked: bool):
+        """BACKGROUND_TASKS_ENABLED — same live-apply reasoning as
+        _on_subagents_toggled above, for the three background-task tools."""
+        config.BACKGROUND_TASKS_ENABLED = checked
+        prefs = persistence.load()
+        prefs["background_tasks_enabled"] = checked
+        persistence.save(prefs)
+        task_tool_names = ("run_background_subagent", "check_background_task", "schedule_background_subagent")
+        if checked:
+            from tools.tasks import register_task_tools
+            register_task_tools(self.agent.registry, self.agent)
+            for name in task_tool_names:
+                self.agent.registry.enable(name)
+        else:
+            for name in task_tool_names:
+                self.agent.registry.disable(name)
+        self._load_tools()
+
+    def _on_subagent_depth_changed(self):
+        """MAX_SUBAGENT_DEPTH — re-read live on every spawn_subagent()/
+        register_subagent_tools() call rather than captured once at
+        registration time, so unlike the two toggles above this needs no
+        registry surgery to apply immediately; persisting to config.py +
+        prefs.json is the whole job here."""
+        value = self.subagent_depth_spin.value()
+        config.MAX_SUBAGENT_DEPTH = value
+        prefs = persistence.load()
+        prefs["max_subagent_depth"] = value
+        persistence.save(prefs)
 
     def _disable_all(self):
         for name in self.agent.registry.list_tools():

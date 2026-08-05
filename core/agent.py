@@ -36,6 +36,14 @@ from tools.git_branches import register_git_branches_tool
 
 CHAIN_BLOCKED_AFTER_SEARCH = {"get_website", "web_search"}
 
+# S51 Part D — how many turns a completed background-task note gets
+# re-injected via push_ephemeral() before chat() gives up trying to surface
+# it automatically. task_queue's own RESULT_TTL_SECONDS (core/task_queue.py)
+# keeps the actual result available well past this regardless — this only
+# bounds the automatic notify-later attempts, not how long the result stays
+# checkable via check_background_task / the Scheduled Tasks tab.
+BACKGROUND_TASK_NOTIFY_RETRIES = 3
+
 
 def strip_think_blocks(text: str) -> str:
     if not text:
@@ -136,6 +144,7 @@ class LuminaAgent:
         self._session_tool_calls = 0       # total tool calls this session
         self._skill_nudge_sent   = False   # only nudge once per session
         self._background_task_ids: set = set()  # dispatched background/scheduled task_ids awaiting an ephemeral completion notice; only meaningful for owner=True desktop sessions, harmless elsewhere
+        self._background_task_notifications: dict = {}  # task_id -> {"summary", "attempts"} for terminal tasks mid-retry (S51 Part D) -- separate lifecycle from task_queue's own result TTL
 
         init_memory_db()
         init_chat_db()
@@ -233,7 +242,6 @@ class LuminaAgent:
         source: passed straight through to ctx.add_user(). OWNER_DIRECT (default)
         preserves current desktop behavior unchanged.
         """
-        self.ctx.add_user(user_input, source=source)
         tools_used_this_turn = set()
         think_step = [0]
 
@@ -246,6 +254,12 @@ class LuminaAgent:
         # collected here into task_summaries and combined with skills_block
         # below into a single call, instead of two push_ephemeral() calls
         # that would silently stomp each other.
+        #
+        # Runs BEFORE ctx.add_user() below, deliberately — the "was last
+        # turn's injected note referenced" check reads self.ctx.history[-1],
+        # which is only still last turn's assistant response if we look
+        # before this turn's user message gets appended.
+        #
         # getattr, not direct attribute access -- several existing unit tests
         # (test_agent_tool_budget.py, test_agent_tool_continuation.py) call
         # LuminaAgent.chat(fake_self, ...) unbound against a minimal
@@ -256,12 +270,59 @@ class LuminaAgent:
         task_summaries = []
         if getattr(self, "owner", False) and getattr(self, "_background_task_ids", None):
             from core.task_queue import get_task_result
-            for tid in list(self._background_task_ids):
-                r = get_task_result(tid)
-                if r is None or r["status"] in ("success", "error"):
+            notifications = getattr(self, "_background_task_notifications", None)
+            if notifications is None:
+                notifications = {}
+
+            # Step 1 — a note injected last turn either got referenced by
+            # the model's own response, or it didn't. Bug #2 (S51 Part A):
+            # discarding unconditionally on terminal status meant a note
+            # shown exactly once, with no retry, silently vanished forever
+            # the moment the model's attention went elsewhere that turn —
+            # which live testing showed is the common case, not an edge
+            # case. Detection is deliberately crude (a short substring
+            # check), not sophisticated content-matching — the bounded
+            # retry count below is the real backstop, not this check.
+            #
+            # \b word-boundary wrap, not a bare substring check — the live
+            # scenario's own summary was a bare "144", and a plain `in`
+            # check would false-positive against "1445", "20144", etc.
+            # Short numeric summaries (counts, calculations, IDs) are the
+            # common case for task-queue-adjacent work, not a hypothetical
+            # edge case, so this is worth the two extra lines even under
+            # "don't over-engineer" — it's still not semantic
+            # acknowledgment-detection, just a tighter substring match.
+            last_assistant_text = ""
+            if self.ctx.history and self.ctx.history[-1].get("role") == "assistant":
+                last_assistant_text = str(self.ctx.history[-1].get("content") or "").lower()
+            for tid in list(notifications):
+                entry = notifications[tid]
+                snippet = entry["summary"][:40].strip().lower()
+                referenced = bool(snippet) and bool(
+                    re.search(r'\b' + re.escape(snippet) + r'\b', last_assistant_text)
+                )
+                if referenced or entry["attempts"] >= BACKGROUND_TASK_NOTIFY_RETRIES:
+                    notifications.pop(tid, None)
                     self._background_task_ids.discard(tid)
+
+            # Step 2 — build this turn's note from whatever's still tracked:
+            # tasks already mid-retry (reuse the cached summary — task_queue's
+            # own RESULT_TTL_SECONDS is a SEPARATE lifecycle from this
+            # in-memory retry state, so an expired task_queue entry doesn't
+            # cut a retry cycle short) plus any newly-terminal task reaching
+            # completion for the first time this turn.
+            for tid in list(self._background_task_ids):
+                if tid in notifications:
+                    summary = notifications[tid]["summary"]
+                else:
+                    r = get_task_result(tid)
                     if r is None:
+                        # Expired out of task_queue before we ever got a
+                        # chance to surface it at all -- nothing to retry.
+                        self._background_task_ids.discard(tid)
                         continue
+                    if r["status"] not in ("success", "error"):
+                        continue  # still running/scheduled
                     if r["status"] == "success":
                         # spawn_subagent() never raises, so a "success" task_queue
                         # status wraps spawn_subagent's OWN {"success","result","error"}
@@ -274,7 +335,14 @@ class LuminaAgent:
                             summary = str(inner)
                     else:
                         summary = f"failed: {r['result']}"
-                    task_summaries.append(f"[Background task {tid} completed: {summary}]")
+                    notifications[tid] = {"summary": summary, "attempts": 0}
+
+                task_summaries.append(f"[Background task {tid} completed: {summary}]")
+                notifications[tid]["attempts"] += 1
+
+            self._background_task_notifications = notifications
+
+        self.ctx.add_user(user_input, source=source)
 
         # Inject relevant skill docs into system prompt for this turn.
         # Skill injection is a nice-to-have — never allowed to kill the turn.
