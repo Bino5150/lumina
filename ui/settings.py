@@ -1125,7 +1125,7 @@ class ToolsTab(QWidget):
         note.setStyleSheet(f"color:{self.c['text_dim']};font-size:11px;font-style:italic;background:transparent;")
         layout.addWidget(note)
 
-    def _load_pending_tools(self):
+    def _load_pending_tools(self, preserve_status: bool = False):
         """List whatever's staged in tools/_pending/ — same directory
         create_tool() writes to and scripts/approve_tool.py --list reads."""
         from tools.toolmaker import PENDING_DIR
@@ -1139,9 +1139,10 @@ class ToolsTab(QWidget):
         self.pending_preview.clear()
         self.pending_approve_btn.setEnabled(False)
         self.pending_reject_btn.setEnabled(False)
-        self.pending_status_lbl.setText(
-            "" if self._pending_names else "Nothing pending review."
-        )
+        if not preserve_status:
+            self.pending_status_lbl.setText(
+                "" if self._pending_names else "Nothing pending review."
+            )
 
     def _on_pending_selected(self):
         rows = self.pending_list.selectionModel().selectedRows()
@@ -1182,7 +1183,7 @@ class ToolsTab(QWidget):
         from tools.toolmaker import approve_pending_tool
         result = approve_pending_tool(name, self.agent.registry)
         self.pending_status_lbl.setText(result)
-        self._load_pending_tools()
+        self._load_pending_tools(preserve_status=True)
         self._load_tools()  # refresh the enabled-tools table below — new tool is now live
 
     def _reject_pending(self):
@@ -1204,7 +1205,7 @@ class ToolsTab(QWidget):
             self.pending_status_lbl.setText(f"Discarded '{name}'.")
         except Exception as e:
             self.pending_status_lbl.setText(f"Error rejecting '{name}': {e}")
-        self._load_pending_tools()
+        self._load_pending_tools(preserve_status=True)
 
     def _load_profiles(self):
         """Populate the profile dropdown from tool_profiles/ directory."""
