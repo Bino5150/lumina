@@ -14,8 +14,10 @@ A full featured, powerful, and efficient local-first AI Agentic Harness/Desktop 
 - ⚡ Native PySide6/Qt desktop UI
 - 🔄 Runtime backend switching
 - 📁 Codebase indexing
-- 🔧 60+ pre-installed tools, plus the ability to create more
+- 🔧 70+ pre-installed tools, plus the ability to create more
 - 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe)
+- 🧩 Specialized sub-agents for delegated tasks
+- ⏰ Background and scheduled task execution
 
 ## Included Personas
 - 🤖 Lumina
@@ -55,13 +57,31 @@ The third pillar: the agent should be an extension of the user, not a generic pr
 
 
 ## Backend Abstraction
-Lumina's LLM layer is fully abstracted. If you want to swap backends, you change one setting. Out of the box, she ships with:
+Lumina's LLM layer is fully abstracted behind one shared interface, so swapping backends is a Settings dropdown, not a code change. Out of the box, she ships with fourteen:
+
+**Local**
 - llama.cpp (primary, recommended)
-- LM Studio compatibility
-- Ollama compatibility
-- vLLM compatibility
-- Now supports cloud models and custom endpoints 
-All backends implement the same interface. A backend change takes effect immediately without restarting the application.
+- LM Studio
+- Ollama
+- vLLM
+
+**Self-hosted gateway**
+- OmniRoute — routes through a local endpoint you run yourself to 200+ upstream providers, many free
+
+**Cloud, native**
+- Anthropic (Claude)
+- Google (Gemini)
+- OpenAI
+- Moonshot (Kimi)
+- Alibaba (Qwen / DashScope)
+
+**Cloud, OpenAI-compatible**
+- OpenRouter
+- DeepSeek
+- Groq
+- Any other OpenAI-compatible endpoint via the generic Custom slot
+
+All fourteen implement the same interface, and each one remembers its own context window and memory-injection limits independently — switching from a 16k local llama.cpp session to a 1M-token Gemini session doesn't drag stale settings along with it. A backend change takes effect immediately, no restart required.
 
 
 ## Security Architecture
@@ -79,7 +99,7 @@ This isn't theoretical hardening for its own sake — it's what makes it safe to
 
 ## Comms — Reach Her From Anywhere
 
-Lumina doesn't have to stay on your desktop. Two remote channels are cuuently live, and both share the same underlying trust architecture described above — they just sit at different points on it.
+Lumina doesn't have to stay on your desktop. Two remote channels are currently live, and both share the same underlying trust architecture described above — they just sit at different points on it.
 
 **Telegram — full trust, your pocket.** Message her from your phone and she responds with the exact same toolset, memory access, and permissions she has sitting in front of you — filesystem, code execution, browser automation, all of it. This works because the channel is locked to a single chat ID at the code level; anyone else who finds the bot's username gets silently ignored, no reply, no acknowledgment. Set up through the Communications tab in Settings — bot token, chat ID, done. TELEGRAM_SETUP.md covers the manual/legacy path (BotFather token creation, config.py fallback) if you'd rather not use the GUI. See `TELEGRAM_SETUP.md` for manual setup.
 
@@ -91,12 +111,12 @@ Both channels, plus a curated "public bio" separate from her private one, are co
 ## Memory
 Most agents fall short with memory. They don’t remember what you talked about yesterday, the project you started last week, what your favorite color is, or even who you are. Every time you start a session, it’s a blank slate. It doesn’t persist. Lumina has a multi-tier memory persistence system. She learns, she grows, she gets smarter, and she evolves.
 
-Her multi-tier framework is a series of different related memory functions that operate together in unison as a whole. She has a basic memory function for facts, events, people, etc. But she also has a layered MemPalace with Temporal Decaying weights and logic attachments. She has Chat History Search. She has Projects, which tag conversations relating to the project. She creates Skills. She indexes codebases, including her own. There’s a “My Human” user bio section. She has a database for people she meets. She has a Knowledge Base where both you and Lumina can store information, documents and files, things to remember and reference later.  
+Her multi-tier framework is a series of different related memory functions that operate together in unison as a whole. She has a basic memory function for facts, events, people, etc. But she also has a layered MemPalace with Temporal Decaying weights and logic attachments. She has Chat History Search. She has Projects, which tag conversations relating to the project. She creates Skills. She indexes codebases, including her own. There’s My Human — a profile that starts with what you tell her and keeps growing on its own from there. (More below.) She has a database for people she meets. She has a Knowledge Base where both you and Lumina can store information, documents and files, things to remember and reference later.  
 
 ### Basic Agent Memory
 She has a basic memory function, flat weighted, “Let me jot this down so I don’t forget” memory. 
 
-# Memory — The MemPalace
+### Memory — The MemPalace
 This is where Lumina gets genuinely unusual.
 Most "memory" implementations in local AI tools are a dump: embed some text, shove it into a vector database, retrieve the top-K chunks. It works, but it doesn't produce understanding. It produces retrieval.
 Lumina's memory system is a three-layer architecture called the MemPalace.
@@ -109,28 +129,36 @@ L2 holds recent, session-based knowledge — ongoing projects, recent decisions,
 
 The MemPalace uses AAAK compression to fit more meaningful content in fewer tokens, and is stored in SQLite with a FTS5 full-text search index. All three layers are automatically injected into the system prompt on every turn. Lumina always knows who you are, what you've been working on, and what matters.
 
-**Dreaming** 
+### Dreaming 
 Most agents only remember what you explicitly tell them to remember. Lumina does that too — but she also dreams.
 
 When a session goes idle, Lumina quietly reviews what was actually said and worked on, distills it into a compact summary, and writes it to a dedicated nightstand — a memory space that's deliberately separate from her curated MemPalace wings. Nothing gets promoted to her permanent identity or critical-fact layers automatically. Ever. A dream is a first draft of a memory, not a fact — it's tagged with its own provenance (dream-sweep), fully reviewable, and fully undoable, so nothing she synthesizes on her own quietly becomes something she "just knows" without you ever having seen it.
 
 This isn't passive logging. It's the same synthesis mechanism her context-compaction system uses under memory pressure, fired proactively instead of reactively — one mechanism, two triggers, same discipline about never letting unattended writes outrank things you told her directly.
 
+### My Human
+Most AI assistants that claim to "know you" have exactly one mechanism for it: a bio field you fill out once and never touch again, quietly going stale as your life, your projects, and your hardware change around it.
 
-## Chat History Search
+My Human is two tiers instead of one. The first is your own bio — whatever you write about yourself in Settings, and the one fact Lumina will never argue with. It's the anchor: authoritative, permanent, changed only when you change it.
+
+The second tier is something Lumina builds herself. Riding the same idle-sweep mechanism that powers Dreaming, she periodically reviews recent conversations and quietly resynthesizes an evolving picture of who you are and what you're working on — the things you never explicitly told her to remember, but that came up anyway. New GPU? New project? Changed your daily driver? She notices, and her picture of you updates without you ever opening a settings field by hand.
+
+The two never fight for the last word. Reconciliation happens once, at curation time — not live, mid-conversation — and Lumina is always told your own bio is authoritative and never contradicted, so nothing you've stated about yourself gets silently overridden by something she inferred. Both fields stay visible and editable in Settings, so if her picture of you ever drifts, you can see exactly what she's inferred and correct it directly.
+
+### Chat History Search
 Full-text search over the raw message log, FTS5-indexed, available as an on-demand tool. Lumina can reach back into previous sessions, find relevant exchanges, and bring that context forward. Not a vector similarity approximation — exact full-text search.
 
-## Knowledge Base
+### Knowledge Base
 Not quite the same as memory — this is for explicit reference material you want her to be able to retrieve. Both you and Lumina can upload documents, references, study material, datasets, etc. Unlike the "chat with your document" feature (which you can also do) in the chat window, the knowledge base is permanently stored, so it's there when you need it. She can search and reference it at any time.   
 
-## The Skills System — Procedural Memory
+### The Skills System — Procedural Memory
 Beyond episodic facts, Lumina has a skills layer: a directory of procedural .md documents she can write, update, and retrieve herself. Skills are indexed via FTS5 and automatically injected into the system prompt when relevant to the current conversation.
 
 When Lumina completes a complex task — say, a multi-step build process for a CUDA project — she can write a skill documenting exactly how it was done: the flags, the gotchas, the sequence. The next time you ask about that kind of task, she surfaces it automatically before you even finish typing. Repeated workflows become more efficient.
 
 After 5 tool calls in a session, Lumina is nudged to consider whether a skill should be saved. She can also self-direct skill creation at any time. This is a memory system that gets smarter as you use it.
 
-## Projects System — Long-Term Workspace Management
+### Projects System — Long-Term Workspace Management
 Lumina can manage ongoing projects across sessions. The Projects system gives each project a persistent workspace with three components:
 - project.md — a running handoff document Lumina maintains herself, summarizing state, decisions, and next steps
 - codebase.md — a FTS5-indexed file tree map Lumina can refresh on demand, giving her a navigable map of an entire codebase
@@ -140,7 +168,7 @@ Lumina manages her own lumina-dev project this way — tracking her own source t
 Tools: create_project, load_project, update_project, refresh_codebase_index, load_codebase, link_chat, get_project_chats.
 
 ## Tools — An Agent That Actually Acts
-Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has over 60 pre-installed tools, and a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
+Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has over 70 pre-installed tools, and a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
 
 Here's what she can do:
 
@@ -181,6 +209,25 @@ One of her more unique features; Lumina can write new tools for herself. Give he
 
 **Meta-Cognition**
 Tools for Lumina to inspect and reason about her own state: what tools are available, what's in her context, what she knows about the current session. Self-awareness as a practical tool.
+
+**Subagents**
+Most agentic frameworks either fake delegation — one model juggling everything in a single context window — or hand you unrestrained parallel spawning with no guardrails. Lumina takes the middle path: real delegation, sequential and bounded.
+
+When a task calls for it, Lumina can spawn a subagent — a fully headless instance of herself with her own isolated context, given a specific task and a specific, caller-defined subset of tools, never an automatic inheritance of everything she has access to. The parent blocks until the child returns a structured result; nothing from the subagent's own conversation bleeds back into the parent's context, just the outcome.
+
+Because the architecture is backend-agnostic, a local parent can spawn a subagent on a completely different backend — hand a quick research task to a cheap cloud model while she keeps working locally, or the reverse. Depth is hard-capped at two and enforced outside the model's own control, so there's no path to a runaway recursive spawn chain. And regardless of who initiated it, a subagent runs at the same trust floor as any non-owner session — the delegation itself is trusted, but anything the subagent reads while doing its job stays exactly as untrusted as if a stranger had sent it.
+
+Off by default — spawning a second inference context is a real cost on a 4GB card — toggle it on in Settings once you've got the headroom. Cloud backends and the V100 tier make it a lot more interesting.
+
+**Scheduled & Background Tasks**
+Two flavors of the same idea: work that happens without you sitting there watching it run.
+
+Background tasks let Lumina kick off a longer job — a multi-step tool chain, a slow crawl, whatever the task needs — and hand the conversation back to you immediately instead of making you wait: "I've kicked that off, I'll let you know when it's done." The result surfaces the moment it's ready, on whatever turn you're on when it lands.
+
+Scheduled tasks are the same underlying queue, fired on a timer instead of on demand. A dedicated Scheduled Tasks panel in Settings shows what's pending, running, or finished, and lets you cancel anything still waiting its turn.
+
+Also off by default, same reasoning as subagents — flip it on in Settings when you want Lumina working in the background instead of only when you're actively talking to her.
+
 
 ## Personas — More Than Skins
 Persona support in most AI apps means a different system prompt name and a slightly different greeting. In Lumina, personas are first-class objects that carry their own identity, system prompt, voice profile, TTS assignment, and tool behavior.
@@ -273,8 +320,6 @@ Requirements:
 This is a list of some of the new features that are in some stage of development & testing on the OG dev build of Lumina, but haven't been merged with the public release yet.
 - **New Features:**
 - Email support (Lumina managing your inbox, and/or Lumina having her own gmail address)
-- Scheduled tasks/chron jobs for proactive workflow without prompting, even when you're asleep 
-- Sub-agents
 - Wake-word for complete hands-free conversation
 - iMessage support
 - Native voice cloning
