@@ -96,6 +96,9 @@ CHATTERBOX_VOICE     = _p.get("chatterbox_voice",    "lumina")
 CHATTERBOX_REF_DIR   = _p.get("chatterbox_ref_dir",  os.path.join(BASE_DIR, "assets", "voices"))
 SUPERTONIC_HOST      = _p.get("supertonic_host",     "http://localhost:7788")
 SUPERTONIC_VOICE     = _p.get("supertonic_voice",    "lumina")
+ELEVENLABS_VOICE_ID  = _p.get("elevenlabs_voice_id", "")
+ELEVENLABS_MODEL     = _p.get("elevenlabs_model",    "eleven_turbo_v2_5")
+ELEVENLABS_OUTPUT_FORMAT = _p.get("elevenlabs_output_format", "wav_22050")
 TTS_ENABLED = _p.get("tts_enabled", True)
 TTS_HOST    = _p.get("tts_host", "http://localhost:8880")
 TTS_VOICE   = _p.get("tts_voice", "af_bella")
@@ -122,6 +125,10 @@ OMNIROUTE_DEFAULT_MODEL = _p.get("omniroute_default_model", "")
 from core import secrets as _secrets
 CUSTOM_API_KEY = _secrets.get_secret("custom_api_key") or _p.get("custom_api_key", "")
 OMNIROUTE_API_KEY = _secrets.get_secret("omniroute_api_key") or _p.get("omniroute_api_key", "")
+# ElevenLabs (TTS) shares this secrets.py-first pattern too -- defined here
+# rather than up in the TTS block above because _secrets isn't imported
+# until this line.
+ELEVENLABS_API_KEY = _secrets.get_secret("elevenlabs_api_key") or _p.get("elevenlabs_api_key", "")
 
 # Context management (per-backend) — local backends are hard-capped by
 # whatever -c value the server was actually launched with; cloud backends

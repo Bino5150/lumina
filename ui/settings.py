@@ -1450,7 +1450,7 @@ class TTSTab(QWidget):
         be_col = QVBoxLayout()
         be_col.addWidget(_lbl("Backend", self.c))
         self.tts_backend_combo = QComboBox()
-        self.tts_backend_combo.addItems(["kokoro", "voicebox", "chatterbox", "supertonic", "piper"])
+        self.tts_backend_combo.addItems(["kokoro", "voicebox", "chatterbox", "supertonic", "elevenlabs", "piper"])
         self.tts_backend_combo.setCurrentText(getattr(config, "TTS_BACKEND", "kokoro"))
         self.tts_backend_combo.setFixedHeight(36)
         self.tts_backend_combo.setStyleSheet(f"""
@@ -1469,6 +1469,21 @@ class TTSTab(QWidget):
         backend_row.addLayout(be_col, 1)
         backend_row.addLayout(url_col, 3)
         layout.addLayout(backend_row)
+
+        # ── ElevenLabs API key (cloud backend -- no local host:port, so it
+        # gets its own field instead of overloading the Server URL box) ──
+        self.eleven_key_widget = QWidget()
+        ek_layout = QHBoxLayout(self.eleven_key_widget)
+        ek_layout.setContentsMargins(0, 4, 0, 0)
+        ek_col = QVBoxLayout()
+        ek_col.addWidget(_lbl("ElevenLabs API Key", self.c))
+        self.eleven_key = _le(getattr(config, "ELEVENLABS_API_KEY", ""), self.c)
+        self.eleven_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.eleven_key.setPlaceholderText("Your ElevenLabs API key")
+        ek_col.addWidget(self.eleven_key)
+        ek_layout.addLayout(ek_col)
+        layout.addWidget(self.eleven_key_widget)
+        self.eleven_key_widget.setVisible(self.tts_backend_combo.currentText() == "elevenlabs")
 
         layout.addWidget(_lbl("Voice settings (speed, pitch, volume) are now per-persona — configure them in the Personas tab.", self.c))
 
@@ -1563,7 +1578,12 @@ class TTSTab(QWidget):
     }
 
     def _on_backend_changed(self, name: str):
+        is_cloud = (name == "elevenlabs")
         self.url.setText(self._BACKEND_URLS.get(name, ""))
+        self.url.setEnabled(not is_cloud)
+        self.eleven_key_widget.setVisible(is_cloud)
+        if is_cloud:
+            self.eleven_key.setText(getattr(config, "ELEVENLABS_API_KEY", ""))
         self.backend_changed.emit(name)
     def _fetch_voices(self):
         fallback = ["af_bella", "af_sarah", "af_nicole", "af_sky",
@@ -1593,6 +1613,11 @@ class TTSTab(QWidget):
         # corruption to prefs.json regardless of what was actually changed.
         if backend_name == "voicebox":
             _c.VOICEBOX_HOST = self.url.text().strip()
+        elif backend_name == "elevenlabs":
+            # Let "Test TTS" reflect the key as typed, before Save persists
+            # it -- same live-test-before-save UX the VOICEBOX_HOST branch
+            # above already gives Voicebox.
+            _c.ELEVENLABS_API_KEY = self.eleven_key.text().strip()
 
         def worker():
             try:
@@ -1613,8 +1638,16 @@ class TTSTab(QWidget):
         self.status_lbl.setText(message)
     def _save(self):
         config.TTS_ENABLED = self.enabled_cb.isChecked()
-        config.TTS_HOST = self.url.text().strip()
         config.TTS_BACKEND = self.tts_backend_combo.currentText()
+        # ElevenLabs is cloud-only -- the URL field doesn't apply to it and
+        # must not stomp TTS_HOST with an empty string, same corruption
+        # class VOICEBOX_HOST already guards against elsewhere in this tab.
+        if config.TTS_BACKEND != "elevenlabs":
+            config.TTS_HOST = self.url.text().strip()
+        if config.TTS_BACKEND == "elevenlabs":
+            config.ELEVENLABS_API_KEY = self.eleven_key.text().strip()
+            from core import secrets as _secrets
+            _secrets.set_secret("elevenlabs_api_key", config.ELEVENLABS_API_KEY)
         config.STT_ENABLED = self.stt_enabled_cb.isChecked()
         config.STT_BACKEND = self.stt_backend_combo.currentText()
         config.STT_MODEL = self.stt_model_combo.currentText()
@@ -2560,7 +2593,7 @@ class PersonasTab(QWidget):
                     "am_adam", "am_michael", "bf_emma", "bf_isabella", "bf_lily"]
         try:
             backend = getattr(config, "TTS_BACKEND", "kokoro")
-            if backend == "voicebox":
+            if backend in ("voicebox", "elevenlabs"):
                 from tts.loader import get_tts_backend
                 return get_tts_backend().list_voices() or fallback
             else:

@@ -7,6 +7,7 @@ Supported backends (config.TTS_BACKEND):
   "voicebox"    — VoiceboxBridge    (Voicebox local server, cloned voices)
   "chatterbox"  — ChatterboxBridge  (native in-process Chatterbox Turbo)
   "supertonic"  — SupertonicBridge  (Supertonic 3, OpenAI-compat at :7788)
+  "elevenlabs"  — ElevenLabsBridge  (ElevenLabs cloud REST API)
   "piper"       — PiperBridge       (stub, offline, no deps)
 """
 import sys
@@ -55,6 +56,9 @@ def get_tts_backend(force_reload: bool = False):
     elif backend_name == "supertonic":
         from tts.supertonic_bridge import SupertonicBridge
         _backend_instance = SupertonicBridge()
+    elif backend_name == "elevenlabs":
+        from tts.elevenlabs_bridge import ElevenLabsBridge
+        _backend_instance = ElevenLabsBridge()
     elif backend_name == "piper":
         from tts.piper_bridge import PiperBridge
         _backend_instance = PiperBridge()
