@@ -511,6 +511,11 @@ class UserProfileTab(QWidget):
         layout.addWidget(self.human_bio)
         self.human_bio.textChanged.connect(self._autosave_bio)
 
+        self.human_profile_curation_cb = QCheckBox("Auto-curate this profile during dream sweeps")
+        self.human_profile_curation_cb.setChecked(config.HUMAN_PROFILE_CURATION_ENABLED)
+        self.human_profile_curation_cb.toggled.connect(self._on_curation_toggled)
+        layout.addWidget(self.human_profile_curation_cb)
+
         layout.addWidget(_lbl("Lumina's notes about you -- refined automatically over time. Edit freely if it drifts.", self.c))
         self.human_profile_curated = _te(
             self._prefs.get("human_profile_curated", ""),
@@ -599,6 +604,16 @@ class UserProfileTab(QWidget):
     def _autosave_curated_profile(self):
         self._prefs["human_profile_curated"] = self.human_profile_curated.toPlainText().strip()
         persistence.save(self._prefs)
+
+    def _on_curation_toggled(self, checked: bool):
+        """HUMAN_PROFILE_CURATION_ENABLED -- same live-apply pattern as
+        DREAM_SWEEP_ENABLED/_on_subagents_toggled: dreaming.py re-reads this
+        config value via getattr() on every sweep, so no tool re-registration
+        is needed here -- just the config attr + prefs round-trip."""
+        config.HUMAN_PROFILE_CURATION_ENABLED = checked
+        prefs = persistence.load()
+        prefs["human_profile_curation_enabled"] = checked
+        persistence.save(prefs)
 
 # ── Tab: Memory ────────────────────────────────────────────────────────────────
 
