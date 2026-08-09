@@ -14,9 +14,9 @@ def get_time() -> str:
 
 
 def reset_chat(context_manager) -> str:
-    """Clear conversation history."""
-    context_manager.clear()
-    return "Chat history cleared."
+    """Stages a conversation-history clear for approval — does not clear it directly."""
+    from tools.pending_actions import stage_action
+    return stage_action("reset_chat", {})
 
 
 def view_prompt(context_manager) -> str:
@@ -25,9 +25,9 @@ def view_prompt(context_manager) -> str:
 
 
 def edit_prompt(context_manager, new_prompt: str) -> str:
-    """Replace the system prompt."""
-    context_manager.update_system_prompt(new_prompt)
-    return "System prompt updated."
+    """Stages a system prompt replacement for approval — does not apply it directly."""
+    from tools.pending_actions import stage_action
+    return stage_action("edit_prompt", {"new_prompt": new_prompt})
 
 
 def list_tools(registry) -> str:

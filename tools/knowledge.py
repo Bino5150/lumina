@@ -106,8 +106,7 @@ def search_people(query: str) -> str:
     return "\n".join(f"[{r['id']}] {r['name']}: {r['info'][:200]}" for r in rows)
 
 
-def delete_knowledge(entry_id: int = None, category: str = None) -> str:
-    """Delete a knowledge entry by ID, or all entries in a category."""
+def _delete_knowledge_direct(entry_id: int = None, category: str = None) -> str:
     conn = get_db()
     if entry_id:
         cur = conn.execute("DELETE FROM knowledge WHERE id=?", (entry_id,))
@@ -121,6 +120,17 @@ def delete_knowledge(entry_id: int = None, category: str = None) -> str:
         return f"Deleted {cur.rowcount} entries from category '{category}'."
     conn.close()
     return "Specify entry_id or category."
+
+
+def delete_knowledge(entry_id: int = None, category: str = None) -> str:
+    """Stages a knowledge deletion for approval — does not delete directly."""
+    from tools.pending_actions import stage_action
+    payload = {}
+    if entry_id:
+        payload["entry_id"] = entry_id
+    if category:
+        payload["category"] = category
+    return stage_action("delete_knowledge", payload)
 
 
 def register_knowledge_tools(registry):

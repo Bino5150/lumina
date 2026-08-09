@@ -135,8 +135,7 @@ def get_recent_memories(limit: int = 5, label: str = None) -> str:
     return "\n".join(f"[{r['id']}] ({r['label']}) {r['content']}" for r in rows)
 
 
-def delete_memory(memory_id: int) -> str:
-    """Delete a memory by its ID."""
+def _delete_memory_direct(memory_id: int) -> str:
     conn = get_db()
     cur = conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
     conn.commit()
@@ -144,6 +143,12 @@ def delete_memory(memory_id: int) -> str:
     if cur.rowcount:
         return f"Memory {memory_id} deleted."
     return f"Memory {memory_id} not found."
+
+
+def delete_memory(memory_id: int) -> str:
+    """Stages a memory deletion for approval — does not delete directly."""
+    from tools.pending_actions import stage_action
+    return stage_action("delete_memory", {"memory_id": memory_id})
 
 
 def register_memory_tools(registry):

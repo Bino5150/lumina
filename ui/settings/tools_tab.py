@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
-import os, sys
+import os, sys, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
 from core import persistence
@@ -23,9 +23,11 @@ class ToolsTab(QWidget):
         self._prefs = persistence.load()
         self._current_profile_path = None
         self._pending_names = []
+        self._pending_action_ids = []
         self._build()
         self._load_profiles()
         self._load_pending_tools()
+        self._load_pending_actions()
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -178,6 +180,72 @@ class ToolsTab(QWidget):
         self.pending_status_lbl = _lbl("", self.c)
         layout.addWidget(self.pending_status_lbl)
 
+        # ── Pending actions review (MB-33 Tier 2) ───────────────────────
+        # edit_prompt/reset_chat/delete_knowledge/delete_memory now only
+        # stage_action() -- they never mutate live state on their own.
+        # This panel is the only place a staged action is actually applied
+        # (_apply_action is not registered as a tool; it's called only from
+        # here, against the live agent's real registry/context, same
+        # proven pattern as the Pending Tools panel above). Approve stays
+        # disabled until a row is selected, which populates the read-only
+        # preview showing exactly what's staged.
+        layout.addWidget(_sec("PENDING ACTIONS — AWAITING REVIEW", self.c))
+        pending_actions_row = QHBoxLayout()
+        pending_actions_row.setSpacing(10)
+
+        pending_actions_list_col = QVBoxLayout()
+        self.pending_actions_list = QTableWidget(0, 1)
+        self.pending_actions_list.setFixedHeight(110)
+        self.pending_actions_list.horizontalHeader().setVisible(False)
+        self.pending_actions_list.verticalHeader().setVisible(False)
+        self.pending_actions_list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.pending_actions_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.pending_actions_list.horizontalHeader().setStretchLastSection(True)
+        self.pending_actions_list.setStyleSheet(f"""
+            QTableWidget{{background:{self.c['bg_card']};color:{self.c['text_primary']};
+            border:1px solid {self.c['border']};border-radius:8px;gridline-color:{self.c['border']};font-size:12px;}}
+            QTableWidget::item{{padding:6px 10px;border:none;}}
+            QTableWidget::item:selected{{background:{self.c['accent_glow']};color:{self.c['accent']};}}
+        """)
+        self.pending_actions_list.itemSelectionChanged.connect(self._on_pending_action_selected)
+        pending_actions_list_col.addWidget(self.pending_actions_list)
+        pending_actions_row.addLayout(pending_actions_list_col, 1)
+
+        pending_actions_preview_col = QVBoxLayout()
+        pending_actions_preview_col.addWidget(_lbl("Staged payload (read this before approving)", self.c))
+        self.pending_actions_preview = QTextEdit()
+        self.pending_actions_preview.setReadOnly(True)
+        self.pending_actions_preview.setFixedHeight(110)
+        self.pending_actions_preview.setStyleSheet(f"""
+            QTextEdit{{background:{self.c['bg_input']};color:{self.c['text_primary']};
+            border:1px solid {self.c['border']};border-radius:7px;padding:6px 10px;
+            font-family:'JetBrains Mono',monospace;font-size:11px;}}
+        """)
+        pending_actions_preview_col.addWidget(self.pending_actions_preview)
+        pending_actions_row.addLayout(pending_actions_preview_col, 2)
+        layout.addLayout(pending_actions_row)
+
+        pending_actions_btn_row = QHBoxLayout()
+        pending_actions_btn_row.addStretch()
+        pending_actions_refresh_btn = _btn("⟳ Refresh", self.c)
+        pending_actions_refresh_btn.setFixedHeight(30)
+        pending_actions_refresh_btn.clicked.connect(self._load_pending_actions)
+        pending_actions_btn_row.addWidget(pending_actions_refresh_btn)
+        self.pending_actions_reject_btn = _btn("✕ Reject", self.c, danger=True)
+        self.pending_actions_reject_btn.setFixedHeight(30)
+        self.pending_actions_reject_btn.setEnabled(False)
+        self.pending_actions_reject_btn.clicked.connect(self._reject_pending_action)
+        pending_actions_btn_row.addWidget(self.pending_actions_reject_btn)
+        self.pending_actions_approve_btn = _btn("✓ Approve & Apply", self.c, accent=True)
+        self.pending_actions_approve_btn.setFixedHeight(30)
+        self.pending_actions_approve_btn.setEnabled(False)
+        self.pending_actions_approve_btn.clicked.connect(self._approve_pending_action)
+        pending_actions_btn_row.addWidget(self.pending_actions_approve_btn)
+        layout.addLayout(pending_actions_btn_row)
+
+        self.pending_actions_status_lbl = _lbl("", self.c)
+        layout.addWidget(self.pending_actions_status_lbl)
+
         # ── Tool table header ──
         top = QHBoxLayout()
         top.addStretch()
@@ -291,6 +359,81 @@ class ToolsTab(QWidget):
         except Exception as e:
             self.pending_status_lbl.setText(f"Error rejecting '{name}': {e}")
         self._load_pending_tools(preserve_status=True)
+
+    def _load_pending_actions(self, preserve_status: bool = False):
+        """List whatever's staged in pending_actions.json -- same queue
+        stage_action() writes to for edit_prompt/reset_chat/delete_knowledge/
+        delete_memory."""
+        from tools.pending_actions import _load_queue
+        queue = _load_queue()
+        self._pending_action_ids = sorted(queue.keys(), key=lambda aid: queue[aid]["staged_at"])
+        self.pending_actions_list.setRowCount(len(self._pending_action_ids))
+        for row, aid in enumerate(self._pending_action_ids):
+            entry = queue[aid]
+            self.pending_actions_list.setItem(row, 0, QTableWidgetItem(f"[{aid}] {entry['kind']}"))
+        self.pending_actions_preview.clear()
+        self.pending_actions_approve_btn.setEnabled(False)
+        self.pending_actions_reject_btn.setEnabled(False)
+        if not preserve_status:
+            self.pending_actions_status_lbl.setText(
+                "" if self._pending_action_ids else "Nothing pending review."
+            )
+
+    def _on_pending_action_selected(self):
+        rows = self.pending_actions_list.selectionModel().selectedRows()
+        has_selection = bool(rows)
+        self.pending_actions_approve_btn.setEnabled(has_selection)
+        self.pending_actions_reject_btn.setEnabled(has_selection)
+        if not has_selection:
+            self.pending_actions_preview.clear()
+            return
+        aid = self._pending_action_ids[rows[0].row()]
+        from tools.pending_actions import _load_queue
+        entry = _load_queue().get(aid, {})
+        self.pending_actions_preview.setPlainText(json.dumps(entry, indent=2))
+
+    def _selected_pending_action_id(self):
+        rows = self.pending_actions_list.selectionModel().selectedRows()
+        if not rows:
+            return None
+        return self._pending_action_ids[rows[0].row()]
+
+    def _approve_pending_action(self):
+        aid = self._selected_pending_action_id()
+        if not aid:
+            return
+        from tools.pending_actions import _load_queue
+        entry = _load_queue().get(aid, {})
+        reply = QMessageBox.question(
+            self, "Approve Action",
+            f"Apply staged action #{aid} ({entry.get('kind', '?')}) now?\n\n"
+            f"{json.dumps(entry.get('payload', {}))}\n\n"
+            "This runs immediately against live state — make sure you've "
+            "actually read the staged payload.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        from tools.pending_actions import _apply_action
+        result = _apply_action(aid, self.agent)
+        self.pending_actions_status_lbl.setText(result)
+        self._load_pending_actions(preserve_status=True)
+
+    def _reject_pending_action(self):
+        aid = self._selected_pending_action_id()
+        if not aid:
+            return
+        reply = QMessageBox.question(
+            self, "Reject Action",
+            f"Discard staged action #{aid} without ever applying it? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        from tools.pending_actions import reject_pending_action
+        result = reject_pending_action(aid)
+        self.pending_actions_status_lbl.setText(result)
+        self._load_pending_actions(preserve_status=True)
 
     def _load_profiles(self):
         """Populate the profile dropdown from tool_profiles/ directory."""
