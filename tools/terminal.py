@@ -34,11 +34,17 @@ import subprocess
 import os
 import signal
 
+from tools.guardrails import check_command
+
 
 def register_terminal_tools(registry):
 
     def run_command(command: str, cwd: str = None, timeout: int = 30) -> str:
         """Execute a shell command and return stdout/stderr."""
+        block_reason = check_command(command)
+        if block_reason:
+            return f"[BLOCKED: {block_reason} — this command was not executed]"
+
         cwd = os.path.expanduser(cwd) if cwd else os.path.expanduser("~")
 
         # FE-01: no ulimit -u here. RLIMIT_NPROC caps the WHOLE USER's process
