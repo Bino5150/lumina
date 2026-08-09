@@ -128,7 +128,7 @@ class GeneralTab(QWidget):
         iter_col.addWidget(self.iter_spin)
         resp_col = QVBoxLayout()
         resp_col.addWidget(_lbl("Response Tokens", self.c))
-        self.resp_spin = _spin(config.RESPONSE_RESERVE_TOKENS, 256, 4096, 256, self.c)
+        self.resp_spin = _spin(config.RESPONSE_RESERVE_TOKENS, 256, 1048576, 256, self.c)
         resp_col.addWidget(self.resp_spin)
         row2.addLayout(iter_col)
         row2.addLayout(resp_col)
