@@ -14,10 +14,10 @@ import re
 # Each pattern: (compiled regex, human-readable reason)
 _DENYLIST = [
     # rm -rf /  or  rm -rf /*  (bare root, optionally followed by wildcard)
-    (re.compile(r"rm\s+(-\w*[rf]\w*\s+)+/(\s|$|\*)"), "recursive/force delete of root"),
+    (re.compile(r"rm\s+(-\w*[rf]\w*\s+)+/(\s|$|\*|['\"])"), "recursive/force delete of root"),
     # rm -rf /home/*, /var/*, /usr/* — any absolute path followed by a wildcard
     (re.compile(r"rm\s+(-\w*[rf]\w*\s+)+/[\w/]*\*"), "recursive/force delete of absolute path with wildcard"),
-    (re.compile(r"rm\s+(-\w*[rf]\w*\s+)+~(\s|/|$)"), "recursive/force delete of home"),
+    (re.compile(r"rm\s+(-\w*[rf]\w*\s+)+~(\s|/|$|['\"])"), "recursive/force delete of home"),
     (re.compile(r"rm\s+(-\w*[rf]\w*\s+)+\*"), "recursive/force delete with wildcard"),
     (re.compile(r"\bdd\s+.*\bof=/dev/"), "dd writing directly to a device"),
     (re.compile(r"\bmkfs(\.\w+)?\b"), "filesystem format"),
@@ -25,8 +25,13 @@ _DENYLIST = [
     (re.compile(r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b"), "pipe remote content to shell"),
     (re.compile(r"\bsudo\s+rm\b"), "sudo rm"),
     (re.compile(r"\bchmod\s+-R\s+777\s+/(\s|$)"), "recursive world-writable on root"),
-    (re.compile(r"\bgit\s+push\s+.*--force\b"), "force push"),
+    (re.compile(r"\bgit\s+push\b.*(--force\b|\s-f\b)"), "force push"),
     (re.compile(r">\s*/dev/sd[a-z]\b"), "raw write to a block device"),
+    # MB-33 extension: git-destructive beyond force-push, and gh repo delete
+    (re.compile(r"\bgit\s+reset\b.*--hard\b"), "git reset --hard (discards uncommitted work)"),
+    (re.compile(r"\bgit\s+clean\b.*\s-\w*f\w*"), "git clean with force flag (deletes untracked files)"),
+    (re.compile(r"\bgit\s+branch\b.*\s-D\b"), "git branch -D (force delete, discards unmerged commits)"),
+    (re.compile(r"\bgh\s+repo\s+delete\b"), "gh repo delete"),
 ]
 
 

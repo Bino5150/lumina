@@ -59,7 +59,16 @@ class TestCheckCommandBlocked:
         ("sudo rm -rf /home", "sudo rm"),
         ("chmod -R 777 /", "recursive world-writable on root"),
         ("git push origin main --force", "force push"),
+        ("git push -f origin main", "force push"),
         ("echo data > /dev/sda", "raw write to a block device"),
+        # MB-33 extension
+        ("git reset --hard origin/main", "git reset --hard (discards uncommitted work)"),
+        ("git clean -fd", "git clean with force flag (deletes untracked files)"),
+        ("git branch -D main", "git branch -D (force delete, discards unmerged commits)"),
+        ("gh repo delete Bino5150/lumina --yes", "gh repo delete"),
+        ('bash -c "rm -rf /"', "recursive/force delete of root"),
+        ("sh -c 'rm -rf ~'", "recursive/force delete of home"),
+        ('sudo env PATH=/bin bash -c "rm -rf /"', "recursive/force delete of root"),
     ])
     def test_blocked(self, command, expected_reason):
         result = check_command(command)
@@ -85,6 +94,16 @@ class TestCheckCommandAllowed:
         "find . -name '*.py'",
         "grep -r 'pattern' .",
         "cd /home/bino && make",
+        # MB-33 extension — legitimate counterparts of the new patterns
+        "git reset --soft HEAD~1",
+        "git reset HEAD file.txt",
+        "git clean -n",
+        "git clean --dry-run",
+        "git branch -d merged-feature",
+        "git branch -a",
+        "gh repo view Bino5150/lumina",
+        "gh repo clone Bino5150/lumina",
+        "git push origin my-feature-branch",
     ])
     def test_allowed(self, command):
         result = check_command(command)
@@ -120,6 +139,11 @@ class TestRunCommandGuard:
         result = run_command("git push origin main --force")
         assert result.startswith("[BLOCKED:")
         assert "force push" in result
+
+    def test_reset_hard_blocked(self, run_command):
+        result = run_command("git reset --hard origin/main")
+        assert result.startswith("[BLOCKED:")
+        assert "reset --hard" in result
 
     def test_normal_git_push_allowed(self, run_command):
         """git push without --force must still work (will fail at the git
