@@ -39,6 +39,11 @@ openai-whisper==20250625       # STT (if used locally)
 
 # ── NLP / Text Processing ────────────────────────────────────────────────────
 tiktoken==0.13.0                # token counting
+pyenchant==3.3.0                # spellcheck backend for the message box —
+                                 # wraps system libenchant; needs
+                                 # libenchant-2-2 + a dictionary backend at
+                                 # the OS level (confirmed present on
+                                 # Skynet: aspell-en + hunspell-en-us)
 
 # ── Data / Storage ────────────────────────────────────────────────────────────
 # sqlite3 — stdlib, no install needed

@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QLabel, QFrame, QSizePolicy, QTextBrowser
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QMimeData
-from PySide6.QtGui import QKeyEvent, QDragEnterEvent, QDropEvent, QPixmap
+from PySide6.QtGui import QKeyEvent, QDragEnterEvent, QDropEvent, QPixmap, QAction, QTextCursor
 
 import re 
 import time
@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import shiboken6
 from core.chat_render import md_to_html
+from ui.spellcheck_highlighter import SpellCheckHighlighter
 
 
 # ── Think Block ────────────────────────────────────────────────────────────────
@@ -361,6 +362,7 @@ class SmartInput(QTextEdit):
             border:1px solid {colors['border']};border-radius:10px;padding:10px 14px;font-size:13px;}}
             QTextEdit:focus{{border:1px solid {colors['border_accent']};}}
         """)
+        self._spell_highlighter = SpellCheckHighlighter(self.document())
 
     def update_placeholder(self, name: str):
         self.setPlaceholderText(f"Message {name}...  (Shift+Enter for newline, drag & drop files)")
@@ -389,6 +391,48 @@ class SmartInput(QTextEdit):
                 event.acceptProposedAction()
                 return
         super().dropEvent(event)
+
+    def contextMenuEvent(self, event):
+        """Right-click menu: standard Qt actions plus spelling suggestions
+        prepended above them when the click landed on a misspelled word.
+        Menu order built via repeated insertAction(first, ...) against the
+        same anchor -- each insert lands right before the anchor, so
+        inserting in order [suggestions..., add-to-dict, separator]
+        produces exactly that order, ending right before the standard
+        Undo/Redo/Cut/Copy/Paste block. Verified against a real QMenu
+        before this was written into the task block, not assumed."""
+        from core.spellcheck import check_word, suggest, add_to_dictionary
+
+        menu = self.createStandardContextMenu()
+        cursor = self.cursorForPosition(event.pos())
+        cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+        word = cursor.selectedText()
+
+        if word and any(c.isalpha() for c in word) and not check_word(word):
+            first = menu.actions()[0] if menu.actions() else None
+            suggestions = suggest(word)
+
+            if suggestions:
+                for s in suggestions:
+                    action = QAction(s, menu)
+                    action.triggered.connect(
+                        lambda checked=False, s=s, c=cursor: self._apply_suggestion(c, s)
+                    )
+                    menu.insertAction(first, action)
+            else:
+                no_sugg = QAction("(no suggestions)", menu)
+                no_sugg.setEnabled(False)
+                menu.insertAction(first, no_sugg)
+
+            add_action = QAction(f'Add "{word}" to Dictionary', menu)
+            add_action.triggered.connect(lambda checked=False, w=word: add_to_dictionary(w))
+            menu.insertAction(first, add_action)
+            menu.insertSeparator(first)
+
+        menu.exec(event.globalPos())
+
+    def _apply_suggestion(self, cursor: QTextCursor, replacement: str):
+        cursor.insertText(replacement)
 
 
 # ── Chat Widget ────────────────────────────────────────────────────────────────
