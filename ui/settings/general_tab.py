@@ -87,8 +87,19 @@ class GeneralTab(QWidget):
         key_col.addWidget(self.cloud_key)
         model_col = QVBoxLayout()
         model_col.addWidget(_lbl("Model", self.c))
-        self.cloud_model = _le("", self.c)
-        model_col.addWidget(self.cloud_model)
+        model_row = QHBoxLayout()
+        model_row.setSpacing(6)
+        self.cloud_model = QComboBox()
+        self.cloud_model.setEditable(True)
+        self.cloud_model.setFixedHeight(36)
+        self.cloud_model.setStyleSheet(f"QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}QComboBox::drop-down{{border:none;width:20px;}}")
+        model_row.addWidget(self.cloud_model, 1)
+        refresh_models_btn = _btn("⟳", self.c)
+        refresh_models_btn.setFixedWidth(36)
+        refresh_models_btn.setToolTip("Fetch available models from this backend using the API key above")
+        refresh_models_btn.clicked.connect(self._refresh_models)
+        model_row.addWidget(refresh_models_btn)
+        model_col.addLayout(model_row)
         cloud_layout.addLayout(key_col, 2)
         cloud_layout.addLayout(model_col, 2)
         layout.addWidget(self.cloud_widget)
@@ -124,7 +135,7 @@ class GeneralTab(QWidget):
         row2.setSpacing(16)
         iter_col = QVBoxLayout()
         iter_col.addWidget(_lbl("Max Tool Iterations", self.c))
-        self.iter_spin = _spin(config.MAX_TOOL_ITERATIONS, 1, 20, 1, self.c)
+        self.iter_spin = _spin(config.MAX_TOOL_ITERATIONS, 1, 100, 1, self.c)
         iter_col.addWidget(self.iter_spin)
         resp_col = QVBoxLayout()
         resp_col.addWidget(_lbl("Response Tokens", self.c))
@@ -194,7 +205,7 @@ class GeneralTab(QWidget):
             key_attr = f"{backend.upper()}_API_KEY"
             model_attr = f"{backend.upper()}_DEFAULT_MODEL"
             self.cloud_key.setText(getattr(config, key_attr, ""))
-            self.cloud_model.setText(getattr(config, model_attr, ""))
+            self.cloud_model.setCurrentText(getattr(config, model_attr, ""))
     def _apply_prompt(self):
         p = self.prompt.toPlainText().strip()
         if not p:
@@ -249,6 +260,37 @@ class GeneralTab(QWidget):
         self.mem_spin.setValue(saved.get("memory_inject_limit", default["memory_inject_limit"]))
         self.result_spin.setValue(saved.get("tool_result_max_chars", default["tool_result_max_chars"]))
 
+    def _refresh_models(self):
+        """Probe the currently-selected cloud backend for its available
+        models using whatever API key is typed right now — not necessarily
+        saved yet. Backends read their key from the config module at
+        construction time (see loader.py), so this temporarily sets
+        config.<BACKEND>_API_KEY for the probe call only and restores the
+        previous value afterward. Clicking Refresh must have no persistent
+        effect until Save is actually pressed — same principle the rest of
+        this tab already follows for cloud credentials."""
+        backend_name = self.backend_combo.currentText()
+        if backend_name not in self.CLOUD_BACKENDS:
+            return
+        key_attr = f"{backend_name.upper()}_API_KEY"
+        prev_key = getattr(config, key_attr, "")
+        setattr(config, key_attr, self.cloud_key.text().strip())
+        try:
+            from core.backends.loader import get_llm_backend
+            probe = get_llm_backend(name=backend_name)
+            models = probe.list_models()
+        except Exception:
+            models = []
+        finally:
+            setattr(config, key_attr, prev_key)
+
+        current = self.cloud_model.currentText()
+        self.cloud_model.clear()
+        if models:
+            self.cloud_model.addItems(models)
+        if current:
+            self.cloud_model.setCurrentText(current)
+
     def _save(self):
         from core.backends.loader import get_llm_backend
         new_system_prompt = self.prompt.toPlainText().strip()
@@ -271,7 +313,7 @@ class GeneralTab(QWidget):
             key_attr = f"{config.LLM_BACKEND.upper()}_API_KEY"
             model_attr = f"{config.LLM_BACKEND.upper()}_DEFAULT_MODEL"
             setattr(config, key_attr, self.cloud_key.text().strip())
-            setattr(config, model_attr, self.cloud_model.text().strip())
+            setattr(config, model_attr, self.cloud_model.currentText().strip())
 
 
         from core.persistence import load as load_prefs, save as save_prefs
@@ -310,7 +352,7 @@ class GeneralTab(QWidget):
             _secrets.set_secret(f"{config.LLM_BACKEND}_api_key", self.cloud_key.text().strip())
             cloud_creds = prefs.get("cloud_credentials", {})
             cloud_creds[config.LLM_BACKEND] = {
-                "default_model": self.cloud_model.text().strip(),
+                "default_model": self.cloud_model.currentText().strip(),
             }
             prefs["cloud_credentials"] = cloud_creds
 

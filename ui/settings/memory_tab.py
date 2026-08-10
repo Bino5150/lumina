@@ -1,11 +1,32 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QTableWidgetItem,
-    QMessageBox, QLineEdit, QInputDialog
+    QMessageBox, QLineEdit, QInputDialog, QFileDialog
 )
 
 import json
+import os
+import zipfile
+from datetime import datetime
 
 from ._widgets import _lbl, _le, _btn, _table
+
+
+def _build_memory_backup(data_dir: str, dest_path: str):
+    """Checkpoint the WAL, then zip everything under data_dir into
+    dest_path. Split out from _backup_memory() below so this logic is
+    testable without a modal QFileDialog in the way. Deliberately does NOT
+    touch ~/.config/lumina/credentials.json — that lives outside
+    config.DATA_DIR entirely, so this can't leak an API key even though it
+    grabs everything else without exceptions."""
+    conn = _db()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _dirs, files in os.walk(data_dir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                arcname = os.path.relpath(fpath, data_dir)
+                zf.write(fpath, arcname)
 
 
 def _db():
@@ -82,11 +103,15 @@ class MemoryTab(QWidget):
         bot = QHBoxLayout()
         del_btn = _btn("Delete Selected", self.c, danger=True)
         del_btn.clicked.connect(self._delete_selected)
-        paste_btn = _btn("Paste from Sapphire...", self.c)
-        paste_btn.setToolTip("Paste a block of memories exported from Sapphire")
+        paste_btn = _btn("Import Memories", self.c)
+        paste_btn.setToolTip("Paste a block of memories exported from another agent")
         paste_btn.clicked.connect(self._paste_import)
+        backup_btn = _btn("⬇ Backup Memory...", self.c, accent=True)
+        backup_btn.setToolTip("Package chat history, MemPalace, and everything else in Lumina's data directory into one archive")
+        backup_btn.clicked.connect(self._backup_memory)
         bot.addWidget(del_btn)
         bot.addWidget(paste_btn)
+        bot.addWidget(backup_btn)
         bot.addStretch()
         layout.addLayout(bot)
 
@@ -96,6 +121,20 @@ class MemoryTab(QWidget):
         conn.close()
         self._all_rows = [dict(r) for r in rows]
         self._render(self._all_rows)
+
+    def _backup_memory(self):
+        import config as _config
+        default_name = f"lumina_memory_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        dest, _ = QFileDialog.getSaveFileName(self, "Save Memory Backup", default_name, "Zip Archives (*.zip)")
+        if not dest:
+            return
+        try:
+            _build_memory_backup(_config.DATA_DIR, dest)
+        except Exception as e:
+            QMessageBox.critical(self, "Backup Failed", f"Could not write backup archive: {e}")
+            return
+        size_mb = os.path.getsize(dest) / (1024 * 1024)
+        QMessageBox.information(self, "Backup Complete", f"Memory backup saved to:\n{dest}\n\n({size_mb:.1f} MB)")
 
     def _render(self, rows: list):
         self.table.setRowCount(0)
