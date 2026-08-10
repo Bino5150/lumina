@@ -160,7 +160,10 @@ class CommunicationsTab(QWidget):
 
         dc_identity_save = _btn("Save Discord Identity", c, accent=True)
         dc_identity_save.clicked.connect(self._save_discord_identity)
-        layout.addWidget(dc_identity_save)
+        dc_identity_save_row = QHBoxLayout()
+        dc_identity_save_row.addStretch()
+        dc_identity_save_row.addWidget(dc_identity_save)
+        layout.addLayout(dc_identity_save_row)
 
         # ── Email (stub — Epic B not yet built) ──
         layout.addWidget(_sec("EMAIL", c))

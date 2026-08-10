@@ -28,7 +28,7 @@ class AboutTab(QWidget):
         by_label.setStyleSheet(f"color:{c['text_primary']};font-size:19px;background:transparent;")
         layout.addWidget(by_label)
 
-        ver_label = QLabel("v0.1.9-beta.1")
+        ver_label = QLabel("v0.2.7-beta.2")
         ver_label.setAlignment(Qt.AlignCenter)
         ver_label.setStyleSheet(f"color:{c['text_primary']};font-size:16px;background:transparent;")
         layout.addWidget(ver_label)
@@ -56,7 +56,7 @@ class AboutTab(QWidget):
         layout.addSpacing(8)
 
         # ── Contact info ─────────────────────────────────────────────────────
-        contact_label = QLabel("Contact: bino5150@gmail.com")   # ← swap with real address
+        contact_label = QLabel("Bino: bino5150@gmail.com\nLumina: therealagentlumina@gmail.com")
         contact_label.setAlignment(Qt.AlignCenter)
         contact_label.setStyleSheet(f"color:{c['text_primary']};font-size:10px;background:transparent;")
         layout.addWidget(contact_label)
@@ -99,16 +99,16 @@ class AboutTab(QWidget):
         linkedin_btn.clicked.connect(
             lambda: __import__("webbrowser").open("https://www.linkedin.com/in/jason-malik-a97b07412/")  # ← swap handle
         )
-        layout.addWidget(gh_btn)
-        layout.addWidget(discord_btn)
-        layout.addWidget(linkedin_btn)
+        layout.addWidget(gh_btn, alignment=Qt.AlignCenter)
+        layout.addWidget(discord_btn, alignment=Qt.AlignCenter)
+        layout.addWidget(linkedin_btn, alignment=Qt.AlignCenter)
 
         layout.addSpacing(12)
 
         self.update_btn = QPushButton("⟳  Check for Updates")
         self.update_btn.setStyleSheet(btn_style)
         self.update_btn.clicked.connect(self._check_updates)
-        layout.addWidget(self.update_btn)
+        layout.addWidget(self.update_btn, alignment=Qt.AlignCenter)
 
         self.update_status = QLabel("")
         self.update_status.setAlignment(Qt.AlignCenter)

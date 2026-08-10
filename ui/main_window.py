@@ -538,7 +538,7 @@ class LuminaWindow(QMainWindow):
         credit2.setStyleSheet(f"color:{COLORS['text_dim']};font-size:10px;background:transparent;")
         layout.addWidget(credit2)
 
-        ver = QLabel("v0.1.9-beta.1")
+        ver = QLabel("v0.2.7-beta.2")
         ver.setAlignment(Qt.AlignCenter)
         ver.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;background:transparent;")
         layout.addWidget(ver)

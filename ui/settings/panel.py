@@ -70,7 +70,7 @@ class SettingsPanel(QWidget):
         tabs.addTab(self.tts_tab,                   "🔊  TTS")
         self.tts_tab.backend_changed.connect(self.personas_tab.refresh_voices)
         tabs.addTab(ComingSoonTab("Image Generation", "Native inline image generation — local and cloud backends. Tracked as MB-21.", c), "🎨  Image Gen")
-        tabs.addTab(ComingSoonTab("Oracle", "Integration with Oracle is planned but not yet built.", c), "🔮  Oracle")
+        tabs.addTab(ComingSoonTab("Oracle", "A performance-oriented, full featured local inference server with integrated dashboard.", c), "🔮  Oracle")
         tabs.addTab(AboutTab(c),                    "✨  About")
 
         layout.addWidget(tabs)

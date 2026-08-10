@@ -32,7 +32,7 @@ def run_cli():
         print(f"  ✓ {preview}{'...' if len(result) > 120 else ''}", flush=True)
 
     print(f"\n{'='*52}")
-    print(f"  LUMINA v0.1.9-beta.1 — CLI Mode")
+    print(f"  LUMINA v0.2.7-beta.2 — CLI Mode")
     print(f"  Backend: {config.LLM_BACKEND} ({config.LLM_BACKEND_URL})")
     print(f"{'='*52}\n")
 
@@ -78,7 +78,7 @@ def run_gui():
 
     app = QApplication(sys.argv)
     app.setApplicationName("Lumina")
-    app.setApplicationVersion("0.1.9-beta.1")
+    app.setApplicationVersion("0.2.7-beta.2")
 
     # Set default font — prefer monospace
     for font_name in ["JetBrains Mono", "Fira Code", "Cascadia Code", "Monospace"]:

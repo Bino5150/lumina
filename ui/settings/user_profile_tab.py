@@ -77,7 +77,10 @@ class UserProfileTab(QWidget):
 
         save_btn = _btn("Save Profile", self.c, accent=True)
         save_btn.clicked.connect(self._save)
-        layout.addWidget(save_btn)
+        save_row = QHBoxLayout()
+        save_row.addStretch()
+        save_row.addWidget(save_btn)
+        layout.addLayout(save_row)
         layout.addStretch()
 
         self.setLayout(QVBoxLayout())
