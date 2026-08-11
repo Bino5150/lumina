@@ -133,11 +133,12 @@ class AgentWorker(QThread):
     """
     BATCH_CHARS = 12  # flush every N characters
 
-    def __init__(self, agent, user_input, signals: StreamSignals):
+    def __init__(self, agent, user_input, signals: StreamSignals, chat_id: int = None):
         super().__init__()
         self.agent = agent
         self.user_input = user_input
         self.signals = signals
+        self.chat_id = chat_id
         self._think_buf = ""
         self._resp_buf = ""
 
@@ -186,7 +187,7 @@ class AgentWorker(QThread):
         self.agent.on_response_token = on_response_token
 
         try:
-            result = self.agent.chat(self.user_input)
+            result = self.agent.chat(self.user_input, chat_id=self.chat_id)
             self._flush_think()
             self._flush_resp()
             self.signals.finished.emit(result)
@@ -806,6 +807,46 @@ class LuminaWindow(QMainWindow):
             chat_id = self._current_chat_id
             threading.Thread(target=lambda: dreaming.on_session_idle(chat_id), daemon=True).start()
 
+    # ── Compaction ─────────────────────────────────────────────────────────────
+
+    def _maybe_compact(self, chat_id: int):
+        """Fire-and-forget: summarize whatever build_messages()'s trim loop
+        has captured into self.agent.ctx._pending_compaction and write it to
+        the same nightstand/{chat_id}/L2 rolling closet on_session_idle()
+        already writes to (S57 correction — NOT wing="sessions"; keeping
+        auto-writes in one wing means palace_store()'s room-scoped rolling
+        merge can never accidentally combine with curated memory).
+
+        `not chat_id` guard mirrors on_session_idle()'s own `not chat_id`
+        check in core/dreaming.py — same failure mode (room=str(chat_id)
+        would write to a literal "None" room if this ever fired before a
+        chat has a real DB-assigned id), same fix.
+        """
+        if not getattr(config, "CONTEXT_COMPACTION_ENABLED", False) or not chat_id:
+            return
+        if self.agent.ctx._compacting:
+            return
+        if self.agent.ctx.pending_compaction_tokens() < config.CONTEXT_COMPACTION_BATCH_TOKENS:
+            return
+
+        self.agent.ctx._compacting = True
+
+        def _run():
+            try:
+                batch = self.agent.ctx.take_pending_compaction()
+                raw_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in batch if m.get("content"))
+                from core.dreaming import run_summarization_call, COMPACTION_PROMPT
+                summary = run_summarization_call(raw_text, prompt=COMPACTION_PROMPT, max_tokens=300)
+                if summary:
+                    from tools.palace import palace_store
+                    palace_store(
+                        content=summary, wing="nightstand", room=str(chat_id),
+                        layer=2, tags=["auto-compaction", f"session:{chat_id}"],
+                    )
+            finally:
+                self.agent.ctx._compacting = False
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── Message handling ───────────────────────────────────────────────────────
 
@@ -853,7 +894,7 @@ class LuminaWindow(QMainWindow):
         if self._current_chat_id:
             save_chat_message(self._current_chat_id, "user", display_text)
         self._live_bubble = self.chat_widget.create_live_bubble()
-        self.worker = AgentWorker(self.agent, content, self.signals)
+        self.worker = AgentWorker(self.agent, content, self.signals, chat_id=self._current_chat_id)
         self.worker.start()
         
 
@@ -995,7 +1036,8 @@ class LuminaWindow(QMainWindow):
                     print(f"[AUTO-NAME] trigger — chat_id={self._current_chat_id} name='{current_name}'", flush=True)
                     print(f"[AUTO-NAME] user_msg preview: {user_msgs[0][:80]}", flush=True)
                     self._auto_name_chat(self._current_chat_id, user_msgs[0], response)
-                
+            self._maybe_compact(self._current_chat_id)
+
 
     def _on_error(self, error: str):
         if self._live_bubble:

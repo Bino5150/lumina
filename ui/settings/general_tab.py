@@ -145,6 +145,24 @@ class GeneralTab(QWidget):
         row2.addLayout(resp_col)
         layout.addLayout(row2)
 
+        row_compaction = QHBoxLayout()
+        row_compaction.setSpacing(16)
+        self.compaction_enabled_cb = QCheckBox("Enable Context-Trim Compaction")
+        self.compaction_enabled_cb.setChecked(config.CONTEXT_COMPACTION_ENABLED)
+        self.compaction_enabled_cb.setToolTip(
+            "When history is trimmed to fit the context budget, summarize what "
+            "was dropped instead of discarding it, and store it in memory."
+        )
+        self.compaction_enabled_cb.toggled.connect(self._on_compaction_toggled)
+        compaction_batch_col = QVBoxLayout()
+        compaction_batch_col.addWidget(_lbl("Compaction Batch Tokens", self.c))
+        self.compaction_batch_spin = _spin(config.CONTEXT_COMPACTION_BATCH_TOKENS, 100, 50000, 100, self.c)
+        compaction_batch_col.addWidget(self.compaction_batch_spin)
+        row_compaction.addWidget(self.compaction_enabled_cb)
+        row_compaction.addLayout(compaction_batch_col)
+        layout.addLayout(row_compaction)
+        self._on_compaction_toggled(config.CONTEXT_COMPACTION_ENABLED)  # set initial enabled state
+
         # ── Dreaming ──
         layout.addWidget(_sec("DREAMING", self.c))
         layout.addWidget(_lbl(
@@ -196,6 +214,9 @@ class GeneralTab(QWidget):
 
     def _on_dream_toggled(self, checked: bool):
         self.dream_idle_spin.setEnabled(checked)
+
+    def _on_compaction_toggled(self, checked: bool):
+        self.compaction_batch_spin.setEnabled(checked)
 
     def _refresh_cloud_row(self, backend: str):
         is_cloud = backend in self.CLOUD_BACKENDS
@@ -301,6 +322,8 @@ class GeneralTab(QWidget):
         config.TOOL_RESULT_MAX_CHARS = self.result_spin.value()
         config.MAX_TOOL_ITERATIONS = self.iter_spin.value()
         config.RESPONSE_RESERVE_TOKENS = self.resp_spin.value()
+        config.CONTEXT_COMPACTION_ENABLED = self.compaction_enabled_cb.isChecked()
+        config.CONTEXT_COMPACTION_BATCH_TOKENS = self.compaction_batch_spin.value()
         config.DREAM_SWEEP_ENABLED = self.dream_enabled_cb.isChecked()
         config.DREAM_IDLE_MINUTES = self.dream_idle_spin.value()
         config.SHOW_THINK_BLOCKS = self.show_think_cb.isChecked()
@@ -328,6 +351,8 @@ class GeneralTab(QWidget):
         # clobbering the other.
         prefs["max_tool_iterations"] = config.MAX_TOOL_ITERATIONS
         prefs["response_reserve_tokens"] = config.RESPONSE_RESERVE_TOKENS
+        prefs["context_compaction_enabled"] = config.CONTEXT_COMPACTION_ENABLED
+        prefs["context_compaction_batch_tokens"] = config.CONTEXT_COMPACTION_BATCH_TOKENS
         prefs["dream_sweep_enabled"] = config.DREAM_SWEEP_ENABLED
         prefs["dream_idle_minutes"] = config.DREAM_IDLE_MINUTES
         prefs["show_think_blocks"] = config.SHOW_THINK_BLOCKS

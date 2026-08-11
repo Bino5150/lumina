@@ -54,7 +54,7 @@ def _fake_agent(response_text="unrelated answer", background_task_ids=None):
         add_user=add_user,
         add_assistant=add_assistant,
         push_ephemeral=lambda block: None,
-        build_messages=lambda tool_budget=0: [],
+        build_messages=lambda tool_budget=0, chat_id=None: [],
     )
 
     ns = types.SimpleNamespace(

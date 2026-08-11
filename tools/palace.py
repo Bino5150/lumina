@@ -370,7 +370,21 @@ def load_halls(layer: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def build_context_block(max_tokens: int = 400, inject_limit: int = None) -> str:
+def _find_pinned_closet_ids(pin_tag: str) -> set[int]:
+    """Closet ids with at least one drawer carrying pin_tag. Tags live on
+    palace_drawers, not palace_closets — same tags-LIKE-match join pattern
+    as list_flagged_writes(), just resolving to closet_id instead of
+    returning the drawer rows themselves."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT DISTINCT closet_id FROM palace_drawers WHERE tags LIKE ? AND closet_id IS NOT NULL",
+        (f'%"{pin_tag}"%',)
+    ).fetchall()
+    conn.close()
+    return {r["closet_id"] for r in rows}
+
+
+def build_context_block(max_tokens: int = 400, inject_limit: int = None, pin_tag: str = None) -> str:
     """
     Build the memory injection block for the system prompt.
     Always loads L0 + L1 in full. Loads L2 (recent/episodic) up to two caps:
@@ -382,6 +396,16 @@ def build_context_block(max_tokens: int = 400, inject_limit: int = None) -> str:
     many low-value fragments; raising it (e.g. on a large cloud context) lets
     substantially more episodic history ride along even when token budget
     isn't the binding constraint.
+
+    pin_tag (MB-11): when set, any L2 closet with a drawer carrying this tag
+    (e.g. "session:{chat_id}") is included unconditionally, ahead of the
+    normal decay-sorted L2 selection and exempt from inject_limit — same
+    always-present treatment as L0/L1. This is how the current session's
+    rolling nightstand closet resurfaces on reopen regardless of what else
+    is competing for the L2 slot count. Still counted against max_tokens
+    like everything else here; only inject_limit is bypassed. None (default)
+    reproduces prior behavior exactly.
+
     Returns a compact string ready to append to system prompt.
     """
     lines = ["## Memory Palace"]
@@ -395,9 +419,16 @@ def build_context_block(max_tokens: int = 400, inject_limit: int = None) -> str:
         layer_lines = []
         # Apply temporal decay ordering to L2 — most recently updated closets first
         if layer == 2:
-            closets = decay_engine.sort_by_recency(closets)
+            if pin_tag:
+                pinned_ids = _find_pinned_closet_ids(pin_tag)
+                pinned = [c for c in closets if c["id"] in pinned_ids]
+                rest   = [c for c in closets if c["id"] not in pinned_ids]
+            else:
+                pinned, rest = [], closets
+            rest = decay_engine.sort_by_recency(rest)
             if inject_limit is not None:
-                closets = closets[:inject_limit]
+                rest = rest[:inject_limit]
+            closets = pinned + rest
 
         for c in closets:
             tok = c["token_est"] or estimate_tokens(c["compressed"])

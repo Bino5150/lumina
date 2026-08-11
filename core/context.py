@@ -45,6 +45,8 @@ class ContextManager:
         self._ephemeral = ""   # per-turn injection, cleared after build_messages()
         self._untrusted_content_seen = False  # sticky once True — stays for the rest of the session
         self.owner = owner  # gates passive context injection below — see _build_system_prompt()
+        self._pending_compaction = []   # messages captured off the trim loop, awaiting summarization
+        self._compacting = False        # prevents overlapping background compaction jobs
 
     def add_user(self, content, source: str = "OWNER_DIRECT"):
         """Accept str (normal message) or list (multipart: image + text).
@@ -73,11 +75,17 @@ class ContextManager:
             "content": tagged
         })
 
-    def _build_system_prompt(self, tool_budget: int = 0) -> str:
+    def _build_system_prompt(self, tool_budget: int = 0, chat_id: int = None) -> str:
         """
         Assemble the full system prompt.
         Palace injection cap is dynamic — uses whatever token budget remains
         after accounting for tools, response reserve, and base system prompt.
+
+        chat_id (MB-11): when set, threaded into build_context_block() as
+        pin_tag=f"session:{chat_id}" so the current session's rolling
+        nightstand closet (dream-sweep and/or compaction writes) always
+        resurfaces on reopen, regardless of inject_limit. None (default) —
+        headless/no-session callers — reproduces prior behavior exactly.
 
         Palace memory, projectlist.md, and the human_bio/human_profile_curated
         block assembled below (human_block) are ALL owner-only. None of this goes through
@@ -107,6 +115,7 @@ class ContextManager:
                 palace_block = build_context_block(
                     max_tokens=palace_budget,
                     inject_limit=config.MEMORY_INJECT_LIMIT,
+                    pin_tag=f"session:{chat_id}" if chat_id else None,
                 )
             except Exception as e:
                 print(f"[PALACE] injection failed: {e}", flush=True)
@@ -185,12 +194,14 @@ class ContextManager:
             parts.append(self._ephemeral)
         return "\n\n".join(parts)
 
-    def build_messages(self, tool_budget: int = 0) -> list:
+    def build_messages(self, tool_budget: int = 0, chat_id: int = None) -> list:
         """
         Build the messages list for the API call.
         Trims oldest history if over budget, always keeps system prompt + palace block.
+        chat_id: threaded through to _build_system_prompt()'s pin_tag — see
+        that method's docstring. None (default) preserves prior behavior.
         """
-        system_prompt = self._build_system_prompt(tool_budget=tool_budget)
+        system_prompt = self._build_system_prompt(tool_budget=tool_budget, chat_id=chat_id)
         self._ephemeral = ""   # consumed — clear for next turn
         available = self.max_tokens - self.reserve - tool_budget
         system_tokens = estimate_tokens(system_prompt) + 4
@@ -202,7 +213,9 @@ class ContextManager:
             total = system_tokens + sum(estimate_message_tokens(m) for m in history_copy)
             if total <= available:
                 break
-            history_copy.pop(0)
+            dropped = history_copy.pop(0)
+            if getattr(config, "CONTEXT_COMPACTION_ENABLED", False):
+                self._pending_compaction.append(dropped)
 
         # F-61 fix: self.history itself used to grow unbounded — only the
         # local copy above was ever trimmed. Harmless for the desktop
@@ -244,3 +257,11 @@ class ContextManager:
     def push_ephemeral(self, block: str):
         """Append a one-turn injection (e.g. skill docs). Cleared after build_messages()."""
         self._ephemeral = block
+
+    def pending_compaction_tokens(self) -> int:
+        return sum(estimate_message_tokens(m) for m in self._pending_compaction)
+
+    def take_pending_compaction(self) -> list:
+        """Drains and returns the pending buffer. Caller owns summarizing it."""
+        batch, self._pending_compaction = self._pending_compaction, []
+        return batch

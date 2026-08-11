@@ -235,12 +235,17 @@ class LuminaAgent:
                 return True, ""
             self.registry.set_gate(_gate)
 
-    def chat(self, user_input: str, source: str = "OWNER_DIRECT") -> str:
+    def chat(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None) -> str:
         """
         Main entry point. Runs tool loop with non-streaming,
         then streams the final response. Returns full response string.
         source: passed straight through to ctx.add_user(). OWNER_DIRECT (default)
         preserves current desktop behavior unchanged.
+        chat_id (MB-11): threaded straight through to ctx.build_messages() for
+        the session-pin read-side fix — see core/context.py's
+        _build_system_prompt() docstring. None (default) preserves current
+        behavior for every caller that doesn't track a chat_id (CLI, headless,
+        subagents).
         """
         tools_used_this_turn = set()
         think_step = [0]
@@ -378,7 +383,7 @@ class LuminaAgent:
         for iteration in range(config.MAX_TOOL_ITERATIONS):
             tool_schemas = self.registry.get_schemas()
             tool_token_estimate = self.registry.schema_token_estimate()
-            messages = self.ctx.build_messages(tool_budget=tool_token_estimate)
+            messages = self.ctx.build_messages(tool_budget=tool_token_estimate, chat_id=chat_id)
 
             try:
                 response = self.llm.chat(
@@ -471,7 +476,7 @@ class LuminaAgent:
                 )
 
         # Max iterations — force final streamed answer
-        messages = self.ctx.build_messages()
+        messages = self.ctx.build_messages(chat_id=chat_id)
         messages.append({"role": "user", "content": "Give your final answer now based on what you have."})
         return self._stream_final(messages, think_step)
 

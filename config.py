@@ -225,6 +225,13 @@ SUBAGENTS_ENABLED = _p.get("subagents_enabled", False)
 BACKGROUND_TASKS_ENABLED = _p.get("background_tasks_enabled", False)
 MAX_SUBAGENT_DEPTH = _p.get("max_subagent_depth", 2)
 
+# Context-trim compaction (MB-11) — messages dropped by build_messages()'s
+# trim loop are captured instead of silently discarded, batched, and
+# summarized into Palace L2 rather than lost outright. Off by default until
+# tested end-to-end, same pattern as SUBAGENTS_ENABLED above.
+CONTEXT_COMPACTION_ENABLED = _p.get("context_compaction_enabled", False)
+CONTEXT_COMPACTION_BATCH_TOKENS = _p.get("context_compaction_batch_tokens", 1400)
+
 # Chat UI — show/hide the model's <think> reasoning block in the chat
 # window. Purely a display toggle: the model still reasons and those tokens
 # still stream in either case, this just controls whether the UI renders

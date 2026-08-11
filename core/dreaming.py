@@ -22,6 +22,12 @@ DREAM_PROMPT = (
     "This is memory synthesis, not a transcript."
 )
 
+COMPACTION_PROMPT = (
+    "Extract only concrete facts, decisions, and outcomes from this exchange. "
+    "No commentary, no restating questions, no narrative framing. Bullet form. "
+    "This is memory compression, not a transcript."
+)
+
 PROFILE_CURATION_PROMPT = (
     "You maintain a running profile of {user} based on conversation, separate "
     "from their own self-written bio.\n\n"
@@ -55,7 +61,7 @@ def curate_human_profile(raw_text: str, bio: str, existing_profile: str) -> str 
 _last_dream_sweep: dict[int, str] = {}  # chat_id -> ISO timestamp of last sweep
 
 
-def run_summarization_call(raw_text: str) -> str | None:
+def run_summarization_call(raw_text: str, prompt: str = DREAM_PROMPT, max_tokens: int = 500) -> str | None:
     """
     S41 / F-62 real fix: this used to be a bespoke requests.post() straight
     to config.LLM_BACKEND_URL with its own hand-rolled model resolution and
@@ -68,13 +74,19 @@ def run_summarization_call(raw_text: str) -> str | None:
     actually active right now, so this correctly follows backend switches,
     real auth headers, and the real timeout config, same as every other
     call in the app.
+
+    MB-11 (S57 correction 2): prompt/max_tokens are now keyword-parameterized
+    rather than duplicating this whole function for compaction's own prompt —
+    defaults match the original dream-sweep behavior exactly, so existing
+    callers (on_session_idle) are unaffected. Compaction calls this with
+    prompt=COMPACTION_PROMPT, max_tokens=300.
     """
     try:
         backend = get_llm_backend()
         return backend.complete_utility(
-            prompt=f"{DREAM_PROMPT}\n\n{raw_text[:6000]}",
+            prompt=f"{prompt}\n\n{raw_text[:6000]}",
             prefill="SUMMARY:",
-            max_tokens=500,
+            max_tokens=max_tokens,
             temperature=0.3,
         )
     except Exception as e:

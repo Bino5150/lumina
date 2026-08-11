@@ -151,6 +151,45 @@ def test_on_session_idle_writes_to_nightstand_wing_on_success(monkeypatch):
     assert "dream-sweep" in stored["tags"]
 
 
+# ── MB-11: run_summarization_call() parameterized for compaction reuse ──
+
+def test_run_summarization_call_defaults_match_original_dream_behavior(monkeypatch):
+    """No prompt/max_tokens passed -> identical contract to before
+    parameterization (DREAM_PROMPT, max_tokens=500)."""
+    fake = FakeBackend()
+    monkeypatch.setattr(dreaming, "get_llm_backend", lambda: fake)
+
+    dreaming.run_summarization_call("user: test message")
+
+    call = fake.calls[0]
+    assert dreaming.DREAM_PROMPT in call["prompt"]
+    assert call["max_tokens"] == 500
+    assert call["prefill"] == "SUMMARY:"
+    assert call["temperature"] == 0.3
+
+
+def test_run_summarization_call_accepts_custom_prompt_and_max_tokens(monkeypatch):
+    """Compaction's call shape: prompt=COMPACTION_PROMPT, max_tokens=300."""
+    fake = FakeBackend()
+    monkeypatch.setattr(dreaming, "get_llm_backend", lambda: fake)
+
+    dreaming.run_summarization_call(
+        "user: hi\nassistant: hello",
+        prompt=dreaming.COMPACTION_PROMPT,
+        max_tokens=300,
+    )
+
+    call = fake.calls[0]
+    assert dreaming.COMPACTION_PROMPT in call["prompt"]
+    assert dreaming.DREAM_PROMPT not in call["prompt"]
+    assert call["max_tokens"] == 300
+    assert call["prefill"] == "SUMMARY:"  # unchanged even for compaction path
+
+
+def test_compaction_prompt_is_distinct_from_dream_prompt():
+    assert dreaming.COMPACTION_PROMPT != dreaming.DREAM_PROMPT
+
+
 # ── MB-08 Part 1: human profile curation ────────────────────────────────
 
 def test_curate_human_profile_calls_backend_with_expected_prompt_shape(monkeypatch):

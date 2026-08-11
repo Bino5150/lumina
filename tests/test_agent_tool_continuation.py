@@ -33,7 +33,7 @@ def _fake_agent(llm, tool_result="tool ran fine"):
         ctx=types.SimpleNamespace(
             add_user=lambda content, source="OWNER_DIRECT": None,
             push_ephemeral=lambda block: None,
-            build_messages=lambda tool_budget=0: [],
+            build_messages=lambda tool_budget=0, chat_id=None: [],
             add_tool_call=lambda message: None,
             add_tool_result=lambda tool_call_id, name, result: None,
         ),
