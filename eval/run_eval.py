@@ -32,6 +32,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.headless import run_headless_turn, reset_headless_agent
+import config
 
 
 def load_tasks(path: str) -> list:
@@ -56,18 +57,22 @@ def run_task(task: dict) -> dict:
     reset_headless_agent(channel_id)
 
     return {"task_id": task["id"], "category": task.get("category"),
-            "prompts": prompts, "turns": turns}
+            "prompts": prompts, "turns": turns, "backend": config.LLM_BACKEND}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", default=os.path.join(os.path.dirname(__file__), "tasks.json"))
     parser.add_argument("--out", default=None)
+    parser.add_argument("--backend", default=None, help="Override config.LLM_BACKEND for this run (e.g. 'omniroute'). Default: unset, resolves to 'llamacpp' since the scratch prefs are always empty.")
     args = parser.parse_args()
 
     tasks = load_tasks(args.tasks)
+    if args.backend:
+        config.LLM_BACKEND = args.backend.lower()
+        config.LLM_BACKEND_URL = None  # let the backend's own default_url win, not the llamacpp-shaped prefs default
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = args.out or os.path.join(os.path.dirname(__file__), "results", f"{timestamp}_raw.jsonl")
+    out_path = args.out or os.path.join(os.path.dirname(__file__), "results", f"{timestamp}_{config.LLM_BACKEND}_raw.jsonl")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     print(f"[EVAL] Data dir isolated to: {EVAL_DATA_DIR}", flush=True)
