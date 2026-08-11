@@ -3,22 +3,39 @@
 ## Procedure
 
 ### 1. Define the Decay Constant (λ)
-Choose your λ based on desired retention:
-- **0.1/day** (~67% retention after 30 days, ~25% after 90 days) - Moderate forgetting
-- **0.15/day** (~48% retention after 30 days, ~15% after 90 days) - Fast forgetting (good for short-term context)
-- **0.05/day** (~86% retention after 30 days) - Slow forgetting (for long-term memory preservation)
+Choose your λ based on desired retention. Figures below are computed directly from
+`w(t) = e^(-λt)`, t in days -- not hand-estimated (the previous version of this list wasn't,
+and every figure in it was off by an order of magnitude or more):
+- **0.05/day** (~22% retention after 30 days) - Slowest of the three, still fairly aggressive
+- **0.1/day** (~5.0% retention after 30 days, ~0.01% after 90 days) - Fast forgetting
+- **0.15/day** (~1.1% retention after 30 days, ~0.0001% after 90 days) - Very fast forgetting (short-term context only)
+
+For gentler, long-term-preservation retention (e.g. ~78% after 30 days), use a much smaller λ
+such as **0.0083/day** -- see `tools/temporal_decay.py`'s shipped default for a worked example.
 
 ### 2. Calculate Weights per Memory
 ```python
 import math
+from datetime import datetime
+
 def decay_weight(timestamp, lambda_rate=0.1):
     current_time = datetime.now().timestamp()
-    mem_time = float(timestamp)
-    delta_t = current_time - mem_time  # seconds
-    tau = 1.0 / (lambda_rate * 86400)  # Convert to seconds
-    weight = math.exp(-delta_t / tau)
+    mem_time = datetime.fromisoformat(timestamp).timestamp()
+    delta_t_days = (current_time - mem_time) / 86400.0  # seconds -> days
+    tau = 1.0 / lambda_rate  # time constant in days -- NOT seconds
+    weight = math.exp(-delta_t_days / tau)
     return max(0.01, min(1.0, weight))  # Clamp to [0.01, 1]
 ```
+(`timestamp` is an ISO-format string, e.g. `datetime.now().isoformat()` -- matches the
+Verification section's calls below and `tools/temporal_decay.py`'s real implementation. A
+previous version of this sample used `float(timestamp)`, which the Verification section's own
+ISO-string example calls would have raised `ValueError` against.)
+
+A previous version of this sample also computed `tau = 1.0 / (lambda_rate * 86400)` and divided a
+raw-seconds `delta_t` by it -- that puts `tau` at sub-millisecond scale, so any two timestamps
+more than ~1ms apart both collapse to the 0.01 floor immediately, regardless of actual age. Keep
+`tau` in the same "days" unit `lambda_rate` is documented in, and convert `delta_t` to days at
+the point of use, as above.
 
 ### 3. Normalize Across Memory Set (Softmax-like)
 ```python
@@ -75,15 +92,20 @@ def progressive_decay(timestamp, lambda_rate=0.1):
 
 ## Verification
 
-Test with known timestamps:
+Test with known timestamps (regenerated from the corrected function above, not hand-estimated --
+the previous version of this section had two different expected-value sets that didn't even
+agree with each other, and neither matched λ=0.1's actual output):
 ```python
-# Should see: 0 (today), ~0.96 (1 day ago), ~0.82 (3 days ago)
-w = decay_weight("2024-12-19T10:00:00")
-w = decay_weight("2024-12-18T10:00:00")  # 1 day
-w = decay_weight("2024-12-16T10:00:00")  # 3 days
+from datetime import datetime, timedelta
+
+now = datetime.now()
+w_today     = decay_weight(now.isoformat())                          # 0 days
+w_1day_ago  = decay_weight((now - timedelta(days=1)).isoformat())    # 1 day
+w_3days_ago = decay_weight((now - timedelta(days=3)).isoformat())    # 3 days
 ```
 
-**Expected:** ~1.0, ~0.958, ~0.741 (for λ=0.1)
+**Expected (for λ=0.1):** `w_today` ≈ 1.0, `w_1day_ago` ≈ 0.905, `w_3days_ago` ≈ 0.741 --
+directly from `e^(-0.1*0)`, `e^(-0.1*1)`, `e^(-0.1*3)`.
 
 ## Use Cases
 
