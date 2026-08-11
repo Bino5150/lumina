@@ -463,7 +463,6 @@ class ToolsTab(QWidget):
         self.table.setRowCount(0)
         tools = self.agent.registry._tools
         disabled = set(self.agent.registry.get_disabled())
-        enabled_count = 0
 
         for name, data in tools.items():
             i = self.table.rowCount()
@@ -476,12 +475,9 @@ class ToolsTab(QWidget):
             cb.setStyleSheet("QCheckBox { margin-left: 22px; }")
             cb.stateChanged.connect(lambda state, n=name: self._toggle(n, state))
             self.table.setCellWidget(i, 2, cb)
-            if name not in disabled:
-                enabled_count += 1
 
-        total = len(tools)
-        self.count_lbl.setText(f"({enabled_count}/{total})")
         self.table.blockSignals(False)
+        self._update_count()
 
     def _toggle(self, name: str, state: int):
         if state == Qt.Checked:
@@ -556,9 +552,35 @@ class ToolsTab(QWidget):
         self._load_tools()
 
     def _update_count(self):
+        """Enabled/total tool count plus a live schema_token_estimate() readout.
+        MB-10 follow-up: dynamic per-turn relevance filtering turned out to be
+        solving a smaller problem than scoped (68 tools, ~6.4k tokens -- lean
+        per-tool, close to TOOL_BUDGET_TOKENS, not blowing past it) once tool
+        profiles and context compaction were accounted for. What profiles alone
+        don't cover is Toolmaker creep -- custom tools accumulate over a long-
+        running install with nothing surfacing the running total except a
+        console-only [TOOLS] print (core/agent.py) most people never see. This
+        is that number, in the one place a human actually looks: red + bold
+        past config.TOOL_BUDGET_TOKENS, same threshold the console warning
+        already uses, so the two never disagree about what "over budget" means.
+        """
         total = len(self.agent.registry.list_tools())
         enabled = len(self.agent.registry.list_enabled())
-        self.count_lbl.setText(f"({enabled}/{total})")
+        tokens = self.agent.registry.schema_token_estimate()
+        over_budget = tokens > config.TOOL_BUDGET_TOKENS
+        self.count_lbl.setText(f"({enabled}/{total} enabled · ~{tokens:,} schema tokens)")
+        if over_budget:
+            self.count_lbl.setStyleSheet(
+                f"color:{self.c['danger']};font-size:12px;background:transparent;font-weight:bold;"
+            )
+            self.count_lbl.setToolTip(
+                f"Enabled tool schemas (~{tokens:,} tokens) exceed the "
+                f"{config.TOOL_BUDGET_TOKENS:,}-token soft budget. Trim the "
+                f"tool set below, or switch to a narrower profile."
+            )
+        else:
+            self.count_lbl.setStyleSheet(f"color:{self.c['text_muted']};font-size:12px;background:transparent;")
+            self.count_lbl.setToolTip("")
 
     def _save_state(self):
         """Persist disabled tool list to prefs.json."""
