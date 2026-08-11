@@ -66,21 +66,51 @@ def temporal_query(wings=["identity", "projects"]):
 ### 6. Progressive Decay (Optional Enhancement)
 For more realistic biological forgetting:
 ```python
-def progressive_decay(timestamp, lambda_rate=0.1):
+def progressive_decay(timestamp, lambda_rate=0.1, long_term_baseline: float = 0.1):
     """
     Implements Ebbinghaus forgetting curve approximation.
-    Phase 1: Rapid initial decay
-    Phase 2: Slower asymptotic approach to baseline
+    Phase 1 (first week): plain exponential decay, e^(-lambda_rate * t_days) --
+        same formula decay_weight() uses.
+    Phase 2 (after the first week): power-law approach to long_term_baseline,
+        starting exactly where phase 1 left off, not a fresh curve pinned to 1.0.
+    long_term_baseline: the floor phase 2 asymptotically approaches as t -> infinity.
+        A real parameter, not a hidden constant -- distinct from decay_weight()'s
+        hard 0.01 clamp (an absolute minimum), this is a meaningful "memories that
+        persist past the initial forgetting window settle here" asymptote. Must be
+        less than phase 1's value at the boundary (exp(-lambda_rate * phase1_days))
+        for the curve to stay monotonically decreasing -- true for any of this doc's
+        example lambda_rate values (0.05/0.1/0.15) against the default 0.1, but not
+        guaranteed for a much larger lambda_rate (e.g. lambda_rate > ~0.33 with this
+        default baseline would make phase 1's boundary value drop below the baseline
+        itself, so phase 2 would rise instead of decay).
     """
-    t = (datetime.now() - datetime.fromisoformat(timestamp)).total_seconds()
-    phase1, phase2 = 3600*24*7, 3600*24*90  # First week, first 90 days
-    
-    if t < phase1:
-        return math.exp(-lambda_rate * 86400 * (t/phase1))  # Exponential in first week
+    t_days = (datetime.now() - datetime.fromisoformat(timestamp)).total_seconds() / 86400.0
+    phase1_days, phase2_days = 7, 90  # first week is exponential; 90-day scale for the tail
+
+    if t_days < phase1_days:
+        return math.exp(-lambda_rate * t_days)
     else:
-        # Power law tail for long-term retention
-        return 0.5 + 0.5 * math.exp(-((t-phase1)/phase2) ** 0.8)
+        w1 = math.exp(-lambda_rate * phase1_days)  # phase 1's own value at the boundary
+        return long_term_baseline + (w1 - long_term_baseline) * math.exp(-((t_days - phase1_days) / phase2_days) ** 0.8)
 ```
+Two bugs fixed here, both found the same session as `decay_weight()`'s units bug (commit
+`6a47513`) but logged and fixed separately since this is a different, deeper issue:
+
+1. **Same units bug as `decay_weight()`** -- `t` used to be raw seconds, multiplied by a stray
+   `86400` inside the phase-1 branch. Converting `t` to `t_days` once, up front, removes the need
+   for any `86400` factor inside either branch.
+2. **Phase discontinuity** (the actual reason this needed more than a units patch) -- the old
+   phase 2 always started from a hardcoded `0.5 + 0.5 * ...`, i.e. it assumed phase 1 always left
+   off at exactly `1.0`. It doesn't: for this doc's own `lambda_rate=0.1` example, phase 1 is
+   already down to `exp(-0.1*7) ≈ 0.497` by the 7-day boundary. The old code jumped from `~0.497`
+   (phase 1, just before the boundary) straight to `1.0` (phase 2, just after it) -- the curve
+   went back UP before continuing to decay. Phase 2 above starts from `w1` (phase 1's own value at
+   the boundary) and decays toward `long_term_baseline` instead, so the two phases connect exactly
+   at `t_days = phase1_days` by construction.
+
+(`progressive_decay()`'s `timestamp` parameter was already an ISO-format string via
+`datetime.fromisoformat(timestamp)` -- it didn't have the separate `float(timestamp)` bug
+`decay_weight()`'s sample had; confirmed, not just assumed, while fixing the two bugs above.)
 
 ## Pitfalls
 
@@ -106,6 +136,31 @@ w_3days_ago = decay_weight((now - timedelta(days=3)).isoformat())    # 3 days
 
 **Expected (for λ=0.1):** `w_today` ≈ 1.0, `w_1day_ago` ≈ 0.905, `w_3days_ago` ≈ 0.741 --
 directly from `e^(-0.1*0)`, `e^(-0.1*1)`, `e^(-0.1*3)`.
+
+### `progressive_decay()` checkpoints (λ=0.1, long_term_baseline=0.1, default phase windows)
+
+Computed directly from the corrected function above -- these did not exist for the previous,
+discontinuous version, since the bug meant no consistent set of checkpoints could have existed
+in the first place.
+
+| t_days | weight | % |
+|---|---|---|
+| 0 | 1.000000 | 100.00% |
+| 1 | 0.904837 | 90.48% |
+| 3 | 0.740818 | 74.08% |
+| 7 (phase boundary) | 0.496585 | 49.66% |
+| 14 | 0.448371 | 44.84% |
+| 30 | 0.383486 | 38.35% |
+| 60 | 0.306070 | 30.61% |
+| 90 | 0.255340 | 25.53% |
+| 365 | 0.119394 | 11.94% |
+| 730 | 0.101988 | 10.20% |
+
+The `t=7` row is the same value whether computed via phase 1's formula (`e^(-0.1*7)`, evaluated
+just below the boundary) or phase 2's (evaluated just above it) -- that agreement is the actual
+fix; the old version jumped to `1.0` there instead. Weight keeps decreasing (never rises) at every
+step past that, settling toward `long_term_baseline=0.1` as t grows -- by `t=730` it's within
+~0.02 of the asymptote.
 
 ## Use Cases
 
