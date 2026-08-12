@@ -2,8 +2,12 @@
 Lumina — Entry Point
 Run with GUI:  python main.py
 Run CLI only:  python main.py --cli
+CLI persona:   python main.py --cli --persona Lumina
+CLI tool override (per-run only, doesn't touch any file):
+               python main.py --cli --persona Lumina --tools Coding
 """
 
+import argparse
 import sys
 import os
 
@@ -19,8 +23,62 @@ os.environ.setdefault("LUMINA_DATA_DIR", os.path.join(os.path.expanduser("~"), "
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
-def run_cli():
-    """Terminal-only mode for testing without PySide6."""
+def apply_cli_persona_and_tools(agent, persona_name: str = None, tools_override: str = None) -> list[str]:
+    """MB-22: resolve --persona / --tools against a live agent, in order.
+
+    Pulled out of run_cli() as its own function so the lookup/apply/message
+    logic is unit-testable against a lightweight fake agent (no real
+    LuminaAgent/backend/DB needed) -- run_cli() itself can't be exercised
+    that cheaply since it also owns the interactive input() loop.
+
+    Returns the list of status lines (also printed here) so callers/tests
+    can assert on them without scraping stdout. Order matches run_cli()'s
+    prior inline behavior: persona (and its own tools_profile, via
+    apply_persona()) first, then --tools as a per-invocation override on
+    top -- so --tools always wins if both are given.
+    """
+    from core.personas import find_persona_by_name
+    from core.tool_profiles import apply_tool_profile, find_profile_by_name
+
+    messages = []
+
+    if persona_name:
+        persona = find_persona_by_name(persona_name)
+        if persona is None:
+            messages.append(f"✗ No persona named '{persona_name}' found in personas/. Running with base config.")
+        else:
+            agent.apply_persona(persona)
+            tools_label = persona.get("tools_profile") or ("inline tool list" if persona.get("tools_enabled") else "unchanged")
+            messages.append(f"✓ Persona: {persona.get('name')} (tools: {tools_label})")
+
+    if tools_override:
+        if find_profile_by_name(tools_override) is None:
+            messages.append(f"✗ No tool profile named '{tools_override}' found. Tool set unchanged.")
+        else:
+            apply_tool_profile(agent.registry, profile_name=tools_override, owner=agent.owner)
+            messages.append(f"✓ Tool profile override: {tools_override}")
+
+    for m in messages:
+        print(f"  {m}\n")
+    return messages
+
+
+def run_cli(persona_name: str = None, tools_override: str = None):
+    """Terminal-only mode for testing without PySide6.
+
+    persona_name: MB-22 -- optional persona to load by name (core/personas.py),
+        same effect as picking it in the desktop app's persona sidebar: applies
+        its system prompt, voice, and its own tools_profile via apply_persona().
+        None (default) preserves current behavior -- base config, no persona
+        applied, matching how the desktop app itself behaves with no saved
+        last_persona pref.
+    tools_override: optional tool profile name (core/tool_profiles.py) applied
+        AFTER persona load, for this invocation only. Mirrors the existing
+        `backend: str = None` override pattern on LuminaAgent.__init__ -- an
+        explicit, per-call opt-in that never touches any file on disk. Useful
+        standalone too (no --persona needed) for a one-off run with the base
+        identity but a trimmed tool set.
+    """
     from core.agent import LuminaAgent
     import config
 
@@ -36,7 +94,15 @@ def run_cli():
     print(f"  Backend: {config.LLM_BACKEND} ({config.LLM_BACKEND_URL})")
     print(f"{'='*52}\n")
 
-    agent = LuminaAgent(on_tool_call=on_tool_call, on_tool_result=on_tool_result)
+    # MB-22: CLI is a trusted local session, same footing as the desktop app --
+    # owner=True is already LuminaAgent's default, unchanged here. channel_id
+    # is now explicit ("cli-local" instead of the generic "default") so PIN
+    # verification/lockout state (tools/pin.py) never shares a bucket with any
+    # other owner=True call site that also left channel_id at its default.
+    agent = LuminaAgent(on_tool_call=on_tool_call, on_tool_result=on_tool_result,
+                         channel_id="cli-local")
+
+    apply_cli_persona_and_tools(agent, persona_name, tools_override)
 
     try:
         status = agent.test_connection()
@@ -108,12 +174,36 @@ def run_gui():
     sys.exit(app.exec())
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    """MB-22: --persona and --tools are CLI-only flags -- run_gui() takes none
+    of its own today, and the GUI's own persona/profile pickers already cover
+    that surface there. Parsed regardless of --cli so the GUI fallback path
+    (PySide6 missing) also gets to honor them."""
+    parser = argparse.ArgumentParser(
+        description="Lumina -- local-first AI agent. Run with no flags for the "
+                    "GUI, or --cli for terminal mode."
+    )
+    parser.add_argument("--cli", action="store_true",
+                         help="Terminal-only mode without PySide6.")
+    parser.add_argument("--persona", type=str, default=None, metavar="NAME",
+                         help="Load a persona by name (e.g. --persona Lumina) -- "
+                              "applies its system prompt, voice, and tool profile, "
+                              "same as switching personas in the desktop app. "
+                              "Omit to run with base config defaults.")
+    parser.add_argument("--tools", type=str, default=None, metavar="PROFILE",
+                         help="Override the tool profile for this run only "
+                              "(e.g. --tools Coding), applied after --persona if "
+                              "both are given. Does not modify any file on disk.")
+    return parser
+
+
 if __name__ == "__main__":
-    if "--cli" in sys.argv:
-        run_cli()
+    args = build_arg_parser().parse_args()
+    if args.cli:
+        run_cli(persona_name=args.persona, tools_override=args.tools)
     else:
         try:
             run_gui()
         except ImportError as e:
             print(f"\nPySide6 not found ({e}). Falling back to CLI mode.\n")
-            run_cli()
+            run_cli(persona_name=args.persona, tools_override=args.tools)

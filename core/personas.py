@@ -44,6 +44,26 @@ def load_persona(path: str) -> dict:
         return json.load(f)
 
 
+def find_persona_by_name(name: str, include_channel_bound: bool = False) -> dict | None:
+    """Case-insensitive lookup by persona name (not filename).
+
+    Mirrors core/tool_profiles.py's find_profile_by_name() -- same shape,
+    same case/whitespace handling -- so the two "look up a thing by its
+    human-facing name" call sites (MB-22's CLI --persona flag and the
+    Settings tool-profile dropdown) can't drift into different matching
+    rules. Excludes channel_bound templates (e.g. discord_template.json) by
+    default, same as list_personas(), since those aren't meant to be
+    selected by name outside their dedicated Communications tab flow.
+    """
+    if not name:
+        return None
+    target = name.strip().lower()
+    for p in list_personas(include_channel_bound=include_channel_bound):
+        if p.get("name", "").strip().lower() == target:
+            return p
+    return None
+
+
 def save_persona(path: str, data: dict):
     os.makedirs(PERSONAS_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
