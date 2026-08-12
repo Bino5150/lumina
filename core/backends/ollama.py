@@ -85,7 +85,9 @@ class OllamaBackend(BaseLLMBackend):
         except requests.exceptions.Timeout:
             raise TimeoutError("Ollama request timed out.")
         except requests.exceptions.HTTPError as e:
-            print(f"[HTTP ERROR BODY] {resp.text}", flush=True)
+            # Bounded -- was an unbounded raw-body print, same hygiene gap
+            # anthropic_backend.py's equivalent had before this pass.
+            print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
             raise RuntimeError(f"Ollama HTTP error: {e}")
 
     def chat_stream(self, messages: list, max_tokens: int = 1024,
@@ -109,6 +111,20 @@ class OllamaBackend(BaseLLMBackend):
             raise ConnectionError(f"Ollama not reachable at {self.base_url}.")
         except requests.exceptions.Timeout:
             raise TimeoutError("Ollama request timed out.")
+        except requests.exceptions.HTTPError as e:
+            # This branch didn't exist before -- same gap as gemini_backend.py
+            # and anthropic_backend.py had: an HTTP error on the streaming
+            # path (e.g. model not pulled, OOM) used to leak as a raw
+            # requests.exceptions.HTTPError instead of the RuntimeError
+            # chat() already raises for the identical failure. core/agent.py's
+            # _stream_final() only catches (ConnectionError, TimeoutError,
+            # RuntimeError, ValueError) for its graceful "[Stream error: ...]"
+            # handling -- an uncaught HTTPError skipped that path entirely.
+            # No quota/billing concept for a local backend, so unlike the two
+            # cloud backends this stays unclassified, matching chat()'s own
+            # existing style here.
+            print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
+            raise RuntimeError(f"Ollama HTTP error: {e}")
 
         buffer = ""
         in_think = False

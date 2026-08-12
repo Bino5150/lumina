@@ -40,6 +40,60 @@ ANTHROPIC_VERSION = "2023-06-01"  # required header, independent of model versio
 API_BASE = "https://api.anthropic.com/v1/messages"
 
 
+def classify_anthropic_error(status_code, raw_body: str) -> dict:
+    """
+    Best-effort classification of an Anthropic API error response into the
+    same normalized "kind" vocabulary core/backends/lmstudio.py's
+    classify_provider_error() already uses for the OpenAI-compatible backend
+    family (generic/billing_required/insufficient_quota/authentication/
+    rate_limited). Never raises.
+
+    Anthropic's error body is a documented, stable envelope:
+        {"type": "error", "error": {"type": <error_type>, "message": <str>},
+         "request_id": <str>}
+    with a fixed, published set of error.type values, each already pinned to
+    one HTTP status (per docs.claude.com/en/api/errors): invalid_request_error
+    (400), authentication_error (401), billing_error (402), permission_error
+    (403), not_found_error (404), rate_limit_error (429), api_error (500),
+    overloaded_error (529). Unlike Gemini/OpenAI-compatible providers, there's
+    no ambiguity to resolve via message text here -- error.type alone is
+    authoritative, so this is a direct lookup rather than a haystack scan.
+    billing_error and permission_error are kept distinct in Anthropic's own
+    vocabulary (billing = payment/plan problem, permission = this key can't
+    use this resource) but map to different normalized kinds here since
+    they're actionable differently: billing_error -> billing_required,
+    permission_error -> authentication (same bucket as an invalid key --
+    both mean "this credential can't do this," just for different reasons).
+    """
+    kind = "generic"
+    message = ""
+    try:
+        body = json.loads(raw_body) if raw_body else {}
+        err = body.get("error", body) if isinstance(body, dict) else {}
+        err_type = str(err.get("type") or "")
+        message = str(err.get("message") or "")
+        if err_type == "rate_limit_error" or status_code == 429:
+            kind = "rate_limited"
+        elif err_type == "billing_error" or status_code == 402:
+            kind = "billing_required"
+        elif err_type in ("authentication_error", "permission_error") or status_code in (401, 403):
+            kind = "authentication"
+    except Exception:
+        pass
+    return {"kind": kind, "message": message}
+
+
+def format_anthropic_error(status_code, raw_body: str, fallback: str) -> str:
+    """Build the single error string chat()/chat_stream() raise on an HTTP
+    error -- same output shape as lmstudio.py's format_provider_error() /
+    gemini_backend.py's format_gemini_error(), so a caller doesn't need to
+    special-case which backend produced it: "Anthropic error (<kind>, HTTP
+    <status>): <detail>"."""
+    info = classify_anthropic_error(status_code, raw_body)
+    detail = info["message"] or (raw_body[:500] if raw_body else fallback)
+    return f"Anthropic error ({info['kind']}, HTTP {status_code}): {detail}"
+
+
 class AnthropicBackend(BaseLLMBackend):
     """Native Claude backend — x-api-key auth, /v1/messages endpoint."""
 
@@ -225,8 +279,13 @@ class AnthropicBackend(BaseLLMBackend):
         except requests.exceptions.Timeout:
             raise TimeoutError("Anthropic API request timed out.")
         except requests.exceptions.HTTPError as e:
-            print(f"[HTTP ERROR BODY] {resp.text}", flush=True)
-            raise RuntimeError(f"Anthropic API HTTP error: {e}")
+            # Was an unbounded, unredacted print of the raw body -- same
+            # hygiene gap gemini_backend.py's equivalent print already
+            # avoided (bounded to 500 chars there). Anthropic's error body
+            # carries no thoughtSignature-class secret to redact, but an
+            # arbitrarily large body still shouldn't dump in full.
+            print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
+            raise RuntimeError(format_anthropic_error(resp.status_code, resp.text, str(e)))
 
     def extract_message(self, response):
         """
@@ -299,6 +358,20 @@ class AnthropicBackend(BaseLLMBackend):
             raise ConnectionError("Anthropic API not reachable.")
         except requests.exceptions.Timeout:
             raise TimeoutError("Anthropic API request timed out.")
+        except requests.exceptions.HTTPError as e:
+            # This branch didn't exist before -- an HTTP error on the
+            # streaming path (rate limited, overloaded, billing/permission
+            # failure -- the exact class of failure chat()'s non-streaming
+            # path already handles above) used to leak as a raw requests.
+            # exceptions.HTTPError instead of the RuntimeError chat() raises.
+            # core/agent.py's _stream_final() only catches (ConnectionError,
+            # TimeoutError, RuntimeError, ValueError) for its graceful
+            # "[Stream error: ...]" handling -- an uncaught HTTPError skipped
+            # that path entirely and fell through to a cruder top-level
+            # handler instead. Same shape as chat()'s handling, just also
+            # applied here.
+            print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
+            raise RuntimeError(format_anthropic_error(resp.status_code, resp.text, str(e)))
 
         thinking_open = False
 

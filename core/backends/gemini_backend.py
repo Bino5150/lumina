@@ -80,6 +80,67 @@ def _redact_thought_signatures(text: str) -> str:
     return _THOUGHT_SIG_RE.sub(r'\1[REDACTED]\2', text)
 
 
+def classify_gemini_error(status_code, raw_body: str) -> dict:
+    """
+    Best-effort classification of a Gemini API error response into the same
+    normalized "kind" vocabulary core/backends/lmstudio.py's
+    classify_provider_error() already uses for the OpenAI-compatible backend
+    family (generic/billing_required/insufficient_quota/authentication/
+    rate_limited) -- so a caller can treat any backend's failure the same
+    way regardless of which provider produced it. Never raises.
+
+    Gemini's error body is Google's standard envelope:
+        {"error": {"code": <int>, "message": <str>, "status": <ENUM_STRING>}}
+    -- a different shape from OpenAI's {"error": {"type", "message"}}: the
+    classifying field is "status" (upper-snake-case, e.g. RESOURCE_EXHAUSTED,
+    PERMISSION_DENIED, UNAUTHENTICATED), not "type", and there's no separate
+    "type" key at all.
+
+    RESOURCE_EXHAUSTED is Gemini's status for BOTH true quota exhaustion
+    (the free-tier daily/per-minute request cap this backend actually hit
+    during testing) and plain rate limiting -- Google doesn't split these
+    into separate statuses. The message text is the only signal that tells
+    them apart ("quota"/"free_tier_requests" wording vs a bare "please retry
+    in Ns" throttle), so -- same message-first-then-status-code precedence
+    classify_provider_error() already uses, for the same reason -- the
+    message is checked before falling back to the bare status/HTTP code.
+    """
+    kind = "generic"
+    message = ""
+    try:
+        body = json.loads(raw_body) if raw_body else {}
+        err = body.get("error", body) if isinstance(body, dict) else {}
+        status = str(err.get("status") or "")
+        message = str(err.get("message") or "")
+        haystack = f"{status} {message}".lower()
+        if "quota" in haystack:
+            kind = "insufficient_quota"
+        elif "billing" in haystack:
+            kind = "billing_required"
+        elif status == "RESOURCE_EXHAUSTED" or status_code == 429:
+            kind = "rate_limited"
+        elif status == "UNAUTHENTICATED" or status_code == 401:
+            kind = "authentication"
+        elif status == "PERMISSION_DENIED" or status_code == 403:
+            kind = "authentication"
+    except Exception:
+        pass
+    return {"kind": kind, "message": message}
+
+
+def format_gemini_error(status_code, raw_body: str, fallback: str) -> str:
+    """Build the single error string chat()/chat_stream() raise on an HTTP
+    error -- same output shape as lmstudio.py's format_provider_error(), so
+    a caller doesn't need to special-case which backend produced it:
+    "Gemini error (<kind>, HTTP <status>): <detail>". raw_body should
+    already be thoughtSignature-redacted (see _redact_thought_signatures)
+    before it reaches this function -- this only classifies/formats, it
+    never touches redaction itself."""
+    info = classify_gemini_error(status_code, raw_body)
+    detail = info["message"] or (raw_body[:500] if raw_body else fallback)
+    return f"Gemini error ({info['kind']}, HTTP {status_code}): {detail}"
+
+
 class GeminiBackend(BaseLLMBackend):
     """Native Gemini backend — x-goog-api-key auth, model-in-URL endpoint."""
 
@@ -347,14 +408,14 @@ class GeminiBackend(BaseLLMBackend):
         except requests.exceptions.Timeout:
             raise TimeoutError("Gemini API request timed out.")
         except requests.exceptions.HTTPError as e:
-            # Bounded, redacted snippet -- never the raw unbounded body. Same
-            # posture as never logging an API key: this can contain a
-            # thoughtSignature in some error-echo shapes, so redact before
-            # truncating, not after (truncating first could cut a signature in
-            # half and leave a partial value visible).
-            body = _redact_thought_signatures(resp.text)[:500]
-            print(f"[HTTP ERROR BODY] model={self.default_model} status={resp.status_code} body={body}", flush=True)
-            raise RuntimeError(f"Gemini API HTTP error: {e}")
+            # Redact before truncating for the log line (truncating first
+            # could cut a thoughtSignature in half and leave a partial value
+            # visible) -- then classify off the full redacted body so a
+            # quota/rate-limit/auth message longer than the 500-char log
+            # preview still gets read correctly.
+            redacted = _redact_thought_signatures(resp.text)
+            print(f"[HTTP ERROR BODY] model={self.default_model} status={resp.status_code} body={redacted[:500]}", flush=True)
+            raise RuntimeError(format_gemini_error(resp.status_code, redacted, str(e)))
 
     def extract_message(self, response):
         """
@@ -440,6 +501,21 @@ class GeminiBackend(BaseLLMBackend):
             raise ConnectionError("Gemini API not reachable.")
         except requests.exceptions.Timeout:
             raise TimeoutError("Gemini API request timed out.")
+        except requests.exceptions.HTTPError as e:
+            # This branch didn't exist before -- an HTTP error on the
+            # streaming path (quota exhausted, rate limited, auth failure --
+            # the exact class of failure chat()'s non-streaming path already
+            # handles above) used to leak as a raw requests.exceptions.
+            # HTTPError instead of the RuntimeError chat() raises. core/
+            # agent.py's _stream_final() only catches (ConnectionError,
+            # TimeoutError, RuntimeError, ValueError) for its graceful
+            # "[Stream error: ...]" handling -- an uncaught HTTPError skipped
+            # that path entirely and fell through to a cruder top-level
+            # handler instead. Same shape as chat()'s handling, just also
+            # applied here.
+            redacted = _redact_thought_signatures(resp.text)
+            print(f"[HTTP ERROR BODY] model={self.default_model} status={resp.status_code} body={redacted[:500]}", flush=True)
+            raise RuntimeError(format_gemini_error(resp.status_code, redacted, str(e)))
 
         for raw_line in resp.iter_lines(decode_unicode=True):
             if not raw_line or not raw_line.startswith("data:"):
