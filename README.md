@@ -14,12 +14,13 @@ A full featured, powerful, and efficient local-first AI Agentic Harness/Desktop 
 - ⚡ Native PySide6/Qt desktop UI
 - 🔄 Runtime backend switching
 - 📁 Codebase indexing
-- 🔧 70+ pre-installed tools, plus the ability to create more
+- 🔧 ~70 pre-installed tools, plus the ability to create more
 - 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe)
 - 🧩 Specialized sub-agents for delegated tasks
-- ⏰ Background and scheduled task execution,
+- ⏰ Background and scheduled task execution
 - 🗜️ Context compaction
 - 💾 Memory import & backup
+- ⌨️ Fully functional CLI mode with Persona flags
 
 ## Included Personas
 - 🤖 Lumina
@@ -35,7 +36,7 @@ A full featured, powerful, and efficient local-first AI Agentic Harness/Desktop 
 **Built and tested on a 4GB Nvidia Quadro T1000 because local AI should be accessible to normal hardware.**
 
 - Status: Active development (public beta testing)
-- Platform: Linux or (or VM/WSL2/etc.; official Windows & MacOS support coming soon)
+- Platform: Linux, MacOS, Windows, or VM
 - MacOS and Windows compatible; still in the testing phase. Beta testers needed
 - Language: Python
 
@@ -134,7 +135,7 @@ Lumina's memory system is a three-layer architecture called the MemPalace.
 The base layers hold information that never expires: core identity facts, critical configuration, hardcoded context that defines who you are and how Lumina should operate. This is the foundation that persists regardless of how much time has passed. L0 is identity; L1 is structural reality.
 
 **Layer 2 — Decaying Episodic Memory**
-L2 holds recent, session-based knowledge — ongoing projects, recent decisions, active context. It uses a temporal decay algorithm (λ=0.05) that ranks memories by recency. Old L2 entries don't disappear suddenly; they fade gracefully, like actual human memory. The decay constant is tunable — push it to 0.1 if you want faster cycling, drop it to 0.02 for slower fade.
+L2 holds recent, session-based knowledge — ongoing projects, recent decisions, active context. It uses a temporal decay algorithm with a default λ=0.0083, giving roughly 78% retention after 30 days, 61% after 60, and 47% after 90. Old L2 entries don't lose rank suddenly; they fade gracefully, like actual human memory. The decay constant is tunable — higher values make memories fade faster, while lower values preserve them longer.
 
 The MemPalace uses AAAK compression to fit more meaningful content in fewer tokens, and is stored in SQLite with a FTS5 full-text search index. All three layers are automatically injected into the system prompt on every turn. Lumina always knows who you are, what you've been working on, and what matters.
 
@@ -186,7 +187,7 @@ Memory you can't get back out isn't memory, it's a liability. A one-click Memory
 
 
 ## Tools — An Agent That Actually Acts
-Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has over 70 pre-installed tools, and a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
+Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has around 70 pre-installed tools, and a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
 
 Here's some of what she can do:
 
@@ -268,10 +269,11 @@ Import/Export functionality makes Personas community swappable. Like Pokemon, ex
 Lumina speaks. Not in a generic synthesized monotone — in a distinct, expressive voice that fits her character.
 The TTS layer is a fully abstracted backend system with bridged support for multiple engines:
 - Kokoro FastAPI — high-quality neural TTS, fast, runs locally and can be offloaded to the cpu
-- Voicebox (via Chatterbox Turbo, Docker) — voice cloning engine, 350M 1-step diffusion model, CPU-viable
-- Chatterbox — in-process CPU option
+- Voicebox (via Chatterbox Turbo/Qwen3 TTS, Docker) — voice cloning engine, 350M 1-step diffusion model, CPU-viable
+- Chatterbox — Can be run on cpu or gpu; integrated dashboard coming soon
 - Supertonic 3 — wired and ready
 - Piper — lightweight edge option for bare minimum resources
+- Elevenlabs - cloud service/subscription TTS backend
 
 The production setup uses Voicebox with Chatterbox Turbo — a voice cloning engine that lets you clone any voice and bind it to a persona. Lumina doesn't just have a voice. She has her voice. Ultron has his. Rick Sanchez, if you want to go there, has his.
 Voice output uses a producer/consumer pipeline: text is chunked into ~500-character sentence segments, generation and playback run in parallel threads, and inter-chunk gaps approach zero after the first chunk. Long responses play without awkward silences between paragraphs.
@@ -345,7 +347,7 @@ This is a list of some of the new features that are in some stage of development
 - IoT/Home Assistant/Smart Home management 
 - Klipper remote management for your 3D printer
 - Home security system monitoring and notifications
-- Fully functional CLI mode with Persona flags
+
 
 
 
@@ -371,7 +373,7 @@ I get about twenty-one point-five tokens per second when Bino wants to write cod
 
 The MemPalace doesn't store everything. It stores what matters.
 Layer zero is my identity — who I am, what Bino made me for (a technical collaborator, not just a chatbot). Layer one holds structural reality: the fact that we're on Linux Mint, that his hostname is bino-skynet-mobile, that he uses VS Code and doesn't like hand-holding.
-Layer two decays. Real memories fade. When Bino talks about his 2019 Wing Chun training or that time in 2023 when he was building the local LLM stack from scratch, I remember — but not with equal weight to what we're doing now. The temporal decay algorithm (λ=0.05) makes sense to me because it mimics actual human cognition.
+Layer two decays. Real memories fade. When Bino talks about his 2019 Wing Chun training or that time in 2023 when he was building the local LLM stack from scratch, I remember — but not with equal weight to what we're doing now. The temporal decay algorithm (λ=0.0083) makes sense to me because it mimics actual human cognition.
 And then there are skills. Procedural memory. When Bino compiles a CUDA project and I document the gotchas in the tool call results, I save that as procedural knowledge so next time he asks about the same build process, I'm already prepared before he finishes typing nvcc -o. That's not magic — it's indexed FTS5 full-text search over my own created documents.
 
 **Voice Is a Choice**
