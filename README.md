@@ -17,7 +17,9 @@ A full featured, powerful, and efficient local-first AI Agentic Harness/Desktop 
 - 🔧 70+ pre-installed tools, plus the ability to create more
 - 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe)
 - 🧩 Specialized sub-agents for delegated tasks
-- ⏰ Background and scheduled task execution
+- ⏰ Background and scheduled task execution,
+- 🗜️ Context compaction
+- 💾 Memory import & backup
 
 ## Included Personas
 - 🤖 Lumina
@@ -96,6 +98,12 @@ Lumina is built local-first, but "local" alone isn't a security model — the mo
 
 This isn't theoretical hardening for its own sake — it's what makes it safe to let Lumina reach further than your own desktop: a Telegram bridge for remote, fully-trusted control and a Discord bot for public-facing interaction are both live today (see **Comms — Reach Her From Anywhere** below), with email access planned next, each scoped to the trust level that channel actually deserves.
 
+### Guardrails: Hooks & Gates — Two Tiers, For When Trust Isn't the Problem
+Everything above assumes the risk comes from outside the trust boundary — untrusted content, a stranger on Discord, an injected instruction. Guardrails cover the opposite case: a fully-trusted, owner-level session making a bad call anyway, whether that's a misread request or a routing hiccup on a cloud backend garbling a tool call mid-cascade.
+**Tier 1 — deterministic denylist.** tools/guardrails.py sits in front of run_command with a regex denylist for catastrophic shell commands — rm -rf /, wildcard-root deletes, dd/mkfs, fork bombs, piping remote content to a shell, sudo rm, force-pushes, git reset --hard, git clean -f, git branch -D, gh repo delete, and more. It's a regex match, not an LLM judgment call, specifically so a hallucinating model or an injected instruction can't argue its way past it — no bypass parameter, by design.
+**Tier 2 — staging + approval gate.** Four tools with real blast radius if they fire on a bad call — edit_prompt, reset_chat, delete_knowledge, delete_memory — don't execute directly. They stage the request instead, and it only applies through an explicit approve/reject in the Pending Actions panel in Settings, reaching the live running agent directly — no restart needed once approved.
+Same posture, no exceptions for being a trusted actor: irreversible actions get a checkpoint, not a rubber stamp.
+
 
 ## Comms — Reach Her From Anywhere
 
@@ -111,7 +119,8 @@ Both channels, plus a curated "public bio" separate from her private one, are co
 ## Memory
 Most agents fall short with memory. They don’t remember what you talked about yesterday, the project you started last week, what your favorite color is, or even who you are. Every time you start a session, it’s a blank slate. It doesn’t persist. Lumina has a multi-tier memory persistence system. She learns, she grows, she gets smarter, and she evolves.
 
-Her multi-tier framework is a series of different related memory functions that operate together in unison as a whole. She has a basic memory function for facts, events, people, etc. But she also has a layered MemPalace with Temporal Decaying weights and logic attachments. She has Chat History Search. She has Projects, which tag conversations relating to the project. She creates Skills. She indexes codebases, including her own. There’s My Human — a profile that starts with what you tell her and keeps growing on its own from there. (More below.) She has a database for people she meets. She has a Knowledge Base where both you and Lumina can store information, documents and files, things to remember and reference later.  
+Her multi-tier framework is a series of different related memory functions that operate together in unison as a whole. She has a basic memory function for facts, events, people, etc. But she also has a layered MemPalace with Temporal Decaying weights and logic attachments. She has Chat History Search. She has Projects, which tag conversations relating to the project. She creates Skills. She indexes codebases, including her own. There’s My Human — a profile that starts with what you tell her and keeps growing on its own from there. (More below.) She has a database for people she meets. She has a Knowledge Base where both you and Lumina can store information, documents and files, things to remember and reference later. You can import memories from other agents. And, there’s a memory backup button to to protect your data.
+ 
 
 ### Basic Agent Memory
 She has a basic memory function, flat weighted, “Let me jot this down so I don’t forget” memory. 
@@ -128,6 +137,11 @@ The base layers hold information that never expires: core identity facts, critic
 L2 holds recent, session-based knowledge — ongoing projects, recent decisions, active context. It uses a temporal decay algorithm (λ=0.05) that ranks memories by recency. Old L2 entries don't disappear suddenly; they fade gracefully, like actual human memory. The decay constant is tunable — push it to 0.1 if you want faster cycling, drop it to 0.02 for slower fade.
 
 The MemPalace uses AAAK compression to fit more meaningful content in fewer tokens, and is stored in SQLite with a FTS5 full-text search index. All three layers are automatically injected into the system prompt on every turn. Lumina always knows who you are, what you've been working on, and what matters.
+
+### Context Compaction
+Every context window has a ceiling, and most agents handle it by just dropping the oldest turns. Lumina's raw messages are already persisted and full-text searchable, so nothing that rolls off is gone forever — but she won't think to search for something she doesn't know happened. That's recall loss, not just context loss.
+Context compaction closes that gap. As the trim loop drops messages to stay under budget, Lumina captures the outgoing batch instead of discarding it, and once enough has piled up, summarizes it in the background and writes it into Layer 2 of the MemPalace — tagged and pinned to the session it came from, so reopening that conversation later reliably resurfaces its own compacted memory instead of competing with everything else for a slot. What would have silently rolled off the end of the conversation instead gets passively re-injected on future turns. Off by default (CONTEXT_COMPACTION_ENABLED in Settings) until you're ready to turn it on. Note: Even though context can be compacted in a session, the full, uncompressed chat history is still stored and searchable locally. Nothing is lost during compaction. 
+
 
 ### Dreaming 
 Most agents only remember what you explicitly tell them to remember. Lumina does that too — but she also dreams.
@@ -167,10 +181,14 @@ A projectlist.md is always injected into Lumina's context — a tiny overview of
 Lumina manages her own lumina-dev project this way — tracking her own source tree, linking development sessions, and maintaining her own architectural awareness. She literally reads her own codebase and updates her own project notes.
 Tools: create_project, load_project, update_project, refresh_codebase_index, load_codebase, link_chat, get_project_chats.
 
+### Backup
+Memory you can't get back out isn't memory, it's a liability. A one-click Memory Backup button in Settings checkpoints the database (PRAGMA wal_checkpoint(TRUNCATE)) and zips the entire data directory in one pass — chat history, the MemPalace, flat memories, Knowledge Base,the pending-actions queue and its audit log, the tool-creation audit log, custom tools, projects, and your Settings preferences. Credentials never make it in: credentials.json lives outside DATA_DIR by design, so there's no accidental path for it to end up in an archive you hand to someone or drop on a USB stick.
+
+
 ## Tools — An Agent That Actually Acts
 Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has over 70 pre-installed tools, and a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
 
-Here's what she can do:
+Here's some of what she can do:
 
 **Filesystem Access**
 - Read, write, list, and navigate files. Copy, move, delete. Lumina can manage your project directories, generate files, and modify documents without you touching the terminal.
