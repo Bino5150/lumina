@@ -331,8 +331,12 @@ class PersonasTab(QWidget):
         """)
         profiles = list_profiles()
         self.rp_tools_combo.addItem("— none —", None)
+        # Same live-count fix as ToolsTab's profile dropdown -- see
+        # profile_display_name()'s docstring. "All Tools" shows the real
+        # registry count instead of all_tools.json's stale snapshot.
+        live_tools = self.agent.registry.all_tool_names()
         for p in profiles:
-            self.rp_tools_combo.addItem(profile_display_name(p), p["_file"])
+            self.rp_tools_combo.addItem(profile_display_name(p, all_tools=live_tools), p["_file"])
         # Select current
         current_tools = (persona.get("tools_profile", "") or "").strip().lower()
         matched = False

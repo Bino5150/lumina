@@ -441,8 +441,13 @@ class ToolsTab(QWidget):
         self.profile_combo.blockSignals(True)
         self.profile_combo.clear()
         self._profiles = list_profiles()
+        # all_tools=... lets "All Tools" show its real live count instead of
+        # all_tools.json's stale "enabled" snapshot -- see profile_display_name()'s
+        # docstring. Harmless no-op for every other profile, whose JSON count
+        # stays authoritative for them.
+        live_tools = self.agent.registry.all_tool_names()
         for p in self._profiles:
-            self.profile_combo.addItem(profile_display_name(p), p["_file"])
+            self.profile_combo.addItem(profile_display_name(p, all_tools=live_tools), p["_file"])
         self.profile_combo.blockSignals(False)
         # Load current live tool state into table without selecting a profile
         self._load_tools()

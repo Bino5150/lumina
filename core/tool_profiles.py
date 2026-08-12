@@ -47,10 +47,28 @@ def delete_profile(path: str):
         os.remove(path)
 
 
-def profile_display_name(profile: dict) -> str:
-    """Returns 'Research (11)' style display name."""
+def profile_display_name(profile: dict, all_tools: list = None) -> str:
+    """Returns 'Research (11)' style display name.
+
+    all_tools: the live registry's full tool universe (registry.all_tool_names()),
+    same parameter FE-11 already threads into resolve_enabled_set() below. That
+    fix made *enforcement* for the "All Tools" profile compute live rather than
+    trust its JSON's own "enabled" list -- which drifts stale every time a new
+    tool ships and nobody remembers to regenerate all_tools.json (confirmed: it
+    sat at 60 while the live registry had grown to 68). FE-11 never touched
+    *display* -- this was still reading the same stale count straight out of
+    the file, so the dropdown showed "All Tools (60)" next to a session that
+    actually had 68 enabled. Mirrors the identical "all tools" name check
+    resolve_enabled_set() uses, so the two paths can't drift apart from each
+    other again. Every other named profile (Research, Coding, Minimal...) is
+    unaffected -- their JSON count is genuinely authoritative for them, same
+    as it always was.
+    """
     name = profile.get("name", "unnamed")
-    count = len(profile.get("enabled", []))
+    if name.strip().lower() == "all tools" and all_tools is not None:
+        count = len(all_tools)
+    else:
+        count = len(profile.get("enabled", []))
     return f"{name} ({count})"
 
 
