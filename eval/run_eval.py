@@ -46,11 +46,25 @@ def run_task(task: dict) -> dict:
     owner = task.get("owner", True)
     tools_profile = task.get("tools_profile")
 
+    # Optional per-task persona -- most tasks omit this and keep prior
+    # behavior (bare config.SYSTEM_PROMPT, no persona layered in). Needed
+    # for tasks whose expected behavior depends on persona-specific system
+    # prompt text, not just the base rules -- routes eval through the same
+    # path production actually uses instead of a narrower stand-in.
+    persona = None
+    persona_name = task.get("persona")
+    if persona_name:
+        from core.personas import find_persona_by_name
+        persona = find_persona_by_name(persona_name)
+        if persona is None:
+            print(f"[EVAL] WARNING: persona '{persona_name}' not found for task "
+                  f"{task['id']} -- running with base config instead.", flush=True)
+
     turns = []
     for prompt in prompts:
         result = run_headless_turn(
             task=prompt, channel_id=channel_id, owner=owner,
-            tools_profile=tools_profile, trace=True,
+            tools_profile=tools_profile, persona=persona, trace=True,
         )
         turns.append(result)
 

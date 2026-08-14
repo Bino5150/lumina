@@ -67,15 +67,31 @@ def score_task(record: dict, task: dict) -> dict:
         else:
             selection_correct = bool(called_names & set(expected))
 
+    # discriminating_tool: some tasks test a signal (e.g. content only one of
+    # several valid tools actually surfaces) that a genuinely free tool choice
+    # might not exercise on a given run. Without this, a run that never called
+    # the tool needed to even see the tested content would score completed:
+    # False -- indistinguishable in the report from the fix actually
+    # regressing. Scoring it here as non-discriminating (completed: None,
+    # excluded from completion_rate the same way an empty keywords list
+    # already is) keeps the eval realistic -- real persona, free tool choice
+    # -- while making a real False mean something whenever it fires.
+    discriminating_tool = task.get("discriminating_tool")
+    discriminating = discriminating_tool is None or discriminating_tool in called_names
+
     keywords = task.get("completion_keywords", [])
     normalized_response = _normalize_numbers(final_response).lower()
-    completed = any(kw.lower() in normalized_response for kw in keywords) if keywords else None
+    if not discriminating:
+        completed = None
+    else:
+        completed = any(kw.lower() in normalized_response for kw in keywords) if keywords else None
 
     return {
         "task_id": task["id"], "category": task.get("category"),
         "depth_bucket": depth_bucket(len(all_tool_calls)), "n_tool_calls": len(all_tool_calls),
         "syntax_clean": syntax_clean, "hallucinated_tools": hallucinated,
         "selection_correct": selection_correct, "completed": completed,
+        "discriminating": discriminating,
         "final_response_preview": final_response[:200],
     }
 
@@ -141,6 +157,14 @@ def write_report(summary, scored, out_path):
                           f"syntax_clean={s['syntax_clean']}, selection_correct={s['selection_correct']}, "
                           f"hallucinated={s['hallucinated_tools']}, completed={s['completed']}")
             lines.append(f"  > {s['final_response_preview']}")
+
+    non_discriminating = [s for s in scored if not s.get("discriminating", True)]
+    if non_discriminating:
+        lines += ["", "## Non-discriminating tasks (discriminating_tool not called this run)",
+                   "Not counted as pass or fail -- the code path being tested never fired this run, "
+                   "so completed is n/a rather than False. Re-run if you need a real signal for these."]
+        for s in non_discriminating:
+            lines.append(f"- **{s['task_id']}** ({s['category']}, {s['n_tool_calls']} calls)")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 

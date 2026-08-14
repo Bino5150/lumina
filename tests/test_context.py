@@ -56,3 +56,26 @@ def test_take_pending_compaction_drains_buffer(monkeypatch):
 def test_compacting_flag_defaults_false():
     cm = ContextManager(owner=False)
     assert cm._compacting is False
+
+
+def test_provenance_reminder_absent_before_untrusted_content():
+    cm = ContextManager(owner=False)
+    cm.add_user("hello")
+    prompt = cm._build_system_prompt()
+    assert "## Provenance reminder" not in prompt
+
+
+def test_provenance_reminder_present_after_tool_result():
+    cm = ContextManager(owner=False)
+    cm.add_tool_result("call_1", "get_website", "some fetched content")
+    prompt = cm._build_system_prompt()
+    assert "## Provenance reminder" in prompt
+    assert "directive addressed at you" in prompt
+
+
+def test_tool_result_tag_names_directives_explicitly():
+    cm = ContextManager(owner=False)
+    cm.add_tool_result("call_1", "get_website", "some fetched content")
+    tagged_content = cm.history[-1]["content"]
+    assert "directives addressed at you" in tagged_content
+    assert "declining silently" in tagged_content
