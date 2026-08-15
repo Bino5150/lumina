@@ -60,6 +60,15 @@ COLORS = {
     "warning":      "#ffa502",
 }
 
+# Same arrow-visibility fix as ui/settings/_widgets.py's _combo() -- a pure
+# CSS border-triangle doesn't actually render as a triangle for Qt's
+# ::down-arrow subcontrol (verified via offscreen render, not assumed), so
+# this uses the same real chevron icon rather than reinventing a second
+# approach for the two combo boxes (persona_combo/chat_combo) that inherit
+# from this app-wide stylesheet instead of _combo(). A :hover state-swap
+# icon was tried and pulled -- see _combo()'s docstring for why.
+_CHEVRON_DOWN = os.path.join(config.ASSETS_DIR, "icons", "chevron_down.png").replace(os.sep, "/")
+
 APP_STYLESHEET = f"""
 QMainWindow, QWidget {{
     background-color: {COLORS['bg_deep']};
@@ -81,7 +90,15 @@ QComboBox {{
     border: 1px solid {COLORS['border']}; border-radius: 6px;
     padding: 4px 8px; font-size: 11px;
 }}
-QComboBox::drop-down {{ border: none; width: 20px; }}
+QComboBox:hover {{ border-color: {COLORS['accent_dim']}; }}
+QComboBox::drop-down {{
+    subcontrol-origin: padding; subcontrol-position: top right; width: 20px;
+    border-left: 1px solid {COLORS['border']}; background: {COLORS['bg_card']};
+    border-top-right-radius: 5px; border-bottom-right-radius: 5px;
+}}
+QComboBox::down-arrow {{
+    image: url({_CHEVRON_DOWN});
+}}
 QComboBox QAbstractItemView {{
     background: {COLORS['bg_card']}; color: {COLORS['text_primary']};
     border: 1px solid {COLORS['border_accent']};

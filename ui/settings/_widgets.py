@@ -1,9 +1,27 @@
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QTextEdit, QLineEdit, QPushButton, QSpinBox,
+    QWidget, QLabel, QTextEdit, QLineEdit, QPushButton, QSpinBox, QComboBox,
     QTableWidget, QAbstractItemView, QScrollArea
 )
 from PySide6.QtGui import QPixmap, QPainter, QPainterPath
 from PySide6.QtCore import Qt
+
+import os as _os
+# 2026-08-14 arrow-visibility fix: the QSS "zero-size box + one colored
+# border side" triangle trick (standard on the web) does NOT reliably
+# render as a triangle for Qt's ::down-arrow/::up-arrow subcontrols -- Qt's
+# style engine pre-allocates that subcontrol's geometry itself and paints
+# whatever region it reserved, so the result was a plain filled rectangle,
+# not a chevron (caught by an actual offscreen render, not assumed from the
+# CSS). Real small PNG icons, same as every other Qt dark-theme project
+# (QDarkStyleSheet etc.) uses for this exact subcontrol, is the reliable
+# fix. Icons live in assets/icons/ -- ASSETS_DIR-relative like every other
+# bundled asset in this codebase (see config.ASSETS_DIR).
+_ICONS_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__)))), "assets", "icons")
+
+def _icon_url(name: str) -> str:
+    # Qt QSS requires forward slashes in url() regardless of platform.
+    return _os.path.join(_ICONS_DIR, name).replace(_os.sep, "/")
 
 
 # ── Style helpers ──────────────────────────────────────────────────────────────
@@ -67,16 +85,70 @@ def _btn(text: str, c: dict, accent: bool = False, danger: bool = False) -> QPus
     return btn
 
 def _spin(val: int, lo: int, hi: int, step: int, c: dict) -> QSpinBox:
+    # Arrow visibility fix (2026-08-14): the old stylesheet never touched the
+    # up-button/down-button subcontrols at all, so they fell back to whatever
+    # the platform style draws by default -- on this dark palette that's
+    # frequently a near-invisible dark-on-dark glyph. Explicit button
+    # backgrounds make the clickable region itself visible, and real chevron
+    # icons (see _icon_url() above) make the arrows visible -- verified by
+    # an actual offscreen render, not assumed from the stylesheet text.
     s = QSpinBox()
     s.setRange(lo, hi)
     s.setSingleStep(step)
     s.setValue(val)
     s.setFixedHeight(36)
+    up_icon = _icon_url("chevron_up.png")
+    down_icon = _icon_url("chevron_down.png")
     s.setStyleSheet(f"""
         QSpinBox{{background:{c['bg_input']};color:{c['text_primary']};
         border:1px solid {c['border']};border-radius:7px;padding:4px 8px;font-size:12px;}}
+        QSpinBox::up-button, QSpinBox::down-button{{
+            subcontrol-origin:border;width:18px;background:{c['bg_card']};
+            border-left:1px solid {c['border']};
+        }}
+        QSpinBox::up-button{{subcontrol-position:top right;border-top-right-radius:6px;}}
+        QSpinBox::down-button{{subcontrol-position:bottom right;border-bottom-right-radius:6px;}}
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover{{background:{c['accent_glow']};}}
+        QSpinBox::up-arrow{{image:url({up_icon});}}
+        QSpinBox::down-arrow{{image:url({down_icon});}}
     """)
     return s
+
+def _combo(c: dict) -> QComboBox:
+    """Shared QComboBox factory -- same rationale as _spin() above. Every
+    call site in this package (and the app-wide stylesheet in main_window.py)
+    had independently reinvented `QComboBox::drop-down{border:none;...}` with
+    no `::down-arrow` rule at all, so the dropdown affordance was invisible
+    everywhere at once, not just on the one field Bino happened to notice
+    (S60-era pattern already named in the deep audit: one root cause copied
+    into N call sites). Fixed once here; callers just add/populate items and
+    connect signals same as before -- this only owns sizing/styling, matching
+    the _le/_btn/_spin convention of "factory returns a styled widget, caller
+    wires behavior.\""""
+    # NOTE: a QComboBox:hover::down-arrow{image:...} state-swap rule was
+    # tried here (matching the spinbox hover-highlight) and pulled during
+    # verification -- it caused Qt to paint a second, oversized, mispositioned
+    # copy of the arrow (offscreen-render-confirmed, not just suspected).
+    # The static arrow below renders correctly and consistently; the border
+    # hover-highlight on the field itself is enough affordance on its own.
+    cb = QComboBox()
+    cb.setFixedHeight(36)
+    down_icon = _icon_url("chevron_down.png")
+    cb.setStyleSheet(f"""
+        QComboBox{{background:{c['bg_input']};color:{c['text_primary']};
+        border:1px solid {c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}
+        QComboBox:hover{{border-color:{c['accent_dim']};}}
+        QComboBox::drop-down{{
+            subcontrol-origin:padding;subcontrol-position:top right;width:22px;
+            border-left:1px solid {c['border']};background:{c['bg_card']};
+            border-top-right-radius:6px;border-bottom-right-radius:6px;
+        }}
+        QComboBox::down-arrow{{image:url({down_icon});}}
+        QComboBox QAbstractItemView{{background:{c['bg_card']};color:{c['text_primary']};
+        border:1px solid {c['border']};selection-background-color:{c['accent_glow']};
+        selection-color:{c['accent']};outline:none;}}
+    """)
+    return cb
 
 def _table(cols: list, c: dict) -> QTableWidget:
     t = QTableWidget()

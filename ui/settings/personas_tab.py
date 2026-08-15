@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
-    QScrollArea, QFileDialog, QMessageBox, QComboBox, QSlider,
+    QScrollArea, QFileDialog, QMessageBox, QSlider,
     QLineEdit, QInputDialog
 )
 from PySide6.QtGui import QIcon
@@ -10,7 +10,7 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
 
-from ._widgets import _sec, _lbl, _te, _le, _btn, make_round_pixmap
+from ._widgets import _sec, _lbl, _te, _le, _btn, _combo, make_round_pixmap
 
 
 # ── Tab: Personas ─────────────────────────────────────────────────────────────
@@ -322,13 +322,7 @@ class PersonasTab(QWidget):
         # ── Tools Profile ──
         layout.addWidget(_sec("TOOLS PROFILE", c))
         tools_row = QHBoxLayout()
-        self.rp_tools_combo = QComboBox()
-        self.rp_tools_combo.setFixedHeight(36)
-        self.rp_tools_combo.setStyleSheet(f"""
-            QComboBox{{background:{c['bg_input']};color:{c['text_primary']};
-            border:1px solid {c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}
-            QComboBox::drop-down{{border:none;width:20px;}}
-        """)
+        self.rp_tools_combo = _combo(c)
         profiles = list_profiles()
         self.rp_tools_combo.addItem("— none —", None)
         # Same live-count fix as ToolsTab's profile dropdown -- see
@@ -363,13 +357,8 @@ class PersonasTab(QWidget):
 
         voice_col = QVBoxLayout()
         voice_col.addWidget(_lbl("Voice", c))
-        self.rp_voice = QComboBox()
+        self.rp_voice = _combo(c)
         self.rp_voice.setFixedHeight(34)
-        self.rp_voice.setStyleSheet(f"""
-            QComboBox{{background:{c['bg_input']};color:{c['text_primary']};
-            border:1px solid {c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}
-            QComboBox::drop-down{{border:none;width:20px;}}
-        """)
         voices = self._fetch_voices()
         self.rp_voice.addItems(voices)
         current_voice = persona.get("tts_voice", config.TTS_VOICE)

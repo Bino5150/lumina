@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QComboBox, QLineEdit
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit
 from PySide6.QtCore import Signal
 
 import os, sys, threading
@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _le, _btn, _scroll_wrap
+from ._widgets import _sec, _lbl, _le, _btn, _combo, _scroll_wrap
 
 
 # ── Tab: TTS ───────────────────────────────────────────────────────────────────
@@ -53,15 +53,9 @@ class TTSTab(QWidget):
 
         be_col = QVBoxLayout()
         be_col.addWidget(_lbl("Backend", self.c))
-        self.tts_backend_combo = QComboBox()
+        self.tts_backend_combo = _combo(self.c)
         self.tts_backend_combo.addItems(["kokoro", "voicebox", "chatterbox", "supertonic", "elevenlabs", "piper"])
         self.tts_backend_combo.setCurrentText(getattr(config, "TTS_BACKEND", "kokoro"))
-        self.tts_backend_combo.setFixedHeight(36)
-        self.tts_backend_combo.setStyleSheet(f"""
-            QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};
-            border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}
-            QComboBox::drop-down{{border:none;width:20px;}}
-        """)
         self.tts_backend_combo.currentTextChanged.connect(self._on_backend_changed)
         be_col.addWidget(self.tts_backend_combo)
 
@@ -107,41 +101,23 @@ class TTSTab(QWidget):
 
         stt_be_col = QVBoxLayout()
         stt_be_col.addWidget(_lbl("Backend", self.c))
-        self.stt_backend_combo = QComboBox()
+        self.stt_backend_combo = _combo(self.c)
         self.stt_backend_combo.addItems(["faster-whisper", "whisper"])
         self.stt_backend_combo.setCurrentText(getattr(config, "STT_BACKEND", "faster-whisper"))
-        self.stt_backend_combo.setFixedHeight(36)
-        self.stt_backend_combo.setStyleSheet(f"""
-            QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};
-            border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}
-            QComboBox::drop-down{{border:none;width:20px;}}
-        """)
         stt_be_col.addWidget(self.stt_backend_combo)
 
         stt_model_col = QVBoxLayout()
         stt_model_col.addWidget(_lbl("Model Size", self.c))
-        self.stt_model_combo = QComboBox()
+        self.stt_model_combo = _combo(self.c)
         self.stt_model_combo.addItems(["tiny", "base", "small", "medium", "large-v2", "large-v3"])
         self.stt_model_combo.setCurrentText(getattr(config, "STT_MODEL", "base"))
-        self.stt_model_combo.setFixedHeight(36)
-        self.stt_model_combo.setStyleSheet(f"""
-            QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};
-            border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}
-            QComboBox::drop-down{{border:none;width:20px;}}
-        """)
         stt_model_col.addWidget(self.stt_model_combo)
 
         stt_device_col = QVBoxLayout()
         stt_device_col.addWidget(_lbl("Device", self.c))
-        self.stt_device_combo = QComboBox()
+        self.stt_device_combo = _combo(self.c)
         self.stt_device_combo.addItems(["cpu", "cuda"])
         self.stt_device_combo.setCurrentText(getattr(config, "STT_DEVICE", "cpu"))
-        self.stt_device_combo.setFixedHeight(36)
-        self.stt_device_combo.setStyleSheet(f"""
-            QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};
-            border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}
-            QComboBox::drop-down{{border:none;width:20px;}}
-        """)
         stt_device_col.addWidget(self.stt_device_combo)
 
         stt_backend_row.addLayout(stt_be_col, 2)

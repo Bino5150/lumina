@@ -1,11 +1,11 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QComboBox, QLineEdit
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLineEdit
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _te, _le, _btn, _spin, _scroll_wrap
+from ._widgets import _sec, _lbl, _te, _le, _btn, _spin, _combo, _scroll_wrap
 
 
 # ── Tab: General ───────────────────────────────────────────────────────────────
@@ -30,11 +30,9 @@ class GeneralTab(QWidget):
         backend_row.setSpacing(12)
         be_col = QVBoxLayout()
         be_col.addWidget(_lbl("Backend", self.c))
-        self.backend_combo = QComboBox()
+        self.backend_combo = _combo(self.c)
         self.backend_combo.addItems(["llamacpp", "lmstudio", "ollama", "vllm", "openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen", "custom", "omniroute"])
         self.backend_combo.setCurrentText(config.LLM_BACKEND)
-        self.backend_combo.setFixedHeight(36)
-        self.backend_combo.setStyleSheet(f"QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}QComboBox::drop-down{{border:none;width:20px;}}")
         self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
         be_col.addWidget(self.backend_combo)
         url_col = QVBoxLayout()
@@ -89,10 +87,8 @@ class GeneralTab(QWidget):
         model_col.addWidget(_lbl("Model", self.c))
         model_row = QHBoxLayout()
         model_row.setSpacing(6)
-        self.cloud_model = QComboBox()
+        self.cloud_model = _combo(self.c)
         self.cloud_model.setEditable(True)
-        self.cloud_model.setFixedHeight(36)
-        self.cloud_model.setStyleSheet(f"QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}QComboBox::drop-down{{border:none;width:20px;}}")
         model_row.addWidget(self.cloud_model, 1)
         refresh_models_btn = _btn("⟳", self.c)
         refresh_models_btn.setFixedWidth(36)

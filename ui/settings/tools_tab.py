@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QFrame,
     QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QMessageBox, QComboBox, QInputDialog
+    QAbstractItemView, QMessageBox, QInputDialog
 )
 from PySide6.QtCore import Qt
 
@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _btn, _spin, _table
+from ._widgets import _sec, _lbl, _btn, _spin, _table, _combo
 
 
 # ── Tab: Tools ─────────────────────────────────────────────────────────────────
@@ -43,14 +43,9 @@ class ToolsTab(QWidget):
 
         profile_layout.addWidget(_lbl("Profile:", self.c))
 
-        self.profile_combo = QComboBox()
+        self.profile_combo = _combo(self.c)
         self.profile_combo.setFixedHeight(32)
         self.profile_combo.setMinimumWidth(180)
-        self.profile_combo.setStyleSheet(f"""
-            QComboBox{{background:{self.c['bg_input']};color:{self.c['text_primary']};
-            border:1px solid {self.c['border']};border-radius:7px;padding:4px 10px;font-size:12px;}}
-            QComboBox::drop-down{{border:none;width:20px;}}
-        """)
         self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
         profile_layout.addWidget(self.profile_combo)
 
