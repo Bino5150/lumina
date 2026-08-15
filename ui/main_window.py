@@ -930,27 +930,57 @@ class LuminaWindow(QMainWindow):
             ext = os.path.splitext(p)[1].lower()
 
             if ext in image_exts:
+                fname = os.path.basename(p)
                 try:
+                    # 2026-08-15 fix: this used to load via bare QPixmap(p) with
+                    # no check that it actually worked. QPixmap(p) returns a
+                    # null (not raised!) pixmap on an unsupported/corrupt file
+                    # -- e.g. .webp support depends on an optional Qt image
+                    # plugin that isn't guaranteed present on every install --
+                    # and .save() on a null pixmap can "succeed" while writing
+                    # a tiny near-empty PNG. Net effect: no error anywhere, but
+                    # Gemini/the model gets fed garbage and the description
+                    # comes back nonsensical -- exactly the "gives me shit with
+                    # pictures" symptom, with nothing in the UI to explain why.
+                    # QImageReader + setAutoTransform also fixes a second, real
+                    # issue: bare QPixmap(p) does not reliably honor a JPEG's
+                    # EXIF orientation tag, so photos taken on a phone can be
+                    # sent sideways/upside-down with no visual indication.
+                    from PySide6.QtGui import QImageReader
+                    reader = QImageReader(p)
+                    reader.setAutoTransform(True)
+                    image = reader.read()
+                    if image.isNull():
+                        raise ValueError(reader.errorString() or "unreadable/unsupported image file")
+
                     # Resize before encoding — cap longest side at 512px
-                    pix_orig = QPixmap(p)
-                    if pix_orig.width() > 512 or pix_orig.height() > 512:
-                        pix_orig = pix_orig.scaled(512, 512, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    if image.width() > 512 or image.height() > 512:
+                        image = image.scaled(512, 512, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    pix_orig = QPixmap.fromImage(image)
+
                     from PySide6.QtCore import QBuffer, QIODevice
                     buf = QBuffer()
                     buf.open(QIODevice.WriteOnly)
-                    pix_orig.save(buf, "PNG")
+                    if not pix_orig.save(buf, "PNG"):
+                        raise ValueError("PNG re-encode failed")
                     raw = bytes(buf.data())
+                    if len(raw) < 100:
+                        # A well-formed PNG header alone is ~60+ bytes; anything
+                        # this small is not a real image even though save()
+                        # reported success -- same silent-garbage failure mode
+                        # as the isNull() case above, caught defensively.
+                        raise ValueError(f"encoded PNG suspiciously small ({len(raw)} bytes)")
                     b64 = base64.b64encode(raw).decode('utf-8')
                     media_type = 'image/png'
                     self._pending_image = (p, b64, media_type)
                     pix = pix_orig.scaledToHeight(72, Qt.SmoothTransformation)
-                    fname = os.path.basename(p)
                     self.chat_widget.show_image_preview(pix, fname)
                     parts.append(f"[image: {fname}]")
                     print(f"[DROP] image encoded: {fname} ({len(b64)} b64 chars)", flush=True)
                 except Exception as e:
-                    parts.append(f"[image:{p}] (encode error: {e})")
-                    
+                    parts.append(f"[image:{fname}] (failed to load: {e})")
+                    print(f"[DROP] image load FAILED: {fname}: {e}", flush=True)
+
             elif ext in audio_exts:
                 try:
                     with open(p, 'rb') as f:

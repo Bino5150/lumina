@@ -18,6 +18,7 @@ from tools.knowledge import register_knowledge_tools
 from tools.web import register_web_tools
 from tools.filesystem import register_filesystem_tools
 from tools.sandbox import register_sandbox_tools
+from tools.vision import register_vision_tools
 from tools.terminal import register_terminal_tools
 from tools.toolmaker import register_toolmaker_tools, load_approved_custom_tools
 from tools.palace import register_palace_tools
@@ -154,6 +155,7 @@ class LuminaAgent:
         register_web_tools(self.registry)
         register_filesystem_tools(self.registry)
         register_sandbox_tools(self.registry)
+        register_vision_tools(self.registry)
         register_terminal_tools(self.registry)
         if owner:
             # Hard exclusion — for non-owner sessions, toolmaker's tools never
