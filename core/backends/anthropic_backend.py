@@ -375,8 +375,16 @@ class AnthropicBackend(BaseLLMBackend):
 
         thinking_open = False
 
-        for raw_line in resp.iter_lines(decode_unicode=True):
-            if not raw_line or not raw_line.startswith("data:"):
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            # Same fix as gemini_backend.py's chat_stream(): Anthropic's SSE
+            # stream also has no charset param on its Content-Type
+            # (text/event-stream), so requests.Response.encoding defaults to
+            # ISO-8859-1 and decode_unicode=True would mangle multi-byte
+            # UTF-8 text. Decode explicitly instead.
+            raw_line = raw_line.decode("utf-8")
+            if not raw_line.startswith("data:"):
                 continue
             data_str = raw_line[len("data:"):].strip()
             if data_str == "[DONE]":

@@ -517,8 +517,17 @@ class GeminiBackend(BaseLLMBackend):
             print(f"[HTTP ERROR BODY] model={self.default_model} status={resp.status_code} body={redacted[:500]}", flush=True)
             raise RuntimeError(format_gemini_error(resp.status_code, redacted, str(e)))
 
-        for raw_line in resp.iter_lines(decode_unicode=True):
-            if not raw_line or not raw_line.startswith("data:"):
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            # Gemini's SSE stream has no charset param on its Content-Type
+            # (text/event-stream), so requests.Response.encoding defaults to
+            # ISO-8859-1 (see requests.utils.get_encoding_from_headers) --
+            # decode_unicode=True would silently mangle every multi-byte
+            # UTF-8 character (em-dashes, curly quotes, accents, emoji) into
+            # mojibake. The API always sends UTF-8, so decode explicitly.
+            raw_line = raw_line.decode("utf-8")
+            if not raw_line.startswith("data:"):
                 continue
             data_str = raw_line[len("data:"):].strip()
             if not data_str:
