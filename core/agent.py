@@ -46,6 +46,28 @@ CHAIN_BLOCKED_AFTER_SEARCH = {"get_website", "web_search"}
 BACKGROUND_TASK_NOTIFY_RETRIES = 3
 
 
+class TurnCancelled(Exception):
+    """Cooperative foreground-turn cancellation at a safe agent boundary."""
+    def __init__(self, partial_response: str = ""):
+        super().__init__("foreground turn cancelled by operator")
+        self.partial_response = partial_response or ""
+
+
+def _cancel_requested(cancel_event) -> bool:
+    return bool(cancel_event is not None and cancel_event.is_set())
+
+
+def _close_cancelled_tool_calls(agent, tool_calls):
+    """Resolve unexecuted tool ids without laundering them as TOOL_OUTPUT."""
+    for tc in tool_calls:
+        tool_id = tc.get("id", "unknown") if isinstance(tc, dict) else "unknown"
+        try:
+            name, _ = agent.llm.parse_tool_call(tc)
+        except Exception:
+            name = "cancelled_tool"
+        agent.ctx.add_cancelled_tool_result(tool_id, name)
+
+
 def strip_think_blocks(text: str) -> str:
     if not text:
         return text
@@ -237,7 +259,8 @@ class LuminaAgent:
                 return True, ""
             self.registry.set_gate(_gate)
 
-    def chat(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None) -> str:
+    def chat(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
+             cancel_event=None) -> str:
         """
         Main entry point. Runs tool loop with non-streaming,
         then streams the final response. Returns full response string.
@@ -248,9 +271,19 @@ class LuminaAgent:
         _build_system_prompt() docstring. None (default) preserves current
         behavior for every caller that doesn't track a chat_id (CLI, headless,
         subagents).
+        cancel_event: optional threading.Event owned by the desktop foreground
+        worker. Cancellation is cooperative: already-blocked provider/tool calls
+        are allowed to return, then chat() exits at the next safe boundary.
         """
         tools_used_this_turn = set()
         think_step = [0]
+
+        # Preserve the user's submitted turn even in the tiny race where /stop
+        # lands before this worker gets past chat()'s prologue. Do not run any
+        # background-notification bookkeeping or provider work in that case.
+        if _cancel_requested(cancel_event):
+            self.ctx.add_user(user_input, source=source)
+            raise TurnCancelled()
 
         # Background/scheduled task completions surface as a one-turn
         # ephemeral injection, same mechanism as skill docs below. owner=True
@@ -386,6 +419,8 @@ class LuminaAgent:
             tool_schemas = self.registry.get_schemas()
             tool_token_estimate = self.registry.schema_token_estimate()
             messages = self.ctx.build_messages(tool_budget=tool_token_estimate, chat_id=chat_id)
+            if _cancel_requested(cancel_event):
+                raise TurnCancelled()
 
             try:
                 response = self.llm.chat(
@@ -394,6 +429,8 @@ class LuminaAgent:
                     max_tokens=config.RESPONSE_RESERVE_TOKENS,
                 )
             except Exception as e:
+                if _cancel_requested(cancel_event):
+                    raise TurnCancelled()
                 provider = getattr(self.llm, "display_name", None) or getattr(self.llm, "name", "the provider")
                 get_model = getattr(self.llm, "get_model", None)
                 model = get_model() if callable(get_model) else "unknown"
@@ -427,11 +464,13 @@ class LuminaAgent:
                     on_response_token(err)
                 return err
 
+            if _cancel_requested(cancel_event):
+                raise TurnCancelled()
             message = self.llm.extract_message(response)
 
             # No tool calls — stream the final response
             if not self.llm.is_tool_call(message):
-                return self._stream_final(messages, think_step)
+                return self._stream_final(messages, think_step, cancel_event=cancel_event)
 
             # Has tool calls
             if message.get("content"):
@@ -440,16 +479,29 @@ class LuminaAgent:
             self.ctx.add_tool_call(message)
             tool_calls = self.llm.get_tool_calls(message)
 
-            for tc in tool_calls:
+            for index, tc in enumerate(tool_calls):
+                if _cancel_requested(cancel_event):
+                    _close_cancelled_tool_calls(self, tool_calls[index:])
+                    raise TurnCancelled()
+
                 tool_id = tc.get("id", "unknown")
                 name, args = self.llm.parse_tool_call(tc)
+                if _cancel_requested(cancel_event):
+                    _close_cancelled_tool_calls(self, tool_calls[index:])
+                    raise TurnCancelled()
 
                 if "web_search" in tools_used_this_turn and name in CHAIN_BLOCKED_AFTER_SEARCH:
                     result = "[Skipped: summarize from search results already provided.]"
                     self.ctx.add_tool_result(tool_id, name, result)
+                    if _cancel_requested(cancel_event):
+                        _close_cancelled_tool_calls(self, tool_calls[index + 1:])
+                        raise TurnCancelled()
                     continue
 
                 self.on_tool_call(name, args)
+                if _cancel_requested(cancel_event):
+                    _close_cancelled_tool_calls(self, tool_calls[index:])
+                    raise TurnCancelled()
                 try:
                     result = self.registry.call(name, args)
                 except Exception as e:
@@ -460,6 +512,10 @@ class LuminaAgent:
                 self.ctx.add_tool_result(tool_id, name, result)
                 self._session_tool_calls += 1
                 
+                if _cancel_requested(cancel_event):
+                    _close_cancelled_tool_calls(self, tool_calls[index + 1:])
+                    raise TurnCancelled()
+
                 # Nudge skill creation after threshold — once per session.
                 # FE-26: this used to be ctx.add_user(...), which injected a
                 # synthetic USER message that persisted in history forever —
@@ -478,20 +534,47 @@ class LuminaAgent:
                 )
 
         # Max iterations — force final streamed answer
+        if _cancel_requested(cancel_event):
+            raise TurnCancelled()
         messages = self.ctx.build_messages(chat_id=chat_id)
         messages.append({"role": "user", "content": "Give your final answer now based on what you have."})
-        return self._stream_final(messages, think_step)
+        return self._stream_final(messages, think_step, cancel_event=cancel_event)
 
-    def _stream_final(self, messages: list, think_step: list) -> str:
+    def _stream_final(self, messages: list, think_step: list, cancel_event=None) -> str:
         """Stream the final response, firing callbacks for UI updates."""
         full_response = []
         in_think = False
+        stream = None
+
+        def _raise_cancelled():
+            if in_think:
+                self.on_think_end()
+            content = "".join(full_response).strip()
+            if content:
+                self.ctx.add_assistant(content)
+            if stream is not None and hasattr(stream, "close"):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            raise TurnCancelled(content)
 
         try:
-            for chunk in self.llm.chat_stream(
+            if _cancel_requested(cancel_event):
+                _raise_cancelled()
+            stream = iter(self.llm.chat_stream(
                 messages=messages,
                 max_tokens=config.RESPONSE_RESERVE_TOKENS
-            ):
+            ))
+            while True:
+                if _cancel_requested(cancel_event):
+                    _raise_cancelled()
+                try:
+                    chunk = next(stream)
+                except StopIteration:
+                    break
+                if _cancel_requested(cancel_event):
+                    _raise_cancelled()
                 if chunk == "__THINK_START__":
                     in_think = True
                     think_step[0] += 1
@@ -506,6 +589,8 @@ class LuminaAgent:
                     full_response.append(chunk)
 
         except (ConnectionError, TimeoutError, RuntimeError, ValueError) as e:
+            if _cancel_requested(cancel_event):
+                _raise_cancelled()
             # ValueError added alongside Bug C's base_url validation
             # (core/backends/lmstudio.py validate_base_url()) — an
             # unconfigured/schemeless endpoint is a real, expected failure

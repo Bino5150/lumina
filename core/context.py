@@ -98,6 +98,19 @@ class ContextManager:
         })
         self._last_usage_snapshot = None
 
+    def add_cancelled_tool_result(self, tool_call_id: str, name: str):
+        """Close a model-emitted tool call that the operator cancelled.
+
+        This is trusted internal control state, not TOOL_OUTPUT: no external
+        payload was executed or returned, so do not set the sticky untrusted
+        provenance flag merely to keep the provider's tool-call protocol valid.
+        """
+        self.history.append({
+            "role": "tool", "tool_call_id": tool_call_id, "name": name,
+            "content": "[Cancelled by operator before execution.]",
+        })
+        self._last_usage_snapshot = None
+
     def _build_system_prompt(self, tool_budget: int = 0, chat_id: int = None) -> str:
         """
         Assemble the full system prompt.

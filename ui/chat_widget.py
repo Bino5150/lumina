@@ -628,7 +628,7 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(True)
         self.mic_btn.setEnabled(not running)
         if running:
-            self.input.setPlaceholderText("Main task running — /status or /btw <question>")
+            self.input.setPlaceholderText("Main task running — /status · /btw <question> · /stop")
         else:
             self.input.update_placeholder(self._persona_name)
             self.input.setFocus()

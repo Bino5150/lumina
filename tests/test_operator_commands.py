@@ -36,6 +36,14 @@ def test_compact_is_a_known_no_argument_command():
     assert "/compact" in command_help()
 
 
+def test_stop_is_a_known_no_argument_command():
+    cmd = parse_operator_command(" /STOP ")
+    assert cmd.name == "stop"
+    assert cmd.argument == ""
+    assert cmd.known is True
+    assert "/stop" in command_help()
+
+
 def test_unknown_slash_command_is_handled_but_not_known():
     cmd = parse_operator_command("/warp now")
     assert cmd.name == "warp"

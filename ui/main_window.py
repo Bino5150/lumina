@@ -23,7 +23,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
-from core.agent import is_error_response
+from core.agent import TurnCancelled, is_error_response
 from core.manual_compaction import latest_manual_compaction_skip, run_manual_compaction
 from core.operator_commands import (
     command_help, compaction_cut_index, format_duration, format_tokens,
@@ -141,6 +141,7 @@ class StreamSignals(QObject):
     response_chunk = Signal(str)   # batched response text
     finished       = Signal(str)
     error          = Signal(str)
+    cancelled      = Signal(str)
     manual_compaction_finished = Signal(object)
     
 class STTSignals(QObject):
@@ -164,6 +165,26 @@ class AgentWorker(QThread):
         self.chat_id = chat_id
         self._think_buf = ""
         self._resp_buf = ""
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> bool:
+        """Request cooperative cancellation; False means it was already requested."""
+        if self._cancel_event.is_set():
+            return False
+        self._cancel_event.set()
+        return True
+
+    def cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def _agent_accepts_cancel_event(self) -> bool:
+        """Compatibility for lightweight GUI-test stubs predating /stop."""
+        import inspect
+        try:
+            params = inspect.signature(self.agent.chat).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(p.name == "cancel_event" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
 
     def _flush_think(self):
         if self._think_buf:
@@ -210,10 +231,17 @@ class AgentWorker(QThread):
         self.agent.on_response_token = on_response_token
 
         try:
-            result = self.agent.chat(self.user_input, chat_id=self.chat_id)
+            kwargs = {"chat_id": self.chat_id}
+            if self._agent_accepts_cancel_event():
+                kwargs["cancel_event"] = self._cancel_event
+            result = self.agent.chat(self.user_input, **kwargs)
             self._flush_think()
             self._flush_resp()
             self.signals.finished.emit(result)
+        except TurnCancelled as e:
+            self._flush_think()
+            self._flush_resp()
+            self.signals.cancelled.emit(e.partial_response)
         except Exception as e:
             self.signals.error.emit(str(e))
 
@@ -711,6 +739,7 @@ class LuminaWindow(QMainWindow):
         self.signals.response_chunk.connect(self._on_response_chunk)
         self.signals.finished.connect(self._on_finished)
         self.signals.error.connect(self._on_error)
+        self.signals.cancelled.connect(self._on_cancelled)
         self.signals.manual_compaction_finished.connect(self._on_manual_compaction_finished)
         self.chat_widget.mic_pressed.connect(self._on_mic_pressed)
 
@@ -940,6 +969,8 @@ class LuminaWindow(QMainWindow):
             self._command_btw(command.argument)
         elif command.name == "compact":
             self._command_compact(command.argument)
+        elif command.name == "stop":
+            self._command_stop(command.argument)
 
     def _command_status(self, argument: str):
         if argument:
@@ -952,7 +983,14 @@ class LuminaWindow(QMainWindow):
             started = self._operator_turn_started_at or now
             last = self._operator_last_progress_at or started
             phase = self._operator_phase or "processing"
-            if self._operator_current_tool:
+            stop_requested = bool(
+                hasattr(self.worker, "cancel_requested") and self.worker.cancel_requested()
+            )
+            if stop_requested and self._operator_current_tool:
+                phase = f"stop requested · waiting for tool: {self._operator_current_tool}"
+            elif stop_requested:
+                phase = f"stop requested · waiting for safe boundary ({phase})"
+            elif self._operator_current_tool:
                 phase = f"tool: {self._operator_current_tool}"
             lines.append(f"Foreground: running {format_duration(now - started)} · {phase}")
             age = now - last
@@ -1044,6 +1082,56 @@ class LuminaWindow(QMainWindow):
 
         self._manual_compaction_thread = threading.Thread(target=_run, daemon=True)
         self._manual_compaction_thread.start()
+
+    def _command_stop(self, argument: str):
+        if argument:
+            self.chat_widget.add_operator_message("/stop takes no arguments.")
+            return
+
+        if self.worker is not None and self.worker.isRunning():
+            if hasattr(self.worker, "cancel_requested") and self.worker.cancel_requested():
+                self.chat_widget.add_operator_message(
+                    "/stop is already requested · waiting for the current provider/tool boundary."
+                )
+                return
+            requested = bool(
+                hasattr(self.worker, "request_cancel") and self.worker.request_cancel()
+            )
+            if not requested:
+                self.chat_widget.add_operator_message(
+                    "/stop could not signal this foreground worker; it is still running."
+                )
+                return
+            self.status_lbl.setText("stop requested...")
+            self.chat_widget.add_operator_message(
+                "/stop requested · foreground turn only · waiting for the current "
+                "provider/tool boundary · background tasks untouched"
+            )
+            return
+
+        compact_thread = self._manual_compaction_thread
+        if compact_thread is not None:
+            if not compact_thread.is_alive():
+                self.chat_widget.add_operator_message(
+                    "/compact is already finalizing; no safe cancellation boundary remains."
+                )
+                return
+            cancel_event = self._manual_compaction_cancel
+            if cancel_event is None:
+                self.chat_widget.add_operator_message("/compact has no active cancellation handle.")
+                return
+            if cancel_event.is_set():
+                self.chat_widget.add_operator_message("/stop is already requested for /compact.")
+                return
+            cancel_event.set()
+            self.chat_widget.add_operator_message(
+                "/stop requested for /compact · it will stop before the next safe persistent-write boundary."
+            )
+            return
+
+        self.chat_widget.add_operator_message(
+            "/stop: no foreground turn or manual compaction is currently running."
+        )
 
     def _command_btw(self, question: str):
         question = (question or "").strip()
@@ -1235,7 +1323,7 @@ class LuminaWindow(QMainWindow):
 
         if self.worker is not None and self.worker.isRunning():
             self.chat_widget.add_operator_message(
-                "Main turn is still running. Use /status or /btw <question>; your message was not sent."
+                "Main turn is still running. Use /status, /btw <question>, or /stop; your message was not sent."
             )
             # SmartInput clears immediately after emitting submit. Restore on
             # the next event-loop tick so an accidental normal message isn't lost.
@@ -1465,6 +1553,37 @@ class LuminaWindow(QMainWindow):
                     self._auto_name_chat(self._current_chat_id, user_msgs[0], response)
             self._maybe_compact(self._current_chat_id)
 
+
+    def _on_cancelled(self, partial_response: str):
+        partial_response = (partial_response or "").strip()
+        if self._live_bubble:
+            if partial_response:
+                self._live_bubble.finalize()
+            else:
+                self._live_bubble.setParent(None)
+                self._live_bubble.deleteLater()
+            self._live_bubble = None
+
+        self.chat_widget.set_turn_running(False)
+        self._operator_turn_started_at = None
+        self._operator_phase = "idle"
+        self._operator_current_tool = None
+        self.status_lbl.setText("")
+
+        if self._current_chat_id and partial_response:
+            save_chat_message(
+                self._current_chat_id, "assistant", partial_response,
+                metadata={"cancelled": True},
+            )
+            self._refresh_chat_list()
+            detail = "partial response kept in the transcript"
+        else:
+            detail = "no assistant response was committed"
+
+        self._refresh_operator_telemetry(refresh_context=True)
+        self.chat_widget.add_operator_message(
+            f"/stop completed · foreground turn stopped · {detail} · background tasks untouched"
+        )
 
     def _on_error(self, error: str):
         if self._live_bubble:
