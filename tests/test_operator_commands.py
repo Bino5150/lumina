@@ -1,8 +1,11 @@
 from core.operator_commands import (
+    chunk_compaction_history,
     command_help,
+    compaction_cut_index,
     format_duration,
     format_tokens,
     parse_operator_command,
+    persisted_compaction_skip_count,
     unwrap_background_result,
 )
 
@@ -25,6 +28,14 @@ def test_btw_preserves_the_full_side_question():
     assert cmd.known is True
 
 
+def test_compact_is_a_known_no_argument_command():
+    cmd = parse_operator_command("/COMPACT")
+    assert cmd.name == "compact"
+    assert cmd.argument == ""
+    assert cmd.known is True
+    assert "/compact" in command_help()
+
+
 def test_unknown_slash_command_is_handled_but_not_known():
     cmd = parse_operator_command("/warp now")
     assert cmd.name == "warp"
@@ -40,6 +51,52 @@ def test_operator_formatters_are_compact_and_stable():
     assert format_tokens(999) == "999"
     assert format_tokens(12_500) == "12.5k"
     assert format_tokens(1_000_000) == "1M"
+
+
+def test_compaction_cut_keeps_two_newest_user_turns_and_whole_tail():
+    history = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "assistant", "content": "tool call", "tool_calls": [{"id": "x"}]},
+        {"role": "tool", "content": "tool result"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "u3"},
+        {"role": "assistant", "content": "a3"},
+        {"role": "user", "content": "u4"},
+    ]
+    cut = compaction_cut_index(history)
+    assert cut == 6
+    assert history[cut]["content"] == "u3"
+    assert compaction_cut_index(history[cut:]) is None
+
+
+def test_persisted_skip_count_tracks_the_same_two_user_turn_boundary():
+    persisted = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "u3"},
+        {"role": "assistant", "content": "a3"},
+        {"role": "user", "content": "u4"},
+    ]
+    assert persisted_compaction_skip_count(persisted) == 4
+
+
+def test_compaction_chunks_replace_attachment_payloads_and_stay_bounded():
+    huge_b64 = "A" * 20_000
+    history = [{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{huge_b64}"}},
+            {"type": "text", "text": "describe this receipt"},
+        ],
+    }]
+    chunks = chunk_compaction_history(history, max_chars=1000)
+    assert chunks == ["user: [image attachment] describe this receipt"]
+    assert huge_b64 not in "".join(chunks)
+    assert all(len(chunk) <= 1000 for chunk in chunks)
 
 
 def test_unwrap_background_result_handles_spawn_subagent_shape():

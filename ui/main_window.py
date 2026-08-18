@@ -24,9 +24,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from core.agent import is_error_response
+from core.manual_compaction import latest_manual_compaction_skip, run_manual_compaction
 from core.operator_commands import (
-    command_help, format_duration, format_tokens, parse_operator_command,
-    unwrap_background_result,
+    command_help, compaction_cut_index, format_duration, format_tokens,
+    parse_operator_command, unwrap_background_result,
 )
 from core.personas import list_personas, load_persona
 from core import persistence
@@ -140,6 +141,7 @@ class StreamSignals(QObject):
     response_chunk = Signal(str)   # batched response text
     finished       = Signal(str)
     error          = Signal(str)
+    manual_compaction_finished = Signal(object)
     
 class STTSignals(QObject):
     transcribed = Signal(str)
@@ -369,6 +371,9 @@ class LuminaWindow(QMainWindow):
         self._operator_phase = "idle"
         self._operator_current_tool = None
         self._btw_task_ids = {}  # task_id -> {question, started_at}; never injected into main context
+        self._manual_compaction_thread = None
+        self._manual_compaction_cancel = None
+        self._manual_compaction_started_at = None
         self._dream_timer = QTimer(self)
         self._dream_timer.timeout.connect(self._check_dream_idle)
         self._dream_timer.start(60_000)  # check once a minute — cheap, no need to be tighter
@@ -706,6 +711,7 @@ class LuminaWindow(QMainWindow):
         self.signals.response_chunk.connect(self._on_response_chunk)
         self.signals.finished.connect(self._on_finished)
         self.signals.error.connect(self._on_error)
+        self.signals.manual_compaction_finished.connect(self._on_manual_compaction_finished)
         self.chat_widget.mic_pressed.connect(self._on_mic_pressed)
 
     # ── Chat management ────────────────────────────────────────────────────────
@@ -746,18 +752,32 @@ class LuminaWindow(QMainWindow):
         self.agent.ctx.clear()
         self.chat_widget.clear_messages()
         msgs = load_chat_messages(chat_id)
+        try:
+            context_skip = latest_manual_compaction_skip(chat_id)
+        except Exception as e:
+            print(f"[COMPACTION] checkpoint read failed for chat {chat_id}: {e}", flush=True)
+            context_skip = 0
+        conversation_index = 0
         for m in msgs:
+            role = m.get("role")
+            is_conversation = role in ("user", "assistant")
+            restore_to_context = (not is_conversation or conversation_index >= context_skip)
+            if is_conversation:
+                conversation_index += 1
+
             content = m.get("content") or ""
             if not content:
                 continue
-            if m["role"] == "user":
+            if role == "user":
                 self.chat_widget.add_user_message(content)
-                self.agent.ctx.add_user(content)
-            elif m["role"] == "assistant":
+                if restore_to_context:
+                    self.agent.ctx.add_user(content)
+            elif role == "assistant":
                 bubble = self.chat_widget.create_live_bubble()
                 bubble._response_text = content
                 bubble.finalize()
-                self.agent.ctx.add_assistant(content)
+                if restore_to_context:
+                    self.agent.ctx.add_assistant(content)
         self._refresh_chat_list()
 
     def _on_chat_selected(self, idx: int):
@@ -918,6 +938,8 @@ class LuminaWindow(QMainWindow):
             self._command_status(command.argument)
         elif command.name == "btw":
             self._command_btw(command.argument)
+        elif command.name == "compact":
+            self._command_compact(command.argument)
 
     def _command_status(self, argument: str):
         if argument:
@@ -939,6 +961,12 @@ class LuminaWindow(QMainWindow):
                 lines.append(f"⚠ No meaningful progress for {format_duration(age)}; task may simply be blocked in a long tool/provider call.")
         else:
             lines.append("Foreground: idle")
+
+        compact_thread = self._manual_compaction_thread
+        if compact_thread is not None:
+            started = self._manual_compaction_started_at or now
+            state = "running" if compact_thread.is_alive() else "finalizing"
+            lines.append(f"Compaction: {state} {format_duration(now - started)}")
 
         try:
             from core.task_queue import get_task_result
@@ -965,8 +993,65 @@ class LuminaWindow(QMainWindow):
 
         self.chat_widget.add_operator_message("\n".join(lines))
 
+    def _command_compact(self, argument: str):
+        if argument:
+            self.chat_widget.add_operator_message("/compact takes no arguments.")
+            return
+        if self.worker is not None and self.worker.isRunning():
+            self.chat_widget.add_operator_message(
+                "/compact is idle-only; wait for the foreground turn to finish."
+            )
+            return
+        if not self._current_chat_id:
+            self.chat_widget.add_operator_message("/compact requires an active chat session.")
+            return
+        if getattr(self.agent.ctx, "_compacting", False):
+            self.chat_widget.add_operator_message(
+                "Automatic context compaction is already running; try /compact again when it finishes."
+            )
+            return
+        if self._manual_compaction_thread is not None:
+            self.chat_widget.add_operator_message("Manual context compaction is already running or finalizing.")
+            return
+
+        history_snapshot = list(self.agent.ctx.history)
+        cut = compaction_cut_index(history_snapshot)
+        if cut is None:
+            self.chat_widget.add_operator_message(
+                "/compact: nothing to compact yet — the newest two user turns are kept live."
+            )
+            return
+
+        chat_id = self._current_chat_id
+        cancel_event = threading.Event()
+        self._manual_compaction_cancel = cancel_event
+        self._manual_compaction_started_at = time.time()
+        self.chat_widget.add_operator_message(
+            "/compact started · preserving the newest two user turns · persisted transcript remains untouched"
+        )
+
+        def _run():
+            try:
+                result = run_manual_compaction(
+                    history_snapshot, chat_id=chat_id, cancel_event=cancel_event
+                )
+            except Exception as e:
+                result = {
+                    "status": "error", "chat_id": chat_id,
+                    "error": f"Unexpected compaction failure: {e}",
+                }
+            self.signals.manual_compaction_finished.emit(result)
+
+        self._manual_compaction_thread = threading.Thread(target=_run, daemon=True)
+        self._manual_compaction_thread.start()
+
     def _command_btw(self, question: str):
         question = (question or "").strip()
+        if self._manual_compaction_thread is not None:
+            self.chat_widget.add_operator_message(
+                "/btw waits while /compact is using the utility backend; try again when compaction finishes."
+            )
+            return
         if not question:
             self.chat_widget.add_operator_message("Usage: /btw <side question>")
             return
@@ -1016,6 +1101,57 @@ class LuminaWindow(QMainWindow):
                 f"/btw finished · {task_id[:8]} · {elapsed}\n{question}\n\n{result_text}"
             )
             self._btw_task_ids.pop(task_id, None)
+
+    def _on_manual_compaction_finished(self, result: dict):
+        self._manual_compaction_thread = None
+        self._manual_compaction_cancel = None
+        self._manual_compaction_started_at = None
+
+        status = result.get("status")
+        if status == "cancelled":
+            self.chat_widget.add_operator_message(
+                "/compact cancelled before any persistent writes were made."
+            )
+            return
+        if status == "nothing_to_compact":
+            self.chat_widget.add_operator_message("/compact: nothing to compact.")
+            return
+        if status != "success":
+            detail = result.get("error") or "unknown error"
+            self.chat_widget.add_operator_message(f"/compact failed: {detail} · live context was not pruned")
+            return
+
+        snapshot = result.get("history_snapshot") or []
+        applied_live = False
+        if self._current_chat_id == result.get("chat_id") and self.agent.ctx.history == snapshot:
+            self.agent.ctx.history = list(result.get("retained_history") or [])
+            self.agent.ctx._last_usage_snapshot = None
+            applied_live = True
+
+        self._refresh_operator_telemetry(refresh_context=True)
+        compacted_messages = result.get("compacted_messages", 0)
+        compacted_tokens = result.get("compacted_tokens", 0)
+        if applied_live:
+            try:
+                usage = self.agent.get_context_usage(
+                    chat_id=self._current_chat_id, refresh=True
+                )
+                context_now = (
+                    f" · context now ~{format_tokens(usage['used_tokens'])} / "
+                    f"{format_tokens(usage['max_tokens'])}"
+                )
+            except Exception:
+                context_now = ""
+            self.chat_widget.add_operator_message(
+                f"/compact finished · summarized {compacted_messages} live messages "
+                f"(~{format_tokens(compacted_tokens)} tokens) · newest two user turns kept live"
+                f"{context_now} · full transcript unchanged"
+            )
+        else:
+            self.chat_widget.add_operator_message(
+                "/compact finished and checkpointed safely; the source chat changed while it ran, "
+                "so its compacted context will take effect when that chat is reopened. Full transcript unchanged."
+            )
 
     # ── Dreaming ────────────────────────────────────────────────────────────────
 
@@ -1088,6 +1224,13 @@ class LuminaWindow(QMainWindow):
         command = parse_operator_command(text)
         if command is not None:
             self._dispatch_operator_command(command)
+            return
+
+        if self._manual_compaction_thread is not None:
+            self.chat_widget.add_operator_message(
+                "Manual context compaction is still running or finalizing. Use /status; your message was not sent."
+            )
+            QTimer.singleShot(0, lambda text=text: self.chat_widget.input.setPlainText(text))
             return
 
         if self.worker is not None and self.worker.isRunning():
