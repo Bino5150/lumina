@@ -9,6 +9,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+from core import emergency_stop
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager
 from tools.registry import ToolRegistry
@@ -54,7 +55,14 @@ class TurnCancelled(Exception):
 
 
 def _cancel_requested(cancel_event) -> bool:
-    return bool(cancel_event is not None and cancel_event.is_set())
+    """True if the normal per-worker /stop Event is set, OR the current
+    emergency execution is no longer permitted (latched, or this
+    execution's epoch has gone stale). This makes every existing /stop
+    safe boundary an E-stop boundary automatically, with no second set of
+    checks sprinkled through the tool loop."""
+    if cancel_event is not None and cancel_event.is_set():
+        return True
+    return not emergency_stop.execution_permitted()
 
 
 def _close_cancelled_tool_calls(agent, tool_calls):
@@ -274,7 +282,32 @@ class LuminaAgent:
         cancel_event: optional threading.Event owned by the desktop foreground
         worker. Cancellation is cooperative: already-blocked provider/tool calls
         are allowed to return, then chat() exits at the next safe boundary.
+
+        Thin wrapper — the real body lives in _chat_impl(), unbound-called
+        via LuminaAgent._chat_impl(self, ...) rather than self._chat_impl(...)
+        so existing tests that call LuminaAgent.chat(fake_self, ...) against a
+        minimal types.SimpleNamespace stand-in stay valid. Every real turn
+        runs inside an emergency execution_scope for its whole lifetime — see
+        core/emergency_stop.py. Metadata is deliberately small and safe
+        (channel id, owner bool, chat id); the user prompt itself is never
+        snapshotted here.
         """
+        with emergency_stop.execution_scope(
+            kind="foreground_turn",
+            label=getattr(self, "channel_id", "default"),
+            metadata={
+                "channel_id": getattr(self, "channel_id", "default"),
+                "owner": getattr(self, "owner", None),
+                "chat_id": chat_id,
+            },
+        ):
+            return LuminaAgent._chat_impl(
+                self, user_input, source=source, chat_id=chat_id,
+                cancel_event=cancel_event,
+            )
+
+    def _chat_impl(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
+                    cancel_event=None) -> str:
         tools_used_this_turn = set()
         think_step = [0]
 

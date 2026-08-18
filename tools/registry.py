@@ -7,6 +7,8 @@ import importlib
 import traceback
 from typing import Callable, Optional
 
+from core import emergency_stop
+
 
 class ToolRegistry:
     def __init__(self):
@@ -82,6 +84,13 @@ class ToolRegistry:
             allowed, reason = self._gate_fn(name)
             if not allowed:
                 return f"[Tool '{name}' blocked: {reason}]"
+        # Universal blast door — applies to every tool regardless of
+        # TOOL_TIERS. Loss-of-trust emergency stop means Lumina has no
+        # hands at all, not just no hands for "sensitive" tiers.
+        try:
+            lease_id = emergency_stop.begin_tool_dispatch(name)
+        except emergency_stop.EmergencyStopError as e:
+            return f"[Tool '{name}' blocked: emergency stop active — {e}]"
         try:
             result = self._tools[name]["fn"](**args)
             return str(result) if result is not None else "[No result]"
@@ -89,6 +98,8 @@ class ToolRegistry:
             return f"[Tool error: bad arguments for '{name}': {e}]"
         except Exception as e:
             return f"[Tool error in '{name}': {e}]"
+        finally:
+            emergency_stop.end_tool_dispatch(lease_id)
 
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())
