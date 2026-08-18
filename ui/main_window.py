@@ -24,6 +24,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from core.agent import is_error_response
+from core.operator_commands import (
+    command_help, format_duration, format_tokens, parse_operator_command,
+    unwrap_background_result,
+)
 from core.personas import list_personas, load_persona
 from core import persistence
 from core import dreaming 
@@ -360,6 +364,11 @@ class LuminaWindow(QMainWindow):
         self._prefs = persistence.load()
         self._last_activity = time.time()
         self._dream_fired_this_idle = False
+        self._operator_turn_started_at = None
+        self._operator_last_progress_at = None
+        self._operator_phase = "idle"
+        self._operator_current_tool = None
+        self._btw_task_ids = {}  # task_id -> {question, started_at}; never injected into main context
         self._dream_timer = QTimer(self)
         self._dream_timer.timeout.connect(self._check_dream_idle)
         self._dream_timer.start(60_000)  # check once a minute — cheap, no need to be tighter
@@ -867,16 +876,21 @@ class LuminaWindow(QMainWindow):
         except Exception:
             self.status_bar.set_error("No backend connected — go to Settings to configure")
 
+    def _tracked_operator_task_ids(self):
+        """Union model-dispatched tasks with UI-only /btw sidequests."""
+        return set(getattr(self.agent, "_background_task_ids", set())) | set(self._btw_task_ids)
+
     def _refresh_operator_telemetry(self, refresh_context: bool = False):
         """Refresh read-only context and desktop-owned background-task telemetry."""
         try:
             from core.task_queue import get_task_result
             running = 0
-            for task_id in list(getattr(self.agent, "_background_task_ids", set())):
+            for task_id in self._tracked_operator_task_ids():
                 entry = get_task_result(task_id)
                 if entry and entry.get("status") == "running":
                     running += 1
             self.status_bar.set_background_tasks(running)
+            self._surface_btw_results(get_task_result)
         except Exception as e:
             print(f"[TELEMETRY] task status unavailable: {e}", flush=True)
 
@@ -887,6 +901,121 @@ class LuminaWindow(QMainWindow):
             self.status_bar.set_context_usage(usage)
         except Exception as e:
             print(f"[TELEMETRY] context usage unavailable: {e}", flush=True)
+
+    def _mark_operator_progress(self, phase: str, tool: str = None):
+        self._operator_phase = phase
+        self._operator_current_tool = tool
+        self._operator_last_progress_at = time.time()
+
+    def _dispatch_operator_command(self, command):
+        """Single dispatch point for owner-facing slash commands."""
+        if not command.known:
+            self.chat_widget.add_operator_message(
+                f"Unknown command /{command.name or '?'}. {command_help()}"
+            )
+            return
+        if command.name == "status":
+            self._command_status(command.argument)
+        elif command.name == "btw":
+            self._command_btw(command.argument)
+
+    def _command_status(self, argument: str):
+        if argument:
+            self.chat_widget.add_operator_message("/status takes no arguments.")
+            return
+
+        now = time.time()
+        lines = []
+        if self.worker is not None and self.worker.isRunning():
+            started = self._operator_turn_started_at or now
+            last = self._operator_last_progress_at or started
+            phase = self._operator_phase or "processing"
+            if self._operator_current_tool:
+                phase = f"tool: {self._operator_current_tool}"
+            lines.append(f"Foreground: running {format_duration(now - started)} · {phase}")
+            age = now - last
+            lines.append(f"Last meaningful progress: {format_duration(age)} ago")
+            if age >= 60:
+                lines.append(f"⚠ No meaningful progress for {format_duration(age)}; task may simply be blocked in a long tool/provider call.")
+        else:
+            lines.append("Foreground: idle")
+
+        try:
+            from core.task_queue import get_task_result
+            counts = {"running": 0, "scheduled": 0}
+            for task_id in self._tracked_operator_task_ids():
+                entry = get_task_result(task_id)
+                status = entry.get("status") if entry else None
+                if status in counts:
+                    counts[status] += 1
+            lines.append(
+                f"Background: {counts['running']} running · {counts['scheduled']} scheduled"
+            )
+        except Exception:
+            lines.append("Background: status unavailable")
+
+        try:
+            usage = self.agent.get_context_usage(chat_id=self._current_chat_id)
+            lines.append(
+                f"Context: ~{format_tokens(usage['used_tokens'])} / "
+                f"{format_tokens(usage['max_tokens'])} · {usage['percent']:.0f}%"
+            )
+        except Exception:
+            lines.append("Context: status unavailable")
+
+        self.chat_widget.add_operator_message("\n".join(lines))
+
+    def _command_btw(self, question: str):
+        question = (question or "").strip()
+        if not question:
+            self.chat_widget.add_operator_message("Usage: /btw <side question>")
+            return
+        if not getattr(config, "BACKGROUND_TASKS_ENABLED", False) or not getattr(config, "SUBAGENTS_ENABLED", False):
+            self.chat_widget.add_operator_message(
+                "/btw requires both Background Tasks and Subagents to be enabled in Settings."
+            )
+            return
+
+        try:
+            from tools.tasks import run_background_subagent
+            persona = None
+            current_persona = getattr(self.agent, "current_persona", None)
+            if isinstance(current_persona, dict):
+                persona = current_persona.get("name")
+            result = run_background_subagent(question, persona=persona)
+            task_id = result["task_id"]
+            # Deliberately DO NOT add this to agent._background_task_ids.
+            # /btw is UI-owned and must never be injected into main context by
+            # LuminaAgent.chat()'s normal background-completion mechanism.
+            self._btw_task_ids[task_id] = {"question": question, "started_at": time.time()}
+            self.chat_widget.add_operator_message(
+                f"/btw sidequest started · {task_id[:8]} · main conversation untouched"
+            )
+            self._refresh_operator_telemetry()
+        except Exception as e:
+            self.chat_widget.add_operator_message(f"/btw failed to start: {e}")
+
+    def _surface_btw_results(self, get_task_result):
+        """Display /btw results independently; never feed them into agent history."""
+        for task_id, meta in list(self._btw_task_ids.items()):
+            entry = get_task_result(task_id)
+            if entry is None:
+                self.chat_widget.add_operator_message(
+                    f"/btw {task_id[:8]} result expired before display."
+                )
+                self._btw_task_ids.pop(task_id, None)
+                continue
+            if entry.get("status") not in ("success", "error", "cancelled"):
+                continue
+            elapsed = format_duration(time.time() - meta["started_at"])
+            result_text = unwrap_background_result(entry)
+            question = meta["question"]
+            if len(question) > 100:
+                question = question[:97] + "..."
+            self.chat_widget.add_operator_message(
+                f"/btw finished · {task_id[:8]} · {elapsed}\n{question}\n\n{result_text}"
+            )
+            self._btw_task_ids.pop(task_id, None)
 
     # ── Dreaming ────────────────────────────────────────────────────────────────
 
@@ -955,12 +1084,26 @@ class LuminaWindow(QMainWindow):
     def _on_user_message(self, text: str):
         if not text.strip():
             return
+
+        command = parse_operator_command(text)
+        if command is not None:
+            self._dispatch_operator_command(command)
+            return
+
         if self.worker is not None and self.worker.isRunning():
+            self.chat_widget.add_operator_message(
+                "Main turn is still running. Use /status or /btw <question>; your message was not sent."
+            )
+            # SmartInput clears immediately after emitting submit. Restore on
+            # the next event-loop tick so an accidental normal message isn't lost.
+            QTimer.singleShot(0, lambda text=text: self.chat_widget.input.setPlainText(text))
             return
         self.worker = None
         
         self._last_activity = time.time()
         self._dream_fired_this_idle = False
+        self._operator_turn_started_at = time.time()
+        self._mark_operator_progress("processing")
 
         content = None
         display_text = text
@@ -991,7 +1134,7 @@ class LuminaWindow(QMainWindow):
             content = text
 
         self.chat_widget.add_user_message(display_text)
-        self.chat_widget.set_input_enabled(False)
+        self.chat_widget.set_turn_running(True)
         self.status_lbl.setText("processing...")
         if self._current_chat_id:
             save_chat_message(self._current_chat_id, "user", display_text)
@@ -1109,29 +1252,35 @@ class LuminaWindow(QMainWindow):
     # ── Streaming signal handlers ──────────────────────────────────────────────
 
     def _on_tool_call(self, name: str, args: dict):
+        self._mark_operator_progress("tool", tool=name)
         self.status_lbl.setText(f"⚙ {name}...")
         if self._live_bubble:
             self._live_bubble.add_tool_call(name, args)
 
     def _on_tool_result(self, name: str, result: str):
+        self._mark_operator_progress("processing")
         self.status_lbl.setText("processing...")
 
     def _on_think_start(self, step: int):
+        self._mark_operator_progress("thinking")
         self.status_lbl.setText(f"thinking (step {step})...")
         if self._live_bubble and config.SHOW_THINK_BLOCKS:
             self._live_bubble.open_think_block(step)
 
     def _on_think_chunk(self, chunk: str):
+        self._mark_operator_progress("thinking")
         if self._live_bubble and config.SHOW_THINK_BLOCKS:
             self._live_bubble.append_think_token(chunk)
             
 
     def _on_think_end(self):
+        self._mark_operator_progress("responding")
         self.status_lbl.setText("responding...")
         if self._live_bubble and config.SHOW_THINK_BLOCKS:
             self._live_bubble.close_think_block()
 
     def _on_response_chunk(self, chunk: str):
+        self._mark_operator_progress("responding")
         self.status_lbl.setText("")
         if self._live_bubble:
             self._live_bubble.append_response_token(chunk)
@@ -1144,7 +1293,10 @@ class LuminaWindow(QMainWindow):
         if self._live_bubble:
             self._live_bubble.finalize()
             self._live_bubble = None
-        self.chat_widget.set_input_enabled(True)
+        self.chat_widget.set_turn_running(False)
+        self._operator_turn_started_at = None
+        self._operator_phase = "idle"
+        self._operator_current_tool = None
         self.status_lbl.setText("")
         self._refresh_operator_telemetry(refresh_context=True)
         if self._current_chat_id and response:
@@ -1176,7 +1328,10 @@ class LuminaWindow(QMainWindow):
             self._live_bubble.append_response_token(f"[Error: {error}]")
             self._live_bubble.finalize()
             self._live_bubble = None
-        self.chat_widget.set_input_enabled(True)
+        self.chat_widget.set_turn_running(False)
+        self._operator_turn_started_at = None
+        self._operator_phase = "idle"
+        self._operator_current_tool = None
         self.status_lbl.setText("")
     
     def _on_mic_pressed(self):

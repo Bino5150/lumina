@@ -590,6 +590,24 @@ class ChatWidget(QWidget):
         lbl.setStyleSheet(f"color:{self.colors['text_muted']};font-size:11px;padding:4px;font-style:italic;background:transparent;border:none;")
         self._insert(lbl)
 
+    def add_operator_message(self, text: str):
+        """Render out-of-band cockpit output without writing it into chat history."""
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame{{background:{self.colors['bg_card']};border:1px solid {self.colors['border']};"
+            "border-radius:8px;margin:2px 24px;}}"
+        )
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(10, 8, 10, 8)
+        lbl = QLabel(f"⌘  {text}")
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl.setStyleSheet(
+            f"color:{self.colors['text_muted']};font-size:11px;background:transparent;border:none;"
+        )
+        layout.addWidget(lbl)
+        self._insert(frame)
+
     def create_live_bubble(self) -> LiveResponseBubble:
         bubble = LiveResponseBubble(self.colors, avatar_path=self.avatar_path,
                                     agent_name=getattr(self, '_persona_name', config.AGENT_NAME),
@@ -602,6 +620,17 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(enabled)
         self.mic_btn.setEnabled(enabled)
         if enabled:
+            self.input.setFocus()
+
+    def set_turn_running(self, running: bool):
+        """Keep text commands usable mid-turn while preventing a second foreground turn."""
+        self.input.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        self.mic_btn.setEnabled(not running)
+        if running:
+            self.input.setPlaceholderText("Main task running — /status or /btw <question>")
+        else:
+            self.input.update_placeholder(self._persona_name)
             self.input.setFocus()
 
     def clear_messages(self):
