@@ -9,7 +9,7 @@ Lumina Main Window
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QComboBox, QSizePolicy, QInputDialog,
-    QMessageBox, QFileDialog, QScrollArea
+    QMessageBox, QFileDialog, QScrollArea, QProgressBar
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject
 from PySide6.QtGui import QFont, QPixmap, QPainter, QBrush, QColor, QPainterPath, QIcon
@@ -262,24 +262,84 @@ class StatusBar(QFrame):
         self.dot.setStyleSheet(f"color:{COLORS['success']};font-size:10px;background:transparent;")
         self.model_lbl = QLabel("Connecting...")
         self.model_lbl.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;background:transparent;")
-        self.token_lbl = QLabel("")
-        self.token_lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;background:transparent;")
+        self.task_lbl = QLabel("")
+        self.task_lbl.setStyleSheet(f"color:{COLORS['success']};font-size:11px;background:transparent;")
+        self.task_lbl.setVisible(False)
+        self.context_lbl = QLabel("")
+        self.context_lbl.setStyleSheet(f"color:{COLORS['text_muted']};font-size:11px;background:transparent;")
+        self.context_bar = QProgressBar()
+        self.context_bar.setRange(0, 1000)
+        self.context_bar.setValue(0)
+        self.context_bar.setTextVisible(False)
+        self.context_bar.setFixedSize(90, 7)
+        self._style_context_bar(0.0)
         layout.addWidget(self.dot)
         layout.addWidget(self.model_lbl)
+        layout.addWidget(self.task_lbl)
         layout.addStretch()
-        layout.addWidget(self.token_lbl)
+        layout.addWidget(self.context_lbl)
+        layout.addWidget(self.context_bar)
 
     def set_connected(self, model: str):
         self.dot.setStyleSheet(f"color:{COLORS['success']};font-size:10px;background:transparent;")
-        self.model_lbl.setText(model[:60]+"..." if len(model)>60 else model)
+        self.model_lbl.setToolTip(model)
+        self.model_lbl.setText(model[:40]+"..." if len(model)>40 else model)
 
     def set_error(self, msg: str = "LM Studio offline"):
         self.dot.setStyleSheet(f"color:{COLORS['danger']};font-size:10px;background:transparent;")
         self.model_lbl.setText(msg)
 
-    def set_tokens(self, count: int):
-        self.token_lbl.setText(f"~{count:,} ctx tokens")
+    @staticmethod
+    def _fmt_tokens(count: int) -> str:
+        count = max(0, int(count or 0))
+        if count >= 1_000_000:
+            return f"{count / 1_000_000:.1f}M".replace(".0M", "M")
+        if count >= 1_000:
+            return f"{count / 1_000:.1f}k".replace(".0k", "k")
+        return str(count)
 
+    def _style_context_bar(self, percent: float):
+        if percent >= 90:
+            chunk = COLORS['danger']
+        elif percent >= 75:
+            chunk = COLORS['warning']
+        else:
+            chunk = COLORS['accent_dim']
+        self.context_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background:{COLORS['bg_input']}; border:none; border-radius:3px;
+            }}
+            QProgressBar::chunk {{ background:{chunk}; border-radius:3px; }}
+        """)
+
+    def set_context_usage(self, usage: dict):
+        used = int(usage.get("used_tokens", 0))
+        limit = max(1, int(usage.get("max_tokens", 1)))
+        reserve = max(0, int(usage.get("reserve_tokens", 0)))
+        headroom = max(0, int(usage.get("prompt_headroom_tokens", 0)))
+        percent = max(0.0, min(100.0, float(usage.get("percent", 0.0))))
+        self.context_lbl.setText(
+            f"Context ~{self._fmt_tokens(used)} / {self._fmt_tokens(limit)} · {percent:.0f}%"
+        )
+        self.context_bar.setValue(int(round(percent * 10)))
+        self._style_context_bar(percent)
+        tip = (
+            "Estimated prompt footprint: dynamic system/memory context, retained "
+            "chat history, and enabled tool schemas. "
+            f"{reserve:,} tokens reserved for response; ~{headroom:,} prompt tokens remain."
+        )
+        self.context_lbl.setToolTip(tip)
+        self.context_bar.setToolTip(tip)
+
+    def set_background_tasks(self, running_count: int):
+        running_count = max(0, int(running_count or 0))
+        if running_count:
+            noun = "task" if running_count == 1 else "tasks"
+            self.task_lbl.setText(f"● {running_count} background {noun} running")
+            self.task_lbl.setVisible(True)
+        else:
+            self.task_lbl.clear()
+            self.task_lbl.setVisible(False)
 
 # ── Main Window ────────────────────────────────────────────────────────────────
 
@@ -318,6 +378,10 @@ class LuminaWindow(QMainWindow):
         self._connect_signals()
         self._restore_session()
         QTimer.singleShot(600, self._check_connection)
+        self._telemetry_timer = QTimer(self)
+        self._telemetry_timer.timeout.connect(self._refresh_operator_telemetry)
+        self._telemetry_timer.start(1000)
+        QTimer.singleShot(0, lambda: self._refresh_operator_telemetry(refresh_context=True))
 
     def _setup_window(self):
         self.setWindowTitle("Lumina")
@@ -803,6 +867,27 @@ class LuminaWindow(QMainWindow):
         except Exception:
             self.status_bar.set_error("No backend connected — go to Settings to configure")
 
+    def _refresh_operator_telemetry(self, refresh_context: bool = False):
+        """Refresh read-only context and desktop-owned background-task telemetry."""
+        try:
+            from core.task_queue import get_task_result
+            running = 0
+            for task_id in list(getattr(self.agent, "_background_task_ids", set())):
+                entry = get_task_result(task_id)
+                if entry and entry.get("status") == "running":
+                    running += 1
+            self.status_bar.set_background_tasks(running)
+        except Exception as e:
+            print(f"[TELEMETRY] task status unavailable: {e}", flush=True)
+
+        try:
+            usage = self.agent.get_context_usage(
+                chat_id=self._current_chat_id, refresh=refresh_context
+            )
+            self.status_bar.set_context_usage(usage)
+        except Exception as e:
+            print(f"[TELEMETRY] context usage unavailable: {e}", flush=True)
+
     # ── Dreaming ────────────────────────────────────────────────────────────────
 
     def _check_dream_idle(self):
@@ -1061,7 +1146,7 @@ class LuminaWindow(QMainWindow):
             self._live_bubble = None
         self.chat_widget.set_input_enabled(True)
         self.status_lbl.setText("")
-        self.status_bar.set_tokens(self.agent.get_token_count())
+        self._refresh_operator_telemetry(refresh_context=True)
         if self._current_chat_id and response:
             save_chat_message(self._current_chat_id, "assistant", response)
             self._refresh_chat_list()

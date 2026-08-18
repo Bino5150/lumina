@@ -47,6 +47,7 @@ class ContextManager:
         self.owner = owner  # gates passive context injection below — see _build_system_prompt()
         self._pending_compaction = []   # messages captured off the trim loop, awaiting summarization
         self._compacting = False        # prevents overlapping background compaction jobs
+        self._last_usage_snapshot = None  # last request-shaped accounting for the operator UI
 
     def add_user(self, content, source: str = "OWNER_DIRECT"):
         """Accept str (normal message) or list (multipart: image + text).
@@ -69,13 +70,16 @@ class ContextManager:
             else:
                 content = f"{tag}\n{content}"
         self.history.append({"role": "user", "content": content})
+        self._last_usage_snapshot = None
 
     def add_assistant(self, content: str):
         self.history.append({"role": "assistant", "content": content})
+        self._last_usage_snapshot = None
 
     def add_tool_call(self, message: dict):
         """Add assistant message containing tool_calls."""
         self.history.append(message)
+        self._last_usage_snapshot = None
 
     def add_tool_result(self, tool_call_id: str, name: str, result: str):
         self._untrusted_content_seen = True
@@ -92,6 +96,7 @@ class ContextManager:
             "name": name,
             "content": tagged
         })
+        self._last_usage_snapshot = None
 
     def _build_system_prompt(self, tool_budget: int = 0, chat_id: int = None) -> str:
         """
@@ -215,6 +220,67 @@ class ContextManager:
             parts.append(self._ephemeral)
         return "\n\n".join(parts)
 
+    def _fit_history_to_budget(self, system_prompt: str, tool_budget: int = 0,
+                               capture_compaction: bool = False):
+        """Return the history slice that fits build_messages()'s real budget.
+
+        Read-only telemetry passes capture_compaction=False so merely asking
+        how full context is can never enqueue messages for compaction.
+        """
+        available = self.max_tokens - self.reserve - tool_budget
+        system_tokens = estimate_tokens(system_prompt) + 4
+        history_copy = list(self.history)
+
+        while history_copy:
+            total = system_tokens + sum(estimate_message_tokens(m) for m in history_copy)
+            if total <= available:
+                break
+            dropped = history_copy.pop(0)
+            if capture_compaction and getattr(config, "CONTEXT_COMPACTION_ENABLED", False):
+                self._pending_compaction.append(dropped)
+
+        return history_copy, system_tokens
+
+    def _make_usage_snapshot(self, system_tokens: int, history_copy: list,
+                             tool_budget: int, chat_id: int = None) -> dict:
+        history_tokens = sum(estimate_message_tokens(m) for m in history_copy)
+        tool_tokens = max(0, int(tool_budget or 0))
+        max_tokens = max(1, int(self.max_tokens))
+        reserve_tokens = max(0, int(self.reserve))
+        used_tokens = system_tokens + history_tokens + tool_tokens
+        percent = min(100.0, max(0.0, (used_tokens / max_tokens) * 100.0))
+        prompt_headroom = max(0, max_tokens - reserve_tokens - used_tokens)
+        return {
+            "used_tokens": used_tokens,
+            "max_tokens": max_tokens,
+            "reserve_tokens": reserve_tokens,
+            "prompt_headroom_tokens": prompt_headroom,
+            "percent": percent,
+            "system_tokens": system_tokens,
+            "history_tokens": history_tokens,
+            "tool_tokens": tool_tokens,
+            "chat_id": chat_id,
+        }
+
+    def context_usage_snapshot(self, tool_budget: int = 0, chat_id: int = None,
+                               refresh: bool = False) -> dict:
+        """Return request-shaped context telemetry without mutating history."""
+        cached = self._last_usage_snapshot
+        if (not refresh and cached is not None
+                and cached.get("max_tokens") == int(self.max_tokens)
+                and cached.get("reserve_tokens") == int(self.reserve)
+                and cached.get("tool_tokens") == max(0, int(tool_budget or 0))
+                and cached.get("chat_id") == chat_id):
+            return dict(cached)
+
+        system_prompt = self._build_system_prompt(tool_budget=tool_budget, chat_id=chat_id)
+        history_copy, system_tokens = self._fit_history_to_budget(
+            system_prompt, tool_budget=tool_budget, capture_compaction=False
+        )
+        snapshot = self._make_usage_snapshot(system_tokens, history_copy, tool_budget, chat_id)
+        self._last_usage_snapshot = snapshot
+        return dict(snapshot)
+
     def build_messages(self, tool_budget: int = 0, chat_id: int = None) -> list:
         """
         Build the messages list for the API call.
@@ -224,19 +290,12 @@ class ContextManager:
         """
         system_prompt = self._build_system_prompt(tool_budget=tool_budget, chat_id=chat_id)
         self._ephemeral = ""   # consumed — clear for next turn
-        available = self.max_tokens - self.reserve - tool_budget
-        system_tokens = estimate_tokens(system_prompt) + 4
-
-        history_copy = list(self.history)
-
-        # Trim from the front (oldest) until we fit
-        while history_copy:
-            total = system_tokens + sum(estimate_message_tokens(m) for m in history_copy)
-            if total <= available:
-                break
-            dropped = history_copy.pop(0)
-            if getattr(config, "CONTEXT_COMPACTION_ENABLED", False):
-                self._pending_compaction.append(dropped)
+        history_copy, system_tokens = self._fit_history_to_budget(
+            system_prompt, tool_budget=tool_budget, capture_compaction=True
+        )
+        self._last_usage_snapshot = self._make_usage_snapshot(
+            system_tokens, history_copy, tool_budget, chat_id
+        )
 
         # F-61 fix: self.history itself used to grow unbounded — only the
         # local copy above was ever trimmed. Harmless for the desktop
@@ -271,13 +330,16 @@ class ContextManager:
 
     def clear(self):
         self.history = []
+        self._last_usage_snapshot = None
 
     def update_system_prompt(self, new_prompt: str):
         self.system_prompt = new_prompt
+        self._last_usage_snapshot = None
 
     def push_ephemeral(self, block: str):
         """Append a one-turn injection (e.g. skill docs). Cleared after build_messages()."""
         self._ephemeral = block
+        self._last_usage_snapshot = None
 
     def pending_compaction_tokens(self) -> int:
         return sum(estimate_message_tokens(m) for m in self._pending_compaction)

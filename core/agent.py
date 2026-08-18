@@ -582,3 +582,11 @@ class LuminaAgent:
 
     def get_token_count(self) -> int:
         return self.ctx.token_count()
+
+    def get_context_usage(self, chat_id: int = None, refresh: bool = False) -> dict:
+        """Return operator-facing context usage with the live tool-schema budget."""
+        return self.ctx.context_usage_snapshot(
+            tool_budget=self.registry.schema_token_estimate(),
+            chat_id=chat_id,
+            refresh=refresh,
+        )
