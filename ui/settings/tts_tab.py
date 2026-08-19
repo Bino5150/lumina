@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, QTimer
 
 import os, sys, threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -20,15 +20,62 @@ class TTSTab(QWidget):
     # These signals marshal the result back to the main thread for the
     # status label update, per Qt's cross-thread widget rule.
     _tts_test_result = Signal(bool, str)
-    _tts_swap_done = Signal(str)
+    _tts_swap_done = Signal(bool, str)
+
+    _RESULT_HOLD_MS = 1750  # ~1.5-2s truthful-outcome display before button text reverts
 
     def __init__(self, agent, c: dict, parent=None):
         super().__init__(parent)
         self.agent = agent
         self.c = c
+        # Single-flight gate shared by Test and Save: guards entry so a
+        # second Test/Save activation -- from a rapid double-click *or* a
+        # direct method call that bypasses the button entirely -- can't start
+        # a second concurrent backend reload. setEnabled(False) alone only
+        # blocks the click path, not direct invocation, so busy is checked
+        # and set atomically under _op_lock at the top of both entry points.
+        self._op_lock = threading.Lock()
+        self._busy = False
+        # Bumped by _try_enter_busy() every time a new operation is
+        # accepted. A delayed button-text-revert timer (see
+        # _schedule_feedback_reset) captures the generation in flight when
+        # it's scheduled and checks it again when it fires -- if a newer
+        # operation has since started, the generation has moved on and the
+        # stale callback is a no-op instead of stomping the new operation's
+        # button text.
+        self._feedback_generation = 0
         self._tts_test_result.connect(self._on_tts_test_result)
         self._tts_swap_done.connect(self._on_tts_swap_done)
         self._build()
+
+    def _try_enter_busy(self) -> bool:
+        with self._op_lock:
+            if self._busy:
+                return False
+            self._busy = True
+            self._feedback_generation += 1
+            return True
+
+    def _leave_busy(self):
+        with self._op_lock:
+            self._busy = False
+        self.test_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+
+    def _schedule_feedback_reset(self, fn):
+        """Delay-run fn() after _RESULT_HOLD_MS, but only if no newer
+        operation has been accepted in the meantime. Callers invoke this
+        while still inside the generation that owns the reset -- capturing
+        self._feedback_generation now is always the right value, since
+        _try_enter_busy() can't bump it again until this operation calls
+        _leave_busy()."""
+        generation = self._feedback_generation
+
+        def guarded():
+            if generation == self._feedback_generation:
+                fn()
+
+        QTimer.singleShot(self._RESULT_HOLD_MS, guarded)
 
     def _build(self):
         outer = QWidget()
@@ -131,13 +178,13 @@ class TTSTab(QWidget):
 
         # ── Save ──
         btn_row = QHBoxLayout()
-        test_btn = _btn("▶ Test TTS", self.c)
-        test_btn.clicked.connect(self._test_tts)
-        save_btn = _btn("Save Settings", self.c, accent=True)
-        save_btn.clicked.connect(self._save)
-        btn_row.addWidget(test_btn)
+        self.test_btn = _btn("▶ Test TTS", self.c)
+        self.test_btn.clicked.connect(self._test_tts)
+        self.save_btn = _btn("Save Settings", self.c, accent=True)
+        self.save_btn.clicked.connect(self._save)
+        btn_row.addWidget(self.test_btn)
         btn_row.addStretch()
-        btn_row.addWidget(save_btn)
+        btn_row.addWidget(self.save_btn)
         layout.addLayout(btn_row)
 
         self.status_lbl = QLabel("")
@@ -180,7 +227,12 @@ class TTSTab(QWidget):
 
 
     def _test_tts(self):
-        self.status_lbl.setText("Testing...")
+        if not self._try_enter_busy():
+            return
+        self.test_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.test_btn.setText("Testing…")
+        self.status_lbl.setText("Testing…")
         import config as _c
         _c.TTS_BACKEND = self.tts_backend_combo.currentText()
         _c.TTS_HOST = self.url.text().strip()
@@ -216,7 +268,18 @@ class TTSTab(QWidget):
 
     def _on_tts_test_result(self, ok: bool, message: str):
         self.status_lbl.setText(message)
+        self.test_btn.setText("✓ Tested" if ok else "✗ Failed")
+        self._schedule_feedback_reset(lambda: self.test_btn.setText("▶ Test TTS"))
+        self._leave_busy()
+
     def _save(self):
+        if not self._try_enter_busy():
+            return
+        self.test_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.save_btn.setText("Saving…")
+        self.status_lbl.setText("Saving…")
+
         config.TTS_ENABLED = self.enabled_cb.isChecked()
         config.TTS_BACKEND = self.tts_backend_combo.currentText()
         # ElevenLabs is cloud-only -- the URL field doesn't apply to it and
@@ -224,10 +287,17 @@ class TTSTab(QWidget):
         # class VOICEBOX_HOST already guards against elsewhere in this tab.
         if config.TTS_BACKEND != "elevenlabs":
             config.TTS_HOST = self.url.text().strip()
+        # Tracked so the failure message below can be truthful: this write
+        # lands in a separate durable file (core/secrets.py, deliberately
+        # outside prefs.json) and happens unconditionally before
+        # persistence.save() is even attempted, so it survives a prefs
+        # write failure regardless of the outcome below.
+        credential_written = False
         if config.TTS_BACKEND == "elevenlabs":
             config.ELEVENLABS_API_KEY = self.eleven_key.text().strip()
             from core import secrets as _secrets
             _secrets.set_secret("elevenlabs_api_key", config.ELEVENLABS_API_KEY)
+            credential_written = True
         config.STT_ENABLED = self.stt_enabled_cb.isChecked()
         config.STT_BACKEND = self.stt_backend_combo.currentText()
         config.STT_MODEL = self.stt_model_combo.currentText()
@@ -243,20 +313,55 @@ class TTSTab(QWidget):
         prefs["stt_backend"] = config.STT_BACKEND
         prefs["stt_model"] = config.STT_MODEL
         prefs["stt_device"] = config.STT_DEVICE
-        persistence.save(prefs)
+
+        # persistence.save() reports failure via its return value, not an
+        # exception (see core/persistence.py) -- it was previously called
+        # here and ignored, so a failed write looked identical to a
+        # successful one. Case A: no backend worker starts, since there's
+        # nothing to swap towards. But by this point config.TTS_*/STT_* are
+        # already live in-process (they were assigned above, unconditionally,
+        # before persistence.save() was ever reached) and -- if ElevenLabs
+        # was selected -- the API key is already durably written to
+        # credentials.json regardless of what happens to prefs.json. "Save
+        # failed" alone would falsely imply nothing changed; only prefs.json
+        # itself failed to write, so those live/credential changes will not
+        # survive a restart even though they're in effect right now.
+        if not persistence.save(prefs):
+            fail_msg = "Settings were not fully saved; live values may remain changed until restart."
+            if credential_written:
+                fail_msg = ("Settings were not fully saved; your ElevenLabs API key was stored, "
+                             "and other live values may remain changed until restart.")
+            self.save_btn.setText("Save Settings")
+            self.status_lbl.setText(fail_msg)
+            self._leave_busy()
+            return
 
         if self.agent.tts:
             self.agent.tts.enabled = config.TTS_ENABLED
 
             def worker():
-                from tts.loader import get_tts_backend
-                self.agent.tts = get_tts_backend(force_reload=True)
-                self._tts_swap_done.emit("Settings saved.")
+                # Settings are already persisted at this point -- a failure
+                # here is a hot-swap failure, not a "nothing was saved"
+                # failure (case B), and must say so rather than stranding
+                # the controls in "Saving..." with no exception handling
+                # around force_reload, as the old worker did.
+                try:
+                    from tts.loader import get_tts_backend
+                    self.agent.tts = get_tts_backend(force_reload=True)
+                    self._tts_swap_done.emit(True, "Settings saved.")
+                except Exception as e:
+                    self._tts_swap_done.emit(False, f"Settings saved; TTS backend swap failed: {e}")
 
             self.status_lbl.setText("Settings saved (finishing TTS backend swap...)")
             threading.Thread(target=worker, daemon=True).start()
         else:
+            self.save_btn.setText("✓ Saved")
             self.status_lbl.setText("Settings saved.")
+            self._schedule_feedback_reset(lambda: self.save_btn.setText("Save Settings"))
+            self._leave_busy()
 
-    def _on_tts_swap_done(self, message: str):
+    def _on_tts_swap_done(self, ok: bool, message: str):
         self.status_lbl.setText(message)
+        self.save_btn.setText("✓ Saved" if ok else "⚠ Swap Failed")
+        self._schedule_feedback_reset(lambda: self.save_btn.setText("Save Settings"))
+        self._leave_busy()

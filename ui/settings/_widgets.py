@@ -64,23 +64,34 @@ def _le(default: str, c: dict) -> QLineEdit:
 def _btn(text: str, c: dict, accent: bool = False, danger: bool = False) -> QPushButton:
     btn = QPushButton(text)
     btn.setCursor(Qt.PointingHandCursor)
+    # :pressed is declared after :hover in each block so it wins the cascade
+    # when a button is pressed while still under the cursor (both selectors
+    # match at that instant; Qt's stylesheet engine resolves equal-specificity
+    # conflicts by source order, same as CSS) -- otherwise a real finger-down
+    # click would render as plain hover, giving no distinct press feedback.
+    # Colors reuse the existing palette only (accent_glow/accent_dim/bg_deep),
+    # no new design-system tokens; padding/border-width are unchanged from
+    # the released/hover rules so pressing never shifts layout geometry.
     if accent:
         btn.setStyleSheet(f"""
             QPushButton{{background:{c['accent']};color:{c['bg_deep']};border:none;
             border-radius:7px;padding:8px 18px;font-size:12px;font-weight:bold;}}
             QPushButton:hover{{background:#33ecff;}}
+            QPushButton:pressed{{background:{c['accent_dim']};}}
         """)
     elif danger:
         btn.setStyleSheet(f"""
             QPushButton{{background:transparent;color:{c['danger']};border:1px solid {c['danger']}44;
             border-radius:7px;padding:6px 14px;font-size:12px;}}
             QPushButton:hover{{background:{c['danger']}22;border-color:{c['danger']};}}
+            QPushButton:pressed{{background:{c['danger']};color:{c['bg_deep']};border-color:{c['danger']};}}
         """)
     else:
         btn.setStyleSheet(f"""
             QPushButton{{background:{c['bg_card']};color:{c['text_primary']};border:1px solid {c['border']};
             border-radius:7px;padding:6px 14px;font-size:12px;}}
             QPushButton:hover{{border-color:{c['accent_dim']};color:{c['accent']};}}
+            QPushButton:pressed{{background:{c['accent_glow']};border-color:{c['accent']};color:{c['accent']};}}
         """)
     return btn
 
