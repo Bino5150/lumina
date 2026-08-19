@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _btn, _spin, _table, _combo
+from ._widgets import _sec, _lbl, _btn, _spin, _table, _combo, ButtonFeedback
 
 
 # ── Tab: Tools ─────────────────────────────────────────────────────────────────
@@ -58,10 +58,11 @@ class ToolsTab(QWidget):
         new_btn.clicked.connect(self._new_profile)
         profile_layout.addWidget(new_btn)
 
-        save_profile_btn = _btn("💾 Save", self.c, accent=True)
-        save_profile_btn.setFixedHeight(30)
-        save_profile_btn.clicked.connect(self._save_profile)
-        profile_layout.addWidget(save_profile_btn)
+        self.save_profile_btn = _btn("💾 Save", self.c, accent=True)
+        self.save_profile_btn.setFixedHeight(30)
+        self.save_profile_btn.clicked.connect(self._save_profile)
+        profile_layout.addWidget(self.save_profile_btn)
+        self._save_profile_feedback = ButtonFeedback(self.save_profile_btn)
 
         self.del_profile_btn = _btn("✕ Delete", self.c, danger=True)
         self.del_profile_btn.setFixedHeight(30)
@@ -602,7 +603,13 @@ class ToolsTab(QWidget):
         except Exception:
             data = {}
         data["enabled"] = enabled
-        save_profile(self._current_profile_path, data)
+        try:
+            save_profile(self._current_profile_path, data)
+        except Exception as e:
+            self._save_profile_feedback.failure("✗ Failed")
+            self.save_profile_btn.setToolTip(f"Profile was not saved: {e}")
+            return
+        self.save_profile_btn.setToolTip("")
         # Refresh dropdown to update count
         current_path = self._current_profile_path
         self._load_profiles()
@@ -614,6 +621,7 @@ class ToolsTab(QWidget):
                 self.profile_combo.blockSignals(False)
                 break
         self._current_profile_path = current_path
+        self._save_profile_feedback.success("✓ Saved")
 
     def _new_profile(self):
         """Create a new empty tool profile."""

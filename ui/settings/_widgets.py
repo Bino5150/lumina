@@ -3,9 +3,10 @@ from PySide6.QtWidgets import (
     QTableWidget, QAbstractItemView, QScrollArea
 )
 from PySide6.QtGui import QPixmap, QPainter, QPainterPath
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 import os as _os
+import shiboken6
 # 2026-08-14 arrow-visibility fix: the QSS "zero-size box + one colored
 # border side" triangle trick (standard on the web) does NOT reliably
 # render as a triangle for Qt's ::down-arrow/::up-arrow subcontrols -- Qt's
@@ -94,6 +95,64 @@ def _btn(text: str, c: dict, accent: bool = False, danger: bool = False) -> QPus
             QPushButton:pressed{{background:{c['accent_glow']};border-color:{c['accent']};color:{c['accent']};}}
         """)
     return btn
+
+class ButtonFeedback:
+    """Shared success/failure text feedback for a synchronous Settings
+    Save/Apply button (Patch 3A.3B). TTSTab already solved this for its
+    async single-flight case (_schedule_feedback_reset's generation-guarded
+    QTimer); this is the same idea generalized for the plain "click ->
+    action already ran synchronously -> show the truthful outcome" case
+    used everywhere else in Settings, so each tab doesn't reinvent its own
+    QTimer bookkeeping.
+
+    success() shows text then reverts to the button's idle text after
+    HOLD_MS. failure() shows text and does NOT revert on its own -- it
+    stays until the next success()/failure() call replaces it, so a real
+    error can't quietly vanish before anyone reads it. Both bump a
+    per-instance generation counter, so a delayed revert scheduled by an
+    older call can never stomp state set by a newer one. The delayed
+    revert also checks shiboken6.isValid(btn) before touching it, since a
+    rebuildable panel (PersonasTab's right panel, rebuilt on every persona
+    selection) can delete the button out from under a pending timer.
+    """
+
+    HOLD_MS = 1750
+
+    def __init__(self, btn: QPushButton, idle_text: str = None):
+        self.btn = btn
+        self.idle_text = btn.text() if idle_text is None else idle_text
+        self._generation = 0
+
+    def success(self, text: str = "✓ Saved", hold_ms: int = None):
+        self._generation += 1
+        generation = self._generation
+        self.btn.setText(text)
+        QTimer.singleShot(
+            self.HOLD_MS if hold_ms is None else hold_ms,
+            lambda: self._revert(generation),
+        )
+
+    def failure(self, text: str = "✗ Failed"):
+        self._generation += 1
+        self.btn.setText(text)
+
+    def _revert(self, generation: int):
+        if generation != self._generation:
+            return
+        if not shiboken6.isValid(self.btn):
+            return
+        self.btn.setText(self.idle_text)
+
+
+def safe_error_detail(e: Exception) -> str:
+    """Exception TYPE name only (e.g. "PermissionError", "OSError") --
+    deliberately never str(e). For credential-storage failure paths, the
+    exception message body is untrusted: a buggy or malicious secret-store
+    implementation could embed the credential value that failed to store
+    directly in its message (see 3A.3B Correction 2). The type name alone
+    still carries real operator value without ever risking leaking one."""
+    return type(e).__name__
+
 
 def _spin(val: int, lo: int, hi: int, step: int, c: dict) -> QSpinBox:
     # Arrow visibility fix (2026-08-14): the old stylesheet never touched the

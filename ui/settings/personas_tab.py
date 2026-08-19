@@ -10,7 +10,7 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
 
-from ._widgets import _sec, _lbl, _te, _le, _btn, _combo, make_round_pixmap
+from ._widgets import _sec, _lbl, _te, _le, _btn, _combo, make_round_pixmap, ButtonFeedback
 
 
 # ── Tab: Personas ─────────────────────────────────────────────────────────────
@@ -437,12 +437,19 @@ class PersonasTab(QWidget):
         layout.addWidget(self.rp_desc)
 
         # ── Save button ──
+        # New QPushButton + ButtonFeedback every call -- this whole panel is
+        # torn down (_clear_right()'s deleteLater()) and rebuilt on every
+        # persona selection, so nothing here can be created once in __init__.
+        # ButtonFeedback's shiboken6.isValid() guard is what keeps a pending
+        # delayed reset from an old panel safe once that old button is gone.
         save_row = QHBoxLayout()
-        save_btn = _btn("💾 Save Persona", c, accent=True)
-        save_btn.clicked.connect(self._save_persona)
-        save_row.addStretch()
-        save_row.addWidget(save_btn)
+        self.rp_save_status_lbl = _lbl("", c)
+        save_row.addWidget(self.rp_save_status_lbl, 1)
+        self.rp_save_btn = _btn("💾 Save Persona", c, accent=True)
+        self.rp_save_btn.clicked.connect(self._save_persona)
+        save_row.addWidget(self.rp_save_btn)
         layout.addLayout(save_row)
+        self._persona_save_feedback = ButtonFeedback(self.rp_save_btn)
         layout.addStretch()
 
     def refresh_voices(self):
@@ -502,11 +509,18 @@ class PersonasTab(QWidget):
         if not self._current_path:
             return
         data = self._collect_persona_data()
-        save_persona(self._current_path, data)
+        try:
+            save_persona(self._current_path, data)
+        except Exception as e:
+            self._persona_save_feedback.failure("✗ Failed")
+            self.rp_save_status_lbl.setText(f"Persona was not saved: {e}")
+            return
         self._current_persona = data
         self._current_persona["_file"] = self._current_path
         self._load_personas()
         print(f"[PERSONA] Saved: {data['name']}", flush=True)
+        self._persona_save_feedback.success("✓ Saved")
+        self.rp_save_status_lbl.setText("")
 
     def _activate(self):
         if not self._current_persona:

@@ -1,11 +1,11 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLineEdit
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLineEdit, QLabel
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _te, _le, _btn, _spin, _combo, _scroll_wrap
+from ._widgets import _sec, _lbl, _te, _le, _btn, _spin, _combo, _scroll_wrap, ButtonFeedback, safe_error_detail
 
 
 # ── Tab: General ───────────────────────────────────────────────────────────────
@@ -195,14 +195,19 @@ class GeneralTab(QWidget):
         self.prompt = _te(config.SYSTEM_PROMPT, self.c, height=140)
         layout.addWidget(self.prompt)
         btn_row = QHBoxLayout()
-        apply_btn = _btn("Apply Change", self.c)
-        apply_btn.clicked.connect(self._apply_prompt)
-        save_btn = _btn("Save All Settings", self.c, accent=True)
-        save_btn.clicked.connect(self._save)
-        btn_row.addWidget(apply_btn)
+        self.apply_btn = _btn("Apply Change", self.c)
+        self.apply_btn.clicked.connect(self._on_apply_clicked)
+        self.save_btn = _btn("Save All Settings", self.c, accent=True)
+        self.save_btn.clicked.connect(self._save)
+        btn_row.addWidget(self.apply_btn)
         btn_row.addStretch()
-        btn_row.addWidget(save_btn)
+        btn_row.addWidget(self.save_btn)
         layout.addLayout(btn_row)
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet(f"color:{self.c['text_muted']};font-size:11px;background:transparent;")
+        layout.addWidget(self.status_lbl)
+        self._apply_feedback = ButtonFeedback(self.apply_btn)
+        self._save_feedback = ButtonFeedback(self.save_btn)
         layout.addStretch()
         self.setLayout(QVBoxLayout())
         self.layout().setContentsMargins(0, 0, 0, 0)
@@ -223,10 +228,15 @@ class GeneralTab(QWidget):
             model_attr = f"{backend.upper()}_DEFAULT_MODEL"
             self.cloud_key.setText(getattr(config, key_attr, ""))
             self.cloud_model.setCurrentText(getattr(config, model_attr, ""))
-    def _apply_prompt(self):
+    def _apply_prompt(self) -> bool:
+        """Pure action, no feedback -- called both by the Apply Change click
+        handler and (unconditionally, when the field is non-empty) from
+        _save()'s tail. Feedback belongs to each of those callers, not
+        here, or Save would also flash Apply's button. Returns True if the
+        live prompt actually changed, False for the empty-field no-op."""
         p = self.prompt.toPlainText().strip()
         if not p:
-            return
+            return False
         persona = getattr(self.agent, "current_persona", None)
         if persona and "system_prompt" in persona:
             # Recombine live: new global rules + whatever persona identity
@@ -237,6 +247,20 @@ class GeneralTab(QWidget):
             self.agent.ctx.update_system_prompt(new_prompt)
         else:
             self.agent.ctx.update_system_prompt(p)
+        return True
+
+    def _on_apply_clicked(self):
+        try:
+            applied = self._apply_prompt()
+        except Exception as e:
+            self._apply_feedback.failure("✗ Failed")
+            self.status_lbl.setText(f"Apply failed: {e}")
+            return
+        if applied:
+            self._apply_feedback.success("✓ Applied")
+        else:
+            self._apply_feedback.success("No change")
+        self.status_lbl.setText("")
 
     _BACKEND_URLS = {
         "llamacpp":  "http://localhost:8080/v1",
@@ -368,41 +392,120 @@ class GeneralTab(QWidget):
         # FE-09: the key itself now goes to secrets.py, not prefs.json —
         # prefs.json gets dragged into Project uploads and the public repo,
         # secrets.py never does. Only default_model stays in prefs.
-        if config.LLM_BACKEND in self.CLOUD_BACKENDS:
-            from core import secrets as _secrets
-            _secrets.set_secret(f"{config.LLM_BACKEND}_api_key", self.cloud_key.text().strip())
-            cloud_creds = prefs.get("cloud_credentials", {})
-            cloud_creds[config.LLM_BACKEND] = {
-                "default_model": self.cloud_model.currentText().strip(),
-            }
-            prefs["cloud_credentials"] = cloud_creds
+        # Credential writes (cloud/custom/omniroute) all happen here, before
+        # save_prefs() below -- same order the original code always used.
+        # set_secret() raises rather than returning False (see core/secrets.py),
+        # and previously an unhandled raise here silently aborted the rest of
+        # _save() (no persistence, no backend swap) with zero visible
+        # feedback. Catching it preserves that exact same "stops here"
+        # behavior -- just with a truthful message instead of a swallowed
+        # traceback. config.* above is already mutated live regardless.
+        #
+        # credential_written is set True only immediately AFTER a set_secret()
+        # call actually returns without raising -- not predicted from backend
+        # type up front. LLM_BACKEND is a single string, so cloud vs.
+        # custom/omniroute are mutually exclusive: at most one set_secret()
+        # call ever happens per invocation, never two. But for custom/
+        # omniroute, self.agent.llm._model = ... runs in the SAME try block
+        # immediately after that call succeeds, and can itself raise (e.g.
+        # agent.llm is None) -- a real partial-state case where the credential
+        # genuinely IS already durably stored even though this except block
+        # still fires. The flag lets the except branch below tell that case
+        # apart from "the secret write itself is what failed," instead of
+        # always claiming a uniform "nothing was saved."
+        credential_written = False
+        try:
+            if config.LLM_BACKEND in self.CLOUD_BACKENDS:
+                from core import secrets as _secrets
+                _secrets.set_secret(f"{config.LLM_BACKEND}_api_key", self.cloud_key.text().strip())
+                credential_written = True
+                cloud_creds = prefs.get("cloud_credentials", {})
+                cloud_creds[config.LLM_BACKEND] = {
+                    "default_model": self.cloud_model.currentText().strip(),
+                }
+                prefs["cloud_credentials"] = cloud_creds
 
-        if config.LLM_BACKEND == "custom":
-            config.CUSTOM_DEFAULT_MODEL = self.custom_model.text().strip()
-            config.CUSTOM_API_KEY = self.custom_api_key.text().strip()
-            from core import secrets as _secrets
-            _secrets.set_secret("custom_api_key", config.CUSTOM_API_KEY)
-            prefs["custom_default_model"] = config.CUSTOM_DEFAULT_MODEL
-            self.agent.llm._model = config.CUSTOM_DEFAULT_MODEL
-        elif config.LLM_BACKEND == "omniroute":
-            config.OMNIROUTE_DEFAULT_MODEL = self.custom_model.text().strip()
-            config.OMNIROUTE_API_KEY = self.custom_api_key.text().strip()
-            from core import secrets as _secrets
-            _secrets.set_secret("omniroute_api_key", config.OMNIROUTE_API_KEY)
-            prefs["omniroute_default_model"] = config.OMNIROUTE_DEFAULT_MODEL
-            self.agent.llm._model = config.OMNIROUTE_DEFAULT_MODEL
+            if config.LLM_BACKEND == "custom":
+                config.CUSTOM_DEFAULT_MODEL = self.custom_model.text().strip()
+                config.CUSTOM_API_KEY = self.custom_api_key.text().strip()
+                from core import secrets as _secrets
+                _secrets.set_secret("custom_api_key", config.CUSTOM_API_KEY)
+                credential_written = True
+                prefs["custom_default_model"] = config.CUSTOM_DEFAULT_MODEL
+                self.agent.llm._model = config.CUSTOM_DEFAULT_MODEL
+            elif config.LLM_BACKEND == "omniroute":
+                config.OMNIROUTE_DEFAULT_MODEL = self.custom_model.text().strip()
+                config.OMNIROUTE_API_KEY = self.custom_api_key.text().strip()
+                from core import secrets as _secrets
+                _secrets.set_secret("omniroute_api_key", config.OMNIROUTE_API_KEY)
+                credential_written = True
+                prefs["omniroute_default_model"] = config.OMNIROUTE_DEFAULT_MODEL
+                self.agent.llm._model = config.OMNIROUTE_DEFAULT_MODEL
+        except Exception as e:
+            self._save_feedback.failure("✗ Failed")
+            # Never str(e) here -- see safe_error_detail()'s docstring. The
+            # exception body is untrusted.
+            error_kind = safe_error_detail(e)
+            if credential_written:
+                # set_secret() itself already succeeded -- this exception
+                # came from a LATER same-try live-apply step (e.g.
+                # self.agent.llm._model = ...), not from credential storage.
+                # Must not be mislabeled as a credential-store error, and
+                # must say the credential really is already durably stored.
+                msg = (
+                    "Settings were not fully saved; your credential was "
+                    f"stored, but a later live update failed ({error_kind})."
+                )
+            else:
+                # The credential write itself is what raised -- nothing was
+                # durably stored. Only the earlier live config mutation
+                # (not the credential) is known to have already changed.
+                msg = (
+                    "Settings were not fully saved; some live values may "
+                    f"already have changed. Credential storage failed ({error_kind})."
+                )
+            self.status_lbl.setText(msg)
+            return
 
-        save_prefs(prefs)
+        # persistence.save() reports failure via its return value, not an
+        # exception (core/persistence.py) -- it was previously called here
+        # and ignored, so a failed write looked identical to a successful
+        # one. By this point config.* is already live and, for a cloud/
+        # custom/omniroute backend, the credential is already durably
+        # written to secrets.py regardless of what happens to prefs.json --
+        # mirrors TTSTab._save()'s same distinction (see tts_tab.py).
+        if not save_prefs(prefs):
+            self._save_feedback.failure("⚠ Not Saved")
+            if credential_written:
+                msg = ("Settings were not fully saved; your API credentials "
+                       "were stored, and other live values may remain "
+                       "changed until restart.")
+            else:
+                msg = "Settings were not fully saved; live values may remain changed until restart."
+            self.status_lbl.setText(msg)
+            return
 
-        self.agent.llm = get_llm_backend()
-        self.agent.llm.base_url = config.LLM_BACKEND_URL
+        # Prefs are durably saved at this point. A failure from here on is a
+        # live-apply failure, not a "nothing was saved" failure -- must say
+        # so rather than reporting it as an outright Save failure.
+        try:
+            self.agent.llm = get_llm_backend()
+            self.agent.llm.base_url = config.LLM_BACKEND_URL
 
-        # Apply context/memory settings to the live agent immediately — no
-        # restart needed, matching the backend-swap precedent above.
-        # ContextManager captured these at construction time (max_tokens,
-        # reserve); update the instance directly, not just the config module,
-        # or a hot-reload gap opens up (see F-09: from-import snapshotting).
-        self.agent.ctx.max_tokens = config.MAX_CONTEXT_TOKENS
-        self.agent.ctx.reserve = config.RESPONSE_RESERVE_TOKENS
-        if new_system_prompt:
-            self._apply_prompt()
+            # Apply context/memory settings to the live agent immediately —
+            # no restart needed, matching the backend-swap precedent above.
+            # ContextManager captured these at construction time (max_tokens,
+            # reserve); update the instance directly, not just the config
+            # module, or a hot-reload gap opens up (see F-09: from-import
+            # snapshotting).
+            self.agent.ctx.max_tokens = config.MAX_CONTEXT_TOKENS
+            self.agent.ctx.reserve = config.RESPONSE_RESERVE_TOKENS
+            if new_system_prompt:
+                self._apply_prompt()
+        except Exception as e:
+            self._save_feedback.failure("⚠ Partial")
+            self.status_lbl.setText(f"Settings saved; live backend apply failed: {e}")
+            return
+
+        self._save_feedback.success("✓ Saved")
+        self.status_lbl.setText("Settings saved.")

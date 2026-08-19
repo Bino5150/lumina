@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _te, _le, _btn, make_round_pixmap, _scroll_wrap
+from ._widgets import _sec, _lbl, _te, _le, _btn, make_round_pixmap, _scroll_wrap, ButtonFeedback, safe_error_detail
 
 
 # ── Tab: Communications ──────────────────────────────────────────────────────
@@ -85,10 +85,13 @@ class CommunicationsTab(QWidget):
             "•••• configured" if get_secret_safe("telegram_bot_token") else "Not set"
         )
         tg_token_row.addWidget(self.tg_token, 1)
-        tg_save = _btn("Save", c)
-        tg_save.clicked.connect(self._save_telegram)
-        tg_token_row.addWidget(tg_save)
+        self.tg_save_btn = _btn("Save", c)
+        self.tg_save_btn.clicked.connect(self._save_telegram)
+        tg_token_row.addWidget(self.tg_save_btn)
         layout.addLayout(tg_token_row)
+        self.tg_save_status_lbl = self._wlbl("")
+        layout.addWidget(self.tg_save_status_lbl)
+        self._tg_save_feedback = ButtonFeedback(self.tg_save_btn)
 
         # ── Telegram bridge on/off ──
         tg_bridge_row = QHBoxLayout()
@@ -117,10 +120,13 @@ class CommunicationsTab(QWidget):
             "•••• configured" if get_secret_safe("discord_bot_token") else "Not set"
         )
         dc_token_row.addWidget(self.dc_token, 1)
-        dc_save = _btn("Save", c)
-        dc_save.clicked.connect(self._save_discord_token)
-        dc_token_row.addWidget(dc_save)
+        self.dc_save_btn = _btn("Save", c)
+        self.dc_save_btn.clicked.connect(self._save_discord_token)
+        dc_token_row.addWidget(self.dc_save_btn)
         layout.addLayout(dc_token_row)
+        self.dc_token_status_lbl = self._wlbl("")
+        layout.addWidget(self.dc_token_status_lbl)
+        self._dc_token_feedback = ButtonFeedback(self.dc_save_btn)
 
         layout.addWidget(_sec("DISCORD BOT IDENTITY", c))
         layout.addWidget(self._wlbl(
@@ -158,12 +164,14 @@ class CommunicationsTab(QWidget):
         self.dc_prompt = _te(discord_persona.get("system_prompt", ""), c, height=140)
         layout.addWidget(self.dc_prompt)
 
-        dc_identity_save = _btn("Save Discord Identity", c, accent=True)
-        dc_identity_save.clicked.connect(self._save_discord_identity)
+        self.dc_identity_save_btn = _btn("Save Discord Identity", c, accent=True)
+        self.dc_identity_save_btn.clicked.connect(self._save_discord_identity)
         dc_identity_save_row = QHBoxLayout()
-        dc_identity_save_row.addStretch()
-        dc_identity_save_row.addWidget(dc_identity_save)
+        self.dc_identity_status_lbl = self._wlbl("")
+        dc_identity_save_row.addWidget(self.dc_identity_status_lbl, 1)
+        dc_identity_save_row.addWidget(self.dc_identity_save_btn)
         layout.addLayout(dc_identity_save_row)
+        self._dc_identity_feedback = ButtonFeedback(self.dc_identity_save_btn)
 
         # ── Email (stub — Epic B not yet built) ──
         layout.addWidget(_sec("EMAIL", c))
@@ -180,16 +188,46 @@ class CommunicationsTab(QWidget):
 
     # ── Telegram ──
     def _save_telegram(self):
+        """Preserves the original unconditional execution order (prefs save,
+        then live config mutation, then optional token secret write) exactly
+        -- only the truthful-feedback layer is new. persistence.save()'s
+        return value used to be discarded outright; now it's read, but every
+        step that used to run unconditionally still runs unconditionally."""
         chat_id = self.tg_chat_id.text().strip()
         self._prefs["telegram_owner_chat_id"] = chat_id
-        persistence.save(self._prefs)
+        prefs_ok = persistence.save(self._prefs)
         config.TELEGRAM_OWNER_CHAT_ID = chat_id or None
         token = self.tg_token.text().strip()
+        secret_error = None
         if token:
             from core.secrets import set_secret
-            set_secret("telegram_bot_token", token)
-            self.tg_token.clear()
-            self.tg_token.setPlaceholderText("•••• configured")
+            try:
+                set_secret("telegram_bot_token", token)
+                self.tg_token.clear()
+                self.tg_token.setPlaceholderText("•••• configured")
+            except Exception as e:
+                secret_error = e
+
+        if not prefs_ok:
+            self._tg_save_feedback.failure("✗ Failed")
+            msg = "Chat ID was not saved to disk."
+            if secret_error is not None:
+                # Never str(secret_error) -- see safe_error_detail()'s
+                # docstring; the exception body is untrusted here.
+                msg += f" Bot token was also not stored (credential store error: {safe_error_detail(secret_error)})."
+            elif token:
+                msg += " Bot token was stored, but this may not survive a restart."
+            self.tg_save_status_lbl.setText(msg)
+            return
+        if secret_error is not None:
+            self._tg_save_feedback.failure("✗ Failed")
+            self.tg_save_status_lbl.setText(
+                f"Chat ID saved; bot token was not stored (credential store error: {safe_error_detail(secret_error)})."
+            )
+            return
+
+        self._tg_save_feedback.success("✓ Saved")
+        self.tg_save_status_lbl.setText("")
 
     def _refresh_telegram_bridge_status(self):
         try:
@@ -220,11 +258,24 @@ class CommunicationsTab(QWidget):
     # ── Discord: token ──
     def _save_discord_token(self):
         token = self.dc_token.text().strip()
-        if token:
-            from core.secrets import set_secret
+        if not token:
+            self._dc_token_feedback.success("No token entered")
+            self.dc_token_status_lbl.setText("")
+            return
+        from core.secrets import set_secret
+        try:
             set_secret("discord_bot_token", token)
-            self.dc_token.clear()
-            self.dc_token.setPlaceholderText("•••• configured")
+        except Exception as e:
+            self._dc_token_feedback.failure("✗ Failed")
+            # Never str(e) -- see safe_error_detail()'s docstring.
+            self.dc_token_status_lbl.setText(
+                f"Bot token was not stored (credential store error: {safe_error_detail(e)})."
+            )
+            return
+        self.dc_token.clear()
+        self.dc_token.setPlaceholderText("•••• configured")
+        self._dc_token_feedback.success("✓ Saved")
+        self.dc_token_status_lbl.setText("")
 
     # ── Discord: identity file ──
     def _load_discord_identity(self) -> dict:
@@ -285,7 +336,14 @@ class CommunicationsTab(QWidget):
         data["system_prompt"] = self.dc_prompt.toPlainText().strip()
         # Preserve everything else in the file untouched — channel_bound,
         # protected, tts_*, description, and the (inert) tools_profile field.
-        save_persona(DISCORD_TEMPLATE_PATH, data)
+        try:
+            save_persona(DISCORD_TEMPLATE_PATH, data)
+        except Exception as e:
+            self._dc_identity_feedback.failure("✗ Failed")
+            self.dc_identity_status_lbl.setText(f"Discord identity was not saved: {e}")
+            return
+        self._dc_identity_feedback.success("✓ Saved")
+        self.dc_identity_status_lbl.setText("")
 
     # ── Public bio autosave ──
     def _autosave_public_bio(self):

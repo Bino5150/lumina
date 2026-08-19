@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _te, _le, _btn, make_round_pixmap, _scroll_wrap
+from ._widgets import _sec, _lbl, _te, _le, _btn, make_round_pixmap, _scroll_wrap, ButtonFeedback
 
 
 # ── Tab: User Profile ──────────────────────────────────────────────────────────
@@ -75,12 +75,14 @@ class UserProfileTab(QWidget):
         av_row.addStretch()
         layout.addLayout(av_row)
 
-        save_btn = _btn("Save Profile", self.c, accent=True)
-        save_btn.clicked.connect(self._save)
+        self.save_btn = _btn("Save Profile", self.c, accent=True)
+        self.save_btn.clicked.connect(self._save)
         save_row = QHBoxLayout()
-        save_row.addStretch()
-        save_row.addWidget(save_btn)
+        self.save_status_lbl = _lbl("", self.c)
+        save_row.addWidget(self.save_status_lbl, 1)
+        save_row.addWidget(self.save_btn)
         layout.addLayout(save_row)
+        self._save_feedback = ButtonFeedback(self.save_btn)
         layout.addStretch()
 
         self.setLayout(QVBoxLayout())
@@ -127,10 +129,21 @@ class UserProfileTab(QWidget):
             """)
 
     def _save(self):
+        # USER_NAME is mutated live before persistence.save() below is even
+        # attempted -- a failure here does not roll that back, so the
+        # failure message must not imply nothing changed.
         config.USER_NAME = self.user_name.text().strip() or config.USER_NAME
         self._prefs["user_name"] = config.USER_NAME
         self._prefs["human_bio"] = self.human_bio.toPlainText().strip()
-        persistence.save(self._prefs)
+        if persistence.save(self._prefs):
+            self._save_feedback.success("✓ Saved")
+            self.save_status_lbl.setText("")
+        else:
+            self._save_feedback.failure("✗ Failed")
+            self.save_status_lbl.setText(
+                "Profile was not saved to disk; your name change may "
+                "already be live and will not survive a restart."
+            )
 
     def _autosave_bio(self):
         self._prefs["human_bio"] = self.human_bio.toPlainText().strip()
