@@ -5,9 +5,12 @@ name: tests
 # every push and PR. Deliberately does NOT install the full requirements.txt
 # (PySide6, playwright+browsers, whisper) — those need system-level deps
 # (Qt libs, browser binaries) that would make this slow and flaky for what
-# is currently a backend-logic test suite. Everything under tests/ only
-# needs `requests` beyond the stdlib. A GUI/integration tier can be added
-# later if the test suite grows to actually need PySide6.
+# is currently a backend-logic test suite. Beyond stdlib, tests/ needs
+# `requests`, `pyenchant` (spellcheck), and `python-telegram-bot` (Telegram
+# bridge) — keep this list in sync with tests/ imports as coverage grows,
+# this is a hand-maintained subset of requirements.txt, not the real thing.
+# A GUI/integration tier can be added later if the test suite grows to
+# actually need PySide6.
 
 on:
   push:
@@ -28,7 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libenchant-2-2
 
       - name: Install test dependencies
-        run: pip install pytest==9.1.1 requests==2.34.2 platformdirs pyenchant==3.3.0
+        run: pip install pytest==9.1.1 requests==2.34.2 platformdirs pyenchant==3.3.0 python-telegram-bot==22.8
 
       - name: Run tests
         run: python -m pytest tests/ -v
