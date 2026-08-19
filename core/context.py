@@ -361,3 +361,17 @@ class ContextManager:
         """Drains and returns the pending buffer. Caller owns summarizing it."""
         batch, self._pending_compaction = self._pending_compaction, []
         return batch
+
+    def restore_pending_compaction(self, batch: list) -> None:
+        """Undo a take_pending_compaction() whose caller never reached a
+        successful write. Restored messages go back at the front, ahead of
+        anything the trim loop captured in the meantime, so chronological
+        order across the combined buffer is preserved.
+
+        Prepends in place (list.__setitem__ slice assignment) rather than
+        rebinding self._pending_compaction to a newly built list -- a
+        concurrent trim-loop append() lands on the same list object either
+        way, instead of racing against whichever list identity wins last."""
+        if not batch:
+            return
+        self._pending_compaction[:0] = list(batch)

@@ -42,7 +42,9 @@ def _fake_window(pending_tokens, compacting=False):
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi there"},
         ],
+        restored=[],  # 3A.2 R9-corrective -- restore_pending_compaction() calls land here
     )
+    ctx.restore_pending_compaction = lambda batch: ctx.restored.append(batch)
     win = types.SimpleNamespace(
         agent=types.SimpleNamespace(ctx=ctx),
     )
@@ -141,6 +143,7 @@ def test_fires_and_writes_to_nightstand_wing_tagged_correctly(monkeypatch):
 
     # Reset after the run, so a later turn can trigger again.
     assert ctx._compacting is False
+    assert ctx.restored == []  # committed successfully -- nothing to restore
 
 
 def test_compacting_flag_resets_even_when_palace_store_raises(monkeypatch):
@@ -149,7 +152,11 @@ def test_compacting_flag_resets_even_when_palace_store_raises(monkeypatch):
     just run_summarization_call()'s own already-covered None-return path.
     A stuck _compacting=True is a silent deadlock: compaction would just
     quietly stop firing for the rest of the session, no error, no crash,
-    nothing to notice."""
+    nothing to notice.
+
+    3A.2 R9-corrective: this is also the Palace-write-failure scenario --
+    the drained batch must come back via restore_pending_compaction()
+    rather than being silently lost along with the failed write."""
     win, ctx = _fake_window(pending_tokens=2000)
     monkeypatch.setattr(dreaming, "run_summarization_call", lambda *a, **k: "- did a thing")
 
@@ -162,6 +169,8 @@ def test_compacting_flag_resets_even_when_palace_store_raises(monkeypatch):
         LuminaWindow._maybe_compact(win, chat_id=42)
 
     assert ctx._compacting is False
+    assert len(ctx.restored) == 1
+    assert [m["content"] for m in ctx.restored[0]] == ["hello", "hi there"]
 
 
 def test_does_not_store_when_summarization_returns_none(monkeypatch):
@@ -174,6 +183,9 @@ def test_does_not_store_when_summarization_returns_none(monkeypatch):
 
     assert store_calls == []
     assert ctx._compacting is False  # finally still resets it
+    # 3A.2 R9-corrective: an empty summary must not lose the batch either.
+    assert len(ctx.restored) == 1
+    assert [m["content"] for m in ctx.restored[0]] == ["hello", "hi there"]
 
 
 def test_pending_buffer_drained_before_summarization_call(monkeypatch):

@@ -405,6 +405,96 @@ def test_blocked_provider_turn_cancelled_via_emergency_latch(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 3A.2 Part A / R2 -- pre-scope emergency race surfaces as TurnCancelled,
+# not a generic error, and still preserves the submitted user turn.
+# ---------------------------------------------------------------------------
+
+def test_prescope_latch_race_raises_turncancelled_and_preserves_user_turn():
+    emergency_stop.latch(source="test", reason="prescope-race")
+
+    ctx = _Ctx()
+    fake = types.SimpleNamespace(ctx=ctx)
+
+    with pytest.raises(TurnCancelled) as exc:
+        LuminaAgent.chat(fake, "keep this user turn")
+
+    assert exc.value.partial_response == ""
+    assert ctx.history == [{"role": "user", "content": "keep this user turn"}]
+
+    emergency_stop.rearm_local()
+
+
+def test_prescope_latch_race_does_not_swallow_unrelated_errors():
+    class _BoomCtx(_Ctx):
+        def add_user(self, content, source="OWNER_DIRECT"):
+            raise RuntimeError("unrelated programmer error")
+
+    emergency_stop.latch(source="test", reason="prescope-race-unrelated-error")
+    fake = types.SimpleNamespace(ctx=_BoomCtx())
+
+    with pytest.raises(RuntimeError, match="unrelated programmer error"):
+        LuminaAgent.chat(fake, "hello")
+
+    emergency_stop.rearm_local()
+
+
+def test_worker_held_before_scope_admission_then_latched_finishes_cancelled_never_starting_work(monkeypatch):
+    """R2: start a worker, hold it before execution-scope admission, latch,
+    release. Must finish as TurnCancelled, never call the provider."""
+    monkeypatch.setattr(agent_module, "build_skills_block", lambda query: "")
+
+    entered_wrapper = threading.Event()
+    release_wrapper = threading.Event()
+    provider_calls = []
+
+    real_execution_scope = emergency_stop.execution_scope
+
+    def _held_execution_scope(*args, **kwargs):
+        entered_wrapper.set()
+        assert release_wrapper.wait(timeout=5)
+        return real_execution_scope(*args, **kwargs)
+
+    monkeypatch.setattr(agent_module.emergency_stop, "execution_scope", _held_execution_scope)
+
+    class _LLM:
+        display_name = "fake"
+
+        def chat(self, **kwargs):
+            provider_calls.append(1)
+            return {"ok": True}
+
+    ctx = _Ctx()
+    fake = types.SimpleNamespace(
+        owner=False, channel_id="dev-race", llm=_LLM(), ctx=ctx,
+        registry=types.SimpleNamespace(schema_token_estimate=lambda: 0, get_schemas=lambda: [], list_enabled=lambda: []),
+    )
+
+    outcome = {}
+
+    def _run_turn():
+        try:
+            LuminaAgent.chat(fake, "hello")
+        except TurnCancelled:
+            outcome["cancelled"] = True
+        else:
+            outcome["cancelled"] = False
+
+    t = threading.Thread(target=_run_turn)
+    t.start()
+    assert entered_wrapper.wait(timeout=5)
+
+    emergency_stop.latch(source="test", reason="worker-before-scope-race")
+    release_wrapper.set()
+    t.join(timeout=5)
+
+    assert outcome["cancelled"] is True
+    assert provider_calls == []  # never reached provider/tool work
+    assert ctx.history == [{"role": "user", "content": "hello"}]
+
+    emergency_stop.rearm_local()
+
+
+# ---------------------------------------------------------------------------
 # 12. Incident snapshot is safe and useful
 # ---------------------------------------------------------------------------
 

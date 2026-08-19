@@ -93,12 +93,38 @@ def run_summarization_call(raw_text: str, prompt: str = DREAM_PROMPT, max_tokens
         print(f"[DREAMING] summarization call failed: {e}", flush=True)
         return None
 
-def on_session_idle(chat_id: int):
+def on_session_idle(chat_id: int, expected_epoch: int = None):
     """Called when a desktop chat session goes idle. Sweeps new messages
-    since the last sweep, writes an L2 nightstand entry if worth it."""
+    since the last sweep, writes an L2 nightstand entry if worth it.
+
+    expected_epoch (3A.2 Part H): the emergency-stop epoch the caller
+    captured BEFORE spawning this onto its own background thread (see
+    ui/main_window.py's _check_dream_idle). None (default) preserves
+    existing behavior exactly for any caller that doesn't track epochs —
+    runs with no emergency execution lease at all, same as every pre-3A.2
+    call site. Passing a real epoch wraps the actual sweep in an
+    execution_scope() pinned to it, so a stale/latched epoch admits no
+    work at all, and a latch landing mid-sweep (while the blocking
+    summarizer/profile-curation calls are in flight) discards their
+    output before either persistent write rather than trusting it."""
     if not getattr(config, "DREAM_SWEEP_ENABLED", False) or not chat_id:
         return
 
+    if expected_epoch is None:
+        _run_session_idle_sweep(chat_id, expected_epoch=None)
+        return
+
+    from core import emergency_stop
+    try:
+        with emergency_stop.execution_scope(
+            kind="dream_sweep", label=str(chat_id), expected_epoch=expected_epoch,
+        ):
+            _run_session_idle_sweep(chat_id, expected_epoch=expected_epoch)
+    except emergency_stop.EmergencyStopError:
+        return  # stale/latched before admission -- no summarizer call, no writes
+
+
+def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None):
     msgs = load_chat_messages(chat_id)
     last = _last_dream_sweep.get(chat_id)
     # FE-29: last is datetime.now().isoformat() — local time, no tz offset —
@@ -120,6 +146,14 @@ def on_session_idle(chat_id: int):
     if not summary:
         return
 
+    if expected_epoch is not None:
+        from core import emergency_stop
+        if not emergency_stop.execution_permitted(expected_epoch):
+            # Latched/stale while the summarizer call was blocked -- allowed
+            # to return, but its output is discarded here, before the
+            # Palace write, and the watermark below is never advanced.
+            return
+
     palace_store(
         content=summary,
         wing="nightstand",
@@ -135,6 +169,10 @@ def on_session_idle(chat_id: int):
         existing = prefs.get("human_profile_curated", "")
         updated = curate_human_profile(raw_text, bio, existing)
         if updated:
+            if expected_epoch is not None:
+                from core import emergency_stop
+                if not emergency_stop.execution_permitted(expected_epoch):
+                    return  # discard stale/latched curation output before saving
             prefs["human_profile_curated"] = updated.strip()
             save_prefs(prefs)
             print(f"[DREAMING] human profile curated", flush=True)

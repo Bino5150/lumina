@@ -58,6 +58,70 @@ def test_compacting_flag_defaults_false():
     assert cm._compacting is False
 
 
+# ---------------------------------------------------------------------------
+# 3A.2 R9-corrective -- restore_pending_compaction()
+# ---------------------------------------------------------------------------
+
+def test_restore_pending_compaction_is_noop_for_empty_batch():
+    cm = ContextManager(owner=False)
+    cm._pending_compaction = [{"role": "user", "content": "still here"}]
+    cm.restore_pending_compaction([])
+    assert cm._pending_compaction == [{"role": "user", "content": "still here"}]
+
+
+def test_restore_pending_compaction_prepends_old_batch_ahead_of_newer_pending():
+    """Required ordering from the spec: a batch taken, then restored after
+    newer messages accumulated in the meantime, must end up BEFORE those
+    newer messages -- not after -- so the next take_pending_compaction()
+    still returns strict chronological order."""
+    cm = ContextManager(owner=False)
+    cm._pending_compaction = [{"role": "user", "content": "old1"}, {"role": "user", "content": "old2"}]
+
+    batch = cm.take_pending_compaction()
+    assert cm._pending_compaction == []
+
+    cm._pending_compaction.append({"role": "user", "content": "new1"})
+    cm._pending_compaction.append({"role": "user", "content": "new2"})
+
+    cm.restore_pending_compaction(batch)
+
+    assert [m["content"] for m in cm._pending_compaction] == ["old1", "old2", "new1", "new2"]
+
+
+def test_restore_pending_compaction_does_not_mutate_or_duplicate_supplied_batch():
+    cm = ContextManager(owner=False)
+    original = [{"role": "user", "content": "old1"}]
+    batch = list(original)
+
+    cm.restore_pending_compaction(batch)
+
+    assert cm._pending_compaction[0] is batch[0]  # same object, not a copy
+    batch.append({"role": "user", "content": "mutated after restore"})
+    assert len(cm._pending_compaction) == 1  # restore() didn't alias the caller's list itself
+
+
+def test_restore_pending_compaction_prepends_in_place_same_list_object():
+    """Concurrency correction: restore must prepend into the EXISTING
+    _pending_compaction list object (slice assignment), not rebind the
+    attribute to a newly built list. Rebinding races against a concurrent
+    trim-loop append() landing on the old list object right as restore
+    swaps in a new one -- that appended message would be stranded on the
+    discarded list and lost. Asserting `is` on the list identity locks
+    this in as part of the contract, not just the resulting content."""
+    cm = ContextManager(owner=False)
+    old_batch = [{"role": "user", "content": "old1"}, {"role": "user", "content": "old2"}]
+
+    # Simulate newer messages already pending after the original take.
+    cm._pending_compaction.extend([{"role": "user", "content": "new1"}, {"role": "user", "content": "new2"}])
+
+    pending_ref = cm._pending_compaction
+
+    cm.restore_pending_compaction(old_batch)
+
+    assert cm._pending_compaction is pending_ref
+    assert [m["content"] for m in cm._pending_compaction] == ["old1", "old2", "new1", "new2"]
+
+
 def test_provenance_reminder_absent_before_untrusted_content():
     cm = ContextManager(owner=False)
     cm.add_user("hello")

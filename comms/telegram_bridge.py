@@ -48,6 +48,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning(f"[TELEGRAM] Rejected message from unauthorized chat_id={chat_id}")
         return  # silent drop — no reply, no acknowledgment
 
+    # 3A.2 Part G blast door: covers the brief window between an emergency
+    # stop being requested and the polling loop actually noticing
+    # _stop_event and tearing itself down. Silent drop, same as the
+    # unauthorized-sender case above — no reply, because the whole point of
+    # an E-stop is closing ingress, not conversing through it while it
+    # closes.
+    from core import emergency_stop
+    if emergency_stop.is_latched():
+        log.info("[TELEGRAM] Dropped inbound message — emergency stop is active.")
+        return
+
     text = update.message.text
     if not text:
         return
@@ -90,6 +101,10 @@ def start_bridge() -> tuple[bool, str]:
     """Called from the GUI toggle. Returns (success, message)."""
     global _thread, _stop_event
 
+    from core import emergency_stop
+    if emergency_stop.is_latched():
+        return False, "Emergency stop is active — the bridge cannot start until it's re-armed."
+
     if _thread is not None and _thread.is_alive():
         return False, "Bridge already running."
 
@@ -110,7 +125,19 @@ def start_bridge() -> tuple[bool, str]:
 
 
 def stop_bridge() -> tuple[bool, str]:
-    """Called from the GUI toggle. Returns (success, message)."""
+    """Called from the GUI Settings toggle — blocking, with a bounded
+    join(). On a clean stop within the timeout this is unchanged from
+    before: clears the thread handle and reports "Bridge stopped."
+
+    Hardened (3A.2 Part G): if join(timeout=5) expires but the thread is
+    still genuinely alive, this must NOT clear _thread/_stop_event —
+    doing so used to make is_running() falsely report False for a bridge
+    that was actually still shutting down (or never even stopping at
+    all), which is exactly the kind of lie an emergency-stop readiness
+    check (is_running()) can't tolerate. Report the truthful still-
+    shutting-down state instead and leave enough state for a later
+    stop_bridge()/request_stop_bridge() call, or is_running(), to remain
+    correct."""
     global _thread, _stop_event
 
     if _thread is None or not _thread.is_alive():
@@ -118,9 +145,28 @@ def stop_bridge() -> tuple[bool, str]:
 
     _stop_event.set()
     _thread.join(timeout=5)
+
+    if _thread.is_alive():
+        return False, "Stop requested — bridge is still shutting down."
+
     _thread = None
     _stop_event = None
     return True, "Bridge stopped."
+
+
+def request_stop_bridge() -> bool:
+    """Non-blocking stop request for the OH SHIT path (3A.2 Part G) —
+    sets the existing stop Event and returns immediately without ever
+    join()ing the bridge thread, so the emergency activation method never
+    blocks the Qt main thread waiting on network I/O to unwind.
+    is_running() remains the truthful signal for when the bridge has
+    actually finished stopping. Returns True if a running bridge was
+    signalled, False if there was nothing to signal."""
+    if _thread is None or not _thread.is_alive():
+        return False
+    if _stop_event is not None:
+        _stop_event.set()
+    return True
 
 
 def is_running() -> bool:

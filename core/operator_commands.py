@@ -26,7 +26,7 @@ def parse_operator_command(text: str):
 
 
 def command_help() -> str:
-    return "Available operator commands: /status · /btw <question> · /compact · /stop"
+    return "Available operator commands: /status · /btw <question> · /compact · /stop · /stop all"
 
 
 def format_duration(seconds: float) -> str:

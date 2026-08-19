@@ -291,20 +291,35 @@ class LuminaAgent:
         core/emergency_stop.py. Metadata is deliberately small and safe
         (channel id, owner bool, chat id); the user prompt itself is never
         snapshotted here.
+
+        3A.2 Part A: a worker can start just before an operator latches
+        E-stop, losing the execution_scope() admission race at entry —
+        before _chat_impl() (and its own add_user()) ever runs. That must
+        surface as an ordinary TurnCancelled, not a generic error, and must
+        still preserve the submitted user turn in live context exactly like
+        every other pre-work cancellation path (2B2's own already-requested
+        check does the same thing at the top of _chat_impl()). Only
+        EmergencyStopError is caught here — never a bare Exception — so an
+        unrelated programmer error out of execution_scope() still surfaces
+        as itself.
         """
-        with emergency_stop.execution_scope(
-            kind="foreground_turn",
-            label=getattr(self, "channel_id", "default"),
-            metadata={
-                "channel_id": getattr(self, "channel_id", "default"),
-                "owner": getattr(self, "owner", None),
-                "chat_id": chat_id,
-            },
-        ):
-            return LuminaAgent._chat_impl(
-                self, user_input, source=source, chat_id=chat_id,
-                cancel_event=cancel_event,
-            )
+        try:
+            with emergency_stop.execution_scope(
+                kind="foreground_turn",
+                label=getattr(self, "channel_id", "default"),
+                metadata={
+                    "channel_id": getattr(self, "channel_id", "default"),
+                    "owner": getattr(self, "owner", None),
+                    "chat_id": chat_id,
+                },
+            ):
+                return LuminaAgent._chat_impl(
+                    self, user_input, source=source, chat_id=chat_id,
+                    cancel_event=cancel_event,
+                )
+        except emergency_stop.EmergencyStopError:
+            self.ctx.add_user(user_input, source=source)
+            raise TurnCancelled()
 
     def _chat_impl(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
                     cancel_event=None) -> str:

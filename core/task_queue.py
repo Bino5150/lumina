@@ -171,6 +171,32 @@ def cancel_task(task_id: str) -> bool:
     return True
 
 
+def cancel_all_scheduled() -> list[str]:
+    """Eagerly cancel every still-heap-resident scheduled job -- the OH SHIT
+    path's operator-visible cleanup (3A.2 Part B). Atomically drains the
+    whole heap under _scheduled_lock, then marks each drained id
+    "cancelled" under _results_lock -- same lock-then-release ordering
+    schedule_task()/cancel_task() already use, never the reverse and never
+    nested. A job the scheduler already popped before this call landed
+    (mid-dispatch race) simply isn't in the heap anymore by the time this
+    reads it, so it's silently NOT touched here -- Patch 3A.1's epoch
+    enforcement (via _dispatch_with_epoch()) remains the real backstop for
+    that race, not this function. Running executor jobs are untouched;
+    this only clears what's still waiting in the schedule."""
+    with _scheduled_lock:
+        drained = list(_scheduled)
+        _scheduled.clear()
+
+    cancelled_ids = [item[1] for item in drained]
+    now = time.time()
+    with _results_lock:
+        for task_id in cancelled_ids:
+            _results[task_id] = {"status": "cancelled", "result": None, "completed_at": now}
+
+    _scheduler_wake.set()
+    return cancelled_ids
+
+
 def _ensure_scheduler_running():
     global _scheduler_thread
     with _scheduler_thread_lock:

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from core.agent import TurnCancelled, is_error_response
+from core import emergency_stop
 from core.manual_compaction import latest_manual_compaction_skip, run_manual_compaction
 from core.operator_commands import (
     command_help, compaction_cut_index, format_duration, format_tokens,
@@ -307,12 +308,17 @@ class StatusBar(QFrame):
         self.context_bar.setTextVisible(False)
         self.context_bar.setFixedSize(90, 7)
         self._style_context_bar(0.0)
+        self.emergency_btn = QPushButton("")
+        self.emergency_btn.setCursor(Qt.PointingHandCursor)
+        self.emergency_btn.setFixedHeight(20)
+        self.set_emergency_state(latched=False, rearm_ready=False)
         layout.addWidget(self.dot)
         layout.addWidget(self.model_lbl)
         layout.addWidget(self.task_lbl)
         layout.addStretch()
         layout.addWidget(self.context_lbl)
         layout.addWidget(self.context_bar)
+        layout.addWidget(self.emergency_btn)
 
     def set_connected(self, model: str):
         self.dot.setStyleSheet(f"color:{COLORS['success']};font-size:10px;background:transparent;")
@@ -375,6 +381,42 @@ class StatusBar(QFrame):
             self.task_lbl.clear()
             self.task_lbl.setVisible(False)
 
+    def set_emergency_state(self, latched: bool, rearm_ready: bool, tooltip: str = ""):
+        """3A.2 Part E/J — the one persistent OH SHIT control, always
+        visible regardless of the current main panel. Three presentations:
+        unlatched (red, offers to latch), latched-draining (obvious but not
+        clickable-to-rearm), latched-safe (offers the deliberate re-arm
+        confirmation). A second click while draining is handled by the
+        caller, not here — this method only ever renders state."""
+        if not latched:
+            self.emergency_btn.setText("⛔ OH SHIT")
+            self.emergency_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['danger']}; color: white; border: none;
+                    border-radius: 4px; padding: 1px 10px; font-size: 11px; font-weight: bold;
+                }}
+                QPushButton:hover {{ background: #ff6b7a; }}
+            """)
+        elif rearm_ready:
+            self.emergency_btn.setText("🔒 RE-ARM")
+            self.emergency_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['warning']}; color: black; border: none;
+                    border-radius: 4px; padding: 1px 10px; font-size: 11px; font-weight: bold;
+                }}
+                QPushButton:hover {{ background: #ffb733; }}
+            """)
+        else:
+            self.emergency_btn.setText("🔒 STOPPED")
+            self.emergency_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['bg_input']}; color: {COLORS['danger']};
+                    border: 1px solid {COLORS['danger']}; border-radius: 4px;
+                    padding: 1px 10px; font-size: 11px; font-weight: bold;
+                }}
+            """)
+        self.emergency_btn.setToolTip(tooltip)
+
 # ── Main Window ────────────────────────────────────────────────────────────────
 
 class LuminaWindow(QMainWindow):
@@ -424,6 +466,7 @@ class LuminaWindow(QMainWindow):
         self._telemetry_timer.timeout.connect(self._refresh_operator_telemetry)
         self._telemetry_timer.start(1000)
         QTimer.singleShot(0, lambda: self._refresh_operator_telemetry(refresh_context=True))
+        self._refresh_emergency_control()
 
     def _setup_window(self):
         self.setWindowTitle("Lumina")
@@ -742,6 +785,7 @@ class LuminaWindow(QMainWindow):
         self.signals.cancelled.connect(self._on_cancelled)
         self.signals.manual_compaction_finished.connect(self._on_manual_compaction_finished)
         self.chat_widget.mic_pressed.connect(self._on_mic_pressed)
+        self.status_bar.emergency_btn.clicked.connect(self._on_emergency_button_clicked)
 
     # ── Chat management ────────────────────────────────────────────────────────
 
@@ -951,10 +995,169 @@ class LuminaWindow(QMainWindow):
         except Exception as e:
             print(f"[TELEMETRY] context usage unavailable: {e}", flush=True)
 
+        try:
+            self._refresh_emergency_control()
+        except Exception as e:
+            print(f"[TELEMETRY] emergency control refresh failed: {e}", flush=True)
+
     def _mark_operator_progress(self, phase: str, tool: str = None):
         self._operator_phase = phase
         self._operator_current_tool = tool
         self._operator_last_progress_at = time.time()
+
+    # ── Emergency interlock (3A.2 Parts C/E/F/I/J) ─────────────────────────────
+
+    def _trigger_emergency_stop(self, source: str):
+        """The ONE local-control-plane OH SHIT activation path. Every
+        activation route (GUI button, local /stop all) calls this and only
+        this. Ordering is security-critical: emergency_stop.latch() must be
+        the very first state change, before any bridge stop, task
+        cancellation, dialog, or logging — see
+        LUMINA_PATCH_3A2_OH_SHIT_CONTROL_SURFACE_SPEC.md Part C. Idempotent
+        while already latched: latch() itself won't advance the epoch or
+        create a second incident, and every step below is safe to repeat as
+        a best-effort re-nudge."""
+        already_latched = emergency_stop.is_latched()
+        incident = emergency_stop.latch(source=source, reason="operator emergency stop")
+
+        self._refresh_emergency_control()
+
+        if self.worker is not None and hasattr(self.worker, "request_cancel"):
+            self.worker.request_cancel()
+
+        if self._manual_compaction_cancel is not None:
+            self._manual_compaction_cancel.set()
+
+        from core.task_queue import cancel_all_scheduled
+        cancel_all_scheduled()
+
+        from comms.telegram_bridge import request_stop_bridge
+        request_stop_bridge()
+
+        if already_latched:
+            s = self._emergency_snapshot_summary()
+            self.chat_widget.add_operator_message(
+                f"⛔ Emergency stop already latched (epoch {s['epoch']}) · still "
+                f"draining · {s['active_executions']} execution(s) · "
+                f"{s['active_tool_dispatches']} tool dispatch(es) · "
+                f"Telegram {s['telegram_state']} · "
+                f"re-arm: {'SAFE' if s['rearm_ready'] else 'BLOCKED'}"
+            )
+        else:
+            self.chat_widget.add_operator_message(
+                f"⛔ EMERGENCY STOP ACTIVE (epoch {incident['new_epoch']}) · all new "
+                "execution authority revoked · in-flight work draining · new chat "
+                "turns, /btw, and /compact are blocked until re-armed"
+            )
+
+        self._refresh_emergency_control()
+
+    def _emergency_rearm_ready(self) -> bool:
+        """3A.2 Part F — the kernel's own can_rearm() is necessary but not
+        sufficient: the GUI has extra local control-plane state the kernel
+        can't see (a QThread that hasn't yet acquired its execution lease,
+        Telegram's own shutdown handshake)."""
+        if not emergency_stop.can_rearm():
+            return False
+        if self.worker is not None and self.worker.isRunning():
+            return False
+        if self._manual_compaction_thread is not None:
+            return False
+        from comms.telegram_bridge import is_running as telegram_is_running
+        if telegram_is_running():
+            return False
+        return True
+
+    def _emergency_snapshot_summary(self) -> dict:
+        """Shared, safe-only aggregate used by both the button tooltip and
+        /status's emergency block — counts and booleans only, never the
+        kernel's per-lease metadata (that's a later slice)."""
+        snap = emergency_stop.snapshot()
+        from comms.telegram_bridge import is_running as telegram_is_running
+        return {
+            "epoch": snap["epoch"],
+            "active_executions": snap["active_execution_count"],
+            "active_tool_dispatches": snap["active_tool_dispatch_count"],
+            "worker_running": self.worker is not None and self.worker.isRunning(),
+            "compaction_running": self._manual_compaction_thread is not None,
+            "telegram_state": "stopping" if telegram_is_running() else "offline",
+            "rearm_ready": self._emergency_rearm_ready(),
+        }
+
+    def _emergency_status_lines(self) -> list:
+        s = self._emergency_snapshot_summary()
+        return [
+            "E-stop: ACTIVE",
+            f"Epoch: {s['epoch']}",
+            f"Active executions: {s['active_executions']}",
+            f"Active tool dispatches: {s['active_tool_dispatches']}",
+            f"Foreground worker: {'running' if s['worker_running'] else 'stopped'}",
+            f"Manual compaction: {'running' if s['compaction_running'] else 'stopped'}",
+            f"Telegram: {s['telegram_state']}",
+            f"Re-arm: {'SAFE' if s['rearm_ready'] else 'BLOCKED'}",
+        ]
+
+    def _emergency_tooltip(self) -> str:
+        s = self._emergency_snapshot_summary()
+        parts = [f"Emergency stop active · epoch {s['epoch']}"]
+        if s["active_executions"]:
+            n = s["active_executions"]
+            parts.append(f"{n} execution{'s' if n != 1 else ''} unwinding")
+        if s["active_tool_dispatches"]:
+            n = s["active_tool_dispatches"]
+            parts.append(f"{n} tool dispatch{'es' if n != 1 else ''} unwinding")
+        parts.append(f"Telegram {s['telegram_state']}")
+        parts.append(f"re-arm: {'SAFE' if s['rearm_ready'] else 'BLOCKED'}")
+        return " · ".join(parts)
+
+    def _refresh_emergency_control(self):
+        """3A.2 Part J — called both right after any emergency-relevant
+        action and from the normal 1 Hz telemetry loop, so asynchronous
+        draining (a tool finishing, Telegram actually stopping) becomes
+        visible without another click."""
+        latched = emergency_stop.is_latched()
+        if not latched:
+            self.status_bar.set_emergency_state(False, False, "")
+            return
+        rearm_ready = self._emergency_rearm_ready()
+        self.status_bar.set_emergency_state(True, rearm_ready, self._emergency_tooltip())
+
+    def _on_emergency_button_clicked(self):
+        if not emergency_stop.is_latched():
+            self._trigger_emergency_stop(source="gui_button")
+            return
+        if self._emergency_rearm_ready():
+            self._confirm_and_rearm()
+        else:
+            # Second interaction while still draining is NOT a toggle and
+            # never calls rearm_local() — repeat the same idempotent
+            # activation, which surfaces an operator-only explanation of
+            # what's still unwinding instead of a misleading dialog.
+            self._trigger_emergency_stop(source="gui_button")
+
+    def _confirm_and_rearm(self):
+        reply = QMessageBox.question(
+            self, "Re-arm Lumina",
+            "Emergency stop is fully drained and safe to clear.\n\n"
+            "Re-arming restores execution authority for NEW work only. It "
+            "does not resurrect anything from before the stop, and "
+            "Telegram stays off until you turn it back on manually in "
+            "Settings.\n\nRe-arm now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            emergency_stop.rearm_local()
+        except emergency_stop.EmergencyStopError as e:
+            self.chat_widget.add_operator_message(f"Re-arm failed: {e}")
+            self._refresh_emergency_control()
+            return
+        self.chat_widget.add_operator_message(
+            "🔓 Re-armed · execution authority restored for new work · "
+            "Telegram remains off — re-enable it manually in Settings if desired."
+        )
+        self._refresh_emergency_control()
 
     def _dispatch_operator_command(self, command):
         """Single dispatch point for owner-facing slash commands."""
@@ -979,6 +1182,16 @@ class LuminaWindow(QMainWindow):
 
         now = time.time()
         lines = []
+
+        # 3A.2 Part I — /status must remain fully usable while latched (it's
+        # local/read-only), but prepend a compact emergency block so an
+        # operator checking status while latched sees the real picture
+        # first. Never dumps prompts/tool args/results/secrets — aggregate
+        # counts and booleans only.
+        if emergency_stop.is_latched():
+            lines.extend(self._emergency_status_lines())
+            lines.append("")
+
         if self.worker is not None and self.worker.isRunning():
             started = self._operator_turn_started_at or now
             last = self._operator_last_progress_at or started
@@ -1035,6 +1248,11 @@ class LuminaWindow(QMainWindow):
         if argument:
             self.chat_widget.add_operator_message("/compact takes no arguments.")
             return
+        if emergency_stop.is_latched():
+            self.chat_widget.add_operator_message(
+                "/compact is blocked while emergency stop is active."
+            )
+            return
         if self.worker is not None and self.worker.isRunning():
             self.chat_widget.add_operator_message(
                 "/compact is idle-only; wait for the foreground turn to finish."
@@ -1068,11 +1286,25 @@ class LuminaWindow(QMainWindow):
             "/compact started · preserving the newest two user turns · persisted transcript remains untouched"
         )
 
+        # 3A.2 Part H — epoch captured BEFORE the thread starts. The
+        # existing 2B2 cancel_event above remains the authoritative
+        # persistence boundary (run_manual_compaction() is untouched and
+        # still owns "did we write anything yet"); this lease only adds
+        # re-arm visibility (can_rearm() stays False while /compact is
+        # genuinely running) and refuses to even start against an
+        # already-stale/latched epoch.
+        epoch = emergency_stop.current_epoch()
+
         def _run():
             try:
-                result = run_manual_compaction(
-                    history_snapshot, chat_id=chat_id, cancel_event=cancel_event
-                )
+                with emergency_stop.execution_scope(
+                    kind="manual_compaction", label=str(chat_id), expected_epoch=epoch,
+                ):
+                    result = run_manual_compaction(
+                        history_snapshot, chat_id=chat_id, cancel_event=cancel_event
+                    )
+            except emergency_stop.EmergencyStopError:
+                result = {"status": "cancelled", "chat_id": chat_id}
             except Exception as e:
                 result = {
                     "status": "error", "chat_id": chat_id,
@@ -1084,8 +1316,22 @@ class LuminaWindow(QMainWindow):
         self._manual_compaction_thread.start()
 
     def _command_stop(self, argument: str):
-        if argument:
-            self.chat_widget.add_operator_message("/stop takes no arguments.")
+        argument = (argument or "").strip().lower()
+        if argument and argument != "all":
+            self.chat_widget.add_operator_message(
+                "/stop takes no arguments, or 'all' for emergency stop."
+            )
+            return
+
+        if argument == "all":
+            self._trigger_emergency_stop(source="operator_command")
+            return
+
+        if emergency_stop.is_latched():
+            self.chat_widget.add_operator_message(
+                "Emergency stop is already controlling active work. Use the "
+                "cockpit's emergency control to re-arm once it's safe."
+            )
             return
 
         if self.worker is not None and self.worker.isRunning():
@@ -1135,6 +1381,11 @@ class LuminaWindow(QMainWindow):
 
     def _command_btw(self, question: str):
         question = (question or "").strip()
+        if emergency_stop.is_latched():
+            self.chat_widget.add_operator_message(
+                "/btw is blocked while emergency stop is active."
+            )
+            return
         if self._manual_compaction_thread is not None:
             self.chat_widget.add_operator_message(
                 "/btw waits while /compact is using the utility backend; try again when compaction finishes."
@@ -1260,7 +1511,15 @@ class LuminaWindow(QMainWindow):
         if time.time() - self._last_activity >= idle_minutes * 60:
             self._dream_fired_this_idle = True
             chat_id = self._current_chat_id
-            threading.Thread(target=lambda: dreaming.on_session_idle(chat_id), daemon=True).start()
+            # 3A.2 Part H — epoch captured here, on the Qt main thread,
+            # BEFORE the daemon thread is created. dreaming.on_session_idle()
+            # runs the whole sweep inside an execution_scope pinned to this
+            # exact epoch, so a stale/latched epoch admits no work at all.
+            epoch = emergency_stop.current_epoch()
+            threading.Thread(
+                target=lambda: dreaming.on_session_idle(chat_id, expected_epoch=epoch),
+                daemon=True,
+            ).start()
 
     # ── Compaction ─────────────────────────────────────────────────────────────
 
@@ -1284,21 +1543,48 @@ class LuminaWindow(QMainWindow):
         if self.agent.ctx.pending_compaction_tokens() < config.CONTEXT_COMPACTION_BATCH_TOKENS:
             return
 
+        # 3A.2 Part H, R9-corrective — epoch captured here, before the thread
+        # starts. Scope ADMISSION failure (stale/latched before the thread is
+        # even let in) never calls take_pending_compaction() at all -- the
+        # batch sits untouched in ctx._pending_compaction for the next
+        # _maybe_compact() to pick back up, same as any other skipped
+        # attempt; nothing to restore.
+        #
+        # Once the batch IS taken, this is transactional: any exit before a
+        # successful Palace write -- a latch landing while the summarizer is
+        # blocked, an empty/failed summary, or a Palace write exception --
+        # restores the exact batch to ctx._pending_compaction via
+        # restore_pending_compaction() (core/context.py) rather than losing
+        # it. Only a confirmed Palace write marks the batch committed.
         self.agent.ctx._compacting = True
+        epoch = emergency_stop.current_epoch()
 
         def _run():
+            batch = []
+            committed = False
             try:
-                batch = self.agent.ctx.take_pending_compaction()
-                raw_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in batch if m.get("content"))
-                from core.dreaming import run_summarization_call, COMPACTION_PROMPT
-                summary = run_summarization_call(raw_text, prompt=COMPACTION_PROMPT, max_tokens=300)
-                if summary:
+                with emergency_stop.execution_scope(
+                    kind="auto_compaction", label=str(chat_id), expected_epoch=epoch,
+                ):
+                    batch = self.agent.ctx.take_pending_compaction()
+                    raw_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in batch if m.get("content"))
+                    from core.dreaming import run_summarization_call, COMPACTION_PROMPT
+                    summary = run_summarization_call(raw_text, prompt=COMPACTION_PROMPT, max_tokens=300)
+                    if not summary:
+                        return
+                    if not emergency_stop.execution_permitted(epoch):
+                        return
                     from tools.palace import palace_store
                     palace_store(
                         content=summary, wing="nightstand", room=str(chat_id),
                         layer=2, tags=["auto-compaction", f"session:{chat_id}"],
                     )
+                    committed = True
+            except emergency_stop.EmergencyStopError:
+                pass  # stale/latched before admission -- no summarizer call, no write
             finally:
+                if batch and not committed:
+                    self.agent.ctx.restore_pending_compaction(batch)
                 self.agent.ctx._compacting = False
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1312,6 +1598,17 @@ class LuminaWindow(QMainWindow):
         command = parse_operator_command(text)
         if command is not None:
             self._dispatch_operator_command(command)
+            return
+
+        if emergency_stop.is_latched():
+            self.chat_widget.add_operator_message(
+                "⛔ Emergency stop is active — new turns are blocked. Use /status, "
+                "or re-arm from the cockpit once it's safe. Your message was not sent."
+            )
+            # Same restore-on-next-tick treatment as every other rejected-turn
+            # path below, and pending image/audio preview state is left
+            # completely untouched by returning here.
+            QTimer.singleShot(0, lambda text=text: self.chat_widget.input.setPlainText(text))
             return
 
         if self._manual_compaction_thread is not None:
