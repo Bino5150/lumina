@@ -70,7 +70,7 @@ def test_bracketed_continuation_failure_sentinel_is_also_flagged():
 
 def test_stream_final_converts_valueerror_to_stream_error_string():
     class FakeLLM:
-        def chat_stream(self, messages, max_tokens):
+        def chat_stream(self, messages, max_tokens, reasoning_effort=None):
             raise ValueError("Custom (OpenAI-compatible): no endpoint URL configured.")
             yield  # pragma: no cover -- makes this a generator function
 
@@ -103,7 +103,7 @@ def test_stream_final_still_handles_the_original_three_exception_types():
             def __init__(self, e):
                 self.e = e
 
-            def chat_stream(self, messages, max_tokens):
+            def chat_stream(self, messages, max_tokens, reasoning_effort=None):
                 raise self.e
                 yield  # pragma: no cover
 

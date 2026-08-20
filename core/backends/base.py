@@ -6,6 +6,8 @@ import re
 from abc import ABC, abstractmethod
 from typing import Optional, Generator
 
+from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
+
 
 class BaseLLMBackend(ABC):
 
@@ -31,7 +33,8 @@ class BaseLLMBackend(ABC):
     @abstractmethod
     def chat(self, messages: list, tools: Optional[list] = None,
              temperature: float = 0.7, max_tokens: int = 1024,
-             disable_thinking: bool = False) -> dict:
+             disable_thinking: bool = False,
+             reasoning_effort: Optional[str] = None) -> dict:
         """
         Non-streaming chat. Used for tool call turns.
         Returns raw response dict with OpenAI-compatible shape.
@@ -40,19 +43,199 @@ class BaseLLMBackend(ABC):
         thinking/reasoning mode is active — see complete_utility() below,
         which is the only caller that sets this True. Backends that don't
         have this failure mode may ignore it.
+        reasoning_effort: Patch 3A.4 Part 3 -- the caller's raw requested
+        reasoning-effort selection for this turn (or None for Provider
+        Default), forwarded unchanged from LuminaAgent.chat(). Per-call
+        only -- never stored on the backend instance. A backend with no
+        real capability data ignores it safely (reasoning_capabilities()
+        stays NO_REASONING_CONTROL, so apply_reasoning() is a no-op).
+        disable_thinking=True always takes precedence over a non-None
+        reasoning_effort -- see _effective_reasoning_effort() below.
         """
         ...
 
     @abstractmethod
     def chat_stream(self, messages: list, max_tokens: int = 1024,
-                    temperature: float = 0.7) -> Generator[str, None, None]:
+                    temperature: float = 0.7,
+                    reasoning_effort: Optional[str] = None) -> Generator[str, None, None]:
         """
         Streaming chat. Yields text chunks + think markers.
         Special yields: '__THINK_START__', '__THINK_END__'
+        reasoning_effort: same per-call contract as chat() above. This
+        signature has no disable_thinking param (never had one), so
+        implementations forward reasoning_effort into apply_reasoning()
+        directly, with no precedence guard needed.
         """
         ...
 
     # --- Helpers (concrete, shared across all backends) ---
+
+    def reasoning_capabilities(self, model: Optional[str] = None) -> ReasoningCapabilities:
+        """
+        Patch 3A.4 Part 1 -- backend-level reasoning capability contract.
+
+        Return what this backend (optionally for a specific `model`)
+        advertises about reasoning/thinking-effort control. See
+        core/backends/reasoning.py for the full field semantics and the
+        Provider Default contract.
+
+        Fail-safe default: this base implementation always returns
+        NO_REASONING_CONTROL (no positively advertised capability, so
+        Lumina sends no reasoning override). Subclasses only need to
+        override this when they actually have real capability data to
+        advertise for a provider/model -- the base default requires zero
+        subclass implementation to already be safe, which is the point:
+        an unknown backend, an unknown model, missing metadata, or an old
+        install that predates this method entirely (nothing to override)
+        must all collapse to the same safe "no override" behavior.
+
+        Must stay side-effect-free. Deliberately does NOT fall back to
+        `self.get_model()` when `model` is omitted: get_model() is
+        network-free for most backends, but not universally -- e.g.
+        LMStudioBackend and OllamaBackend fall through to a live HTTP call
+        when no model is configured yet. Silently triggering that just to
+        answer a capability query (e.g. to populate a Settings dropdown)
+        would be a surprising, provider-inconsistent side effect. Callers
+        that want a model-aware answer must pass `model` explicitly; a
+        subclass override that wants to use its own already-configured
+        model is responsible for confirming that specific path is local
+        for itself before doing so.
+        """
+        return NO_REASONING_CONTROL
+
+    def apply_reasoning(self, payload: dict, requested: Optional[str],
+                         model: Optional[str] = None) -> None:
+        """
+        Patch 3A.4 Part 2A -- shared, pure payload-translation entry point.
+
+        Validates `requested` against this backend's (optionally
+        model-specific) reasoning_capabilities() and, only if it validates
+        to a real advertised effort, hands off to _apply_reasoning_override()
+        to mutate `payload` in place.
+
+        Critical invariant: if `requested` is None, or fails validation
+        (unsupported/stale/unknown effort string, or a model this backend
+        has no positive capability data for), `payload` is left
+        byte-for-byte unchanged with respect to reasoning configuration --
+        _apply_reasoning_override() is not even called in that case. This
+        always routes through reasoning_capabilities(model).validate()
+        rather than letting each provider hand-roll its own copy of that
+        fail-safe rule (see core/backends/reasoning.py for why "nearest
+        match" degradation is deliberately not a thing here).
+
+        Must stay side-effect-free apart from mutating the supplied
+        `payload` dict in place: no HTTP, no model discovery, no prefs
+        reads/writes. Mutates in place (rather than returning a
+        replacement) to match the existing request builders, which already
+        hand back plain mutable dicts.
+        """
+        effort = self.reasoning_capabilities(model).validate(requested)
+        if effort is None:
+            return
+        self._apply_reasoning_override(payload, effort, model)
+
+    def _apply_reasoning_override(self, payload: dict, effort: str,
+                                   model: Optional[str] = None) -> None:
+        """
+        Provider-specific wire translation hook. No-op by default.
+
+        Only ever invoked by apply_reasoning() above, and only after
+        `effort` has already been validated as a real, positively
+        advertised value for this backend/model -- implementations do not
+        need to re-validate `effort` themselves. Must mutate `payload` in
+        place and do nothing else (no HTTP, no I/O, no reads of prefs or
+        config) -- see apply_reasoning()'s side-effect-free contract above.
+        """
+        pass
+
+    def configured_model(self) -> Optional[str]:
+        """
+        Patch 3A.4 Part 4 -- side-effect-free read of this backend's
+        currently-configured model id, for reasoning-preference restoration
+        (core/reasoning_preferences.py) and any other caller that needs a
+        model id without risking network I/O.
+
+        Deliberately does NOT call self.get_model(): get_model() is
+        network-free for most backends, but LMStudioBackend/OllamaBackend
+        fall through to a live HTTP call when no model is configured yet
+        (see reasoning_capabilities()'s docstring above for the same
+        concern) -- silently triggering that just to answer "what model is
+        configured" would be a surprising, provider-inconsistent side
+        effect, especially from a cold/fresh-process restoration path that
+        never opened Settings or touched the network.
+
+        Base implementation reads self._model, which is how every backend
+        EXCEPT AnthropicBackend and GeminiBackend tracks its configured
+        model (both of those use self.default_model instead and override
+        this method accordingly -- see their own configured_model()).
+        getattr() (not direct attribute access) so a hypothetical subclass
+        that never sets self._model at all still safely returns None
+        rather than raising. A falsy value (None or "", e.g.
+        OmniRouteBackend's unconfigured default) is treated identically to
+        "no configured model" -- never returned as an empty string.
+        """
+        model = getattr(self, "_model", None)
+        return model or None
+
+    def reasoning_capabilities_ready(self, model: Optional[str] = None) -> bool:
+        """
+        Patch 3A.4 Part 4 -- capability-discovery readiness seam.
+
+        True by default: every backend in this patch except OpenRouterBackend
+        advertises reasoning capability from a static, hardcoded table (or
+        NO_REASONING_CONTROL) that is always immediately available -- there
+        is nothing to discover, so there is nothing to ever be "not ready"
+        for. OpenRouterBackend overrides this to report whether a
+        successful list_models()-driven capability-cache refresh has ever
+        happened on this instance (see core/backends/openrouter.py).
+
+        Side-effect-free: must never perform I/O itself, only report state.
+        """
+        return True
+
+    def refresh_reasoning_capabilities(self) -> bool:
+        """
+        Patch 3A.4 Part 4 -- explicit, opt-in dynamic capability refresh.
+
+        Base/static default: nothing to refresh, so this is a no-op that
+        always reports success (True) without touching the network.
+        OpenRouterBackend overrides this to actually perform its
+        list_models()-driven discovery and report whether THIS refresh
+        attempt specifically succeeded (see core/backends/openrouter.py).
+
+        Stays fully separate from reasoning_capabilities(), which remains a
+        pure cache read forever -- this is the only method in the whole
+        reasoning-capability surface that is allowed to perform network I/O,
+        and only when a caller explicitly invokes it.
+        """
+        return True
+
+    def _effective_reasoning_effort(self, reasoning_effort: Optional[str],
+                                     disable_thinking: bool) -> Optional[str]:
+        """
+        Patch 3A.4 Part 3 -- shared disable_thinking-wins precedence guard.
+
+        complete_utility() (below) calls chat(..., disable_thinking=True)
+        for non-agentic utility completions (dream-sweep summarization,
+        chat auto-naming, ...) and never passes reasoning_effort itself, so
+        this never fires from that real call site today. It exists purely
+        as defense-in-depth for a FUTURE caller that might supply both
+        disable_thinking=True and a non-None reasoning_effort to the same
+        chat() call: disable_thinking must always win, so the request never
+        ends up simultaneously asking a backend to suppress thinking AND
+        to reason at some explicit effort level -- a self-contradictory
+        combination no caller should be able to produce even by accident.
+
+        Every chat() override that accepts disable_thinking (LMStudio-
+        family, Anthropic, Gemini, Ollama) routes its reasoning_effort
+        through this before calling apply_reasoning(), instead of each
+        hand-rolling the same `None if disable_thinking else reasoning_effort`
+        check. chat_stream() implementations never receive disable_thinking
+        at all (confirmed against the abstract signature above), so they
+        call apply_reasoning() with reasoning_effort directly and have no
+        need for this guard.
+        """
+        return None if disable_thinking else reasoning_effort
 
     def extract_message(self, response: dict) -> dict:
         try:

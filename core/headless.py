@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from core.agent import LuminaAgent
+from core.reasoning_preferences import resolve_reasoning_effort
 
 # Process-lifetime cache, keyed by channel_id, so a channel can hold an
 # actual conversation across messages.
@@ -151,6 +152,25 @@ def get_headless_agent(channel_id: str, owner: bool,
         return agent
 
 
+def _agent_accepts_reasoning_effort(agent) -> bool:
+    """
+    Patch 3A.4 Part 4 -- mirrors ui/main_window.py's AgentWorker.
+    _agent_accepts_cancel_event() compatibility check exactly, adapted for
+    this module's plain-function (non-class) call site. Protects
+    tests/test_headless.py's SimpleNamespace fake agents (predating this
+    patch), whose chat(task, source=...) has no reasoning_effort param and
+    no **kwargs -- calling them with an unexpected keyword would raise
+    TypeError.
+    """
+    import inspect
+    try:
+        params = inspect.signature(agent.chat).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(p.name == "reasoning_effort" or p.kind == inspect.Parameter.VAR_KEYWORD
+               for p in params)
+
+
 def run_headless_turn(task: str, channel_id: str, owner: bool,
                        persona: dict = None, tools_profile: str = None,
                        tools_enabled: list = None,
@@ -194,7 +214,17 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
         # at all. The cache lookup above is the only part that needed
         # protecting.
         source = "OWNER_DIRECT" if owner else "EXTERNAL_CHANNEL_INBOUND"
-        response = agent.chat(task, source=source)
+        # Patch 3A.4 Part 4 -- resolved fresh every turn against the actual
+        # live backend in use (agent.llm), never cached/memoized. Guarded
+        # by _agent_accepts_reasoning_effort() (see above) for compatibility
+        # with pre-3A.4 fake agents used in tests/test_headless.py, which
+        # lack both a reasoning_effort chat() param and a .llm attribute.
+        chat_kwargs = {"source": source}
+        if _agent_accepts_reasoning_effort(agent):
+            llm = getattr(agent, "llm", None)
+            if llm is not None:
+                chat_kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
+        response = agent.chat(task, **chat_kwargs)
         response = _sanitize_response(response, owner)
 
         result = {"success": True, "response": response}

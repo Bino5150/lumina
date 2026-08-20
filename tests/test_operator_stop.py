@@ -158,7 +158,7 @@ class _StreamingLLM:
     def __init__(self, chunks):
         self.chunks = list(chunks)
 
-    def chat_stream(self, messages, max_tokens):
+    def chat_stream(self, messages, max_tokens, reasoning_effort=None):
         yield from self.chunks
 
 

@@ -27,7 +27,7 @@ class _FakeLLM:
     def __init__(self, response_text="ok"):
         self.response_text = response_text
 
-    def chat(self, messages, tools=None, max_tokens=None):
+    def chat(self, messages, tools=None, max_tokens=None, reasoning_effort=None):
         return {"content": self.response_text}
 
     def extract_message(self, response):
@@ -36,7 +36,7 @@ class _FakeLLM:
     def is_tool_call(self, message):
         return False
 
-    def chat_stream(self, messages, max_tokens):
+    def chat_stream(self, messages, max_tokens, reasoning_effort=None):
         yield self.response_text
 
 

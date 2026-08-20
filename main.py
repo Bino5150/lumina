@@ -80,6 +80,7 @@ def run_cli(persona_name: str = None, tools_override: str = None):
         identity but a trimmed tool set.
     """
     from core.agent import LuminaAgent
+    from core.reasoning_preferences import resolve_reasoning_effort
     import config
 
     def on_tool_call(name, args):
@@ -130,7 +131,16 @@ def run_cli(persona_name: str = None, tools_override: str = None):
             continue
 
         print(f"\n{config.AGENT_NAME}: ", end="", flush=True)
-        response = agent.chat(user_input)
+        # Patch 3A.4 Part 4 -- resolved FRESH every turn (never cached/
+        # memoized) against the actual live backend instance in use right
+        # now, since Settings can swap it during the app's lifetime. agent
+        # is always a real LuminaAgent here (run_cli() constructs it just
+        # above), so agent.llm and LuminaAgent.chat()'s reasoning_effort
+        # param are both always present -- no compatibility guard needed
+        # at this call site (unlike ui/main_window.py's AgentWorker, which
+        # must also tolerate pre-3A.4 GUI-test agent stubs).
+        reasoning_effort = resolve_reasoning_effort(agent.llm)
+        response = agent.chat(user_input, reasoning_effort=reasoning_effort)
         print(response + "\n")
 
 

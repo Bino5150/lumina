@@ -32,6 +32,7 @@ from core.operator_commands import (
 )
 from core.personas import list_personas, load_persona
 from core import persistence
+from core.reasoning_preferences import resolve_reasoning_effort
 from core import dreaming 
 from ui.chat_widget import ChatWidget, LiveResponseBubble
 from ui.settings import SettingsPanel
@@ -187,6 +188,19 @@ class AgentWorker(QThread):
             return True
         return any(p.name == "cancel_event" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
 
+    def _agent_accepts_reasoning_effort(self) -> bool:
+        """Patch 3A.4 Part 4 -- same compatibility shape as
+        _agent_accepts_cancel_event() above, for the same reason: lightweight
+        GUI-test agent stubs (tests/test_operator_stop_ui.py) predate
+        reasoning-effort persistence and define chat() with neither a
+        reasoning_effort param nor **kwargs."""
+        import inspect
+        try:
+            params = inspect.signature(self.agent.chat).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(p.name == "reasoning_effort" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
     def _flush_think(self):
         if self._think_buf:
             self.signals.think_chunk.emit(self._think_buf)
@@ -235,6 +249,16 @@ class AgentWorker(QThread):
             kwargs = {"chat_id": self.chat_id}
             if self._agent_accepts_cancel_event():
                 kwargs["cancel_event"] = self._cancel_event
+            # Patch 3A.4 Part 4 -- resolved fresh on every turn against the
+            # actual live backend in use (self.agent.llm), never cached on
+            # this worker or the agent, since Settings can swap the active
+            # backend between turns. Guarded the same way cancel_event is
+            # above, for the same pre-3A.4 GUI-test-stub compatibility
+            # reason (see _agent_accepts_reasoning_effort()).
+            if self._agent_accepts_reasoning_effort():
+                llm = getattr(self.agent, "llm", None)
+                if llm is not None:
+                    kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
             result = self.agent.chat(self.user_input, **kwargs)
             self._flush_think()
             self._flush_resp()

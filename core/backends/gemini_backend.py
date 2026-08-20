@@ -44,11 +44,43 @@ Inherits BaseLLMBackend directly and implements the contract natively.
 import json
 import re
 import requests
+from typing import Optional
 
 import config
 from core.backends.base import BaseLLMBackend
+from core.backends.reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
+
+# Patch 3A.4 Part 2A -- per-model reasoning ("thinking level") capability
+# data. Model-specific matrix, not a provider-wide list -- Gemini's own
+# docs show thinking-level support varies per model, and the task spec
+# gave an explicit required matrix (reproduced here) rather than one
+# uniform set. Unknown/unlisted Gemini model -> NO_REASONING_CONTROL.
+_REASONING_MODELS = {
+    "gemini-3.7-flash": ReasoningCapabilities(
+        efforts=("low", "medium", "high"), default_effort="medium"),
+    "gemini-3.6-flash": ReasoningCapabilities(
+        efforts=("minimal", "low", "medium", "high"), default_effort="medium"),
+    "gemini-3.5-flash": ReasoningCapabilities(
+        efforts=("minimal", "low", "medium", "high"), default_effort="medium"),
+    "gemini-3.5-flash-lite": ReasoningCapabilities(
+        efforts=("minimal", "low", "medium", "high"), default_effort="minimal"),
+    "gemini-3.1-pro-preview": ReasoningCapabilities(
+        efforts=("low", "medium", "high"), default_effort="high"),
+    "gemini-3.1-flash-lite-image": ReasoningCapabilities(
+        efforts=("minimal", "high"), default_effort="minimal"),
+    "gemini-3-flash-preview": ReasoningCapabilities(
+        efforts=("minimal", "low", "medium", "high"), default_effort="high"),
+    "gemini-3-pro-preview": ReasoningCapabilities(
+        efforts=("low", "high"), default_effort="high"),
+    "gemini-2.5-pro": ReasoningCapabilities(
+        efforts=("low", "medium", "high")),
+    "gemini-2.5-flash": ReasoningCapabilities(
+        efforts=("low", "medium", "high")),
+    "gemini-2.5-flash-lite": ReasoningCapabilities(
+        efforts=("low", "medium", "high")),
+}
 
 
 def normalize_gemini_tool_result(value):
@@ -185,6 +217,71 @@ class GeminiBackend(BaseLLMBackend):
             "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
         ]
+
+    def configured_model(self) -> Optional[str]:
+        """
+        Patch 3A.4 Part 4 override -- GeminiBackend has NO self._model
+        attribute at all (it uses self.default_model exclusively, same as
+        AnthropicBackend). See AnthropicBackend.configured_model()'s
+        docstring for the full rationale -- the base BaseLLMBackend
+        implementation reading self._model would silently return None here
+        even though a real configured model exists.
+        """
+        return self.default_model or None
+
+    # ------------------------------------------------------------------
+    # Patch 3A.4 Part 2A -- reasoning-effort capability + wire translation
+    # ------------------------------------------------------------------
+
+    def reasoning_capabilities(self, model=None) -> ReasoningCapabilities:
+        """
+        `model=None` always falls through to NO_REASONING_CONTROL, matching
+        the base class's documented contract (get_model() is not consulted
+        even though it would be side-effect-free here today).
+        """
+        if model is None:
+            return NO_REASONING_CONTROL
+        return _REASONING_MODELS.get(model, NO_REASONING_CONTROL)
+
+    def _apply_reasoning_override(self, payload: dict, effort: str, model=None) -> None:
+        """
+        POSITIVELY VERIFIED wire shape (not left inert) -- confirmed
+        2026-08-20 against Google's own authoritative Gemini API REST
+        reference docs at ai.google.dev/gemini-api/docs/generate-content/
+        thinking and .../gemini-3 (the generateContent endpoint page, not
+        the Interactions API and not a Python/JS SDK's snake_case
+        convenience naming):
+
+          - The REST JSON field is nested as
+            generationConfig.thinkingConfig.thinkingLevel (camelCase) --
+            confirmed via that doc's own REST request example:
+                {"generationConfig": {"thinkingConfig": {"thinkingLevel": "low"}}}
+          - Valid thinkingLevel values per that doc: minimal / low / medium
+            / high, with support varying by model -- already encoded
+            per-model in _REASONING_MODELS above, so `effort` reaching this
+            method has already been validated against the right set for
+            this specific model.
+          - The legacy sibling field is
+            generationConfig.thinkingConfig.thinkingBudget. The gemini-3
+            doc states explicitly: "You cannot use both thinking_level and
+            the legacy thinking_budget parameter in the same request.
+            Doing so will return a 400 error." Lumina's own _build_payload()
+            never sets thinkingBudget today (confirmed: no thinking field
+            exists anywhere in current payload construction before this
+            change), but thinkingBudget is popped defensively below anyway
+            so the two fields can never coexist in the payload regardless
+            of future changes elsewhere -- per the Part 2A spec, these must
+            never be mixed under any circumstance.
+
+        Merges defensively into any pre-existing generationConfig /
+        thinkingConfig dict (payload already carries maxOutputTokens /
+        temperature in generationConfig from _build_payload()) rather than
+        overwriting either object wholesale.
+        """
+        generation_config = payload.setdefault("generationConfig", {})
+        thinking_config = generation_config.setdefault("thinkingConfig", {})
+        thinking_config.pop("thinkingBudget", None)
+        thinking_config["thinkingLevel"] = effort
 
     # ------------------------------------------------------------------
     # Request translation: OpenAI-shaped tool registry -> Gemini shape
@@ -392,12 +489,22 @@ class GeminiBackend(BaseLLMBackend):
     # ------------------------------------------------------------------
 
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=1024,
-             disable_thinking: bool = False):
+             disable_thinking: bool = False,
+             reasoning_effort: Optional[str] = None):
         # disable_thinking accepted for interface consistency with
-        # complete_utility() but not acted on here — same reasoning as
-        # AnthropicBackend: this backend doesn't enable Gemini's thinking
-        # mode by default, so the conflict doesn't apply today.
+        # complete_utility() but not acted on here for THINKING itself —
+        # same reasoning as AnthropicBackend: this backend doesn't enable
+        # Gemini's thinking mode by default, so the conflict doesn't apply
+        # today. Still routed through _effective_reasoning_effort() below
+        # so the disable_thinking-wins precedence contract holds regardless.
         payload = self._build_payload(messages, tools, max_tokens, temperature)
+        # Patch 3A.4 Part 3 -- apply the already-verified native translation
+        # (Part 2A's thinkingConfig.thinkingLevel) after the payload is
+        # fully built, before the HTTP call. self.default_model is a stable
+        # instance attribute, reused consistently for both the URL below
+        # and this capability lookup.
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        self.apply_reasoning(payload, effective_effort, model=self.default_model)
         url = f"{API_ROOT}/models/{self.default_model}:generateContent"
         try:
             resp = requests.post(url, headers=self.headers, json=payload, timeout=self.timeout)
@@ -472,7 +579,8 @@ class GeminiBackend(BaseLLMBackend):
     # Streaming chat
     # ------------------------------------------------------------------
 
-    def chat_stream(self, messages, max_tokens=1024, temperature=0.7):
+    def chat_stream(self, messages, max_tokens=1024, temperature=0.7,
+                     reasoning_effort: Optional[str] = None):
         """
         Yields plain text chunks. No tools param — confirmed against base.py,
         same contract as anthropic_backend.py's chat_stream(). Gemini's streaming
@@ -485,6 +593,9 @@ class GeminiBackend(BaseLLMBackend):
         docstring for why.
         """
         payload = self._build_payload(messages, tools=None, max_tokens=max_tokens, temperature=temperature)
+        # Patch 3A.4 Part 3 -- same native translation as chat() above, no
+        # disable_thinking on this signature so no precedence guard needed.
+        self.apply_reasoning(payload, reasoning_effort, model=self.default_model)
         url = f"{API_ROOT}/models/{self.default_model}:streamGenerateContent"
 
         try:

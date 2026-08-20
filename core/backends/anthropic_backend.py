@@ -32,12 +32,49 @@ Inherits BaseLLMBackend directly and implements the contract natively.
 
 import json
 import requests
+from typing import Optional
 
 import config
 from core.backends.base import BaseLLMBackend
+from core.backends.reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
 ANTHROPIC_VERSION = "2023-06-01"  # required header, independent of model version
 API_BASE = "https://api.anthropic.com/v1/messages"
+
+# Patch 3A.4 Part 2A -- per-model reasoning-effort capability data.
+#
+# Part 2A's task spec named the required model "Claude Sonnet 5" and
+# suggested (but did not confirm) a "claude-sonnet-5" id. At the time, a
+# repo-wide grep (config.py, config.example.py, anthropic_backend.py's own
+# default/list_models(), every test file) for "claude-sonnet-5" /
+# "sonnet 5" / "sonnet5" / "SONNET_5" found ZERO matches, so the
+# capability matrix was keyed only to "claude-sonnet-4-6" -- the one
+# ANTHROPIC_DEFAULT_MODEL actually resolved to at the time.
+#
+# CORRECTED (Part 2A correction pass): "claude-sonnet-5" is now confirmed
+# to exist, and per Anthropic's own documentation it does NOT share an
+# effort matrix with "claude-sonnet-4-6" -- claude-sonnet-4-6 does not
+# support "xhigh". The two ids are therefore mapped as separate, distinct
+# entries below, each with its own capability constant; do not collapse
+# them back into one shared object even though both currently use
+# default_effort="high", since their `efforts` tuples differ.
+# ANTHROPIC_DEFAULT_MODEL in config.py is unaffected by this correction
+# and still resolves to "claude-sonnet-4-6" -- this map is capability
+# data only, not a change of Lumina's default model.
+_SONNET_5_CAPS = ReasoningCapabilities(
+    efforts=("low", "medium", "high", "xhigh", "max"),
+    default_effort="high",
+)
+
+_SONNET_4_6_CAPS = ReasoningCapabilities(
+    efforts=("low", "medium", "high", "max"),
+    default_effort="high",
+)
+
+_REASONING_MODELS = {
+    "claude-sonnet-5": _SONNET_5_CAPS,
+    "claude-sonnet-4-6": _SONNET_4_6_CAPS,
+}
 
 
 def classify_anthropic_error(status_code, raw_body: str) -> dict:
@@ -136,6 +173,58 @@ class AnthropicBackend(BaseLLMBackend):
             "claude-sonnet-4-6",
             "claude-haiku-4-5-20251001",
         ]
+
+    def configured_model(self) -> Optional[str]:
+        """
+        Patch 3A.4 Part 4 override -- AnthropicBackend has NO self._model
+        attribute at all (it uses self.default_model exclusively, unlike
+        every LMStudioBackend-derived backend). The BaseLLMBackend default
+        implementation reads self._model, which would silently return None
+        here even though a real configured model exists -- that would
+        silently break reasoning-preference restoration for Anthropic
+        specifically. `or None` keeps the same falsy-safe contract as the
+        base implementation even though default_model is never actually
+        falsy in practice (always defaulted via getattr in __init__).
+        """
+        return self.default_model or None
+
+    # ------------------------------------------------------------------
+    # Patch 3A.4 Part 2A -- reasoning-effort capability + wire translation
+    # ------------------------------------------------------------------
+
+    def reasoning_capabilities(self, model=None) -> ReasoningCapabilities:
+        """
+        See the _REASONING_MODELS module-level comment above: both
+        "claude-sonnet-5" and "claude-sonnet-4-6" are confirmed, distinct
+        entries with different effort matrices (claude-sonnet-4-6 does not
+        support "xhigh"). `model=None` always falls through to
+        NO_REASONING_CONTROL, matching the base class's documented
+        contract (get_model() is not consulted here even though it would
+        be side-effect-free for this backend, to keep the contract
+        uniform across backends where it isn't).
+        """
+        if model is None:
+            return NO_REASONING_CONTROL
+        return _REASONING_MODELS.get(model, NO_REASONING_CONTROL)
+
+    def _apply_reasoning_override(self, payload: dict, effort: str, model=None) -> None:
+        """
+        payload["output_config"]["effort"] = effort -- merged defensively:
+        if `payload` already has an "output_config" dict (current
+        _build_payload() never puts one there, but this must not assume
+        that holds forever), any existing keys in it are preserved
+        alongside the new "effort" key via setdefault() + in-place mutation
+        rather than overwriting the whole object.
+
+        Deliberately does NOT touch the separate Anthropic `thinking` field
+        (extended thinking) -- effort is independent of that per the Part
+        2A spec, and this backend doesn't enable extended thinking by
+        default today anyway (see chat()'s disable_thinking comment).
+        "adaptive" is never a member of either Sonnet capability's efforts, so it can
+        never reach here via the validated `effort` param.
+        """
+        output_config = payload.setdefault("output_config", {})
+        output_config["effort"] = effort
 
     # ------------------------------------------------------------------
     # Request translation: OpenAI-shaped tool registry -> Anthropic shape
@@ -261,15 +350,24 @@ class AnthropicBackend(BaseLLMBackend):
     # ------------------------------------------------------------------
 
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=1024,
-             disable_thinking: bool = False):
+             disable_thinking: bool = False,
+             reasoning_effort: Optional[str] = None):
         # disable_thinking accepted for interface consistency with
-        # complete_utility() but not acted on here — this backend doesn't
-        # enable Anthropic's extended-thinking mode by default (see
-        # _build_payload), so the prefill-vs-thinking conflict this param
-        # exists for doesn't apply. Worth a real look if extended thinking
-        # ever gets wired in here — Anthropic's API has a similar
-        # constraint around prefill and extended thinking.
+        # complete_utility() but not acted on here for THINKING itself —
+        # this backend doesn't enable Anthropic's extended-thinking mode by
+        # default (see _build_payload), so the prefill-vs-thinking conflict
+        # this param exists for doesn't apply. Worth a real look if
+        # extended thinking ever gets wired in here — Anthropic's API has a
+        # similar constraint around prefill and extended thinking. Still
+        # routed through _effective_reasoning_effort() below so the
+        # disable_thinking-wins precedence contract holds regardless.
         payload = self._build_payload(messages, tools, max_tokens, temperature, stream=False)
+        # Patch 3A.4 Part 3 -- apply the already-verified native translation
+        # (Part 2A's output_config.effort) after the payload is fully built,
+        # before the HTTP call. self.default_model is a stable instance
+        # attribute (not a method call) already reused consistently here.
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        self.apply_reasoning(payload, effective_effort, model=self.default_model)
         try:
             resp = requests.post(API_BASE, headers=self.headers, json=payload, timeout=self.timeout)
             resp.raise_for_status()
@@ -322,7 +420,8 @@ class AnthropicBackend(BaseLLMBackend):
     # Streaming chat
     # ------------------------------------------------------------------
 
-    def chat_stream(self, messages, max_tokens=1024, temperature=0.7):
+    def chat_stream(self, messages, max_tokens=1024, temperature=0.7,
+                     reasoning_effort: Optional[str] = None):
         """
         Yields plain text chunks, wrapping extended-thinking content in
         __THINK_START__ / __THINK_END__ sentinels — same convention lmstudio.py
@@ -348,6 +447,10 @@ class AnthropicBackend(BaseLLMBackend):
         payload["messages"] = self._translate_messages(convo)
         if system_str:
             payload["system"] = system_str
+
+        # Patch 3A.4 Part 3 -- same native translation as chat() above, no
+        # disable_thinking on this signature so no precedence guard needed.
+        self.apply_reasoning(payload, reasoning_effort, model=self.default_model)
 
         try:
             resp = requests.post(

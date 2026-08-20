@@ -13,7 +13,7 @@ from core.agent import LuminaAgent
 
 def test_stream_final_does_not_print_debug_spam(capsys):
     class FakeLLM:
-        def chat_stream(self, messages, max_tokens):
+        def chat_stream(self, messages, max_tokens, reasoning_effort=None):
             yield "hello "
             yield "world"
 

@@ -155,9 +155,11 @@ class LMStudioBackend(BaseLLMBackend):
 
     def chat(self, messages: list, tools: Optional[list] = None,
              temperature: float = 0.7, max_tokens: int = 4096,
-             disable_thinking: bool = False) -> dict:
+             disable_thinking: bool = False,
+             reasoning_effort: Optional[str] = None) -> dict:
+        model = self.get_model()
         payload = {
-            "model": self.get_model(),
+            "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -167,6 +169,19 @@ class LMStudioBackend(BaseLLMBackend):
         if tools and not has_vision:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+
+        # Patch 3A.4 Part 3 -- generic polymorphic reasoning translation.
+        # This does NOT give LMStudioBackend itself reasoning semantics --
+        # its own reasoning_capabilities() stays NO_REASONING_CONTROL
+        # (untouched), so apply_reasoning() is a no-op here. But self.
+        # reasoning_capabilities(model) is an instance-method call, so on
+        # OpenAIBackend/GroqBackend/OpenRouterBackend/QwenBackend (all of
+        # which inherit this chat() unmodified and override
+        # reasoning_capabilities()/_apply_reasoning_override() themselves)
+        # it resolves to each subclass's own real capability data and wire
+        # translation -- zero provider conditionals added here.
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        self.apply_reasoning(payload, effective_effort, model=model)
 
         # S41 correction: complete_utility() briefly dropped these when it
         # replaced dreaming.py/auto-naming's old bespoke requests.post()
@@ -201,14 +216,19 @@ class LMStudioBackend(BaseLLMBackend):
             raise RuntimeError(format_provider_error(self.display_name, resp.status_code, resp.text, str(e)))
 
     def chat_stream(self, messages: list, max_tokens: int = 4096,
-                    temperature: float = 0.7) -> Generator[str, None, None]:
+                    temperature: float = 0.7,
+                    reasoning_effort: Optional[str] = None) -> Generator[str, None, None]:
+        model = self.get_model()
         payload = {
-            "model": self.get_model(),
+            "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
         }
+        # No disable_thinking on this signature (never had one) -- forward
+        # reasoning_effort straight through, no precedence guard needed.
+        self.apply_reasoning(payload, reasoning_effort, model=model)
         base_url = validate_base_url(self.base_url, self.display_name)
         try:
             resp = requests.post(

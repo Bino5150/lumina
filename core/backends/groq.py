@@ -6,7 +6,45 @@ Set GROQ_API_KEY in config.py
 
 from typing import Optional
 from .lmstudio import LMStudioBackend
+from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 import config
+
+
+# Patch 3A.4 Part 2A -- per-model reasoning-effort capability data.
+#
+# Declared here on GroqBackend, NOT on LMStudioBackend -- OpenAIBackend and
+# every other LMStudioBackend-derived backend must keep reporting
+# NO_REASONING_CONTROL unless it has its own real data.
+#
+# Model-specific, not provider-wide: GPT-OSS and Qwen3 reasoning models on
+# Groq advertise two completely different, non-overlapping effort
+# vocabularies (verified against console.groq.com/docs/reasoning,
+# 2026-08-20) -- offering one family's values to the other would be a
+# silent capability lie, so each gets its own ReasoningCapabilities
+# instance rather than a shared one.
+#
+# GPT-OSS 120B/20B: reasoning_effort accepts low/medium/high, default medium.
+_GPT_OSS_CAPS = ReasoningCapabilities(
+    efforts=("low", "medium", "high"),
+    default_effort="medium",
+)
+
+# Qwen3.6 27B (current non-deprecated Qwen3 reasoning model on Groq as of
+# 2026-08-20 -- qwen/qwen3-32b was deprecated 2026-06-17 in favor of this
+# model per the same docs page): reasoning_effort accepts none/default.
+# "default" here is a REAL, distinct, provider-advertised literal string --
+# not to be confused with Lumina's own `None` Provider-Default sentinel.
+# See tests/test_reasoning_translation.py for the explicit side-by-side
+# proof this distinction can't regress silently.
+_QWEN_REASONING_CAPS = ReasoningCapabilities(
+    efforts=("none", "default"),
+)
+
+_REASONING_MODELS = {
+    "openai/gpt-oss-120b": _GPT_OSS_CAPS,
+    "openai/gpt-oss-20b": _GPT_OSS_CAPS,
+    "qwen/qwen3.6-27b": _QWEN_REASONING_CAPS,
+}
 
 
 class GroqBackend(LMStudioBackend):
@@ -52,3 +90,32 @@ class GroqBackend(LMStudioBackend):
         if not self.api_key:
             return False, "GROQ_API_KEY not set in config.py"
         return True, f"Configured — {self._model}"
+
+    # ------------------------------------------------------------------
+    # Patch 3A.4 Part 2A -- reasoning-effort capability + wire translation
+    # ------------------------------------------------------------------
+
+    def reasoning_capabilities(self, model: Optional[str] = None) -> ReasoningCapabilities:
+        """
+        Implemented directly here, NOT on LMStudioBackend -- see the module
+        docstring above _REASONING_MODELS for why. `model=None` always
+        falls through to NO_REASONING_CONTROL, matching the base class's
+        documented contract (get_model() is not consulted).
+        """
+        if model is None:
+            return NO_REASONING_CONTROL
+        return _REASONING_MODELS.get(model, NO_REASONING_CONTROL)
+
+    def _apply_reasoning_override(self, payload: dict, effort: str,
+                                   model: Optional[str] = None) -> None:
+        """
+        Same Chat-Completions-shaped `reasoning_effort` field GPT-OSS and
+        Qwen3 both use on Groq -- only the set of values that validated to
+        get here differs (see reasoning_capabilities() / _REASONING_MODELS
+        above). For a Qwen model this emits the literal provider value
+        "default" verbatim when that's what was requested and validated --
+        this is NOT the same thing as Lumina's `None` Provider-Default
+        sentinel, which never reaches this method at all (apply_reasoning()
+        returns early on None before calling here).
+        """
+        payload["reasoning_effort"] = effort

@@ -53,9 +53,11 @@ class OllamaBackend(BaseLLMBackend):
 
     def chat(self, messages: list, tools: Optional[list] = None,
              temperature: float = 0.7, max_tokens: int = 1024,
-             disable_thinking: bool = False) -> dict:
+             disable_thinking: bool = False,
+             reasoning_effort: Optional[str] = None) -> dict:
+        model = self.get_model()
         payload = {
-            "model": self.get_model(),
+            "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -71,6 +73,22 @@ class OllamaBackend(BaseLLMBackend):
         # live bug today since llamacpp is the active local backend; worth
         # revisiting if/when Ollama becomes the daily driver and utility
         # calls start hitting the same prefill-vs-thinking conflict there.
+
+        # Patch 3A.4 Part 3 -- reasoning_effort accepted for interface
+        # consistency with every other backend's chat() (mechanical
+        # signature widening) and routed through apply_reasoning() for
+        # uniformity with LMStudio/Anthropic/Gemini's treatment -- but this
+        # is always a no-op today: OllamaBackend.reasoning_capabilities()
+        # is never overridden, so it stays NO_REASONING_CONTROL via the
+        # base class default and apply_reasoning() never mutates payload.
+        # No real Ollama reasoning-effort capability data exists yet (out
+        # of scope for this slice, same as every other local backend) --
+        # wiring the call through now costs nothing behaviorally and means
+        # Ollama isn't the one asymmetric exception among the backends that
+        # accept disable_thinking, but it does NOT give Ollama real
+        # reasoning-effort semantics.
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        self.apply_reasoning(payload, effective_effort, model=model)
 
         try:
             resp = requests.post(
@@ -91,14 +109,19 @@ class OllamaBackend(BaseLLMBackend):
             raise RuntimeError(f"Ollama HTTP error: {e}")
 
     def chat_stream(self, messages: list, max_tokens: int = 1024,
-                    temperature: float = 0.7) -> Generator[str, None, None]:
+                    temperature: float = 0.7,
+                    reasoning_effort: Optional[str] = None) -> Generator[str, None, None]:
+        model = self.get_model()
         payload = {
-            "model": self.get_model(),
+            "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
         }
+        # See chat()'s comment above -- always a no-op today (no disable_thinking
+        # on this signature, matching the abstract contract, so no precedence guard needed).
+        self.apply_reasoning(payload, reasoning_effort, model=model)
         try:
             resp = requests.post(
                 f"{self.base_url}/chat/completions",

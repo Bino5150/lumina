@@ -11,7 +11,7 @@ from core.agent import LuminaAgent
 
 def _fake_self(schema_tokens):
     class FakeLLM:
-        def chat(self, messages, tools, max_tokens):
+        def chat(self, messages, tools, max_tokens, reasoning_effort=None):
             raise RuntimeError("stop")
 
     return types.SimpleNamespace(

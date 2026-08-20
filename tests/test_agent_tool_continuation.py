@@ -66,7 +66,7 @@ class _RaisingAfterNCallsLLM:
     def get_model(self):
         return "gemini-3.5-flash"
 
-    def chat(self, messages, tools=None, max_tokens=None):
+    def chat(self, messages, tools=None, max_tokens=None, reasoning_effort=None):
         self.call_count += 1
         if self.call_count > self.calls_before_raise:
             raise RuntimeError(self.raise_msg)

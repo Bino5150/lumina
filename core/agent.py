@@ -6,6 +6,7 @@ Full turn cycle: receive → think → tool calls → stream final response.
 import re
 import sys
 import os
+from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
@@ -268,7 +269,7 @@ class LuminaAgent:
             self.registry.set_gate(_gate)
 
     def chat(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
-             cancel_event=None) -> str:
+             cancel_event=None, reasoning_effort: Optional[str] = None) -> str:
         """
         Main entry point. Runs tool loop with non-streaming,
         then streams the final response. Returns full response string.
@@ -282,6 +283,18 @@ class LuminaAgent:
         cancel_event: optional threading.Event owned by the desktop foreground
         worker. Cancellation is cooperative: already-blocked provider/tool calls
         are allowed to return, then chat() exits at the next safe boundary.
+        reasoning_effort (Patch 3A.4 Part 3): the caller's raw requested
+        reasoning-effort selection for this ENTIRE turn — the same value is
+        used for the initial request, every tool-continuation, and the
+        final stream (see _chat_impl()/_stream_final()). Per-call state
+        only: never stored on self, a backend instance, config, or prefs.
+        None (default) preserves current behavior for every existing
+        caller — main.py, ui/main_window.py, core/headless.py,
+        tools/subagent.py — none of which pass this yet. core/agent.py
+        never inspects/validates this value itself; it's forwarded
+        unchanged all the way down to whichever backend is active, which
+        owns validation/translation entirely via its own
+        reasoning_capabilities()/apply_reasoning().
 
         Thin wrapper — the real body lives in _chat_impl(), unbound-called
         via LuminaAgent._chat_impl(self, ...) rather than self._chat_impl(...)
@@ -315,14 +328,14 @@ class LuminaAgent:
             ):
                 return LuminaAgent._chat_impl(
                     self, user_input, source=source, chat_id=chat_id,
-                    cancel_event=cancel_event,
+                    cancel_event=cancel_event, reasoning_effort=reasoning_effort,
                 )
         except emergency_stop.EmergencyStopError:
             self.ctx.add_user(user_input, source=source)
             raise TurnCancelled()
 
     def _chat_impl(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
-                    cancel_event=None) -> str:
+                    cancel_event=None, reasoning_effort: Optional[str] = None) -> str:
         tools_used_this_turn = set()
         think_step = [0]
 
@@ -475,6 +488,7 @@ class LuminaAgent:
                     messages=messages,
                     tools=tool_schemas,
                     max_tokens=config.RESPONSE_RESERVE_TOKENS,
+                    reasoning_effort=reasoning_effort,
                 )
             except Exception as e:
                 if _cancel_requested(cancel_event):
@@ -518,7 +532,8 @@ class LuminaAgent:
 
             # No tool calls — stream the final response
             if not self.llm.is_tool_call(message):
-                return self._stream_final(messages, think_step, cancel_event=cancel_event)
+                return self._stream_final(messages, think_step, cancel_event=cancel_event,
+                                           reasoning_effort=reasoning_effort)
 
             # Has tool calls
             if message.get("content"):
@@ -586,9 +601,11 @@ class LuminaAgent:
             raise TurnCancelled()
         messages = self.ctx.build_messages(chat_id=chat_id)
         messages.append({"role": "user", "content": "Give your final answer now based on what you have."})
-        return self._stream_final(messages, think_step, cancel_event=cancel_event)
+        return self._stream_final(messages, think_step, cancel_event=cancel_event,
+                                   reasoning_effort=reasoning_effort)
 
-    def _stream_final(self, messages: list, think_step: list, cancel_event=None) -> str:
+    def _stream_final(self, messages: list, think_step: list, cancel_event=None,
+                       reasoning_effort: Optional[str] = None) -> str:
         """Stream the final response, firing callbacks for UI updates."""
         full_response = []
         in_think = False
@@ -612,7 +629,8 @@ class LuminaAgent:
                 _raise_cancelled()
             stream = iter(self.llm.chat_stream(
                 messages=messages,
-                max_tokens=config.RESPONSE_RESERVE_TOKENS
+                max_tokens=config.RESPONSE_RESERVE_TOKENS,
+                reasoning_effort=reasoning_effort,
             ))
             while True:
                 if _cancel_requested(cancel_event):
