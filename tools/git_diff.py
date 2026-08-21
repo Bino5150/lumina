@@ -1,39 +1,30 @@
 """Tool: git_diff - show diffs from a commit or between refs in a local repo."""
 import subprocess
 import os
+from typing import Optional
 
-# Repo path allowlist — restricts this tool to known project roots. Update in
-# all four git_*.py files together if a new repo needs to be added. Oracle
-# paths intentionally excluded pending confirmation from Bino.
-_ALLOWED_REPOS = {
-    os.path.realpath(os.path.expanduser(p)) for p in ("~/lumina", "~/lumina-release")
-}
+from core.git_repos import resolve_git_repo
+from core.project_context import ProjectContextState
 
 
-def _resolve_allowed_repo(repo_path: str):
-    """Returns (real_path, error_message_or_None)."""
-    real = os.path.realpath(os.path.expanduser(repo_path))
-    if real not in _ALLOWED_REPOS:
-        allowed = ", ".join(sorted(_ALLOWED_REPOS))
-        return real, f"Error: repo_path not in allowlist. Allowed: {allowed}. Got: {repo_path}"
-    return real, None
-
-
-def git_diff(repo_path: str, commit: str = None, ref_a: str = None, ref_b: str = None, max_lines: int = 300) -> str:
+def git_diff(repo_path: Optional[str] = None, commit: str = None, ref_a: str = None, ref_b: str = None,
+             max_lines: int = 300, *, project_state: Optional[ProjectContextState] = None) -> str:
     """
     Show diff for a specific commit or between two refs in a local git repo.
 
     Args:
-        repo_path: Absolute or ~-expanded path to a git repository.
+        repo_path: Absolute or ~-expanded path to a git repository. If omitted, defaults to
+            the active Project's root (still subject to the Git allowlist).
         commit: Show the diff introduced by this commit (single commit hash/ref).
         ref_a: Start of range (branch/commit/tag). Requires ref_b.
         ref_b: End of range (branch/commit/tag). Requires ref_a.
         max_lines: Maximum diff lines to return (default 300, max 2000).
+        project_state: internal — the calling agent's ProjectContextState, injected by the registrar.
 
     Returns:
         Unified diff output or error message.
     """
-    repo_path, _err = _resolve_allowed_repo(repo_path)
+    repo_path, _err = resolve_git_repo(repo_path, project_state)
     if _err:
         return _err
     if not os.path.isdir(repo_path):
@@ -103,17 +94,27 @@ def git_diff(repo_path: str, commit: str = None, ref_a: str = None, ref_b: str =
     except Exception as e:
         return f"Error running git diff: {e}"
 
-def register_git_diff_tool(registry):
+def register_git_diff_tool(registry, project_state: Optional[ProjectContextState] = None):
+    def _tool_git_diff(repo_path: str = None, commit: str = None, ref_a: str = None,
+                        ref_b: str = None, max_lines: int = 300) -> str:
+        return git_diff(repo_path, commit=commit, ref_a=ref_a, ref_b=ref_b,
+                         max_lines=max_lines, project_state=project_state)
+
     registry.register(
         name="git_diff",
-        fn=git_diff,
-        description="Show the diff of changes in a specific commit, or between two refs (branches, tags, SHAs) in a local git repository.",
+        fn=_tool_git_diff,
+        description="Show the diff of changes in a specific commit, or between two refs (branches, tags, SHAs) in a "
+                     "local git repository. If repo_path is omitted, defaults to the active Project's root — which "
+                     "must still be an allowlisted Git repository (a Project binding alone does not authorize a "
+                     "repo for Git tools).",
         parameters={
             "type": "object",
             "properties": {
                 "repo_path": {
                     "type": "string",
-                    "description": "Path to local git repo. Must be one of the allowlisted project roots: ~/lumina, ~/lumina-release."
+                    "description": "Path to local git repo. Must be one of the allowlisted project roots: "
+                                    "~/lumina, ~/lumina-release. If omitted, defaults to the active Project's root "
+                                    "(still subject to the same allowlist)."
                 },
                 "commit": {
                     "type": "string",
@@ -132,6 +133,6 @@ def register_git_diff_tool(registry):
                     "description": "Maximum diff lines to return (default 300, max 2000)."
                 }
             },
-            "required": ["repo_path"]
+            "required": []
         }
     )

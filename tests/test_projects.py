@@ -298,6 +298,59 @@ def test_activate_project_without_state_holder_reports_error(tmp_path):
     assert result.startswith("[Error:")
 
 
+# ── CODING-02B-B3: legacy no-context ordering ────────────────────────────
+#
+# Pre-CODING-02B-B, activate_project() checked "is there anywhere to store
+# an active context at all" BEFORE ever touching binding state -- a missing
+# ProjectContextState made binding state irrelevant. CODING-02B-B's refactor
+# resolved the binding FIRST, so a tracked-but-unbound project with no
+# ProjectContextState surfaced the binding-specific error instead of the
+# established "no project context available for this session" message.
+# These prove the restored ordering directly, using the real registered
+# activate_project closure -- not resolve_tracked_project() in isolation.
+#
+# Case C (tracked project, real ProjectContextState, no binding -> binding
+# error) is already fully covered above by
+# test_activation_missing_binding_fails_closed -- not duplicated here.
+
+def test_activate_project_no_state_no_binding_reports_no_context_error(tmp_path):
+    """Case A: tracked project, no binding, project_state=None -- must
+    report the no-context error, not the binding-specific one. This is the
+    exact edge CODING-02B-B2 flagged: pre-fix, resolve_tracked_project() ran
+    first and raised BindingNotFound before the project_state check was ever
+    reached."""
+    tools = _tools(project_state=None)
+    os.makedirs(os.path.join(tp.PROJECTS_DIR, "unbound-nostate"))
+
+    result = tools["activate_project"]("unbound-nostate")
+    assert result == "[Error: no project context available for this session]"
+
+
+def test_activate_project_no_state_valid_binding_still_reports_no_context_error(tmp_path):
+    """Case B: tracked project WITH a valid local binding, project_state=
+    None -- must still report the no-context error. The legacy contract:
+    if there's nowhere to store an active context, binding state (bound or
+    not) is irrelevant to which error surfaces."""
+    tools = _tools(project_state=None)
+    root = _make_source_root(tmp_path)
+    tools["create_project"]("bound-nostate", "desc", str(root))
+
+    result = tools["activate_project"]("bound-nostate")
+    assert result == "[Error: no project context available for this session]"
+
+
+def test_activate_project_no_state_unknown_project_reports_unknown_error(tmp_path):
+    """Case D: an unknown tracked Project identity, project_state=None --
+    must still report the established 'no project named ...' error, never
+    the no-context error. Identity validation must run, and fail, before the
+    project_state check -- an unknown name isn't a context-storage problem."""
+    tools = _tools(project_state=None)
+
+    result = tools["activate_project"]("never-heard-of-it-either")
+    assert result.startswith("[Error: no project named")
+    assert "no project context available" not in result
+
+
 # ── CODING-02B-A1: create_project owner-only binding-authority fix ──────
 #
 # create_project(name, description, root_path) calls the exact same

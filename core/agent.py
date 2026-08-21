@@ -229,10 +229,10 @@ class LuminaAgent:
         # source once reviewed and hardened) — same as get_weather's history,
         # but these are wired statically here rather than left to the FE-11
         # loader below, since they're now genuine built-ins, not custom tools.
-        register_git_status_tool(self.registry)
-        register_git_diff_tool(self.registry)
-        register_git_log_tool(self.registry)
-        register_git_branches_tool(self.registry)
+        register_git_status_tool(self.registry, project_state=self.project_context)
+        register_git_diff_tool(self.registry, project_state=self.project_context)
+        register_git_log_tool(self.registry, project_state=self.project_context)
+        register_git_branches_tool(self.registry, project_state=self.project_context)
 
         # FE-11: reload any custom tool that was approved through the
         # toolmaker review pipeline in a past session. Not owner-gated —
@@ -253,7 +253,7 @@ class LuminaAgent:
         # same as every other tool registered above.
         if config.SUBAGENTS_ENABLED:
             from tools.subagent import register_subagent_tools
-            register_subagent_tools(self.registry, self._subagent_depth)
+            register_subagent_tools(self.registry, self._subagent_depth, project_state=self.project_context)
 
         if config.BACKGROUND_TASKS_ENABLED:
             from tools.tasks import register_task_tools

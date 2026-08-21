@@ -4,19 +4,44 @@ is the /btw pattern: dispatch a task to run in the background, return
 immediately with a task_id, let the caller check on it later (or get
 surfaced an ephemeral notice next turn -- see agent.py wiring in Part F).
 """
+from typing import Optional
+
 import config
+from core.project_context import ProjectContext
 from core.task_queue import submit_task, schedule_task, get_task_result
-from tools.subagent import spawn_subagent
+from tools.subagent import spawn_subagent, resolve_dispatch_project_context
 
 
 def run_background_subagent(task: str, persona: str = None,
-                             backend: str = None, tools_enabled: list = None) -> dict:
+                             backend: str = None, tools_enabled: list = None,
+                             project: str = None,
+                             _project_context: Optional[ProjectContext] = None) -> dict:
     """Dispatches a subagent to run in the background. Returns
     {"task_id": str} immediately -- does not block. Same owner=False,
     explicit-tools-only contract as spawn_subagent(), inherited for free
-    since this calls it directly rather than building a parallel path."""
+    since this calls it directly rather than building a parallel path.
+
+    project / _project_context (CODING-02B-B): resolved to an immutable
+    ProjectContext HERE, synchronously, before submit_task() is ever called
+    -- this function's own call is the true dispatch instant for a
+    background task, well before the executor actually invokes
+    spawn_subagent(). The queued job therefore only ever carries an
+    already-resolved ProjectContext (or None), never a name to re-look-up
+    later. project omitted (both default None) preserves exactly today's
+    no-context behavior for every existing direct caller.
+
+    On an invalid/unknown/unbound project override, fails closed BEFORE any
+    task is enqueued: returns {"task_id": None, "error": "<reason>"}, the
+    same shape a caller checks either way -- no task_id key ever silently
+    means "it dispatched, check back later" when it didn't."""
+    try:
+        resolved_context = resolve_dispatch_project_context(project, _project_context)
+    except Exception as e:
+        return {"task_id": None, "error": str(e)}
+
     task_id = submit_task(spawn_subagent, task, persona=persona,
-                           backend=backend, tools_enabled=tools_enabled)
+                           backend=backend, tools_enabled=tools_enabled,
+                           _project_context=resolved_context)
     return {"task_id": task_id}
 
 
@@ -30,12 +55,27 @@ def check_background_task(task_id: str) -> dict:
 
 
 def schedule_background_subagent(task: str, run_at: float, persona: str = None,
-                                  backend: str = None, tools_enabled: list = None) -> dict:
+                                  backend: str = None, tools_enabled: list = None,
+                                  project: str = None,
+                                  _project_context: Optional[ProjectContext] = None) -> dict:
     """Same as run_background_subagent but fires at run_at (unix timestamp)
     instead of immediately -- the scheduled/cron half of the same
-    abstraction."""
+    abstraction.
+
+    project / _project_context resolved to an immutable ProjectContext HERE,
+    at schedule time, exactly like run_background_subagent() above -- NOT
+    re-resolved when run_at arrives. The scheduled heap entry
+    (core/task_queue.py) stores this already-resolved value verbatim; the
+    scheduler loop never re-derives it, no matter what the parent's active
+    Project or binding.json looks like by the time the job actually fires."""
+    try:
+        resolved_context = resolve_dispatch_project_context(project, _project_context)
+    except Exception as e:
+        return {"task_id": None, "error": str(e)}
+
     task_id = schedule_task(run_at, spawn_subagent, task, persona=persona,
-                             backend=backend, tools_enabled=tools_enabled)
+                             backend=backend, tools_enabled=tools_enabled,
+                             _project_context=resolved_context)
     return {"task_id": task_id}
 
 
@@ -53,14 +93,22 @@ def register_task_tools(registry, agent):
     directly unit-testable, see tests/test_tasks.py); only the registered
     tool wrappers here know about the owning agent.
     """
-    def _tool_run_background_subagent(task, persona=None, backend=None, tools_enabled=None):
-        result = run_background_subagent(task, persona=persona, backend=backend, tools_enabled=tools_enabled)
-        agent._background_task_ids.add(result["task_id"])
+    def _tool_run_background_subagent(task, persona=None, backend=None, tools_enabled=None, project=None):
+        snapshot = agent.project_context.snapshot()
+        result = run_background_subagent(task, persona=persona, backend=backend,
+                                          tools_enabled=tools_enabled, project=project,
+                                          _project_context=snapshot)
+        if result.get("task_id"):
+            agent._background_task_ids.add(result["task_id"])
         return result
 
-    def _tool_schedule_background_subagent(task, run_at, persona=None, backend=None, tools_enabled=None):
-        result = schedule_background_subagent(task, run_at, persona=persona, backend=backend, tools_enabled=tools_enabled)
-        agent._background_task_ids.add(result["task_id"])
+    def _tool_schedule_background_subagent(task, run_at, persona=None, backend=None, tools_enabled=None, project=None):
+        snapshot = agent.project_context.snapshot()
+        result = schedule_background_subagent(task, run_at, persona=persona, backend=backend,
+                                               tools_enabled=tools_enabled, project=project,
+                                               _project_context=snapshot)
+        if result.get("task_id"):
+            agent._background_task_ids.add(result["task_id"])
         return result
 
     registry.register(
@@ -77,6 +125,10 @@ def register_task_tools(registry, agent):
                 "backend": {"type": "string", "description": "Optional LLM backend name override for the subagent."},
                 "tools_enabled": {"type": "array", "items": {"type": "string"},
                                    "description": "Optional explicit list of tool names to grant the subagent. Defaults to none."},
+                "project": {"type": "string",
+                            "description": "Optional tracked Project name for the child. If omitted, inherits the "
+                                            "parent's active Project at dispatch time. Granting a Project does not "
+                                            "grant any tool capability by itself."},
             },
             "required": ["task"],
         },
@@ -109,6 +161,11 @@ def register_task_tools(registry, agent):
                 "backend": {"type": "string", "description": "Optional LLM backend name override for the subagent."},
                 "tools_enabled": {"type": "array", "items": {"type": "string"},
                                    "description": "Optional explicit list of tool names to grant the subagent. Defaults to none."},
+                "project": {"type": "string",
+                            "description": "Optional tracked Project name for the child. Resolved at schedule time, "
+                                            "not when the task fires. If omitted, inherits the parent's active "
+                                            "Project as of schedule time. Granting a Project does not grant any "
+                                            "tool capability by itself."},
             },
             "required": ["task", "run_at"],
         },

@@ -11,6 +11,7 @@ from core.project_context import (
     BindingRootInvalid,
     MalformedBinding,
     ProjectBindingError,
+    ProjectContext,
     load_project_binding,
     save_project_binding,
     validate_project_name,
@@ -33,6 +34,35 @@ PROJECTLIST  = os.path.join(PROJECTS_DIR, "projectlist.md")
 # tracked **Root:** line was already proven stale/wrong on both the release
 # and dev-local trees).
 PROJECT_CHATS_DIR = os.path.join(config.DATA_DIR, "projects")
+
+
+def resolve_tracked_project(name: str) -> ProjectContext:
+    """Resolves a tracked Project name to its machine-local ProjectContext,
+    without activating it on any agent's ProjectContextState. Shared by
+    activate_project() below and CODING-02B-B's explicit child Project
+    override (spawn_subagent/run_background_subagent/
+    schedule_background_subagent) so both paths enforce the identical
+    identity+binding contract.
+
+    Raises:
+        ValueError: invalid name, or no tracked Project directory exists
+            under PROJECTS_DIR for it. Unknown tracked identity is a
+            tools/projects.py-level concept (this module owns PROJECTS_DIR),
+            deliberately NOT layered into core/project_context.py's
+            exception hierarchy, which only ever describes the machine-local
+            *binding* — a narrower, separate concern.
+        BindingNotFound / MalformedBinding / BindingRootInvalid: the tracked
+            Project exists, but its machine-local binding does not, or is
+            unusable — see core/project_context.py's load_project_binding().
+
+    Never parses tracked Markdown for a root, never accepts a raw path in
+    place of a name, never guesses.
+    """
+    name = validate_project_name(name)
+    project_dir = os.path.join(PROJECTS_DIR, name)
+    if not os.path.isdir(project_dir):
+        raise ValueError(f"no project named {name!r}. Check projectlist.")
+    return load_project_binding(name)
 
 
 def init_projects():
@@ -242,21 +272,34 @@ def register_projects_tools(registry, project_state=None):
         instance's ProjectContextState, never any other agent, never a
         process-global. Fails closed: an unknown project, or a project with
         no local binding, never guesses or falls back to a tracked
-        **Root:** line (CODING-02A proved those are unreliable)."""
+        **Root:** line (CODING-02A proved those are unreliable).
+
+        CODING-02B-B3: pre-CODING-02B-B legacy ordering restored -- identity
+        is checked first, and a missing ProjectContextState (project_state
+        is None, meaning there is nowhere to store an active context at all)
+        short-circuits BEFORE binding resolution. Binding state is simply
+        irrelevant when there's no context to set it into; the tracked-but-
+        unbound case must not surface a binding error ahead of that. Once a
+        real ProjectContextState exists, binding resolution defers to
+        resolve_tracked_project() -- same fail-closed identity+binding
+        contract CODING-02B-B's explicit child Project override shares,
+        just wrapped here in this tool's own user-facing error text."""
         try:
             name = validate_project_name(name)
         except ValueError as e:
             return f"[Error: {e}]"
 
         project_dir = os.path.join(PROJECTS_DIR, name)
-        if not os.path.exists(project_dir):
-            return f"[Error: no project named '{name}'. Check projectlist.]"
+        if not os.path.isdir(project_dir):
+            return f"[Error: no project named {name!r}. Check projectlist.]"
 
         if project_state is None:
             return "[Error: no project context available for this session]"
 
         try:
-            context = load_project_binding(name)
+            context = resolve_tracked_project(name)
+        except ValueError as e:
+            return f"[Error: {e}]"
         except BindingNotFound:
             return (
                 f"[Error: project '{name}' has no local execution root configured "

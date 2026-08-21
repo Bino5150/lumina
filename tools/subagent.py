@@ -98,16 +98,46 @@ compound this into anything new; worth remembering the day parallel
 subagents or deeper delegation chains get discussed.
 """
 import uuid
+from typing import Optional
+
 import config
 from core.agent import LuminaAgent
+from core.project_context import ProjectContext
 from core.tool_profiles import apply_tool_profile
+
+
+def resolve_dispatch_project_context(project: Optional[str],
+                                      inherited_context: Optional[ProjectContext]) -> Optional[ProjectContext]:
+    """CODING-02B-B: the one place that decides which immutable
+    ProjectContext a spawned child should start with, shared by the
+    synchronous, immediate-background, and scheduled-background dispatch
+    paths so none of them re-derive this logic independently.
+
+    project supplied (an explicit override name) -- resolved to a real
+    tracked Project + its machine-local binding RIGHT NOW, at the caller's
+    dispatch time. May raise (invalid name, unknown tracked Project, missing/
+    malformed/stale binding) -- callers decide how to surface that; this
+    function never swallows a failure into a silent None.
+
+    project omitted -- the caller's own already-captured immutable snapshot
+    is used verbatim. No re-resolution, no binding.json re-read, no lookup
+    by name here -- inherited_context is a ProjectContext value already
+    captured via ProjectContextState.snapshot() at the true dispatch moment,
+    never a name to look up later.
+    """
+    if project is not None:
+        from tools.projects import resolve_tracked_project
+        return resolve_tracked_project(project)
+    return inherited_context
 
 
 def spawn_subagent(task: str,
                     persona: str = None,
                     backend: str = None,
                     tools_enabled: list = None,
-                    _parent_depth: int = 0) -> dict:
+                    project: str = None,
+                    _parent_depth: int = 0,
+                    _project_context: Optional[ProjectContext] = None) -> dict:
     """
     Instantiates a headless, owner=False LuminaAgent, runs one turn, returns
     a structured result. Never raises -- a tool call should always get
@@ -116,16 +146,34 @@ def spawn_subagent(task: str,
     _parent_depth: threaded in by register_subagent_tools()'s closure at
     registration time -- NOT a model-controllable argument. The registered
     tool schema must not expose a depth parameter at all.
+
+    project (CODING-02B-B): optional model-facing tracked Project name for
+    the child. Resolved fresh, right here, via resolve_dispatch_project_context()
+    -- for this synchronous entry point, "right here" IS dispatch time, so
+    resolving inline (same as the persona lookup just below) is exactly as
+    timely as resolving in a registrar closure would be. Wins over
+    _project_context when both are given.
+
+    _project_context: internal only, MUST NOT appear in the registered tool
+    schema. The parent's own active-Project snapshot, captured by
+    register_subagent_tools()'s closure (synchronous case) or by
+    tools/tasks.py's registrar wrappers (background/scheduled case) at the
+    real dispatch moment -- never a mutable ProjectContextState, never the
+    parent LuminaAgent itself. None (default, every pre-CODING-02B-B caller)
+    preserves exactly today's no-context behavior.
     """
     if _parent_depth >= config.MAX_SUBAGENT_DEPTH:
         return {"success": False, "result": "", "tool_calls_made": 0,
                 "error": f"Max subagent depth ({config.MAX_SUBAGENT_DEPTH}) reached."}
 
     try:
+        resolved_context = resolve_dispatch_project_context(project, _project_context)
+
         sub = LuminaAgent(owner=False,
                            channel_id=f"subagent-{uuid.uuid4()}",
                            backend=backend,
-                           depth=_parent_depth + 1)
+                           depth=_parent_depth + 1,
+                           project_context=resolved_context)
 
         if persona:
             from core.personas import list_personas, load_persona
@@ -156,7 +204,7 @@ def spawn_subagent(task: str,
         return {"success": False, "result": "", "tool_calls_made": 0, "error": str(e)}
 
 
-def register_subagent_tools(registry, parent_depth: int):
+def register_subagent_tools(registry, parent_depth: int, project_state=None):
     """Gated at the call site (agent.py), not here -- mirrors every other
     conditional tool registration in the project.
 
@@ -165,14 +213,21 @@ def register_subagent_tools(registry, parent_depth: int):
     enforcement mechanism -- if parent_depth is already at
     MAX_SUBAGENT_DEPTH, the tool is never registered at all, so a maxed-out
     subagent doesn't even see spawn_subagent as an available tool.
+
+    project_state (CODING-02B-B): the constructing agent's own
+    core.project_context.ProjectContextState, same holder threaded into
+    filesystem/file_edit/terminal/projects/git registrars. The closure below
+    calls .snapshot() at the moment the tool actually fires -- the true
+    synchronous dispatch instant -- never earlier, never cached.
     """
     if parent_depth >= config.MAX_SUBAGENT_DEPTH:
         return
 
-    def _tool_spawn_subagent(task, persona=None, backend=None, tools_enabled=None):
+    def _tool_spawn_subagent(task, persona=None, backend=None, tools_enabled=None, project=None):
+        snapshot = project_state.snapshot() if project_state is not None else None
         return spawn_subagent(task, persona=persona, backend=backend,
-                               tools_enabled=tools_enabled,
-                               _parent_depth=parent_depth)
+                               tools_enabled=tools_enabled, project=project,
+                               _parent_depth=parent_depth, _project_context=snapshot)
 
     registry.register(
         name="spawn_subagent",
@@ -189,6 +244,12 @@ def register_subagent_tools(registry, parent_depth: int):
                 "backend": {"type": "string", "description": "Optional LLM backend name override for the subagent. Defaults to the current backend."},
                 "tools_enabled": {"type": "array", "items": {"type": "string"},
                                    "description": "Optional explicit list of tool names to grant the subagent. Defaults to none."},
+                "project": {"type": "string",
+                            "description": "Optional tracked Project name for the child. If omitted, inherits the "
+                                            "parent's active Project at dispatch time. Granting a Project does not "
+                                            "grant any tool capability by itself -- it only changes which root "
+                                            "project-aware tools default to, and only for tools already explicitly "
+                                            "listed in tools_enabled."},
             },
             "required": ["task"],
         },
