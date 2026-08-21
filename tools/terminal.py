@@ -37,7 +37,11 @@ import signal
 from tools.guardrails import check_command
 
 
-def register_terminal_tools(registry):
+def register_terminal_tools(registry, project_state=None):
+    """project_state (CODING-02B-A): optional core.project_context.
+    ProjectContextState, threaded in from the owning LuminaAgent. None
+    (default — every pre-CODING-02B-A caller/test) preserves legacy
+    behavior exactly: no cwd falls back to $HOME, same as before."""
 
     def run_command(command: str, cwd: str = None, timeout: int = 30) -> str:
         """Execute a shell command and return stdout/stderr."""
@@ -45,7 +49,15 @@ def register_terminal_tools(registry):
         if block_reason:
             return f"[BLOCKED: {block_reason} — this command was not executed]"
 
-        cwd = os.path.expanduser(cwd) if cwd else os.path.expanduser("~")
+        if cwd:
+            # Explicit cwd always wins, expanded exactly as before — an
+            # explicit relative cwd stays relative (resolved by the OS
+            # against Popen's own parent cwd) even with a project active;
+            # this branch never consults project_state at all.
+            cwd = os.path.expanduser(cwd)
+        else:
+            context = project_state.get() if project_state is not None else None
+            cwd = context.root if context is not None else os.path.expanduser("~")
 
         # FE-01: no ulimit -u here. RLIMIT_NPROC caps the WHOLE USER's process
         # count, not "children of this shell" — with normal desktop usage

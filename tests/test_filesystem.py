@@ -16,6 +16,7 @@ closures, not a reimplementation.
 import os
 
 from tools.filesystem import register_filesystem_tools
+from core.project_context import ProjectContext, ProjectContextState
 
 
 class _CapturingRegistry:
@@ -141,3 +142,86 @@ def test_write_file_overwrite_and_append_unchanged(tmp_path):
     r2 = write_file(str(f), "world\n", mode="append")
     assert "Written" in r2
     assert f.read_bytes() == b"hello\nworld\n"
+
+
+# ── CODING-02B-A: project-aware relative-path defaulting ────────────────
+
+def _project_tools(project_state=None):
+    reg = _CapturingRegistry()
+    register_filesystem_tools(reg, project_state=project_state)
+    return reg.fns["read_file"], reg.fns["write_file"], reg.fns["list_dir"], reg.fns["search_files"]
+
+
+def _active_state(root):
+    state = ProjectContextState()
+    state.set(ProjectContext(name="p", root=str(root)))
+    return state
+
+
+def test_relative_read_resolves_against_active_project_root(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "f.txt").write_text("hello\n")
+    read_file, _, _, _ = _project_tools(_active_state(tmp_path))
+    result = read_file("sub/f.txt")
+    assert _body(result) == "hello\n"
+
+
+def test_relative_write_resolves_against_active_project_root(tmp_path):
+    _, write_file, _, _ = _project_tools(_active_state(tmp_path))
+    write_file("new.txt", "content\n")
+    assert (tmp_path / "new.txt").read_text() == "content\n"
+
+
+def test_list_dir_default_dot_lists_active_root(tmp_path):
+    (tmp_path / "a.txt").write_text("x")
+    (tmp_path / "b.txt").write_text("y")
+    _, _, list_dir, _ = _project_tools(_active_state(tmp_path))
+    result = list_dir()
+    assert "a.txt" in result
+    assert "b.txt" in result
+    assert str(tmp_path) in result  # display header shows the resolved root
+
+
+def test_search_files_default_dot_searches_active_root(tmp_path):
+    (tmp_path / "target.py").write_text("x = 1\n")
+    (tmp_path / "other.md").write_text("# doc\n")
+    _, _, _, search_files = _project_tools(_active_state(tmp_path))
+    result = search_files(pattern="*.py")
+    assert "target.py" in result
+    assert "other.md" not in result
+
+
+def test_absolute_path_unchanged_even_with_active_project(tmp_path):
+    outside = tmp_path.parent / f"outside_{tmp_path.name}.txt"
+    outside.write_text("elsewhere\n")
+    try:
+        read_file, _, _, _ = _project_tools(_active_state(tmp_path))
+        result = read_file(str(outside))
+        assert _body(result) == "elsewhere\n"
+    finally:
+        outside.unlink()
+
+
+def test_tilde_path_unchanged_even_with_active_project(tmp_path):
+    read_file, _, _, _ = _project_tools(_active_state(tmp_path))
+    result = read_file("~/definitely-does-not-exist-lumina-test.txt")
+    assert "not found" in result.lower()
+    assert str(tmp_path) not in result
+
+
+def test_no_active_project_preserves_legacy_relative_behavior(tmp_path, monkeypatch):
+    """With no active project, a relative path resolves exactly as it did
+    before CODING-02B-A -- against the process cwd, not any project root."""
+    (tmp_path / "here.txt").write_text("legacy\n")
+    monkeypatch.chdir(tmp_path)
+    read_file, _, _, _ = _project_tools(project_state=None)
+    result = read_file("here.txt")
+    assert _body(result) == "legacy\n"
+
+
+def test_no_active_project_list_dir_lists_process_cwd(tmp_path, monkeypatch):
+    (tmp_path / "only_here.txt").write_text("x")
+    monkeypatch.chdir(tmp_path)
+    _, _, list_dir, _ = _project_tools(project_state=None)
+    result = list_dir()
+    assert "only_here.txt" in result

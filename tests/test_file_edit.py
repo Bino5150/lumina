@@ -18,6 +18,7 @@ import pytest
 
 from tools import file_edit
 from tools.file_edit import edit_file, register_file_edit_tools
+from core.project_context import ProjectContext, ProjectContextState
 
 
 # ── Registration helpers ───────────────────────────────────────────────────
@@ -323,6 +324,76 @@ def test_broken_symlink_rejected_not_reported_as_missing(tmp_path):
     assert "file not found" not in result
 
 
+# ── CODING-02B-A: project-aware relative-path resolution ────────────────
+
+def _active_state(root):
+    state = ProjectContextState()
+    state.set(ProjectContext(name="p", root=str(root)))
+    return state
+
+
+def test_relative_path_edits_under_active_project_root(tmp_path):
+    (tmp_path / "sub").mkdir()
+    f = tmp_path / "sub" / "f.txt"
+    f.write_text("hello world\n")
+    result = edit_file("sub/f.txt", [{"old_text": "world", "new_text": "there"}],
+                        project_state=_active_state(tmp_path))
+    assert result.startswith("[Edited:")
+    assert f.read_text() == "hello there\n"
+
+
+def test_relative_edit_preserves_crlf_with_active_project(tmp_path):
+    """Project-aware resolution must not disturb CODING-01's exact-byte
+    UTF-8 kernel semantics -- CRLF stays CRLF."""
+    (tmp_path / "sub").mkdir()
+    f = tmp_path / "sub" / "f.txt"
+    f.write_bytes(b"hello\r\nworld\r\n")
+    result = edit_file("sub/f.txt", [{"old_text": "world", "new_text": "there"}],
+                        project_state=_active_state(tmp_path))
+    assert result.startswith("[Edited:")
+    assert f.read_bytes() == b"hello\r\nthere\r\n"
+
+
+def test_relative_path_with_no_active_project_behaves_exactly_as_before(tmp_path, monkeypatch):
+    f = tmp_path / "f.txt"
+    f.write_text("hello world\n")
+    monkeypatch.chdir(tmp_path)
+    result = edit_file("f.txt", [{"old_text": "world", "new_text": "there"}])
+    assert result.startswith("[Edited:")
+    assert f.read_text() == "hello there\n"
+
+
+def test_relative_symlink_target_still_rejected_with_active_project(tmp_path):
+    """The critical proof that the shared resolver did NOT accidentally
+    realpath() the target: a relative path that names a symlink, resolved
+    against an active project root, must still be rejected by CODING-01's
+    kernel exactly like an absolute symlink path already is (see
+    test_symlink_rejected above)."""
+    project_root = tmp_path / "root"
+    project_root.mkdir()
+    real = tmp_path / "real.txt"
+    real.write_text("hello\n")
+    link = project_root / "link.txt"
+    link.symlink_to(real)
+
+    result = edit_file("link.txt", [{"old_text": "hello", "new_text": "hi"}],
+                        project_state=_active_state(project_root))
+    assert result.startswith("[Error:")
+    assert "symlink" in result
+    assert real.read_text() == "hello\n"
+
+
+def test_absolute_path_unaffected_by_active_project(tmp_path):
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    f = tmp_path / "f.txt"
+    f.write_text("hello world\n")
+    result = edit_file(str(f), [{"old_text": "world", "new_text": "there"}],
+                        project_state=_active_state(other_root))
+    assert result.startswith("[Edited:")
+    assert f.read_text() == "hello there\n"
+
+
 def test_non_utf8_rejected_no_temp_residue(tmp_path):
     f = tmp_path / "binary.txt"
     f.write_bytes(b"\xff\xfe\x00invalid utf-8\x80\x81")
@@ -492,10 +563,31 @@ def test_expected_sha256_is_optional():
     assert "expected_sha256" not in params["required"]
 
 
-def test_registration_points_to_real_production_function():
+def test_registration_wraps_the_real_production_function(monkeypatch):
+    """CODING-02B-A: register_file_edit_tools() now registers a thin
+    project_state-forwarding wrapper (registered fn is no longer `edit_file`
+    by identity — same pattern tools/tasks.py already uses to thread the
+    owning agent through its registered wrappers), so identity is no longer
+    the right check here. This proves the wrapper still delegates to the
+    real, unmodified edit_file with the caller's exact args (plus
+    project_state) rather than a drifted reimplementation."""
+    import tools.file_edit as file_edit_module
+
+    calls = []
+
+    def _fake_edit_file(path, edits, expected_sha256="", project_state=None):
+        calls.append((path, edits, expected_sha256, project_state))
+        return "[fake]"
+
+    monkeypatch.setattr(file_edit_module, "edit_file", _fake_edit_file)
+
+    sentinel_state = object()
     reg = _CapturingRegistry()
-    register_file_edit_tools(reg)
-    assert reg.fns["edit_file"] is edit_file
+    register_file_edit_tools(reg, project_state=sentinel_state)
+    result = reg.fns["edit_file"]("some/path", [{"old_text": "a", "new_text": "b"}])
+
+    assert result == "[fake]"
+    assert calls == [("some/path", [{"old_text": "a", "new_text": "b"}], "", sentinel_state)]
 
 
 # ── Failure injection (40-43) ──────────────────────────────────────────────

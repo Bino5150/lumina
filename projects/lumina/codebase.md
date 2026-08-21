@@ -1,5 +1,4 @@
 # Codebase Index — lumina
-*Root: /home/bino/lumina-release*
 
 - `CLAUDE_CONTEXT.md` (10890b)
 - `LICENSE` (11357b)

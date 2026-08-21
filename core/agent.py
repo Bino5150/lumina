@@ -13,6 +13,7 @@ import config
 from core import emergency_stop
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager
+from core.project_context import ProjectContext, ProjectContextState
 from tools.registry import ToolRegistry
 from tools.meta import register_meta_tools
 from tools.memory import register_memory_tools, init_memory_db, init_chat_db
@@ -130,7 +131,8 @@ class LuminaAgent:
                  owner: bool = True,
                  channel_id: str = "default",
                  depth: int = 0,
-                 backend: str = None):
+                 backend: str = None,
+                 project_context: Optional[ProjectContext] = None):
         """
         Streaming callbacks:
           on_tool_call(name, args)     — tool about to execute
@@ -150,6 +152,16 @@ class LuminaAgent:
             argument, the model must never set its own depth.
         backend: optional backend name override, passed straight to get_llm_backend().
             None (default) preserves current behavior — config.LLM_BACKEND.
+        project_context (CODING-02B-A): optional ProjectContext this agent
+            starts with. None (default, every existing caller) means no
+            active project — every project-aware tool falls back to its
+            pre-CODING-02B-A legacy path/cwd behavior exactly. Deliberately
+            NOT resolved from a project *name* here — the constructor only
+            ever accepts an already-resolved, immutable ProjectContext, so
+            CODING-02B-B's subagent/background-task dispatch can capture one
+            once at dispatch time and hand it straight through, rather than
+            this constructor re-resolving a name (and potentially a since-
+            changed binding) itself.
         """
         self.llm = get_llm_backend(name=backend)
         self.owner = owner
@@ -157,6 +169,10 @@ class LuminaAgent:
         self.ctx = ContextManager(owner=owner)
         self.registry = ToolRegistry()
         self.channel_id = channel_id
+        # Per-instance holder, never a module/process global — see
+        # core/project_context.py's own module docstring for why. Two
+        # LuminaAgent instances always get two distinct holders.
+        self.project_context = ProjectContextState(project_context)
 
         if owner:
             # FE-09: one-time, idempotent — moves any cloud API keys still
@@ -185,11 +201,11 @@ class LuminaAgent:
         register_memory_tools(self.registry)
         register_knowledge_tools(self.registry)
         register_web_tools(self.registry)
-        register_filesystem_tools(self.registry)
-        register_file_edit_tools(self.registry)
+        register_filesystem_tools(self.registry, project_state=self.project_context)
+        register_file_edit_tools(self.registry, project_state=self.project_context)
         register_sandbox_tools(self.registry)
         register_vision_tools(self.registry)
-        register_terminal_tools(self.registry)
+        register_terminal_tools(self.registry, project_state=self.project_context)
         if owner:
             # Hard exclusion — for non-owner sessions, toolmaker's tools never
             # exist in the registry at all. Not disabled, not absent from a
@@ -203,7 +219,7 @@ class LuminaAgent:
         register_skills_tools(self.registry)   
         register_chat_history_tools(self.registry) 
         init_projects()
-        register_projects_tools(self.registry)
+        register_projects_tools(self.registry, project_state=self.project_context)
         register_diff_tools(self.registry)
         register_browser_tools(self.registry)
         register_telegram_tools(self.registry)

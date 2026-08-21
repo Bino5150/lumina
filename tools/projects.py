@@ -6,6 +6,16 @@ import os
 import json
 import config
 
+from core.project_context import (
+    BindingNotFound,
+    BindingRootInvalid,
+    MalformedBinding,
+    ProjectBindingError,
+    load_project_binding,
+    save_project_binding,
+    validate_project_name,
+)
+
 PROJECTS_DIR = os.path.join(config.BASE_DIR, "projects")
 PROJECTLIST  = os.path.join(PROJECTS_DIR, "projectlist.md")
 
@@ -13,6 +23,15 @@ PROJECTLIST  = os.path.join(PROJECTS_DIR, "projectlist.md")
 # personal state -- project.md/codebase.md/projectlist.md stay tracked in
 # the repo on purpose (shareable project journals, same category as the
 # tracked skills/*.md files). Only the chat-linkage file moves.
+#
+# CODING-02B-A: the machine-local project->root *binding* (binding.json,
+# core/project_context.py) is a second, independent piece of personal state
+# living alongside chats.json in this same DATA_DIR directory -- for the
+# same reason chats.json moved out in FE-13. Tracked project.md/
+# projectlist.md now hold identity/description/notes only; they are never
+# read as an execution-root source (see CODING-02A's source-vet: the
+# tracked **Root:** line was already proven stale/wrong on both the release
+# and dev-local trees).
 PROJECT_CHATS_DIR = os.path.join(config.DATA_DIR, "projects")
 
 
@@ -38,18 +57,40 @@ def _write_projectlist(content: str):
         f.write(content)
 
 
-def register_projects_tools(registry):
+def register_projects_tools(registry, project_state=None):
 
     def create_project(name: str, description: str, root_path: str) -> str:
-        """Create a new project workspace."""
+        """Create a new project workspace: tracked identity (project.md/
+        codebase.md/projectlist.md — name, description, notes) plus a
+        machine-local execution-root binding for root_path.
+
+        CODING-02B-A: root_path is no longer written into any tracked file
+        (see CODING-02A's source-vet — a tracked root is machine-specific
+        and was already proven stale/contradictory across trees). It is
+        still used, locally and only on this machine, to create the
+        binding.json execution-root binding via save_project_binding().
+
+        Validates name and root_path fully before writing anything. If the
+        tracked identity is created but the binding fails (or vice versa),
+        reports the true partial state rather than a blanket success —
+        no rollback is attempted or claimed."""
+        try:
+            name = validate_project_name(name)
+        except ValueError as e:
+            return f"[Error: {e}]"
+
+        canon_root = os.path.abspath(os.path.expanduser(root_path))
+        if not os.path.isdir(canon_root):
+            return f"[Error: root_path does not exist or is not a directory: {canon_root}]"
+
         project_dir = os.path.join(PROJECTS_DIR, name)
         try:
             os.makedirs(project_dir, exist_ok=True)
-            # Create project.md
+            # Create project.md — identity/description/notes only, no root.
             project_md = os.path.join(project_dir, "project.md")
             if not os.path.exists(project_md):
                 with open(project_md, 'w', encoding='utf-8') as f:
-                    f.write(f"# {name}\n\n**Description:** {description}\n**Root:** {root_path}\n\n## Status\n\n## Notes\n")
+                    f.write(f"# {name}\n\n**Description:** {description}\n\n## Status\n\n## Notes\n")
             # Create chats.json — lives in the data dir, not project_dir (FE-13)
             chats_json = os.path.join(PROJECT_CHATS_DIR, name, "chats.json")
             if not os.path.exists(chats_json):
@@ -61,15 +102,24 @@ def register_projects_tools(registry):
             if not os.path.exists(codebase_md):
                 with open(codebase_md, 'w', encoding='utf-8') as f:
                     f.write(f"# Codebase Index — {name}\n\n*Run refresh_codebase_index to populate.*\n")
-            # Append to projectlist.md
+            # Append to projectlist.md — no root here either.
             current = _read_projectlist()
-            entry = f"- **{name}** `{root_path}` — {description}\n"
+            entry = f"- **{name}** — {description}\n"
             if entry.strip() not in current:
                 with open(PROJECTLIST, 'a', encoding='utf-8') as f:
                     f.write(entry)
-            return f"[Project created: {project_dir}]"
         except Exception as e:
-            return f"[Error creating project '{name}': {e}]"
+            return f"[Error creating tracked project '{name}': {e}]"
+
+        try:
+            save_project_binding(name, canon_root)
+        except Exception as e:
+            return (
+                f"[Project '{name}' created (tracked identity only) — local execution "
+                f"root NOT configured: {e}. Use set_project_root to configure it.]"
+            )
+
+        return f"[Project created: {project_dir} | local execution root bound: {canon_root}]"
 
     def load_project(name: str) -> str:
         """Load a project's project.md handoff document."""
@@ -114,7 +164,11 @@ def register_projects_tools(registry):
             "build", "dist", ".venv", "venv", ".idea"
         }
         try:
-            lines = [f"# Codebase Index — {name}", f"*Root: {root}*\n"]
+            # CODING-02B-A: no machine root line -- codebase.md is a tracked,
+            # public artifact (see CODING-02A's finding that this line was
+            # already leaking an absolute local path into it). root_path is
+            # still used operationally, just above, to perform the walk.
+            lines = [f"# Codebase Index — {name}\n"]
             file_count = 0
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames[:] = sorted(
@@ -155,6 +209,80 @@ def register_projects_tools(registry):
                 return f.read()
         except Exception as e:
             return f"[Error loading codebase index for '{name}': {e}]"
+
+    def set_project_root(name: str, root_path: str) -> str:
+        """Configure (or update) the machine-local execution-root binding
+        for an existing tracked project. Pure configuration -- does NOT
+        activate the project for this or any agent (see activate_project),
+        and never touches tracked Markdown. Owner-only (see
+        core/tool_profiles.py's OWNER_ONLY_TOOLS) -- this is persistent
+        machine-local configuration, not routine coding context."""
+        try:
+            name = validate_project_name(name)
+        except ValueError as e:
+            return f"[Error: {e}]"
+
+        project_dir = os.path.join(PROJECTS_DIR, name)
+        if not os.path.exists(project_dir):
+            return f"[Error: no project named '{name}'. Create it first with create_project.]"
+
+        try:
+            context = save_project_binding(name, root_path)
+        except (ValueError, ProjectBindingError) as e:
+            return f"[Error: {e}]"
+
+        return (
+            f"[Local execution root configured for '{name}': {context.root} "
+            f"(not activated — use activate_project to select it)]"
+        )
+
+    def activate_project(name: str) -> str:
+        """Make an existing tracked project's machine-local execution root
+        this agent's active project -- affects only this LuminaAgent
+        instance's ProjectContextState, never any other agent, never a
+        process-global. Fails closed: an unknown project, or a project with
+        no local binding, never guesses or falls back to a tracked
+        **Root:** line (CODING-02A proved those are unreliable)."""
+        try:
+            name = validate_project_name(name)
+        except ValueError as e:
+            return f"[Error: {e}]"
+
+        project_dir = os.path.join(PROJECTS_DIR, name)
+        if not os.path.exists(project_dir):
+            return f"[Error: no project named '{name}'. Check projectlist.]"
+
+        if project_state is None:
+            return "[Error: no project context available for this session]"
+
+        try:
+            context = load_project_binding(name)
+        except BindingNotFound:
+            return (
+                f"[Error: project '{name}' has no local execution root configured "
+                f"on this machine. Use set_project_root to configure it.]"
+            )
+        except (MalformedBinding, BindingRootInvalid) as e:
+            return f"[Error: {e}]"
+
+        project_state.set(context)
+        return f"[Active project: {context.name} | root: {context.root}]"
+
+    def get_active_project() -> str:
+        """Read-only introspection -- never guesses; reports this agent's
+        actual current ProjectContextState, truthfully, including 'none'."""
+        context = project_state.get() if project_state is not None else None
+        if context is None:
+            return "[No active project]"
+        return f"[Active project: {context.name} | root: {context.root}]"
+
+    def clear_active_project() -> str:
+        """Clears only this agent's active project. Project-aware tools
+        (filesystem, edit_file, run_command) immediately revert to their
+        legacy, pre-CODING-02B-A default behavior for this agent."""
+        if project_state is not None:
+            project_state.clear()
+        return "[Active project cleared]"
 
     def link_chat(name: str, chat_id: int, summary: str) -> str:
         """Link a chat session to a project with a one-line summary."""
@@ -206,9 +334,9 @@ def register_projects_tools(registry):
         parameters={
             "type": "object",
             "properties": {
-                "name":        {"type": "string", "description": "Short project identifier, no spaces. e.g. 'lumina-dev'"},
+                "name":        {"type": "string", "description": "Short project identifier: letters, digits, '-', '_' only, starting with a letter or digit. e.g. 'lumina-dev'"},
                 "description": {"type": "string", "description": "One-line description of the project."},
-                "root_path":   {"type": "string", "description": "Absolute path to the project's source root. e.g. '~/lumina'"}
+                "root_path":   {"type": "string", "description": "Absolute path to the project's source root on this machine. e.g. '~/lumina'. Used only to create a machine-local execution-root binding — never written into tracked project files."}
             },
             "required": ["name", "description", "root_path"]
         }
@@ -296,4 +424,51 @@ def register_projects_tools(registry):
             },
             "required": ["name"]
         }
+    )
+
+    registry.register(
+        name="set_project_root",
+        fn=set_project_root,
+        description="Configure (or update) the machine-local execution-root binding for an "
+                     "existing project. Does not activate the project — use activate_project "
+                     "for that. Owner-only.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "name":      {"type": "string", "description": "Existing project name."},
+                "root_path": {"type": "string", "description": "Absolute path to the project's source root on this machine."}
+            },
+            "required": ["name", "root_path"]
+        }
+    )
+
+    registry.register(
+        name="activate_project",
+        fn=activate_project,
+        description="Make an existing project's machine-local execution root this agent's "
+                     "active project — relative filesystem/edit paths and run_command's default "
+                     "working directory then default to it. Fails if the project is unknown or "
+                     "has no local execution root configured on this machine.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Project name to activate."}
+            },
+            "required": ["name"]
+        }
+    )
+
+    registry.register(
+        name="get_active_project",
+        fn=get_active_project,
+        description="Report this agent's currently active project, if any.",
+        parameters={"type": "object", "properties": {}, "required": []}
+    )
+
+    registry.register(
+        name="clear_active_project",
+        fn=clear_active_project,
+        description="Clear this agent's active project. Project-aware tools revert to their "
+                     "legacy default path/cwd behavior.",
+        parameters={"type": "object", "properties": {}, "required": []}
     )

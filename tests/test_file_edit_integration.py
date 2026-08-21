@@ -87,6 +87,40 @@ def test_nonowner_default_deny_unaffected_by_grant_to_other_session(isolated_age
     assert "edit_file" not in ungranted.registry.list_enabled()
 
 
+# ── CODING-02B-A: real-agent project-context wiring ─────────────────────
+
+def test_real_agent_edit_file_resolves_relative_path_against_active_project(isolated_agent_data, tmp_path):
+    """End-to-end proof that core/agent.py's real self.project_context ->
+    register_file_edit_tools(..., project_state=self.project_context) wiring
+    actually reaches edit_file via registry.call(), not just the direct
+    module-level call already covered in tests/test_file_edit.py."""
+    from core.project_context import ProjectContext
+
+    agent = LuminaAgent(owner=True, channel_id="coding-02b-a-fs-test", backend="llamacpp")
+    (tmp_path / "sub").mkdir()
+    f = tmp_path / "sub" / "f.txt"
+    f.write_text("hello world\n")
+
+    agent.project_context.set(ProjectContext(name="p", root=str(tmp_path)))
+    result = agent.registry.call("edit_file", {
+        "path": "sub/f.txt",
+        "edits": [{"old_text": "world", "new_text": "there"}],
+    })
+    assert result.startswith("[Edited:")
+    assert f.read_text() == "hello there\n"
+
+
+def test_two_real_agents_have_independent_project_contexts(isolated_agent_data, tmp_path):
+    agent_a = LuminaAgent(owner=True, channel_id="coding-02b-a-iso-a", backend="llamacpp")
+    agent_b = LuminaAgent(owner=True, channel_id="coding-02b-a-iso-b", backend="llamacpp")
+
+    from core.project_context import ProjectContext
+    agent_a.project_context.set(ProjectContext(name="p", root=str(tmp_path)))
+
+    assert agent_a.project_context.get() is not None
+    assert agent_b.project_context.get() is None
+
+
 # ── Emergency-stop interaction ──────────────────────────────────────────
 
 @pytest.fixture(autouse=True)

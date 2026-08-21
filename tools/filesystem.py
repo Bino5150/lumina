@@ -5,11 +5,19 @@ Filesystem Tools — read, write, list, search files.
 import os
 import fnmatch
 
-def register_filesystem_tools(registry):
+from core.project_context import resolve_project_path
+
+def register_filesystem_tools(registry, project_state=None):
+    """project_state (CODING-02B-A): an optional core.project_context.
+    ProjectContextState, threaded in from the owning LuminaAgent. None
+    (default — every pre-CODING-02B-A caller, including every existing
+    direct test that builds a bare ToolRegistry) preserves legacy behavior
+    exactly: relative paths resolve however they always did, against the
+    process's own cwd."""
 
     def read_file(path: str, start: int = 0, max_bytes: int = 32000) -> str:
         """Read a file and return its contents."""
-        path = os.path.expanduser(path)
+        path = resolve_project_path(path, project_state)
         if not os.path.exists(path):
             return f"[Error: file not found: {path}]"
         if not os.path.isfile(path):
@@ -35,7 +43,7 @@ def register_filesystem_tools(registry):
 
     def write_file(path: str, content: str, mode: str = "overwrite") -> str:
         """Write content to a file. mode: overwrite or append."""
-        path = os.path.expanduser(path)
+        path = resolve_project_path(path, project_state)
         try:
             os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
             write_mode = 'a' if mode == 'append' else 'w'
@@ -48,7 +56,7 @@ def register_filesystem_tools(registry):
 
     def list_dir(path: str = ".", show_hidden: bool = False) -> str:
         """List contents of a directory."""
-        path = os.path.expanduser(path)
+        path = resolve_project_path(path, project_state)
         if not os.path.exists(path):
             return f"[Error: path not found: {path}]"
         if not os.path.isdir(path):
@@ -73,7 +81,7 @@ def register_filesystem_tools(registry):
 
     def search_files(path: str = ".", pattern: str = "*", content: str = "") -> str:
         """Search for files by name pattern and optionally by content."""
-        path = os.path.expanduser(path)
+        path = resolve_project_path(path, project_state)
         if not os.path.exists(path):
             return f"[Error: path not found: {path}]"
         matches = []

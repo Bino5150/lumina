@@ -23,6 +23,7 @@ import hashlib
 import tempfile
 
 from tools.diff import _unified_diff
+from core.project_context import resolve_project_path
 
 
 class _KernelError(Exception):
@@ -176,8 +177,16 @@ def _apply_replacement(path: str, new_bytes: bytes, original_fst, original_finge
                 pass
 
 
-def edit_file(path: str, edits: list, expected_sha256: str = "") -> str:
-    path = os.path.abspath(os.path.expanduser(path))
+def edit_file(path: str, edits: list, expected_sha256: str = "", project_state=None) -> str:
+    """project_state (CODING-02B-A): optional core.project_context.
+    ProjectContextState. None (default) preserves this function's exact
+    pre-CODING-02B-A behavior — every direct call in tests/test_file_edit.py
+    and tests/test_file_edit_integration.py omits it and is unaffected.
+    Path resolution happens here, strictly before the kernel admission
+    logic below (_read_target_snapshot's lstat/O_NOFOLLOW/fstat sequence) —
+    resolve_project_path() never calls realpath(), so it cannot resolve away
+    a symlink component before the kernel gets a chance to reject it."""
+    path = os.path.abspath(resolve_project_path(path, project_state))
 
     try:
         raw, fst, fingerprint = _read_target_snapshot(path)
@@ -275,10 +284,20 @@ def edit_file(path: str, edits: list, expected_sha256: str = "") -> str:
     )
 
 
-def register_file_edit_tools(registry):
+def register_file_edit_tools(registry, project_state=None):
+    """project_state: see edit_file()'s own docstring. Threaded through a
+    thin wrapper closure (not registered directly) so the registered tool's
+    dispatched kwargs still match its JSON schema exactly — project_state
+    is per-agent plumbing, never a model-facing parameter. Same pattern
+    tools/tasks.py already uses to thread the owning agent through its
+    registered tool wrappers."""
+
+    def _tool_edit_file(path, edits, expected_sha256=""):
+        return edit_file(path, edits, expected_sha256=expected_sha256, project_state=project_state)
+
     registry.register(
         name="edit_file",
-        fn=edit_file,
+        fn=_tool_edit_file,
         description=(
             "Surgically edit an existing UTF-8 text file by replacing exact "
             "text spans. Each old_text must match the file's current contents "

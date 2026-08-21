@@ -93,8 +93,19 @@ TOOL_TIERS = {
     "browser_current_url": "read_only", "browser_get_links": "read_only",
     "browser_extract": "read_only", "browser_screenshot": "read_only",
     "diff_texts": "read_only", "diff_files": "read_only", "submit_pin": "read_only",
+    "get_active_project": "read_only",
 
     "edit_prompt": "write_local", "reset_chat": "write_local",
+    # CODING-02B-A: project-context tools. activate_project/clear_active_project
+    # only ever mutate the calling agent's own per-instance ProjectContextState
+    # (core/project_context.py) -- no filesystem/system state beyond that, same
+    # tier as edit_file. set_project_root is the one that writes persistent
+    # machine-local configuration (DATA_DIR/projects/<name>/binding.json) and
+    # is additionally hard-excluded via OWNER_ONLY_TOOLS below -- the tier here
+    # documents its write_local semantics, the owner-only set is what actually
+    # enforces the exclusion.
+    "activate_project": "write_local", "clear_active_project": "write_local",
+    "set_project_root": "write_local",
     "save_memory": "write_local", "delete_memory": "write_local",
     "save_knowledge": "write_local", "delete_knowledge": "write_local",
     "save_person": "write_local", "write_file": "write_local",
@@ -126,6 +137,22 @@ OWNER_ONLY_TOOLS = {
     "create_tool", "list_custom_tools", "delete_tool",
     "list_pending_tools", "show_pending_tool_source", "reject_pending_tool",
     "palace_review_writes", "palace_undo_write",
+    # CODING-02B-A: persistent machine-local configuration (writes
+    # DATA_DIR/projects/<name>/binding.json) -- distinct from
+    # activate_project/clear_active_project, which only ever touch the
+    # calling agent's own in-memory ProjectContextState and stay available
+    # to a non-owner session that's been explicitly granted them.
+    "set_project_root",
+    # CODING-02B-A1: create_project also calls save_project_binding()
+    # directly (tools/projects.py) -- it writes the exact same
+    # DATA_DIR/projects/<name>/binding.json as set_project_root, so it must
+    # be excluded for the identical reason. CODING-02B-A classified
+    # set_project_root as owner-only but left create_project unclassified,
+    # leaving a second, un-gated path to the same privileged write. Left
+    # deliberately absent from TOOL_TIERS (not given a "write_local" entry)
+    # -- OWNER_ONLY_TOOLS is checked before tier/PIN logic ever runs for a
+    # non-owner session, so a tier entry here would be redundant at best.
+    "create_project",
 }
 
 
