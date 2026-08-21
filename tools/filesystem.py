@@ -16,9 +16,17 @@ def register_filesystem_tools(registry):
             return f"[Error: not a file: {path}]"
         size = os.path.getsize(path)
         try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            # Binary read + manual decode -- text mode's universal-newline
+            # translation would silently normalize CRLF to LF, which would
+            # make text copied from here into edit_file's old_text no
+            # longer match the file's actual on-disk bytes. errors="replace"
+            # is fine here: this is a read/display path, not a mutation
+            # path, and an arbitrary byte offset can legitimately land
+            # mid-codepoint since start/max_bytes are byte, not char, units.
+            with open(path, 'rb') as f:
                 f.seek(start)
-                content = f.read(max_bytes)
+                chunk = f.read(max_bytes)
+            content = chunk.decode('utf-8', errors='replace')
             truncated = (start + max_bytes) < size
             header = f"[file: {path} | {size} bytes total | reading from byte {start}{' | more remaining' if truncated else ' | end of file'}]\n"
             return header + content

@@ -98,6 +98,7 @@ TOOL_TIERS = {
     "save_memory": "write_local", "delete_memory": "write_local",
     "save_knowledge": "write_local", "delete_knowledge": "write_local",
     "save_person": "write_local", "write_file": "write_local",
+    "edit_file": "write_local",
     "palace_remember": "write_local", "palace_hall": "write_local",
     "save_skill": "write_local", "apply_patch": "write_local",
     "browser_navigate": "write_local", "browser_click": "write_local",

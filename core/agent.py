@@ -19,6 +19,7 @@ from tools.memory import register_memory_tools, init_memory_db, init_chat_db
 from tools.knowledge import register_knowledge_tools
 from tools.web import register_web_tools
 from tools.filesystem import register_filesystem_tools
+from tools.file_edit import register_file_edit_tools
 from tools.sandbox import register_sandbox_tools
 from tools.vision import register_vision_tools
 from tools.terminal import register_terminal_tools
@@ -185,6 +186,7 @@ class LuminaAgent:
         register_knowledge_tools(self.registry)
         register_web_tools(self.registry)
         register_filesystem_tools(self.registry)
+        register_file_edit_tools(self.registry)
         register_sandbox_tools(self.registry)
         register_vision_tools(self.registry)
         register_terminal_tools(self.registry)
