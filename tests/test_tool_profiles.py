@@ -54,15 +54,16 @@ def test_coding_profile_did_not_gain_unrelated_tools():
     """CODING-01B-B added edit_file; CODING-02B-A added exactly
     activate_project/get_active_project/clear_active_project (NOT
     set_project_root -- see test_set_project_root_not_in_coding_profile
-    below) -- this is a regression guard against accidentally sweeping in
-    other tools (e.g. the still-out-of-scope diff_texts/diff_files/git_*
-    tools) while editing the same JSON file."""
+    below); CODING-03A1 added exactly search_code (search_files stays,
+    additive not replaced) -- this is a regression guard against
+    accidentally sweeping in other tools (e.g. the still-out-of-scope
+    diff_texts/diff_files/git_* tools) while editing the same JSON file."""
     coding = next(p for p in list_profiles() if p.get("name") == "Coding")
     enabled = set(coding.get("enabled", []))
     expected = {
         "get_time", "list_tools", "view_prompt", "reset_chat",
         "save_memory", "search_memory", "get_recent_memories",
-        "read_file", "write_file", "edit_file", "list_dir", "search_files",
+        "read_file", "write_file", "edit_file", "list_dir", "search_files", "search_code",
         "run_python", "run_command",
         "activate_project", "get_active_project", "clear_active_project",
         "create_tool", "list_custom_tools", "delete_tool",

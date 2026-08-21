@@ -86,6 +86,7 @@ TOOL_TIERS = {
     "web_search": "read_only", "get_website": "read_only", "get_wikipedia": "read_only",
     "check_for_updates": "read_only",
     "list_dir": "read_only", "search_files": "read_only", "read_file": "read_only",
+    "search_code": "read_only",
     "palace_recall": "read_only", "palace_status": "read_only",
     "list_skills": "read_only", "recall_skill": "read_only",
     "search_chat_history": "read_only", "get_chat_session": "read_only",

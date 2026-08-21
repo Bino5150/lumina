@@ -4,7 +4,7 @@
   "enabled": [
     "get_time", "list_tools", "view_prompt", "reset_chat",
     "save_memory", "search_memory", "get_recent_memories",
-    "read_file", "write_file", "edit_file", "list_dir", "search_files",
+    "read_file", "write_file", "edit_file", "list_dir", "search_files", "search_code",
     "run_python", "run_command",
     "activate_project", "get_active_project", "clear_active_project",
     "create_tool", "list_custom_tools", "delete_tool",
