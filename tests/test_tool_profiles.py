@@ -55,7 +55,8 @@ def test_coding_profile_did_not_gain_unrelated_tools():
     activate_project/get_active_project/clear_active_project (NOT
     set_project_root -- see test_set_project_root_not_in_coding_profile
     below); CODING-03A1 added exactly search_code (search_files stays,
-    additive not replaced) -- this is a regression guard against
+    additive not replaced); CODING-04A2-B4 added exactly the five managed-
+    process tools -- this is a regression guard against
     accidentally sweeping in other tools (e.g. the still-out-of-scope
     diff_texts/diff_files/git_* tools) while editing the same JSON file."""
     coding = next(p for p in list_profiles() if p.get("name") == "Coding")
@@ -65,6 +66,7 @@ def test_coding_profile_did_not_gain_unrelated_tools():
         "save_memory", "search_memory", "get_recent_memories",
         "read_file", "write_file", "edit_file", "list_dir", "search_files", "search_code",
         "run_python", "run_command",
+        "start_process", "read_process", "send_process_input", "stop_process", "list_processes",
         "activate_project", "get_active_project", "clear_active_project",
         "create_tool", "list_custom_tools", "delete_tool",
         "palace_remember", "palace_hall", "palace_recall", "palace_status",

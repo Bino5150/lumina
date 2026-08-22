@@ -87,6 +87,8 @@ TOOL_TIERS = {
     "check_for_updates": "read_only",
     "list_dir": "read_only", "search_files": "read_only", "read_file": "read_only",
     "search_code": "read_only",
+    "read_process": "read_only", "list_processes": "read_only",
+    "start_process": "execute", "send_process_input": "execute", "stop_process": "execute",
     "palace_recall": "read_only", "palace_status": "read_only",
     "list_skills": "read_only", "recall_skill": "read_only",
     "search_chat_history": "read_only", "get_chat_session": "read_only",
@@ -138,6 +140,12 @@ OWNER_ONLY_TOOLS = {
     "create_tool", "list_custom_tools", "delete_tool",
     "list_pending_tools", "show_pending_tool_source", "reject_pending_tool",
     "palace_review_writes", "palace_undo_write",
+    # CODING-04A2-B4: the persistent-process manager is process-global.
+    # Observation and control are therefore owner-only just like launch;
+    # profiles and PIN verification are separate axes and cannot restore
+    # these capabilities to a non-owner session.
+    "start_process", "read_process", "send_process_input",
+    "stop_process", "list_processes",
     # CODING-02B-A: persistent machine-local configuration (writes
     # DATA_DIR/projects/<name>/binding.json) -- distinct from
     # activate_project/clear_active_project, which only ever touch the

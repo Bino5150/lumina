@@ -80,6 +80,7 @@ def run_cli(persona_name: str = None, tools_override: str = None):
         identity but a trimmed tool set.
     """
     from core.agent import LuminaAgent
+    from core import process_manager
     from core.reasoning_preferences import resolve_reasoning_effort
     import config
 
@@ -95,53 +96,58 @@ def run_cli(persona_name: str = None, tools_override: str = None):
     print(f"  Backend: {config.LLM_BACKEND} ({config.LLM_BACKEND_URL})")
     print(f"{'='*52}\n")
 
-    # MB-22: CLI is a trusted local session, same footing as the desktop app --
-    # owner=True is already LuminaAgent's default, unchanged here. channel_id
-    # is now explicit ("cli-local" instead of the generic "default") so PIN
-    # verification/lockout state (tools/pin.py) never shares a bucket with any
-    # other owner=True call site that also left channel_id at its default.
-    agent = LuminaAgent(on_tool_call=on_tool_call, on_tool_result=on_tool_result,
-                         channel_id="cli-local")
-
-    apply_cli_persona_and_tools(agent, persona_name, tools_override)
-
     try:
-        status = agent.test_connection()
-        print(f"  ✓ {status}\n")
-    except ConnectionError as e:
-        print(f"  ✗ {e}\n")
-        sys.exit(1)
+        # MB-22: CLI is a trusted local session, same footing as the desktop app --
+        # owner=True is already LuminaAgent's default, unchanged here. channel_id
+        # is now explicit ("cli-local" instead of the generic "default") so PIN
+        # verification/lockout state (tools/pin.py) never shares a bucket with any
+        # other owner=True call site that also left channel_id at its default.
+        agent = LuminaAgent(on_tool_call=on_tool_call, on_tool_result=on_tool_result,
+                             channel_id="cli-local")
 
-    print("  Enter to chat. 'quit' to exit. 'tokens' for context usage.\n")
+        apply_cli_persona_and_tools(agent, persona_name, tools_override)
 
-    while True:
         try:
-            user_input = input(f"{config.USER_NAME}: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print(f"\n\n  Later, {config.USER_NAME}. ✦\n")
-            break
+            status = agent.test_connection()
+            print(f"  ✓ {status}\n")
+        except ConnectionError as e:
+            print(f"  ✗ {e}\n")
+            sys.exit(1)
 
-        if not user_input:
-            continue
-        if user_input.lower() in ("quit", "exit"):
-            print(f"\n  Later, {config.USER_NAME}. ✦\n")
-            break
-        if user_input.lower() == "tokens":
-            print(f"  Context: ~{agent.get_token_count()} tokens\n")
-            continue
+        print("  Enter to chat. 'quit' to exit. 'tokens' for context usage.\n")
 
-        print(f"\n{config.AGENT_NAME}: ", end="", flush=True)
-        # Patch 3A.4 Part 4 -- resolved FRESH every turn (never cached/
-        # memoized) against the actual live backend instance in use right
-        # now, since Settings can swap it during the app's lifetime. agent
-        # is always a real LuminaAgent here (run_cli() constructs it just
-        # above), so agent.llm and LuminaAgent.chat()'s reasoning_effort
-        # param are both always present -- no compatibility guard needed
-        # at this call site (unlike ui/main_window.py's AgentWorker, which
-        # must also tolerate pre-3A.4 GUI-test agent stubs).
-        reasoning_effort = resolve_reasoning_effort(agent.llm)
-        response = agent.chat(user_input, reasoning_effort=reasoning_effort)
-        print(response + "\n")
+        while True:
+            try:
+                user_input = input(f"{config.USER_NAME}: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print(f"\n\n  Later, {config.USER_NAME}. ✦\n")
+                break
+
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit"):
+                print(f"\n  Later, {config.USER_NAME}. ✦\n")
+                break
+            if user_input.lower() == "tokens":
+                print(f"  Context: ~{agent.get_token_count()} tokens\n")
+                continue
+
+            print(f"\n{config.AGENT_NAME}: ", end="", flush=True)
+            # Patch 3A.4 Part 4 -- resolved FRESH every turn (never cached/
+            # memoized) against the actual live backend instance in use right
+            # now, since Settings can swap it during the app's lifetime. agent
+            # is always a real LuminaAgent here (run_cli() constructs it just
+            # above), so agent.llm and LuminaAgent.chat()'s reasoning_effort
+            # param are both always present -- no compatibility guard needed
+            # at this call site (unlike ui/main_window.py's AgentWorker, which
+            # must also tolerate pre-3A.4 GUI-test agent stubs).
+            reasoning_effort = resolve_reasoning_effort(agent.llm)
+            response = agent.chat(user_input, reasoning_effort=reasoning_effort)
+            print(response + "\n")
+    finally:
+        # Ordinary CLI exit (quit, EOF, Ctrl-C, connection failure, or an
+        # unexpected loop exception) owns normal managed-process shutdown.
+        process_manager.shutdown_all()
 
 
 def run_gui():
@@ -149,6 +155,7 @@ def run_gui():
     from PySide6.QtWidgets import QApplication
     from PySide6.QtGui import QFont
     from core.agent import LuminaAgent
+    from core import process_manager
     from ui.main_window import LuminaWindow
     import config
 
@@ -181,7 +188,13 @@ def run_gui():
     agent.on_tool_call = on_tool_call
 
     window.show()
-    sys.exit(app.exec())
+    try:
+        exit_code = app.exec()
+    finally:
+        # Canonical GUI lifecycle boundary: runs on normal event-loop return
+        # and on adjacent GUI cleanup/event-loop exceptions alike.
+        process_manager.shutdown_all()
+    sys.exit(exit_code)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

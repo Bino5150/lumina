@@ -19,6 +19,12 @@ import time
 import pytest
 
 from core import emergency_stop, process_control, process_manager
+from process_test_helpers import (
+    descendant_python_command,
+    python_command,
+    sleeping_python_command,
+    wait_for_path,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -521,6 +527,247 @@ def test_shutdown_all_terminates_every_running_job():
 
 def test_shutdown_all_idempotent_with_no_jobs():
     assert process_manager.shutdown_all(wait_seconds=0.1) == 0
+
+
+# ── Serialized stdin / EOF core (CODING-04A2-B1) ─────────────────────────
+
+
+def test_send_input_writes_exact_text_without_implicit_newline(tmp_path):
+    working_dir = tmp_path / "stdin working directory"
+    working_dir.mkdir()
+    pid = process_manager.launch(
+        python_command(
+            "import sys; print(repr(sys.stdin.readline()), flush=True)"
+        ),
+        cwd=str(working_dir),
+    )
+    try:
+        result = process_manager.send_input(pid, "hello")
+        assert result["chars_written"] == 5
+        time.sleep(0.15)
+        snap = process_manager.get_job_snapshot(pid)
+        assert snap["status"] == "running"
+        assert snap["stdout"]["text"] == ""
+
+        process_manager.send_input(pid, "\n")
+        snap = _wait_for_status(pid)
+        assert snap["status"] == "exited"
+        assert "'hello\\n'" in snap["stdout"]["text"]
+    finally:
+        process_manager.request_stop(pid)
+        _wait_for_status(pid)
+
+
+def test_send_input_preserves_repeated_write_order(tmp_path):
+    pid = process_manager.launch(
+        python_command("import sys; print(sys.stdin.read(6), flush=True)"),
+        cwd=str(tmp_path),
+    )
+    try:
+        process_manager.send_input(pid, "abc")
+        process_manager.send_input(pid, "def")
+        snap = _wait_for_status(pid)
+        assert snap["stdout"]["text"].strip() == "abcdef"
+    finally:
+        process_manager.request_stop(pid)
+        _wait_for_status(pid)
+
+
+def test_send_input_write_and_close_delivers_eof(tmp_path):
+    pid = process_manager.launch(
+        python_command("import sys; print(repr(sys.stdin.read()), flush=True)"),
+        cwd=str(tmp_path),
+    )
+    result = process_manager.send_input(pid, "payload", close_stdin=True)
+    assert result == {
+        "process_id": pid,
+        "chars_written": 7,
+        "stdin_closed": True,
+        "already_closed": False,
+    }
+    snap = _wait_for_status(pid)
+    assert snap["status"] == "exited"
+    assert "'payload'" in snap["stdout"]["text"]
+
+
+def test_send_input_empty_no_close_is_harmless_noop(tmp_path):
+    pid = process_manager.launch(sleeping_python_command(), cwd=str(tmp_path))
+    try:
+        result = process_manager.send_input(pid)
+        assert result["chars_written"] == 0
+        assert result["stdin_closed"] is False
+        assert process_manager.get_job_snapshot(pid)["status"] == "running"
+    finally:
+        process_manager.request_stop(pid)
+        _wait_for_status(pid)
+
+
+def test_send_input_repeated_close_is_clean_while_tree_running(tmp_path):
+    pid = process_manager.launch(sleeping_python_command(), cwd=str(tmp_path))
+    try:
+        first = process_manager.send_input(pid, close_stdin=True)
+        second = process_manager.send_input(pid, close_stdin=True)
+        assert first["already_closed"] is False
+        assert second["already_closed"] is True
+        assert second["stdin_closed"] is True
+    finally:
+        process_manager.request_stop(pid)
+        _wait_for_status(pid)
+
+
+def test_send_input_unknown_and_terminal_ids_are_distinct(tmp_path):
+    with pytest.raises(process_manager.ProcessNotFound):
+        process_manager.send_input("p-000000000000", "x")
+
+    pid = process_manager.launch(python_command("pass"), cwd=str(tmp_path))
+    _wait_for_status(pid)
+    with pytest.raises(process_manager.ProcessNotRunning):
+        process_manager.send_input(pid, "x")
+
+
+@pytest.mark.parametrize("failure_type", [BrokenPipeError, OSError, ValueError])
+def test_send_input_closed_pipe_and_raw_pipe_failures_are_translated(
+        failure_type, tmp_path):
+    pid = process_manager.launch(sleeping_python_command(), cwd=str(tmp_path))
+    with process_manager._registry_lock:
+        job = process_manager._registry[pid]
+    original = job.proc.stdin
+    try:
+        original.close()
+        with pytest.raises(process_manager.ProcessInputClosed):
+            process_manager.send_input(pid, "x")
+
+        class BrokenStream:
+            closed = False
+
+            def write(self, text):
+                raise failure_type("raw pipe detail")
+
+            def flush(self):
+                raise AssertionError("flush must not follow failed write")
+
+            def close(self):
+                self.closed = True
+
+        job.proc.stdin = BrokenStream()
+        with pytest.raises(process_manager.ProcessInputError) as exc_info:
+            process_manager.send_input(pid, "x")
+        assert "raw pipe detail" not in str(exc_info.value)
+    finally:
+        job.proc.stdin = original
+        process_manager.request_stop(pid)
+        _wait_for_status(pid)
+
+
+def test_send_input_serializes_competing_writers(tmp_path):
+    pid = process_manager.launch(sleeping_python_command(), cwd=str(tmp_path))
+    with process_manager._registry_lock:
+        job = process_manager._registry[pid]
+    original = job.proc.stdin
+
+    class BlockingStream:
+        closed = False
+
+        def __init__(self):
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.state_lock = threading.Lock()
+            self.active = 0
+            self.overlap = False
+            self.writes = []
+
+        def write(self, text):
+            with self.state_lock:
+                self.active += 1
+                if self.active > 1:
+                    self.overlap = True
+            self.entered.set()
+            assert self.release.wait(timeout=5.0)
+            self.writes.append(text)
+            with self.state_lock:
+                self.active -= 1
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    stream = BlockingStream()
+    job.proc.stdin = stream
+    errors = []
+
+    def _write(text):
+        try:
+            process_manager.send_input(pid, text)
+        except Exception as exc:
+            errors.append(exc)
+
+    try:
+        first = threading.Thread(target=_write, args=("first",))
+        second = threading.Thread(target=_write, args=("second",))
+        first.start()
+        assert stream.entered.wait(timeout=2.0)
+        second.start()
+        time.sleep(0.1)
+        stream.release.set()
+        first.join(timeout=5.0)
+        second.join(timeout=5.0)
+        assert errors == []
+        assert stream.overlap is False
+        assert stream.writes == ["first", "second"]
+    finally:
+        job.proc.stdin = original
+        process_manager.request_stop(pid)
+        _wait_for_status(pid)
+
+
+def test_send_input_stale_epoch_is_refused_without_changing_lease_state(tmp_path):
+    pid = process_manager.launch(sleeping_python_command(), cwd=str(tmp_path))
+    with process_manager._registry_lock:
+        lease_id = process_manager._registry[pid].lease_id
+    before = emergency_stop.snapshot()["active_execution_count"]
+
+    process_manager.send_input(pid, "x")
+    assert emergency_stop.snapshot()["active_execution_count"] == before
+    assert lease_id in emergency_stop._executions
+
+    emergency_stop.latch(source="test", reason="stdin authority proof")
+    with pytest.raises(process_manager.ProcessInputRefused):
+        process_manager.send_input(pid, "stale")
+    assert lease_id in emergency_stop._executions
+
+    process_manager.request_stop(pid)
+    _wait_for_status(pid)
+    assert lease_id not in emergency_stop._executions
+    emergency_stop.rearm_local()
+    with pytest.raises(process_manager.ProcessNotRunning):
+        process_manager.send_input(pid, "cannot revive")
+
+
+def test_send_input_leader_exit_does_not_create_descendant_control_loophole(tmp_path):
+    sentinel = tmp_path / "leader exited descendant live.pid"
+    pid = process_manager.launch(
+        descendant_python_command(sentinel), cwd=str(tmp_path)
+    )
+    with process_manager._registry_lock:
+        job = process_manager._registry[pid]
+    deadline = time.time() + 3.0
+    while time.time() < deadline and job.proc.poll() is None:
+        time.sleep(0.02)
+
+    try:
+        assert wait_for_path(sentinel), "descendant did not report startup"
+        assert job.proc.poll() == 0
+        assert process_manager.get_job_snapshot(pid)["status"] == "running"
+        emergency_stop.latch(source="test", reason="leader-exit stdin proof")
+        with pytest.raises(process_manager.ProcessInputRefused):
+            process_manager.send_input(pid, "stale descendant control")
+    finally:
+        process_manager.request_stop(pid)
+        _wait_for_status(pid, timeout=10.0)
+        if emergency_stop.is_latched():
+            emergency_stop.rearm_local()
 
 
 # ── Emergency-lease persistence (Section 16/31) ────────────────────────────

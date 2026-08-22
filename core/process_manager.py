@@ -11,11 +11,9 @@ never itself branch on platform or touch a POSIX/Windows-only API
 directly (tests/test_process_control.py's portability regression tests
 assert exactly that by grepping this file's own source).
 
-No model-facing tool is registered here or anywhere else in this slice --
-this is engine + safety-boundary only. CODING-04A2 will build
-start_process/read_process/send_process_input/stop_process/list_processes
-on top of the internal functions here (launch/request_stop/
-get_job_snapshot/etc.), after independent safety review.
+No model-facing tool is registered here -- this remains the engine and safety
+boundary.  The five integrated model adapters live in tools/processes.py and
+use this module's public launch/input/stop/snapshot functions.
 
 Module-global runtime state, same idiom as core/task_queue.py and
 core/emergency_stop.py -- deliberately not a class-based singleton, so
@@ -53,7 +51,7 @@ _STATUSES = frozenset({"running", "exited", "stopped", "emergency_killed", "shut
 
 
 class ProcessManagerError(Exception):
-    """Base class for launch() rejections."""
+    """Base class for stable manager-boundary operation errors."""
 
 
 class InvalidLaunchRequest(ProcessManagerError):
@@ -73,6 +71,30 @@ class LaunchRefused(ProcessManagerError):
     """Emergency stop is latched, or the calling execution's own epoch is
     already stale -- the process-manager-boundary equivalent of
     emergency_stop.EmergencyStopError."""
+
+
+class InvalidProcessInput(ProcessManagerError):
+    """The requested stdin operation has an invalid argument."""
+
+
+class ProcessNotFound(ProcessManagerError):
+    """No retained managed job exists for the supplied Lumina process ID."""
+
+
+class ProcessNotRunning(ProcessManagerError):
+    """The managed tree is terminal or already being terminated."""
+
+
+class ProcessInputClosed(ProcessManagerError):
+    """The managed process stdin stream is already closed."""
+
+
+class ProcessInputRefused(ProcessManagerError):
+    """The launching emergency epoch no longer has execution authority."""
+
+
+class ProcessInputError(ProcessManagerError):
+    """A managed stdin write, flush, or close failed at the OS stream."""
 
 
 class _StreamBuffer:
@@ -369,6 +391,69 @@ def launch(command: str, cwd: str, channel_id: str = "") -> str:
         raise
 
 
+def send_input(process_id: str, text: str = "", close_stdin: bool = False) -> dict:
+    """Write exact text and/or deliver EOF to a live managed process.
+
+    This is an internal manager primitive only; CODING-04A2-B1 deliberately
+    exposes no model-facing tool.  All operations on a job's stdin share one
+    lock, so write+flush+optional-close is atomic relative to every competing
+    caller and watcher cleanup.  Emergency authority is checked both before
+    waiting for that lock and again after acquiring it: a queued writer cannot
+    regain authority after a latch advances the launching job's epoch.
+
+    No newline is appended.  The persistent process lease established at
+    launch is neither replaced nor extended by input.
+    """
+    if not isinstance(process_id, str) or not process_id:
+        raise InvalidProcessInput("process_id must be a non-empty string")
+    if not isinstance(text, str):
+        raise InvalidProcessInput("text must be a string")
+    if not isinstance(close_stdin, bool):
+        raise InvalidProcessInput("close_stdin must be a boolean")
+
+    with _registry_lock:
+        job = _registry.get(process_id)
+    if job is None:
+        raise ProcessNotFound("managed process was not found")
+
+    def _check_authority():
+        with job.lifecycle_lock:
+            if job.status != "running" or job.stop_reason is not None:
+                raise ProcessNotRunning("managed process is not running")
+        if not emergency_stop.execution_permitted(job.epoch):
+            raise ProcessInputRefused("managed process input authority is stale")
+
+    _check_authority()
+    with job.stdin_lock:
+        _check_authority()
+        stream = job.proc.stdin
+        if stream is None or getattr(stream, "closed", False):
+            if close_stdin and not text:
+                return {
+                    "process_id": process_id,
+                    "chars_written": 0,
+                    "stdin_closed": True,
+                    "already_closed": True,
+                }
+            raise ProcessInputClosed("managed process stdin is closed")
+
+        try:
+            if text:
+                stream.write(text)
+                stream.flush()
+            if close_stdin:
+                stream.close()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise ProcessInputError("managed process stdin operation failed") from exc
+
+        return {
+            "process_id": process_id,
+            "chars_written": len(text),
+            "stdin_closed": bool(close_stdin),
+            "already_closed": False,
+        }
+
+
 def request_stop(process_id: str) -> bool:
     """Internal stop core (Section 21) -- no model-facing tool calls this
     in A1; A2 will wrap it. Idempotent: returns False for an unknown
@@ -403,7 +488,7 @@ def emergency_kill_all() -> int:
 
 def shutdown_all(wait_seconds: float = 5.0) -> int:
     """Normal (non-emergency) application-shutdown core (Section 24) --
-    not wired to any GUI closeEvent or CLI exit path in this slice.
+    wired at the top-level GUI and CLI lifecycle boundaries in main.py.
     Requests termination for every running job, classified "shutdown_killed",
     then optionally waits up to wait_seconds total for their watchers to
     finalize. Idempotent; a process that dies via an uncatchable
