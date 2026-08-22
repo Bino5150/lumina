@@ -20,12 +20,67 @@ pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import config
-from core import persistence
+from core import persistence, secrets
+
+
+# Every config global GeneralTab._save() can assign. Registering each with
+# monkeypatch makes teardown restore the process-wide config module even when
+# a save assertion fails partway through. The provider-specific names cover
+# the conditional cloud/custom/omniroute branches as well as the local branch
+# this fixture deliberately selects.
+_SAVE_MUTATED_CONFIG_ATTRS = (
+    "SYSTEM_PROMPT",
+    "MAX_CONTEXT_TOKENS",
+    "MEMORY_INJECT_LIMIT",
+    "TOOL_RESULT_MAX_CHARS",
+    "MAX_TOOL_ITERATIONS",
+    "RESPONSE_RESERVE_TOKENS",
+    "CONTEXT_COMPACTION_ENABLED",
+    "CONTEXT_COMPACTION_BATCH_TOKENS",
+    "DREAM_SWEEP_ENABLED",
+    "DREAM_IDLE_MINUTES",
+    "SHOW_THINK_BLOCKS",
+    "LLM_BACKEND",
+    "LLM_BACKEND_URL",
+    "LM_STUDIO_BASE_URL",
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_DEFAULT_MODEL",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_DEFAULT_MODEL",
+    "GROQ_API_KEY",
+    "GROQ_DEFAULT_MODEL",
+    "OPENAI_API_KEY",
+    "OPENAI_DEFAULT_MODEL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "GEMINI_API_KEY",
+    "GEMINI_DEFAULT_MODEL",
+    "KIMI_API_KEY",
+    "KIMI_DEFAULT_MODEL",
+    "QWEN_API_KEY",
+    "QWEN_DEFAULT_MODEL",
+    "CUSTOM_DEFAULT_MODEL",
+    "CUSTOM_API_KEY",
+    "OMNIROUTE_DEFAULT_MODEL",
+    "OMNIROUTE_API_KEY",
+)
 
 
 @pytest.fixture
 def isolated_prefs(tmp_path, monkeypatch):
     monkeypatch.setattr(persistence, "PREFS_PATH", str(tmp_path / "prefs.json"))
+    monkeypatch.setattr(secrets, "SECRETS_PATH", str(tmp_path / "credentials.json"))
+
+    # _save() mutates config process-wide. Snapshot every possible target for
+    # automatic teardown before applying this fixture's deterministic values.
+    for attr in _SAVE_MUTATED_CONFIG_ATTRS:
+        monkeypatch.setattr(config, attr, getattr(config, attr))
+
+    # Never inherit a user's ambient cloud backend: that would make these
+    # preference tests attempt credential persistence before save_prefs().
+    monkeypatch.setattr(config, "LLM_BACKEND", "llamacpp")
+    monkeypatch.setattr(config, "LLM_BACKEND_URL", "http://localhost:8080/v1")
+    monkeypatch.setattr(config, "LM_STUDIO_BASE_URL", "http://localhost:8080/v1")
     monkeypatch.setattr(config, "CONTEXT_COMPACTION_ENABLED", False)
     monkeypatch.setattr(config, "CONTEXT_COMPACTION_BATCH_TOKENS", 1400)
 
@@ -43,7 +98,12 @@ def _make_tab():
 
 @pytest.fixture
 def tab(isolated_prefs):
-    return _make_tab()
+    result = _make_tab()
+    # Hermeticity tripwire: fail before _save() if ambient prefs ever leak a
+    # cloud backend back into either config or the constructed widget.
+    assert config.LLM_BACKEND == "llamacpp"
+    assert result.backend_combo.currentText() == "llamacpp"
+    return result
 
 
 def test_initial_state_reflects_config_defaults(tab):
