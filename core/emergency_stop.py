@@ -150,6 +150,59 @@ def execution_scope(kind: str, label: str = "", expected_epoch: int = None, meta
             _executions.pop(lease_id, None)
 
 
+def begin_persistent_execution(kind: str, label: str = "", expected_epoch: int = None,
+                                metadata: dict = None) -> str:
+    """CODING-04A1: non-context-manager sibling of execution_scope(), for
+    work whose lifetime is NOT bound to a single synchronous call stack --
+    a managed OS process that keeps running after the launching call
+    returns must still hold a real lease against re-arm for its entire OS
+    lifetime, long after the Python stack frame that started it is gone.
+    Deliberately reuses _executions as its single source of truth (same
+    dict execution_scope() already populates) rather than a second,
+    parallel table -- can_rearm()/snapshot() need no changes to already
+    see a persistent lease exactly like any other.
+
+    Fails closed exactly like execution_scope(): rejects if latched, or
+    if expected_epoch (or, absent that, the calling execution's own
+    ContextVar epoch) no longer matches the current epoch. Does NOT touch
+    _current_epoch_var/_current_execution_id_var -- there is no "current
+    execution" to nest this under once it outlives its caller's stack.
+
+    Caller MUST eventually call end_persistent_execution() exactly once
+    per lease this returns -- normally from watcher/finalization code,
+    once the underlying work has actually stopped, not merely been asked
+    to (see core/process_manager.py's _watch_job)."""
+    with _lock:
+        if _latched:
+            raise EmergencyStopActive(f"emergency stop is latched; cannot begin {kind}")
+        if expected_epoch is not None:
+            epoch = expected_epoch
+        else:
+            ctx_epoch = _current_epoch_var.get()
+            epoch = ctx_epoch if ctx_epoch is not None else _epoch
+        if epoch != _epoch:
+            raise StaleExecution(f"{kind} epoch {epoch} is stale (current epoch {_epoch})")
+        lease_id = str(uuid.uuid4())
+        _executions[lease_id] = {
+            "id": lease_id,
+            "kind": kind,
+            "label": label,
+            "epoch": epoch,
+            "started_at": time.time(),
+            "metadata": dict(metadata) if metadata else {},
+        }
+        return lease_id
+
+
+def end_persistent_execution(lease_id: str):
+    """Idempotent -- safe to call from watcher finalization, failed-spawn
+    cleanup, or a concurrent stop path without coordinating who 'owns'
+    the call. A lease already closed (or never opened) is silently a
+    no-op, identical to end_tool_dispatch()'s established convention."""
+    with _lock:
+        _executions.pop(lease_id, None)
+
+
 def begin_tool_dispatch(name: str) -> str:
     """Atomic lowest-level execution gate — the universal blast door
     immediately before a tool function actually runs. Raises

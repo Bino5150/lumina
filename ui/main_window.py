@@ -1058,6 +1058,14 @@ class LuminaWindow(QMainWindow):
         from comms.telegram_bridge import request_stop_bridge
         request_stop_bridge()
 
+        # CODING-04A1: any persistent managed process (engine only in this
+        # slice -- no model-facing tool can create one yet) must be reached
+        # by the same OH SHIT cascade, after the latch, same as every other
+        # step here. emergency_kill_all() only requests termination; it does
+        # not block waiting for it, and does not itself touch the latch.
+        from core import process_manager
+        process_manager.emergency_kill_all()
+
         if already_latched:
             s = self._emergency_snapshot_summary()
             self.chat_widget.add_operator_message(

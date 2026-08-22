@@ -569,3 +569,72 @@ def test_incident_snapshot_is_safe_and_useful():
 
     assert emergency_stop.can_rearm() is True
     assert emergency_stop.rearm_local() is True
+
+
+# ---------------------------------------------------------------------------
+# 13. Persistent execution lease primitives (CODING-04A1)
+#
+# begin_persistent_execution()/end_persistent_execution() are the
+# non-context-manager sibling of execution_scope(), for work (a managed OS
+# process, see core/process_manager.py) whose lifetime is not bound to a
+# single synchronous call stack. These tests exercise the kernel primitives
+# directly, without any real subprocess -- see tests/test_process_manager.py
+# for the full integration proof against real managed processes.
+# ---------------------------------------------------------------------------
+
+def test_persistent_execution_appears_as_active_execution():
+    lease_id = emergency_stop.begin_persistent_execution(kind="managed_process", label="p-abc123")
+    try:
+        snap = emergency_stop.snapshot()
+        assert snap["active_execution_count"] == 1
+        kinds = [e["kind"] for e in snap["active_executions"]]
+        assert "managed_process" in kinds
+    finally:
+        emergency_stop.end_persistent_execution(lease_id)
+
+
+def test_persistent_execution_shares_executions_dict_not_a_second_table():
+    lease_id = emergency_stop.begin_persistent_execution(kind="managed_process", label="p-shared")
+    try:
+        assert lease_id in emergency_stop._executions
+        assert emergency_stop._executions[lease_id]["kind"] == "managed_process"
+    finally:
+        emergency_stop.end_persistent_execution(lease_id)
+
+
+def test_persistent_execution_blocks_can_rearm_after_latch():
+    lease_id = emergency_stop.begin_persistent_execution(kind="managed_process", label="p-block")
+    emergency_stop.latch(source="test", reason="persistent lease blocks rearm")
+    assert emergency_stop.can_rearm() is False
+
+    emergency_stop.end_persistent_execution(lease_id)
+    assert emergency_stop.can_rearm() is True
+    emergency_stop.rearm_local()
+
+
+def test_begin_persistent_execution_fails_closed_when_latched():
+    emergency_stop.latch(source="test", reason="already latched")
+    with pytest.raises(emergency_stop.EmergencyStopActive):
+        emergency_stop.begin_persistent_execution(kind="managed_process", label="p-late")
+    emergency_stop.rearm_local()
+
+
+def test_begin_persistent_execution_fails_closed_on_stale_epoch():
+    stale_epoch = emergency_stop.current_epoch()
+    emergency_stop.latch(source="test", reason="advance epoch")
+    emergency_stop.rearm_local()
+    with pytest.raises(emergency_stop.StaleExecution):
+        emergency_stop.begin_persistent_execution(
+            kind="managed_process", label="p-stale", expected_epoch=stale_epoch,
+        )
+
+
+def test_end_persistent_execution_is_idempotent():
+    lease_id = emergency_stop.begin_persistent_execution(kind="managed_process", label="p-dup")
+    emergency_stop.end_persistent_execution(lease_id)
+    emergency_stop.end_persistent_execution(lease_id)  # must not raise
+    assert lease_id not in emergency_stop._executions
+
+
+def test_end_persistent_execution_unknown_lease_is_a_safe_noop():
+    emergency_stop.end_persistent_execution("never-existed")  # must not raise

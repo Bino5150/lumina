@@ -432,6 +432,101 @@ def test_command_status_no_emergency_block_when_not_latched():
 
 
 # ---------------------------------------------------------------------------
+# CODING-04A1 -- process-manager emergency cascade wiring
+# ---------------------------------------------------------------------------
+
+def test_process_manager_kill_all_comes_after_latch_and_after_existing_steps(monkeypatch):
+    order = []
+
+    real_latch = emergency_stop.latch
+    monkeypatch.setattr(emergency_stop, "latch", lambda **kw: (order.append("latch"), real_latch(**kw))[1])
+
+    import core.task_queue as task_queue_module
+    monkeypatch.setattr(task_queue_module, "cancel_all_scheduled", lambda: (order.append("cancel_scheduled"), [])[1])
+
+    import comms.telegram_bridge as bridge_module
+    monkeypatch.setattr(bridge_module, "request_stop_bridge", lambda: (order.append("telegram_stop"), False)[1])
+    monkeypatch.setattr(bridge_module, "is_running", lambda: False)
+
+    import core.process_manager as process_manager_module
+    monkeypatch.setattr(process_manager_module, "emergency_kill_all", lambda: (order.append("process_manager_kill"), 0)[1])
+
+    fake = _window_fake()
+    LuminaWindow._trigger_emergency_stop(fake, source="test")
+
+    assert order[0] == "latch"
+    assert order.index("latch") < order.index("process_manager_kill")
+    assert order.index("cancel_scheduled") < order.index("process_manager_kill")
+    assert order.index("telegram_stop") < order.index("process_manager_kill")
+
+    emergency_stop.rearm_local()
+
+
+def test_repeated_emergency_activation_safe_with_process_manager_wired(monkeypatch):
+    import core.task_queue as task_queue_module
+    monkeypatch.setattr(task_queue_module, "cancel_all_scheduled", lambda: [])
+    import comms.telegram_bridge as bridge_module
+    monkeypatch.setattr(bridge_module, "request_stop_bridge", lambda: False)
+    monkeypatch.setattr(bridge_module, "is_running", lambda: False)
+
+    import core.process_manager as process_manager_module
+    kill_calls = []
+    monkeypatch.setattr(process_manager_module, "emergency_kill_all", lambda: kill_calls.append(1) or 0)
+
+    fake = _window_fake()
+    LuminaWindow._trigger_emergency_stop(fake, source="test")
+    LuminaWindow._trigger_emergency_stop(fake, source="test")
+    LuminaWindow._trigger_emergency_stop(fake, source="test")  # must not raise, no duplicate authority changes
+
+    assert kill_calls == [1, 1, 1]
+    emergency_stop.rearm_local()
+
+
+def test_emergency_cascade_reaches_a_real_managed_process(monkeypatch):
+    """Integration proof (not mocked): a real managed process launched via
+    core.process_manager is actually terminated by the real OH SHIT
+    cascade, exactly like tests/test_process_manager.py's own race tests
+    prove at the manager level -- this test proves the UI wiring itself
+    is the thing that reaches it."""
+    import core.task_queue as task_queue_module
+    monkeypatch.setattr(task_queue_module, "cancel_all_scheduled", lambda: [])
+    import comms.telegram_bridge as bridge_module
+    monkeypatch.setattr(bridge_module, "request_stop_bridge", lambda: False)
+    monkeypatch.setattr(bridge_module, "is_running", lambda: False)
+
+    import core.process_manager as process_manager_module
+    process_manager_module._reset_for_tests()
+
+    pid = process_manager_module.launch("sleep 30", cwd="/tmp")
+    try:
+        fake = _window_fake()
+        LuminaWindow._trigger_emergency_stop(fake, source="test")
+
+        deadline = time.time() + 5.0
+        snap = process_manager_module.get_job_snapshot(pid)
+        while time.time() < deadline and snap["status"] == "running":
+            time.sleep(0.05)
+            snap = process_manager_module.get_job_snapshot(pid)
+        assert snap["status"] == "emergency_killed"
+    finally:
+        process_manager_module._reset_for_tests()
+        emergency_stop.rearm_local()
+
+
+def test_no_model_facing_process_tool_registered():
+    """CODING-04A1 must finish with zero new model path capable of
+    launching a persistent process -- start_process/read_process/
+    send_process_input/stop_process/list_processes are all deferred to
+    CODING-04A2, after independent safety review."""
+    import core.process_manager as process_manager_module
+    forbidden = {"start_process", "read_process", "send_process_input",
+                 "stop_process", "list_processes"}
+    for name in forbidden:
+        assert not hasattr(process_manager_module, f"register_{name}")
+    assert not hasattr(process_manager_module, "register_process_tools")
+
+
+# ---------------------------------------------------------------------------
 # Part H (auto-compaction) / R9 -- epoch captured before the daemon thread
 # starts; admission failure preserves the pending batch untouched; a
 # mid-flight latch discards the stale summary before the Palace write.
