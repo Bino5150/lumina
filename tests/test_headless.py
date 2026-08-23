@@ -11,6 +11,108 @@ import threading
 import time
 import types
 import core.headless as headless
+import pytest
+
+
+# ── CODING-06R.1 Repair A: cached-agent owner authority ────────────────────
+#
+# get_headless_agent()'s force_tools_profile branch used to apply the
+# CALL-TIME owner argument to an already-cached agent's registry, instead
+# of the cached agent's own (immutable) agent.owner. A cache-hit call with
+# owner=True for a channel that was genuinely established as owner=False
+# could therefore re-enable owner-only tools (run_tests,
+# save_coding_checkpoint, read_coding_checkpoint, ...) on that non-owner's
+# registry even though agent.owner itself never changed -- confirmed 06R
+# privilege-elevation finding. Mirrors core/agent.py's apply_persona(),
+# which already gates its own apply_tool_profile() call on self.owner
+# rather than any external argument.
+class TestCachedOwnerAuthority:
+    @pytest.fixture(autouse=True)
+    def _isolated_cache(self):
+        saved = (dict(headless._agents), dict(headless._last_used), dict(headless._is_owner))
+        headless._agents.clear()
+        headless._last_used.clear()
+        headless._is_owner.clear()
+        yield
+        headless._agents.clear()
+        headless._last_used.clear()
+        headless._is_owner.clear()
+        headless._agents.update(saved[0])
+        headless._last_used.update(saved[1])
+        headless._is_owner.update(saved[2])
+
+    def test_non_owner_cache_hit_with_mismatched_owner_true_stays_non_owner(self):
+        from core.tool_profiles import OWNER_ONLY_TOOLS
+        channel = "test-cached-owner-mismatch-nonowner"
+        agent = headless.get_headless_agent(channel, owner=False)
+        assert agent.owner is False
+
+        agent2 = headless.get_headless_agent(
+            channel, owner=True, force_tools_profile="Coding",
+        )
+        assert agent2 is agent, "cache hit must return the same instance"
+        assert agent.owner is False, "agent.owner must never be mutated by a later call"
+
+        enabled = set(agent.registry.list_enabled())
+        for tool in ("run_tests", "save_coding_checkpoint", "read_coding_checkpoint"):
+            assert tool not in enabled, (
+                f"{tool} was enabled on a genuine non-owner's cached agent via a "
+                f"mismatched call-time owner=True argument"
+            )
+        assert enabled.isdisjoint(OWNER_ONLY_TOOLS)
+
+    def test_owner_cache_hit_with_mismatched_owner_false_not_demoted(self):
+        channel = "test-cached-owner-mismatch-owner"
+        agent = headless.get_headless_agent(channel, owner=True)
+        assert agent.owner is True
+
+        agent2 = headless.get_headless_agent(
+            channel, owner=False, force_tools_profile="Coding",
+        )
+        assert agent2 is agent
+        assert agent.owner is True, "agent.owner must never be mutated by a later call"
+
+        enabled = set(agent.registry.list_enabled())
+        assert "run_tests" in enabled
+        assert "save_coding_checkpoint" in enabled
+        assert "read_coding_checkpoint" in enabled
+
+    def test_same_owner_repeated_calls_unaffected(self):
+        channel = "test-cached-owner-mismatch-same"
+        agent = headless.get_headless_agent(channel, owner=False)
+        agent2 = headless.get_headless_agent(
+            channel, owner=False, force_tools_profile="Coding",
+        )
+        assert agent2 is agent
+        enabled = set(agent.registry.list_enabled())
+        assert "run_python" in enabled  # Coding profile still applies for a real non-owner
+        assert "run_tests" not in enabled  # but its owner-only member stays stripped
+
+    def test_owner_mismatch_logs_but_does_not_raise(self, capsys):
+        channel = "test-cached-owner-mismatch-log"
+        headless.get_headless_agent(channel, owner=False)
+        headless.get_headless_agent(channel, owner=True, force_tools_profile="Coding")
+        out = capsys.readouterr().out
+        assert channel in out
+        assert "owner" in out.lower()
+
+    def test_fresh_construction_owner_true_unaffected(self):
+        channel = "test-cached-owner-mismatch-fresh-owner"
+        agent = headless.get_headless_agent(
+            channel, owner=True, force_tools_profile="Coding",
+        )
+        assert agent.owner is True
+        enabled = set(agent.registry.list_enabled())
+        assert "run_tests" in enabled
+
+    def test_fresh_construction_owner_false_unaffected(self):
+        channel = "test-cached-owner-mismatch-fresh-guest"
+        agent = headless.get_headless_agent(
+            channel, owner=False, force_tools_profile="Coding",
+        )
+        assert agent.owner is False
+        enabled = set(agent.registry.list_enabled())
+        assert "run_tests" not in enabled
 
 
 def test_idle_callback_fires_after_lock_released(monkeypatch):

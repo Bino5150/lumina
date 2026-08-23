@@ -11,6 +11,7 @@ posture. No bypass parameter, by design — see MB-33.
 
 from collections.abc import Sequence
 import re
+import shlex
 
 # Each pattern: (compiled regex, human-readable reason)
 _DENYLIST = [
@@ -41,6 +42,25 @@ def check_command(command: str) -> str | None:
     for pattern, reason in _DENYLIST:
         if pattern.search(command):
             return reason
+
+    # CODING-06R.1: the regexes above catch a contiguous "-f"/"-D"/"--force"
+    # token but miss a combined short-flag spelling like "-uf" (set-upstream
+    # + force) or "-fD" (force + delete) -- confirmed 06R bypass. Reuses the
+    # exact same combined/reordered-short-flag-aware parser check_argv
+    # already relies on, applied to each Git invocation found after a
+    # best-effort shell-string tokenization, rather than widening the regex
+    # with more naive substring matching.
+    reason = _git_command_reason(command)
+    if reason:
+        return reason
+
+    # CODING-06R.1: none of the patterns above have any Windows-native
+    # coverage -- on a Windows host this function provides zero protection
+    # against rd/rmdir, del/erase, format, or PowerShell Remove-Item.
+    reason = _windows_destructive_reason(command)
+    if reason:
+        return reason
+
     return None
 
 
@@ -159,6 +179,148 @@ def _git_subcommand(argv):
     return None, []
 
 
+def _git_catastrophic_reason(argv) -> str | None:
+    """Shared by check_argv (direct) and check_command (after best-effort
+    shell-string tokenization, see _git_command_reason below) so a Git
+    catastrophic form is decided identically by both guardrail entry
+    points instead of drifting into two separately-maintained rules.
+    argv[0] must be the git executable itself; argv[1:] are its own args.
+    """
+    subcommand, subargs = _git_subcommand(argv)
+    if subcommand == "push" and (
+        any(arg == "--force" or arg.startswith("--force=")
+            or arg.startswith("--force-with-lease") for arg in subargs)
+        or _has_short_flag(subargs, "f")
+    ):
+        return "force push"
+    if subcommand == "reset" and any(
+        arg == "--hard" or arg.startswith("--hard=") for arg in subargs
+    ):
+        return "git reset --hard (discards uncommitted work)"
+    if subcommand == "clean" and (
+        "--force" in subargs or _has_short_flag(subargs, "f")
+    ):
+        return "git clean with force flag (deletes untracked files)"
+    if subcommand == "branch" and _has_short_flag(subargs, "D"):
+        return "git branch -D (force delete, discards unmerged commits)"
+    return None
+
+
+# CODING-06R.1: splits a raw shell string on chaining/pipe operators (&&,
+# ||, ;, |, &, newline) into plain-text segments -- not a real shell
+# parser, deliberately. A segment boundary inside a quoted string (e.g. a
+# commit message containing a literal ";") is not recognized; that can
+# only ever cause a missed split (segments stay too large), never a false
+# one, which matches this module's existing backstop-not-sandbox posture.
+_SHELL_CHAIN_SPLIT_RE = re.compile(r"&&|\|\||[;|&\n]")
+
+
+def _shell_chain_segments(command: str):
+    return [segment for segment in _SHELL_CHAIN_SPLIT_RE.split(command) if segment.strip()]
+
+
+def _git_command_reason(command: str) -> str | None:
+    """check_command's Git structural pass: find every "git" token inside
+    each chain segment (git need not be the segment's first word --
+    "sudo git push -f" is real usage) and decide it exactly like
+    check_argv does. shlex, not str.split(), so a quoted commit message
+    containing "-f" or "-D" is one token, not several -- an unparsable
+    segment (unbalanced quotes) is skipped rather than raising, since this
+    remains a backstop and the pre-existing _DENYLIST regexes above already
+    ran unconditionally regardless of what happens here.
+    """
+    for segment in _shell_chain_segments(command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        for index, token in enumerate(tokens):
+            if _executable_basename(token) == "git":
+                reason = _git_catastrophic_reason(tokens[index:])
+                if reason:
+                    return reason
+    return None
+
+
+# CODING-06R.1: narrow Windows-native catastrophic-command backstop, same
+# granularity as the existing POSIX rm/dd/mkfs entries above (root or
+# wildcard-broad targets only -- an ordinary `rd /s build\output` or
+# `del report.txt` is untouched, per module docstring: backstop, not a
+# sandbox). Reached both directly (a raw command string spawned on a
+# Windows host by core/process_control.py's _spawn_windows) and via
+# check_argv's _inline_shell_command() delegation for `cmd /c ...` /
+# `powershell|pwsh -Command ...`, since both route the extracted inline
+# text through check_command().
+_WINDOWS_DESTRUCTIVE_EXECUTABLES = {"rd", "rmdir", "del", "erase", "format", "remove-item", "ri"}
+
+
+def _windows_drive_target(token: str) -> bool:
+    stripped = token.strip("\"'")
+    return bool(re.fullmatch(r"[A-Za-z]:\\?", stripped))
+
+
+def _windows_broad_target(token: str) -> bool:
+    stripped = token.strip("\"'")
+    if _is_root_target(stripped):
+        return True
+    return stripped.endswith("*")
+
+
+def _windows_destructive_reason_for(executable: str, args) -> str | None:
+    flags = [a for a in args if a.startswith(("/", "-"))]
+    targets = [a for a in args if not a.startswith(("/", "-"))]
+    flags_casefold = {a.casefold() for a in flags}
+
+    if executable in {"rd", "rmdir"}:
+        # /S is structurally required here -- unlike `del`, Windows `rd`
+        # without it can only ever remove an already-empty directory, so a
+        # bare `rd C:\` targeting a populated root is not itself
+        # catastrophic; it just fails.
+        if "/s" in flags_casefold and any(_windows_broad_target(t) for t in targets):
+            return "Windows recursive directory delete of a root or wildcard-broad target"
+
+    if executable in {"del", "erase"}:
+        # Mirrors the POSIX rm entries' looser gate: any one of force,
+        # recurse, or quiet (which suppresses the wildcard-delete
+        # confirmation prompt, effectively making it non-interactive)
+        # alongside a root/wildcard target is treated as destructive intent.
+        if flags_casefold & {"/f", "/s", "/q"} and any(_windows_broad_target(t) for t in targets):
+            return "Windows force/recursive file delete of a root or wildcard-broad target"
+
+    if executable == "format" and any(_windows_drive_target(t) for t in targets):
+        return "Windows drive format"
+
+    if executable in {"remove-item", "ri"}:
+        if "-recurse" in flags_casefold and "-force" in flags_casefold and any(
+            _windows_broad_target(t) for t in targets
+        ):
+            return "PowerShell Remove-Item -Recurse -Force on a root or wildcard-broad target"
+
+    return None
+
+
+def _windows_destructive_reason(command: str) -> str | None:
+    """Only the leading word of each chain segment is treated as the
+    executable -- unlike Git, there's no common Windows command-line idiom
+    that prefixes rd/del/format/Remove-Item the way `sudo` prefixes a POSIX
+    command, so scanning every token position would only add false-positive
+    surface (e.g. the bare word "format" appearing as an unrelated argument
+    elsewhere in the line) without catching any real additional case.
+    Plain whitespace split, not shlex -- shlex's POSIX backslash-escaping
+    would mangle a literal Windows path (C:\\Users\\... -> CUsers...).
+    """
+    for segment in _shell_chain_segments(command):
+        tokens = segment.split()
+        if not tokens:
+            continue
+        executable = _executable_basename(tokens[0])
+        if executable in _WINDOWS_DESTRUCTIVE_EXECUTABLES:
+            reason = _windows_destructive_reason_for(executable, tokens[1:])
+            if reason:
+                return reason
+    return None
+
+
 def _sudo_command(argv) -> str | None:
     args = argv[1:]
     options_with_value = {
@@ -246,23 +408,9 @@ def check_argv(argv) -> str | None:
             return "recursive world-writable on root"
 
     if executable == "git":
-        subcommand, subargs = _git_subcommand(argv)
-        if subcommand == "push" and (
-            any(arg == "--force" or arg.startswith("--force=")
-                or arg.startswith("--force-with-lease") for arg in subargs)
-            or _has_short_flag(subargs, "f")
-        ):
-            return "force push"
-        if subcommand == "reset" and any(
-            arg == "--hard" or arg.startswith("--hard=") for arg in subargs
-        ):
-            return "git reset --hard (discards uncommitted work)"
-        if subcommand == "clean" and (
-            "--force" in subargs or _has_short_flag(subargs, "f")
-        ):
-            return "git clean with force flag (deletes untracked files)"
-        if subcommand == "branch" and _has_short_flag(subargs, "D"):
-            return "git branch -D (force delete, discards unmerged commits)"
+        reason = _git_catastrophic_reason(argv)
+        if reason:
+            return reason
 
     if executable == "gh":
         lowered = [arg.casefold() for arg in args]

@@ -126,6 +126,18 @@ def get_headless_agent(channel_id: str, owner: bool,
     dict is also passed, its own "tools_profile"/"tools_enabled" keys are
     NOT trusted for tool gating when force_tools_profile is set — only its
     identity fields get applied. See comms/discord_bridge.py.
+
+    owner authority: a cached agent's own agent.owner (fixed at
+    construction) is what gates its tools, always — a later call's own
+    `owner` argument is used only to construct a brand-new agent on a
+    cache miss and is otherwise ignored for tool-profile application on a
+    cache hit. Mirrors core/agent.py's apply_persona(), which already
+    gates its own tool-profile application on self.owner rather than any
+    external argument. Without this, a call-time owner=True for an
+    existing owner=False channel could re-enable owner-only tools
+    (run_tests, save_coding_checkpoint, ...) on that channel's cached
+    registry even though the agent's actual authority never changed —
+    CODING-06R's confirmed cache-hit privilege-elevation finding.
     """
     with _lock:
         _reap_idle()
@@ -147,8 +159,13 @@ def get_headless_agent(channel_id: str, owner: bool,
         agent = _agents[channel_id]
         if force_tools_profile:
             from core.tool_profiles import apply_tool_profile
+            if owner != agent.owner:
+                print(f"[HEADLESS] get_headless_agent(channel_id={channel_id!r}) called "
+                      f"with owner={owner} but the cached agent's authoritative owner is "
+                      f"{agent.owner} — using the cached agent's own owner for tool-profile "
+                      f"gating; the mismatched call-time argument is ignored.", flush=True)
             apply_tool_profile(agent.registry, profile_name=force_tools_profile,
-                                tools_enabled=None, owner=owner)
+                                tools_enabled=None, owner=agent.owner)
         return agent
 
 

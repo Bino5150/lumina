@@ -169,6 +169,19 @@ class _Job:
         # finalize time -- set by _terminate_job(), never overwritten by a
         # later, redundant stop request racing against the first.
         self.stop_reason = None
+        # CODING-06R.1: set exactly once, under lifecycle_lock, the instant
+        # _watch_job() itself observes process_control.tree_is_alive() go
+        # False -- i.e. the managed tree (leader AND every descendant) is
+        # confirmed dead, not merely that the leader exited (see
+        # _watch_job's own docstring on that distinction). This closes the
+        # window between "tree is genuinely dead" and "job.status has been
+        # stamped": _terminate_job() checks this flag and refuses to set
+        # stop_reason once it's True, so a cancel/timeout/stop that arrives
+        # after natural death was observed -- but before the watcher has
+        # finished draining streams / retiring control / stamping status --
+        # can no longer overwrite a natural PASS/FAIL with
+        # cancelled/timed_out/interrupted. Confirmed 06R misclassification.
+        self.tree_dead_observed = False
         self.stdout_buffer = _StreamBuffer(STREAM_BUFFER_MAX_CHARS)
         self.stderr_buffer = _StreamBuffer(STREAM_BUFFER_MAX_CHARS)
         self.stdout_thread = None
@@ -273,6 +286,16 @@ def _watch_job(job: "_Job"):
     while process_control.tree_is_alive(job.control_metadata):
         time.sleep(_TREE_POLL_INTERVAL_SECONDS)
 
+    # The precise instant natural death is observed -- CODING-06R.1. Every
+    # racing _terminate_job() call checks this flag under the same lock
+    # before touching stop_reason, so nothing after this line can still be
+    # reclassified as cancelled/timed_out/stopped by a late-arriving
+    # request. Deliberately set here, before release_control()/stream
+    # joins/status stamping below -- those steps only finish finalization,
+    # they don't decide it.
+    with job.lifecycle_lock:
+        job.tree_dead_observed = True
+
     # The manager never re-uses a control identity once the underlying
     # tree/group is confirmed empty -- retiring it here (exactly once,
     # only now) is what makes it safe for a PGID/Job-Object-handle number
@@ -309,6 +332,15 @@ def _terminate_job(job: "_Job", reason: str):
     actually observes death (see _watch_job)."""
     with job.lifecycle_lock:
         if job.status != "running":
+            return
+        if job.tree_dead_observed:
+            # CODING-06R.1: the watcher has already observed the managed
+            # tree die naturally -- it is mid-finalization (stream drain /
+            # control retirement / status stamp still pending) but the
+            # outcome itself is no longer this function's to decide. Do
+            # not set stop_reason and do not request termination of a tree
+            # that is already confirmed dead; let the watcher finish
+            # finalizing the natural result untouched.
             return
         if job.stop_reason is None:
             job.stop_reason = reason

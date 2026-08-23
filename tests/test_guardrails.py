@@ -76,6 +76,112 @@ class TestCheckCommandBlocked:
         assert result == expected_reason, f"Expected '{expected_reason}', got '{result}' for: {command}"
 
 
+# ── CODING-06R.1 Repair C: combined/reordered Git short flags in check_command ──
+#
+# The pre-existing regexes above only match a contiguous "-f"/"-D" token or
+# "--force" — "git push -uf origin main" (set-upstream + force combined)
+# and "git branch -fD name" (force + delete combined) both slipped past
+# them while check_argv's structural parser already caught the argv
+# equivalents. check_command now runs the exact same combined-short-flag
+# parser after a best-effort shell-string tokenization.
+class TestCheckCommandCombinedGitShortFlags:
+    @pytest.mark.parametrize("command, expected_reason", [
+        ("git push -uf origin main", "force push"),
+        ("git push -fu origin main", "force push"),
+        ("git push --force-with-lease origin main", "force push"),
+        ("git branch -fD name", "git branch -D (force delete, discards unmerged commits)"),
+        ("git branch -Df name", "git branch -D (force delete, discards unmerged commits)"),
+        ("cd /tmp && git push -uf origin main", "force push"),
+        ("sudo git push -uf origin main", "force push"),
+        ("echo start; git branch -fD stale-feature", "git branch -D (force delete, discards unmerged commits)"),
+    ])
+    def test_combined_short_flags_blocked(self, command, expected_reason):
+        result = check_command(command)
+        assert result is not None, f"Expected block for: {command}"
+        assert result == expected_reason, f"Expected '{expected_reason}', got '{result}' for: {command}"
+
+    @pytest.mark.parametrize("command", [
+        "git push origin main",
+        "git push -u origin main",
+        "git branch -d merged-feature",
+        "git branch -u upstream/main",
+        "git commit -m 'fix -f mentions and -D flags in prose'",
+        "git checkout -b feature -f",  # -f on checkout, not push/branch/reset/clean
+        "git status -uf",  # -uf on status is meaningless noise, not push
+    ])
+    def test_combined_short_flags_no_false_positive(self, command):
+        result = check_command(command)
+        assert result is None, f"False positive — '{command}' was blocked: {result}"
+
+
+# ── CODING-06R.1 Repair D: Windows-native destructive commands ────────────
+#
+# check_command previously had zero Windows-native coverage at all — on a
+# Windows host (core/process_control.py's _spawn_windows runs a raw shell
+# string through cmd.exe) rd/rmdir, del/erase, format, and PowerShell
+# Remove-Item -Recurse -Force all reached the OS completely unchecked.
+class TestCheckCommandWindowsDestructive:
+    @pytest.mark.parametrize("command, expected_reason", [
+        ("rd /s /q C:\\", "Windows recursive directory delete of a root or wildcard-broad target"),
+        ("rmdir /s C:\\*", "Windows recursive directory delete of a root or wildcard-broad target"),
+        ("rd /S \\\\server\\share\\", "Windows recursive directory delete of a root or wildcard-broad target"),
+        ("del /f /s /q C:\\*", "Windows force/recursive file delete of a root or wildcard-broad target"),
+        ("erase /q C:\\*", "Windows force/recursive file delete of a root or wildcard-broad target"),
+        ("format C:", "Windows drive format"),
+        ("format D: /Q", "Windows drive format"),
+        ('Remove-Item -Recurse -Force C:\\', "PowerShell Remove-Item -Recurse -Force on a root or wildcard-broad target"),
+        ('Remove-Item -Recurse -Force C:\\*', "PowerShell Remove-Item -Recurse -Force on a root or wildcard-broad target"),
+        ("cd C:\\tmp && rd /s /q C:\\", "Windows recursive directory delete of a root or wildcard-broad target"),
+    ])
+    def test_windows_destructive_blocked(self, command, expected_reason):
+        result = check_command(command)
+        assert result is not None, f"Expected block for: {command}"
+        assert result == expected_reason, f"Expected '{expected_reason}', got '{result}' for: {command}"
+
+    @pytest.mark.parametrize("command", [
+        "rd myfolder",
+        "rd /s build\\output",
+        "rmdir /s project\\node_modules",
+        "del report.txt",
+        "del /q temp\\*.log",
+        "erase old_notes.txt",
+        "format",  # no drive target — just prints usage/prompts
+        "Remove-Item .\\build",
+        "Remove-Item -Recurse -Force .\\build",  # broad flags, narrow relative target
+        "Remove-Item -Force C:\\temp\\stale.txt",  # force but no -Recurse
+        "dir C:\\",
+        "type C:\\Windows\\System32\\drivers\\etc\\hosts",
+    ])
+    def test_windows_destructive_no_false_positive(self, command):
+        result = check_command(command)
+        assert result is None, f"False positive — '{command}' was blocked: {result}"
+
+
+class TestCheckArgvWindowsDestructiveDelegation:
+    """cmd /c ... and powershell/pwsh -Command ... reach the same Windows
+    checks through check_argv's existing inline-shell delegation to
+    check_command."""
+
+    @pytest.mark.parametrize("argv, expected_reason", [
+        (["cmd", "/c", "rd /s /q C:\\"],
+         "Windows recursive directory delete of a root or wildcard-broad target"),
+        (["cmd.exe", "/C", "del /f /s /q C:\\*"],
+         "Windows force/recursive file delete of a root or wildcard-broad target"),
+        (["powershell", "-Command", "Remove-Item -Recurse -Force C:\\"],
+         "PowerShell Remove-Item -Recurse -Force on a root or wildcard-broad target"),
+        (["pwsh", "-c", "format C:"], "Windows drive format"),
+    ])
+    def test_blocked(self, argv, expected_reason):
+        assert check_argv(argv) == expected_reason
+
+    @pytest.mark.parametrize("argv", [
+        ["cmd", "/c", "rd myfolder"],
+        ["powershell", "-Command", "Remove-Item .\\build -Recurse -Force"],
+    ])
+    def test_allowed(self, argv):
+        assert check_argv(argv) is None
+
+
 class TestCheckCommandAllowed:
     """Legitimate commands must pass cleanly — no false positives."""
 

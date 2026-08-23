@@ -1624,6 +1624,152 @@ def test_cancellation_set_after_normal_completion_cannot_rewrite_history(tmp_pat
     assert first["returncode"] == second["returncode"] == 0
 
 
+# ── CODING-06R.1 Repair B: natural completion must win over a late stop ───
+#
+# Confirmed 06R race: _watch_job() observes the managed tree naturally dead
+# (process_control.tree_is_alive() goes False) but has not yet finished
+# finalizing -- release_control(), the stream-thread joins, and the final
+# status stamp are all still pending. A cancel/timeout/stop arriving in
+# that exact window used to be able to stamp cancelled/timed_out/stopped
+# onto a job that had actually completed naturally. job.tree_dead_observed
+# (set under job.lifecycle_lock the instant that observation happens, in
+# _watch_job, before release_control()) closes the window: _terminate_job()
+# now refuses to touch stop_reason once it's set. These tests pin the
+# window open deterministically by gating process_control.release_control,
+# which core/process_manager.py only ever calls immediately after setting
+# the flag -- unlike a real race, timing luck is not involved.
+
+def _pin_natural_death_window(job):
+    """Monkeypatches release_control so it blocks on the returned `allow`
+    event as soon as this job's tree is confirmed naturally dead. Caller
+    must use this inside a pytest.MonkeyPatch.context() and set `allow`
+    before the context exits (in a finally), or the watcher thread leaks."""
+    real_release_control = process_control.release_control
+    entered = threading.Event()
+    allow = threading.Event()
+
+    def gated_release_control(control_metadata):
+        if control_metadata is job.control_metadata:
+            entered.set()
+            assert allow.wait(timeout=5.0)
+        return real_release_control(control_metadata)
+
+    return gated_release_control, entered, allow
+
+
+def test_late_request_stop_after_natural_tree_death_cannot_overwrite_result(tmp_path):
+    process_id = process_manager.launch("true", cwd=str(tmp_path))
+    with process_manager._registry_lock:
+        job = process_manager._registry[process_id]
+    gated, entered, allow = _pin_natural_death_window(job)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(process_control, "release_control", gated)
+        try:
+            assert entered.wait(timeout=5.0), "watcher never reached the natural-death window"
+            with job.lifecycle_lock:
+                assert job.tree_dead_observed is True
+                assert job.status == "running", (
+                    "the race window requires status to still read running -- "
+                    "finalization must not have raced ahead of this assertion"
+                )
+
+            process_manager.request_stop(process_id)
+
+            with job.lifecycle_lock:
+                assert job.stop_reason is None, (
+                    "a stop arriving after natural death was observed must not stamp "
+                    "a stop_reason -- doing so would overwrite the natural PASS/FAIL"
+                )
+        finally:
+            allow.set()
+
+    snap = _wait_for_status(process_id, timeout=10.0)
+    assert snap["status"] == "exited"
+    assert snap["termination_reason"] is None
+    assert snap["returncode"] == 0
+
+
+def test_late_cancel_after_natural_tree_death_cannot_overwrite_result(tmp_path):
+    process_id = process_manager.launch_argv(
+        _python_argv("print('done', flush=True)"), cwd=str(tmp_path)
+    )
+    with process_manager._registry_lock:
+        job = process_manager._registry[process_id]
+    gated, entered, allow = _pin_natural_death_window(job)
+    cancel_event = threading.Event()
+    result_holder = {}
+
+    def _wait():
+        result_holder["result"] = process_manager.wait_for_completion(
+            process_id, timeout=10, cancel_event=cancel_event
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(process_control, "release_control", gated)
+        try:
+            assert entered.wait(timeout=5.0), "watcher never reached the natural-death window"
+
+            waiter = threading.Thread(target=_wait)
+            waiter.start()
+            # wait_for_completion polls at a 0.05s cadence -- give it a real
+            # chance to observe cancel_event and attempt termination while
+            # the natural-death window is still held open below.
+            time.sleep(0.2)
+            cancel_event.set()
+            time.sleep(0.2)
+
+            with job.lifecycle_lock:
+                assert job.stop_reason is None, (
+                    "cancel arriving after natural death was observed must not stamp "
+                    "a stop_reason -- doing so would overwrite the natural PASS/FAIL"
+                )
+        finally:
+            allow.set()
+        waiter.join(timeout=10)
+
+    assert result_holder["result"]["status"] == "exited"
+    assert result_holder["result"]["termination_reason"] is None
+    assert result_holder["result"]["returncode"] == 0
+
+
+def test_late_timeout_after_natural_tree_death_cannot_overwrite_result(tmp_path):
+    process_id = process_manager.launch_argv(
+        _python_argv("print('done', flush=True)"), cwd=str(tmp_path)
+    )
+    with process_manager._registry_lock:
+        job = process_manager._registry[process_id]
+    gated, entered, allow = _pin_natural_death_window(job)
+    result_holder = {}
+
+    def _wait():
+        result_holder["result"] = process_manager.wait_for_completion(process_id, timeout=0.1)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(process_control, "release_control", gated)
+        try:
+            assert entered.wait(timeout=5.0), "watcher never reached the natural-death window"
+
+            waiter = threading.Thread(target=_wait)
+            waiter.start()
+            # The 0.1s deadline above expires well within this sleep, while
+            # the natural-death window is still held open.
+            time.sleep(0.4)
+
+            with job.lifecycle_lock:
+                assert job.stop_reason is None, (
+                    "a timeout expiring after natural death was observed must not stamp "
+                    "a stop_reason -- doing so would overwrite the natural PASS/FAIL"
+                )
+        finally:
+            allow.set()
+        waiter.join(timeout=10)
+
+    assert result_holder["result"]["status"] == "exited"
+    assert result_holder["result"]["termination_reason"] is None
+    assert result_holder["result"]["returncode"] == 0
+
+
 def test_internal_visibility_blocks_every_existing_model_lookup_and_control(tmp_path):
     internal_id = process_manager.launch_argv(
         _python_argv("import time; time.sleep(30)"), cwd=str(tmp_path)
