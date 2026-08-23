@@ -18,6 +18,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Optional, Sequence
 
 import core.coding_checkpoint as checkpoint_store
+import core.coding_validation_evidence as validation_evidence
 from core.project_context import ProjectContext, load_project_binding
 
 
@@ -25,6 +26,25 @@ GIT_TIMEOUT_SECONDS = 5
 MAX_GIT_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_GIT_STDERR_BYTES = 16 * 1024
 FILE_READ_CHUNK_BYTES = 128 * 1024
+
+# CODING-06A3 corrective 1: the validation-state fingerprint is a narrower,
+# validation-specific layer on top of CODING-05A2's observation, not a
+# replacement for its target/state architecture (see _validation_state_
+# fingerprint() below). Versioned independently of _TARGET_IDENTITY_ALGO_
+# VERSION and the general state reference document so either can evolve
+# without the other.
+#
+# v2 (CODING-06A3 final verification corrective): folded git_state.
+# status_digest into the hashed document. v1 hashed only HEAD/branch/
+# detached/unborn/operation_state plus dirty-path *content* bytes, keyed
+# by deduplicated path -- never by XY status -- so a staged edit and the
+# byte-identical unstaged edit it came from produced the same fingerprint.
+# Bumped so a v1 fingerprint is never compared as equal to a v2 one purely
+# by coincidence of encoding; nothing persists validation_state_ref across
+# a schema change (it is recomputed live every observation), so there is
+# no stored-row migration concern here.
+_VALIDATION_FINGERPRINT_ALGO_VERSION = 2
+MAX_SYMLINK_TARGET_CHARS = 4096
 
 FRESH = "fresh"
 STALE = "stale"
@@ -145,6 +165,8 @@ class LiveObservation:
     relevant_files: tuple
     state_ref: str
     binding_complete: bool
+    validation_state_ref: Optional[str]
+    validation_state_complete: bool
 
     def observation_payload(self) -> dict:
         return {
@@ -211,6 +233,8 @@ class LiveCheckpointRead:
     current: Optional[LiveObservation]
     freshness: FreshnessResult
     validation_applicability: tuple
+    machine_validation_applicability: tuple = ()
+    live_machine_validations: tuple = ()
     metadata: Optional[SafeRowMetadata] = None
 
 
@@ -712,6 +736,140 @@ def _state_reference(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _dirty_path_state(root: str, relative_path: str) -> dict:
+    """One Git-visible dirty or untracked path's content-sensitive state,
+    for the validation fingerprint only (CODING-06A3 corrective 1).
+
+    Mirrors _observe_relevant_file()'s safety properties -- O_NOFOLLOW,
+    lstat before opening a regular file, one retry on an observed mid-read
+    change -- but additionally captures a symlink's own target text. A
+    boolean is_symlink flag (all _observe_relevant_file needs for the
+    general relevant-files feature) cannot see a symlink retarget; the
+    target string is this fingerprint's only content signal for a symlink,
+    and it is read, never followed.
+
+    Terminal states: "content" (regular file, sha256 of its bytes),
+    "symlink" (its own target text, bounded), or "missing" (deleted, or any
+    path that stopped being a regular file/symlink between measurement and
+    read -- deleted/missing is represented structurally, never guessed at).
+    Raises UnstableCapture if a regular file's bytes changed while being
+    hashed and a single retry still observed a change -- fail closed rather
+    than persist a fingerprint that never actually existed at one instant.
+    """
+    candidate = os.path.join(root, *relative_path.split("/"))
+    for attempt in range(2):
+        try:
+            before = os.lstat(candidate)
+        except OSError:
+            return {"path": relative_path, "state": "missing"}
+
+        if stat.S_ISLNK(before.st_mode):
+            try:
+                target = os.readlink(candidate)
+            except OSError:
+                return {"path": relative_path, "state": "missing"}
+            if len(target) > MAX_SYMLINK_TARGET_CHARS:
+                target = target[:MAX_SYMLINK_TARGET_CHARS]
+            return {"path": relative_path, "state": "symlink", "target": target}
+
+        if not stat.S_ISREG(before.st_mode):
+            # Git only ever tracks blobs (regular files or symlinks); any
+            # other entry type showing up as a Git-visible changed path is
+            # unexpected -- fail closed rather than guess at its content.
+            raise UnstableCapture(
+                f"unsupported filesystem entry type for {relative_path!r}"
+            )
+        try:
+            digest = _hash_regular_file_once(candidate, before)
+            return {"path": relative_path, "state": "content", "sha256": digest}
+        except _FileChanged as error:
+            if attempt == 1:
+                raise UnstableCapture(
+                    f"{relative_path!r} changed during validation hashing"
+                ) from error
+    raise AssertionError("unreachable dirty-path retry state")
+
+
+def _validation_state_fingerprint(
+    identity: checkpoint_store.TargetIdentity, git_state: Optional[_GitState]
+) -> tuple:
+    """Content-sensitive fingerprint for machine-evidence binding only.
+
+    CODING-06A3 corrective 1: CODING-05A2's general state_ref is Git-
+    status-classification-sensitive, not content-sensitive -- an already-
+    modified tracked file or an already-untracked file can have its bytes
+    rewritten without status_digest (or therefore state_ref) changing at
+    all, since git status only reports path/XY classification and (for
+    tracked entries) the *index* object id, never the actual current
+    worktree bytes. This function layers a narrower, validation-specific
+    fingerprint on top rather than changing general state_ref's already-
+    persisted (schema_version 1, CODING-05A2) semantics -- see the module
+    docstring reasoning replicated in capture_live_observation().
+
+    CODING-06A3 final verification corrective: content-sensitivity alone is
+    not sufficient -- the *entries* list is keyed by deduplicated path only
+    (never by XY status), and worktree bytes are identical for a path
+    whether it is staged, unstaged, or both ("MM"). Without also folding in
+    git_state.status_digest (CODING-05A2's own index/status-classification
+    digest -- XY code plus HEAD and index blob ids per path), two
+    observations with byte-identical dirty-path content but different
+    index state (an unstaged edit vs. `git add`-ing that exact same edit,
+    or a partially-staged "MM" path vs. a wholly-unstaged one with matching
+    final bytes) would collide onto the same fingerprint. status_digest is
+    included verbatim as an already-computed field, not recomputed or
+    redesigned here.
+
+    Returns (fingerprint_hex_or_None, complete_bool). complete is False
+    (fingerprint None) only when the Git-visible changed-path list itself
+    was truncated (bounded/fail-closed: a partial view of "what changed"
+    cannot honestly stand behind a fingerprint claiming full coverage) --
+    callers must treat that as "cannot certify this state for machine
+    evidence," not as any particular content.
+
+    HEAD anchors all *clean* tracked content (a commit is already content-
+    addressed), so only Git-visible dirty tracked paths and untracked paths
+    need their own bytes measured -- never a full-tree walk. Ignored files
+    stay outside repository state exactly as they already do for status_
+    digest; this never makes them Git-visible on their own.
+    """
+    if git_state is None:
+        document = {
+            "v": _VALIDATION_FINGERPRINT_ALGO_VERSION,
+            "kind": identity.kind,
+            "target_key": identity.target_key,
+        }
+        encoded = json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        return hashlib.sha256(encoded).hexdigest(), True
+
+    if git_state.changed_paths_truncated:
+        return None, False
+
+    dirty_paths = sorted({changed.path for changed in git_state.changed_paths})
+    entries = [
+        _dirty_path_state(identity.canonical_root, path) for path in dirty_paths
+    ]
+    entries.sort(key=lambda item: item["path"])
+
+    document = {
+        "v": _VALIDATION_FINGERPRINT_ALGO_VERSION,
+        "kind": identity.kind,
+        "target_key": identity.target_key,
+        "head": git_state.head,
+        "branch": git_state.branch,
+        "detached": git_state.detached,
+        "unborn": git_state.unborn,
+        "operation_state": list(git_state.operation_state),
+        "status_digest": git_state.status_digest,
+        "entries": entries,
+    }
+    encoded = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), True
+
+
 def capture_live_observation(
     project: ProjectContext, relevant_paths: Sequence[str] = ()
 ) -> LiveObservation:
@@ -746,6 +904,9 @@ def capture_live_observation(
 
         if identity_a == identity_b and git_a == git_b:
             state_ref = _state_reference(identity_b, git_b, relevant_files)
+            validation_state_ref, validation_state_complete = (
+                _validation_state_fingerprint(identity_b, git_b)
+            )
             if git_b is None:
                 return LiveObservation(
                     identity=identity_b,
@@ -763,6 +924,8 @@ def capture_live_observation(
                     relevant_files=relevant_files,
                     state_ref=state_ref,
                     binding_complete=True,
+                    validation_state_ref=validation_state_ref,
+                    validation_state_complete=validation_state_complete,
                 )
             return LiveObservation(
                 identity=identity_b,
@@ -780,6 +943,8 @@ def capture_live_observation(
                 relevant_files=relevant_files,
                 state_ref=state_ref,
                 binding_complete=True,
+                validation_state_ref=validation_state_ref,
+                validation_state_complete=validation_state_complete,
             )
         if attempt == 1:
             raise UnstableCapture("target or repository changed during capture")
@@ -817,6 +982,99 @@ def _bind_reported_validations(reports: Sequence[dict], observation: LiveObserva
     return bound
 
 
+def _machine_validation_label(record: validation_evidence.EvidenceRecord) -> str:
+    if record.scope_key == "full":
+        label = "pytest:full"
+    else:
+        count = len(record.selectors)
+        suffix = "+" if record.selectors_truncated else ""
+        label = f"pytest:{count}{suffix} selector{'s' if count != 1 else ''}"
+    return label[: checkpoint_store.MAX_VALIDATION_LABEL_LEN]
+
+
+def _machine_validation_summary(record: validation_evidence.EvidenceRecord) -> str:
+    counts = record.counts if isinstance(record.counts, dict) else {}
+    summary = (
+        f"passed={counts.get('passed', 0)} failed={counts.get('failed', 0)} "
+        f"errors={counts.get('errors', 0)} collected={counts.get('collected', 0)}"
+    )
+    return summary[: checkpoint_store.MAX_VALIDATION_SUMMARY_LEN]
+
+
+def _machine_validation_dict(record: validation_evidence.EvidenceRecord) -> dict:
+    """Translate one internal EvidenceRecord into the checkpoint store's
+    validation-record shape. This is the ONLY place a validation dict with
+    source == MACHINE_VALIDATION_SOURCE is ever constructed -- always from
+    an EvidenceRecord that itself only ever came from
+    core.coding_validation_evidence.lookup_compatible_evidence(), never
+    from model-visible JSON or caller input."""
+    return {
+        "label": _machine_validation_label(record),
+        "outcome": record.outcome,
+        "source": checkpoint_store.MACHINE_VALIDATION_SOURCE,
+        "exit_code": record.exit_code,
+        "summary": _machine_validation_summary(record),
+        "timestamp": record.created_at,
+        "state_ref": record.state_ref,
+        "binding_complete": True,
+    }
+
+
+def _bind_machine_evidence(project_name: str, observation: LiveObservation) -> list:
+    """Automatic association (CODING-06A3 section 12): looks up durable
+    Lumina-local evidence compatible with THIS exact observation's
+    (project_name, target_key, validation_state_ref) and returns it in
+    checkpoint validation-record shape, newest-per-scope. Evidence is keyed
+    by the content-sensitive validation fingerprint (corrective 1), not the
+    general state_ref -- a lookup with an incomplete fingerprint (bounded
+    changed-path observation was truncated) or a lookup failure both
+    degrade to "no machine evidence this save" rather than blocking the
+    checkpoint save itself -- evidence lookup and checkpoint save are
+    separate truths, same as core.coding_validation_evidence's own
+    persistence failures never blocking a real test result."""
+    if not observation.validation_state_complete or observation.validation_state_ref is None:
+        return []
+    try:
+        records = validation_evidence.lookup_compatible_evidence(
+            project_name=project_name,
+            target_key=observation.identity.target_key,
+            state_ref=observation.validation_state_ref,
+        )
+    except Exception:
+        return []
+    return [
+        _machine_validation_dict(record)
+        for record in records[: checkpoint_store.MAX_MACHINE_VALIDATIONS]
+    ]
+
+
+def _live_machine_validations(project_name: str, current: LiveObservation) -> tuple:
+    """CODING-06A3 corrective 2: the read-time counterpart of
+    _bind_machine_evidence() above -- a fresh lookup against CURRENT
+    measured state, never the checkpoint row's baked machine_validations
+    from whenever it was last saved. This is the sole authority for what
+    read_coding_checkpoint shows as machine evidence: the durable evidence
+    store's newest compatible record per scope wins, full stop. A stale
+    baked PASS can never outrank a newer machine FAIL (or vice versa)
+    because the baked list is never consulted here at all. Fails closed
+    (empty tuple) on an incomplete fingerprint or a lookup error -- never
+    falls back to the baked list, and never raises out to the caller."""
+    if not current.validation_state_complete or current.validation_state_ref is None:
+        return ()
+    try:
+        records = validation_evidence.lookup_compatible_evidence(
+            project_name=project_name,
+            target_key=current.identity.target_key,
+            state_ref=current.validation_state_ref,
+        )
+    except Exception:
+        return ()
+    return tuple(
+        _machine_validation_dict(record)
+        for record in records[: checkpoint_store.MAX_MACHINE_VALIDATIONS]
+    )
+
+
 def save_live_checkpoint(
     project: ProjectContext,
     workflow: dict,
@@ -833,6 +1091,7 @@ def save_live_checkpoint(
         "relevant_files": observation.relevant_file_payload(),
         "changed_paths": observation.changed_path_payload(),
         "validations": _bind_reported_validations(reported_validations, observation),
+        "machine_validations": _bind_machine_evidence(project.name, observation),
         "observation": observation.observation_payload(),
     }
     record = checkpoint_store._save_checkpoint_for_identity(
@@ -914,11 +1173,24 @@ def compare_freshness(
     return FreshnessResult(STALE if reasons else FRESH, tuple(reasons))
 
 
-def _validation_applicability(record, current: LiveObservation) -> tuple:
+def _applicability_for(validations, reference: Optional[str]) -> tuple:
+    """Shared by reported and machine-evidence validations alike: an
+    entry's own recorded state_ref must exactly match the CURRENT
+    reference value for it to apply. Source plays no role in this
+    comparison -- a lumina_local entry goes stale under an unchanged
+    repository exactly the same way a reported one does (CODING-06A3
+    section 21: stale evidence must never present as current, fail closed
+    by omission of 'applies'). `reference` is the caller's current measured
+    value to compare against -- the general state_ref for reported
+    validations, or the content-sensitive validation_state_ref (corrective
+    1) for machine-evidence validations; a None reference (e.g. an
+    incomplete validation fingerprint) never matches anything."""
     results = []
-    for validation in record.validations:
+    for validation in validations:
         complete = validation.get("binding_complete") is True
-        matches = complete and validation.get("state_ref") == current.state_ref
+        matches = (
+            complete and reference is not None and validation.get("state_ref") == reference
+        )
         if not complete:
             reason = "binding_incomplete"
         elif not matches:
@@ -933,6 +1205,14 @@ def _validation_applicability(record, current: LiveObservation) -> tuple:
             reason=reason,
         ))
     return tuple(results)
+
+
+def _validation_applicability(record, current: LiveObservation) -> tuple:
+    return _applicability_for(record.validations, current.state_ref)
+
+
+def _machine_validation_applicability(live_machine_validations, current: LiveObservation) -> tuple:
+    return _applicability_for(live_machine_validations, current.validation_state_ref)
 
 
 def _find_checkpoint_row(project_name: str, identity) -> Optional[object]:
@@ -1027,10 +1307,18 @@ def load_live_checkpoint(project: ProjectContext) -> LiveCheckpointRead:
     relevant_paths = tuple(item["path"] for item in record.relevant_files)
     current = capture_live_observation(project, relevant_paths)
     freshness = compare_freshness(record.observation, record.relevant_files, current)
+    # CODING-06A3 corrective 2: the machine-evidence view shown by a bare
+    # read is always a FRESH lookup against current measured state, never
+    # this row's baked machine_validations from whenever it was last saved
+    # -- see _live_machine_validations()'s docstring for the precedence
+    # rule this implements. No resave, no revision bump: this is read-only.
+    live_machine = _live_machine_validations(project.name, current)
     return LiveCheckpointRead(
         status="ok",
         record=record,
         current=current,
         freshness=freshness,
         validation_applicability=_validation_applicability(record, current),
+        machine_validation_applicability=_machine_validation_applicability(live_machine, current),
+        live_machine_validations=live_machine,
     )

@@ -56,10 +56,20 @@ from typing import Optional
 
 from core.project_context import validate_project_name
 
-SCHEMA_VERSION = 1
-_KNOWN_SCHEMA_VERSIONS = {1}
+SCHEMA_VERSION = 2
+_KNOWN_SCHEMA_VERSIONS = {1, 2}
 _TARGET_IDENTITY_ALGO_VERSION = 1
 _GIT_PROBE_TIMEOUT = 5
+
+# CODING-06A3: schema_version 2 adds the machine_validations envelope key
+# (see _CHECKPOINT_TOP_KEYS below). A v1 row predates it and never has it;
+# _validate_checkpoint() treats an absent key as [] for either version, so
+# old rows keep loading exactly as they always have. Every NEW save (an
+# insert or an update of a loaded v1 row) now writes SCHEMA_VERSION=2 --
+# see _save_checkpoint_for_identity(), unchanged in that respect. A prior
+# Lumina build that only knows _KNOWN_SCHEMA_VERSIONS={1} raises
+# UnsupportedSchema on a v2 row before ever parsing its payload, rather
+# than silently mishandling a machine_validations key it doesn't expect.
 
 # ---------------------------------------------------------------------------
 # Bounds. Deliberately stricter per-field than the ~32 KiB total cap alone
@@ -83,6 +93,7 @@ MAX_VALIDATION_LABEL_LEN = 48
 MAX_VALIDATION_SUMMARY_LEN = 240
 MAX_VALIDATION_STATE_REF_LEN = 100
 MAX_VALIDATION_TIMESTAMP_LEN = 40
+MAX_MACHINE_VALIDATIONS = 8
 MAX_TOTAL_PAYLOAD_BYTES = 32 * 1024
 
 VALID_PHASES = {
@@ -91,9 +102,21 @@ VALID_PHASES = {
 }
 VALID_VALIDATION_OUTCOMES = {"pass", "fail", "error", "skipped"}
 _VALID_VALIDATION_SOURCE = "reported"
+# CODING-06A3: the only other legal validation source, and the only one
+# that means "Lumina itself launched and observed this" rather than "a
+# model said so." Never accepted through save_coding_checkpoint's
+# model-facing path -- see core/coding_checkpoint_observation.py's
+# _bind_reported_validations(), which unconditionally forces "reported"
+# regardless of what a caller supplies. Only
+# core.coding_checkpoint_observation._bind_machine_evidence() ever
+# constructs a validation dict with this source, from an internal
+# core.coding_validation_evidence.EvidenceRecord -- never from a
+# model-visible JSON string.
+MACHINE_VALIDATION_SOURCE = "lumina_local"
 
 _CHECKPOINT_TOP_KEYS = {
-    "workflow", "relevant_files", "changed_paths", "validations", "observation",
+    "workflow", "relevant_files", "changed_paths", "validations",
+    "machine_validations", "observation",
 }
 _WORKFLOW_KEYS = {"task_id", "title", "phase", "slice_id", "summary", "next_steps", "blockers"}
 _PATH_RECORD_KEYS = {"path", "sha256", "missing", "is_symlink"}
@@ -171,6 +194,7 @@ class CheckpointRecord:
     relevant_files: list
     changed_paths: list
     validations: list
+    machine_validations: list
     observation: Optional[dict]
     created_at: str
     updated_at: str
@@ -505,7 +529,7 @@ def _validate_changed_paths(items, where: str) -> list:
     ]
 
 
-def _validate_validation_record(item, where: str) -> dict:
+def _validate_validation_record(item, where: str, *, expected_source: str = _VALID_VALIDATION_SOURCE) -> dict:
     _check_keys(item, _VALIDATION_KEYS, where)
     label = _require_str(item, "label", where, MAX_VALIDATION_LABEL_LEN)
     outcome = _require_str(item, "outcome", where, 20)
@@ -513,9 +537,13 @@ def _validate_validation_record(item, where: str) -> dict:
         _fail(f"{where}.outcome must be one of {sorted(VALID_VALIDATION_OUTCOMES)}, got {outcome!r}")
 
     source = item.get("source")
-    if source != _VALID_VALIDATION_SOURCE:
-        _fail(f"{where}.source must be exactly {_VALID_VALIDATION_SOURCE!r} "
-              f"-- a reported validation is not a verified one")
+    if source != expected_source:
+        reason = (
+            "a reported validation is not a verified one"
+            if expected_source == _VALID_VALIDATION_SOURCE
+            else "machine evidence must originate from Lumina's own execution path"
+        )
+        _fail(f"{where}.source must be exactly {expected_source!r} -- {reason}")
 
     exit_code = item.get("exit_code")
     if exit_code is not None:
@@ -553,6 +581,26 @@ def _validate_validations(items, where: str) -> list:
     if len(items) > MAX_VALIDATIONS:
         _fail(f"{where} exceeds max count {MAX_VALIDATIONS}")
     return [_validate_validation_record(item, f"{where}[{i}]") for i, item in enumerate(items)]
+
+
+def _validate_machine_validations(items, where: str) -> list:
+    """Same shape as _validate_validations(), but every entry must carry
+    source == MACHINE_VALIDATION_SOURCE. Only
+    core.coding_checkpoint_observation._bind_machine_evidence() ever
+    populates this list before it reaches _validate_checkpoint() -- there
+    is no model-facing path that can supply this key at all (see
+    tools/coding_checkpoint.py's save_coding_checkpoint schema, which
+    doesn't expose it)."""
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        _fail(f"{where} must be a list")
+    if len(items) > MAX_MACHINE_VALIDATIONS:
+        _fail(f"{where} exceeds max count {MAX_MACHINE_VALIDATIONS}")
+    return [
+        _validate_validation_record(item, f"{where}[{i}]", expected_source=MACHINE_VALIDATION_SOURCE)
+        for i, item in enumerate(items)
+    ]
 
 
 def _validate_str_list(items, where: str, max_count: int, max_item_len: int) -> list:
@@ -716,6 +764,9 @@ def _validate_checkpoint(checkpoint) -> dict:
         checkpoint.get("changed_paths"), "checkpoint.changed_paths"
     )
     validations = _validate_validations(checkpoint.get("validations"), "checkpoint.validations")
+    machine_validations = _validate_machine_validations(
+        checkpoint.get("machine_validations"), "checkpoint.machine_validations"
+    )
     observation = _validate_observation(
         checkpoint.get("observation"), "checkpoint.observation"
     )
@@ -725,6 +776,7 @@ def _validate_checkpoint(checkpoint) -> dict:
         "relevant_files": relevant_files,
         "changed_paths": changed_paths,
         "validations": validations,
+        "machine_validations": machine_validations,
         "observation": observation,
     }
 
@@ -776,6 +828,7 @@ def _row_to_record(row, project_name: str) -> CheckpointRecord:
         relevant_files=validated["relevant_files"],
         changed_paths=validated["changed_paths"],
         validations=validated["validations"],
+        machine_validations=validated["machine_validations"],
         observation=validated["observation"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -895,6 +948,7 @@ def _save_checkpoint_for_identity(
         relevant_files=envelope["relevant_files"],
         changed_paths=envelope["changed_paths"],
         validations=envelope["validations"],
+        machine_validations=envelope["machine_validations"],
         observation=envelope["observation"],
         created_at=created_at,
         updated_at=now,

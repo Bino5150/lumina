@@ -668,3 +668,243 @@ def test_no_model_facing_registration_or_existing_git_tool_dependency():
     assert "registry.register" not in source
     assert "tools.git_status" not in source
     assert "shell=True" not in source
+
+
+# ===========================================================================
+# CODING-06A3 corrective 1 -- content-sensitive validation_state_ref.
+#
+# The general state_ref (above) is Git-status-classification-sensitive
+# only: it is built from status_digest, which for an already-dirty tracked
+# path or an already-untracked path reflects only path + XY classification
+# (+ the *index* object id for a tracked entry) -- never the worktree's
+# actual current bytes. validation_state_ref is a narrower, validation-
+# specific fingerprint layered on top for machine-evidence binding only;
+# it must never replace or be conflated with the persisted checkpoint
+# schema's own state_ref/observation semantics (unaffected by this suite).
+# ===========================================================================
+
+def test_clean_tree_has_complete_validation_state_ref(repo_context):
+    _root, context = repo_context
+    current = obs.capture_live_observation(context)
+    assert current.validation_state_complete is True
+    assert current.validation_state_ref is not None
+    assert len(current.validation_state_ref) == 64
+
+
+def test_directory_target_has_complete_validation_state_ref(directory_context):
+    _root, context = directory_context
+    current = obs.capture_live_observation(context)
+    assert current.validation_state_complete is True
+    assert current.validation_state_ref is not None
+
+
+def test_modified_tracked_file_content_a_to_content_b_detected(repo_context):
+    """The core corrective 1 proof: an ALREADY-modified tracked file's
+    further content edit is invisible to `git status` (still just "M"),
+    so the general state_ref never moves -- but validation_state_ref must."""
+    root, context = repo_context
+    (root / "README.md").write_text("content A\n")
+    first = obs.capture_live_observation(context)
+    (root / "README.md").write_text("content B\n")
+    second = obs.capture_live_observation(context)
+
+    assert first.state_ref == second.state_ref  # proves the exploit is real
+    assert first.validation_state_ref != second.validation_state_ref  # and fixed
+
+
+def test_untracked_file_content_a_to_content_b_detected(repo_context):
+    root, context = repo_context
+    (root / "scratch.txt").write_text("content A\n")
+    first = obs.capture_live_observation(context)
+    (root / "scratch.txt").write_text("content B\n")
+    second = obs.capture_live_observation(context)
+
+    assert first.state_ref == second.state_ref  # untracked path/status unchanged
+    assert first.validation_state_ref != second.validation_state_ref
+
+
+def test_clean_to_modified_tracked_file_also_changes_validation_state_ref(repo_context):
+    root, context = repo_context
+    clean = obs.capture_live_observation(context)
+    (root / "README.md").write_text("modified once\n")
+    dirty = obs.capture_live_observation(context)
+    assert dirty.validation_state_ref != clean.validation_state_ref
+
+
+def test_unchanged_dirty_content_remains_stable(repo_context):
+    root, context = repo_context
+    (root / "README.md").write_text("dirty\n")
+    first = obs.capture_live_observation(context)
+    second = obs.capture_live_observation(context)
+    assert first.validation_state_ref == second.validation_state_ref
+    assert first.validation_state_complete is True
+
+
+def test_restore_exact_bytes_returns_same_validation_state_ref(repo_context):
+    root, context = repo_context
+    (root / "README.md").write_text("original\n")
+    original = obs.capture_live_observation(context)
+
+    (root / "README.md").write_text("different\n")
+    changed = obs.capture_live_observation(context)
+    assert changed.validation_state_ref != original.validation_state_ref
+
+    (root / "README.md").write_text("original\n")
+    restored = obs.capture_live_observation(context)
+    assert restored.validation_state_ref == original.validation_state_ref
+
+
+def test_deleted_tracked_file_detected_structurally_and_stable(repo_context):
+    root, context = repo_context
+    clean = obs.capture_live_observation(context)
+
+    (root / "README.md").unlink()
+    deleted = obs.capture_live_observation(context)
+    assert deleted.validation_state_ref != clean.validation_state_ref
+    assert deleted.validation_state_complete is True
+
+    still_deleted = obs.capture_live_observation(context)
+    assert still_deleted.validation_state_ref == deleted.validation_state_ref  # stable while missing
+
+    # Recreating the EXACT original committed bytes returns to the EXACT
+    # original fingerprint -- proves this is content-addressed, not merely
+    # a "changed vs not changed" flag.
+    (root / "README.md").write_text("hello\n")
+    recreated = obs.capture_live_observation(context)
+    assert recreated.validation_state_ref == clean.validation_state_ref
+
+
+def test_symlink_retarget_detected_without_following(repo_context):
+    root, context = repo_context
+    (root / "target_b.txt").write_text("b\n")
+    (root / "target_c.txt").write_text("c\n")
+    link = root / "link.txt"
+    try:
+        link.symlink_to("target_a.txt")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unsupported in this environment")
+    (root / "target_a.txt").write_text("a\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "add symlink")
+
+    # Both retargets point somewhere OTHER than the committed target, so
+    # Git's own "M" classification (and therefore the general state_ref)
+    # is identical in both cases -- only the symlink's own target text
+    # differs, and only validation_state_ref may see that.
+    link.unlink()
+    link.symlink_to("target_b.txt")
+    first = obs.capture_live_observation(context)
+
+    link.unlink()
+    link.symlink_to("target_c.txt")
+    second = obs.capture_live_observation(context)
+
+    assert first.state_ref == second.state_ref
+    assert first.validation_state_ref != second.validation_state_ref
+
+    # And stable when unchanged.
+    third = obs.capture_live_observation(context)
+    assert third.validation_state_ref == second.validation_state_ref
+
+
+def test_worktree_identity_isolates_validation_state_ref(tmp_path):
+    root = tmp_path / "wtmain"
+    root.mkdir()
+    _init_repo(root)
+    worktree = tmp_path / "wt"
+    result = _git(root, "worktree", "add", "-b", "wt-branch", str(worktree), check=False)
+    if result.returncode != 0:
+        pytest.skip("git worktree unavailable in this environment")
+
+    main_context = save_project_binding("wtmain", str(root))
+    wt_context = save_project_binding("wtchild", str(worktree))
+
+    main_current = obs.capture_live_observation(main_context)
+    wt_current = obs.capture_live_observation(wt_context)
+    assert main_current.identity.target_key != wt_current.identity.target_key
+    assert main_current.validation_state_ref != wt_current.validation_state_ref
+
+    (worktree / "only_in_worktree.txt").write_text("x\n")
+    wt_dirty = obs.capture_live_observation(wt_context)
+    assert wt_dirty.validation_state_ref != wt_current.validation_state_ref
+    # The main worktree's own fingerprint is untouched by a change made
+    # only in the linked worktree.
+    main_unchanged = obs.capture_live_observation(main_context)
+    assert main_unchanged.validation_state_ref == main_current.validation_state_ref
+
+
+def test_changed_paths_truncated_makes_validation_state_incomplete(repo_context, monkeypatch):
+    """Bounded/fail-closed: when the Git-visible changed-path list itself
+    was truncated, the fingerprint cannot honestly claim full coverage of
+    what changed -- it must report incomplete (None ref) rather than a
+    partial, misleadingly-confident value."""
+    root, context = repo_context
+    (root / "dirty.txt").write_text("dirty\n")
+
+    real_capture = obs._capture_git_state
+
+    def _forced_truncated(path):
+        return replace(real_capture(path), changed_paths_truncated=True)
+
+    monkeypatch.setattr(obs, "_capture_git_state", _forced_truncated)
+    current = obs.capture_live_observation(context)
+    assert current.validation_state_complete is False
+    assert current.validation_state_ref is None
+
+
+# ===========================================================================
+# CODING-06A3 final verification corrective -- validation_state_ref must
+# also be Git index/status-sensitive, not content-sensitive alone.
+#
+# _validation_state_fingerprint()'s `entries` list is keyed by deduplicated
+# path only, and each entry hashes current *worktree* bytes -- never which
+# XY status produced them. Two observations whose Git-visible dirty paths
+# happen to end up with byte-identical worktree content must still be
+# distinguishable when Git's own index/status state differs (unstaged vs.
+# staged vs. partially staged), because a machine-evidence record bound to
+# one index state must never silently "apply" to a different index state
+# just because the file bytes on disk currently match.
+# ===========================================================================
+
+def test_unstaged_vs_staged_same_bytes_validation_state_ref_differs(repo_context):
+    """Same HEAD, same final worktree bytes -- unstaged (index==HEAD) vs.
+    staged (index==worktree, `git add`) must NOT collide."""
+    root, context = repo_context
+
+    (root / "README.md").write_text("changed\n")
+    unstaged = obs.capture_live_observation(context)
+
+    _git(root, "checkout", "--", "README.md")
+    (root / "README.md").write_text("changed\n")
+    _git(root, "add", "README.md")
+    staged = obs.capture_live_observation(context)
+
+    assert unstaged.head == staged.head
+    assert unstaged.validation_state_ref != staged.validation_state_ref
+
+
+def test_partially_staged_vs_unstaged_only_same_final_bytes_differs(repo_context):
+    """Same HEAD, same final worktree bytes, different index content:
+    a partially-staged ("MM") path (index holds an intermediate edit,
+    worktree holds a further one) vs. a path never staged at all whose
+    worktree happens to land on that exact same final content. Git status
+    classifies these differently (MM vs ".M") with a different index blob
+    id -- the fingerprint must too."""
+    root, context = repo_context
+
+    _git(root, "reset", "--hard", "HEAD")
+    (root / "README.md").write_text("intermediate\n")
+    _git(root, "add", "README.md")
+    (root / "README.md").write_text("final\n")
+    mixed = obs.capture_live_observation(context)
+    by_path = {item.path: item for item in mixed.changed_paths}
+    assert by_path["README.md"].status == "MM"
+
+    _git(root, "reset", "--hard", "HEAD")
+    (root / "README.md").write_text("final\n")
+    unstaged_only = obs.capture_live_observation(context)
+    by_path = {item.path: item for item in unstaged_only.changed_paths}
+    assert by_path["README.md"].status == ".M"  # porcelain v2: "." is unchanged, not space
+
+    assert mixed.head == unstaged_only.head
+    assert mixed.validation_state_ref != unstaged_only.validation_state_ref

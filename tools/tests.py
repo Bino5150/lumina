@@ -5,11 +5,23 @@ supplies which tests to run (selectors), an optional cwd override, and a
 timeout -- Lumina owns executable construction, environment, lifecycle,
 result classification, repository observation, and evidence applicability.
 
-No durable checkpoint evidence is written here. checkpoint_bindable is a
-truthful description of whether THIS run's observed pre/post repository
-state could later qualify as machine evidence -- it is never persisted,
-never authorizes commit/push, and is independent of whether the tests
-themselves passed.
+No durable CHECKPOINT is written here -- run_tests never touches
+core.coding_checkpoint's storage, and a passing run confers no commit,
+push, or checkpoint authority. checkpoint_bindable is a truthful
+description of whether THIS run's observed pre/post repository state
+could later qualify as machine evidence; it is independent of whether the
+tests themselves passed.
+
+CODING-06A3: when checkpoint_bindable is True AND the run reached a
+conclusive pytest judgment ("passed" or "failed"), the completed INTERNAL
+result object (never the JSON string rendered back to the model) is
+handed to core.coding_validation_evidence.record_test_evidence(), which
+durably persists it as source="lumina_local" machine evidence in its own
+store -- entirely separate from core.coding_checkpoint's table. This is
+informational only: it does not create, modify, or touch any coding
+checkpoint, and confers no authorization of any kind. See
+core/coding_checkpoint_observation.py's _bind_machine_evidence() for how a
+later checkpoint save automatically incorporates compatible evidence.
 """
 
 import json
@@ -21,6 +33,7 @@ from typing import Optional
 import config
 import core.coding_checkpoint as checkpoint_store
 import core.coding_checkpoint_observation as checkpoint_observation
+import core.coding_validation_evidence as validation_evidence
 from core import emergency_stop, test_runner
 
 
@@ -214,8 +227,24 @@ def _build_evidence(*, result, cwd, active_project, selectors,
     # drifted across the whole window -- no separate re-check call is needed.
     stable_binding = pre_ok and post_ok and pre_observation is not None and post_observation is not None
 
-    pre_ref = pre_observation.state_ref if pre_observation is not None else None
-    post_ref = post_observation.state_ref if post_observation is not None else None
+    # CODING-06A3 corrective 1: bindability is gated on the content-
+    # sensitive validation fingerprint (core.coding_checkpoint_observation's
+    # validation_state_ref), not the general state_ref -- the general one
+    # is Git-status-classification-sensitive only, and would stay identical
+    # across a content edit to an already-modified tracked file or an
+    # already-untracked file. An incomplete fingerprint (observation
+    # bounded/truncated) yields None here, which fails checkpoint_bindable
+    # closed exactly like a missing observation already does below.
+    pre_ref = (
+        pre_observation.validation_state_ref
+        if pre_observation is not None and pre_observation.validation_state_complete
+        else None
+    )
+    post_ref = (
+        post_observation.validation_state_ref
+        if post_observation is not None and post_observation.validation_state_complete
+        else None
+    )
     stable_state = None
     if pre_ref is not None and post_ref is not None:
         stable_state = pre_ref == post_ref
@@ -237,6 +266,34 @@ def _build_evidence(*, result, cwd, active_project, selectors,
         stable_repository_state=stable_state,
         checkpoint_bindable=checkpoint_bindable,
     )
+
+
+def _record_machine_evidence(*, evidence: TestExecutionEvidence, post_observation, selectors):
+    """CODING-06A3: the ONLY call site that can ever create durable
+    Lumina-local evidence. Sourced entirely from the internal `evidence`
+    object and `post_observation` -- never from the JSON string this
+    module renders back to the model, and never reachable from any
+    model-facing tool argument. record_test_evidence() itself is the
+    authoritative gate on which result.status values are eligible
+    ("passed"/"failed" only); this wrapper only adds the
+    checkpoint_bindable / observation-availability precondition and never
+    lets a persistence problem affect the result already computed."""
+    if not evidence.checkpoint_bindable or post_observation is None:
+        return
+    try:
+        validation_evidence.record_test_evidence(
+            project_name=evidence.project_name,
+            target_key=post_observation.identity.target_key,
+            target_kind=post_observation.identity.kind,
+            state_ref=evidence.post_state_ref,
+            selectors=selectors,
+            status=evidence.result.status,
+            exit_code=evidence.result.exit_code,
+            counts=evidence.result.counts,
+            duration_seconds=evidence.result.duration_seconds,
+        )
+    except Exception:
+        pass
 
 
 def _failure_payload(detail: dict, excerpt_limit=None) -> dict:
@@ -399,6 +456,10 @@ def register_tests_tools(registry, project_state=None, cancel_state=None):
             selectors=normalized_selectors,
             pre_observation=pre_observation, pre_ok=bool(pre_ok),
             post_observation=post_observation, post_ok=bool(post_ok),
+        )
+        _record_machine_evidence(
+            evidence=evidence, post_observation=post_observation,
+            selectors=normalized_selectors,
         )
         return _render_result(evidence)
 

@@ -122,10 +122,10 @@ def _compact_observation(summary: Optional[dict]) -> Optional[dict]:
     }
 
 
-def _render_validations(record, applicability) -> list:
+def _render_validations(items, applicability) -> list:
     applies = list(applicability)
     rendered = []
-    for index, validation in enumerate(record.validations):
+    for index, validation in enumerate(items):
         current = applies[index] if index < len(applies) else None
         rendered.append({
             "label": validation["label"],
@@ -193,6 +193,7 @@ def _read_result(result, project_name: str) -> str:
     workflow = None
     relevant_files = []
     validations = []
+    machine_validations = []
     updated_at = None
     if result.record is not None:
         recorded_summary = _observation_summary(
@@ -200,7 +201,14 @@ def _read_result(result, project_name: str) -> str:
         )
         workflow = result.record.workflow
         relevant_files = result.record.relevant_files
-        validations = _render_validations(result.record, result.validation_applicability)
+        validations = _render_validations(result.record.validations, result.validation_applicability)
+        # CODING-06A3 corrective 2: rendered from a fresh evidence-store
+        # lookup (result.live_machine_validations), never this row's baked
+        # machine_validations from whenever it was last saved -- see
+        # core.coding_checkpoint_observation._live_machine_validations().
+        machine_validations = _render_validations(
+            result.live_machine_validations, result.machine_validation_applicability
+        )
         updated_at = result.record.updated_at
 
     message = (
@@ -217,6 +225,7 @@ def _read_result(result, project_name: str) -> str:
         "workflow": workflow,
         "relevant_files": relevant_files,
         "validations": validations,
+        "machine_validations": machine_validations,
         "recorded_observation": recorded_summary,
         "current_observation": current_summary,
         "output_truncated": False,
@@ -235,6 +244,7 @@ def _read_result(result, project_name: str) -> str:
         **core,
         "workflow": workflow_compact,
         "validations": _compact_validations(validations),
+        "machine_validations": _compact_validations(machine_validations),
         "recorded_observation": _compact_observation(recorded_summary),
         "current_observation": _compact_observation(current_summary),
         "output_truncated": True,
