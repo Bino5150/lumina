@@ -13,6 +13,9 @@ luck.
 """
 import json
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -1353,3 +1356,400 @@ def test_manager_contract_never_decides_finalization_from_leader_poll_alone():
         _wait_for_status(pid, timeout=10.0)
         import subprocess
         subprocess.run(["pkill", "-9", "-f", "sleep 7110"])
+
+
+# ── CODING-06A1A: managed direct argv / blocking completion kernel ────────
+
+def _python_argv(source, *args):
+    return [sys.executable, "-u", "-c", source, *map(str, args)]
+
+
+def _descendant_argv(sentinel, child_seconds=30, leader_seconds=0):
+    child_source = (
+        "import os, pathlib, sys, time; "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8'); "
+        "time.sleep(float(sys.argv[2]))"
+    )
+    leader_source = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-u', '-c', {child_source!r}, "
+        "sys.argv[1], sys.argv[2]], stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "time.sleep(float(sys.argv[3]))"
+    )
+    return _python_argv(
+        leader_source, sentinel, child_seconds, leader_seconds
+    )
+
+
+def _pid_is_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _wait_pid_gone(pid, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_alive(pid):
+            return True
+        time.sleep(0.02)
+    return not _pid_is_alive(pid)
+
+
+def _force_fixture_tree_dead(process_id, descendant_pid=None):
+    """Mutation-safe POSIX cleanup for the live-host argv tree tests."""
+    with process_manager._registry_lock:
+        job = process_manager._registry.get(process_id)
+    if descendant_pid is not None:
+        try:
+            os.kill(descendant_pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if job is not None:
+        try:
+            pgid = job.control_metadata.get("pgid")
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            job.proc.kill()
+        except OSError:
+            pass
+
+
+def test_launch_argv_preserves_literals_env_and_provenance_without_shell_expansion(tmp_path):
+    sentinel = tmp_path / "shell expansion must not happen"
+    literal = f"$(touch {sentinel})"
+    env = dict(os.environ)
+    env["LUMINA_ARGV_TEST"] = "environment value"
+    argv = _python_argv(
+        "import json, os, sys; print(json.dumps({"
+        "'argv': sys.argv[1:], 'env': os.environ['LUMINA_ARGV_TEST']}), flush=True)",
+        "space value", "'quotes'", "λ", "$HOME", ";", "&&", "|",
+        "(literal)", "-leading", literal,
+    )
+    process_id = process_manager.launch_argv(
+        argv, cwd=str(tmp_path), env=env,
+        provenance={"kind": "structured_test", "request": "a1a"},
+    )
+
+    result = process_manager.wait_for_completion(process_id, timeout=5)
+    payload = json.loads(result["stdout"]["text"])
+    assert payload == {
+        "argv": [
+            "space value", "'quotes'", "λ", "$HOME", ";", "&&", "|",
+            "(literal)", "-leading", literal,
+        ],
+        "env": "environment value",
+    }
+    assert result["argv"] == argv
+    assert result["command"] is None
+    assert result["provenance"] == {"kind": "structured_test", "request": "a1a"}
+    assert result["visibility"] == "internal"
+    assert result["status"] == "exited"
+    assert result["returncode"] == 0
+    assert result["termination_reason"] is None
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("argv", [
+    None,
+    "not-an-argv-sequence",
+    [],
+    [""],
+    [sys.executable, 7],
+    [sys.executable, "bad\0argument"],
+])
+def test_launch_argv_structural_errors_rejected_before_spawn_lease_or_slot(
+    monkeypatch, argv
+):
+    monkeypatch.setattr(
+        process_control, "spawn_argv",
+        lambda *a, **k: pytest.fail("invalid argv reached platform spawn"),
+    )
+    with pytest.raises(process_manager.InvalidLaunchRequest):
+        process_manager.launch_argv(argv, cwd="/tmp")
+    assert emergency_stop.snapshot()["active_execution_count"] == 0
+    assert process_manager._live_reserved == 0
+    assert process_manager._registry == {}
+
+
+def test_launch_argv_guardrail_blocks_before_spawn_lease_or_slot(monkeypatch):
+    monkeypatch.setattr(
+        process_control, "spawn_argv",
+        lambda *a, **k: pytest.fail("blocked argv reached platform spawn"),
+    )
+    with pytest.raises(process_manager.CommandBlocked) as exc_info:
+        process_manager.launch_argv(["/usr/bin/rm", "-rf", "/"], cwd="/tmp")
+    assert "recursive/force delete of root" in str(exc_info.value)
+    assert emergency_stop.snapshot()["active_execution_count"] == 0
+    assert process_manager._live_reserved == 0
+    assert process_manager._registry == {}
+
+
+def test_launch_argv_nonzero_exit_and_complete_stream_drain(tmp_path):
+    process_id = process_manager.launch_argv(
+        _python_argv(
+            "import sys; sys.stdout.write('O' * 70000); sys.stdout.flush(); "
+            "sys.stderr.write('E' * 70000); sys.stderr.flush(); raise SystemExit(7)"
+        ),
+        cwd=str(tmp_path),
+    )
+    result = process_manager.wait_for_completion(process_id, timeout=10)
+
+    assert result["status"] == "exited"
+    assert result["returncode"] == 7
+    assert result["stdout"]["end_offset"] == 70000
+    assert result["stderr"]["end_offset"] == 70000
+    assert len(result["stdout"]["text"]) == process_manager.STREAM_BUFFER_MAX_CHARS
+    assert len(result["stderr"]["text"]) == process_manager.STREAM_BUFFER_MAX_CHARS
+    with process_manager._registry_lock:
+        job = process_manager._registry[process_id]
+    assert job.stdout_thread.is_alive() is False
+    assert job.stderr_thread.is_alive() is False
+    assert job.control_metadata["retired"] is True
+    assert job.completion_event.is_set()
+
+
+def test_wait_for_completion_does_not_change_legacy_string_launch_contract(tmp_path):
+    process_id = process_manager.launch("true", cwd=str(tmp_path))
+    with pytest.raises(process_manager.InvalidWaitRequest):
+        process_manager.wait_for_completion(process_id, timeout=5)
+    _wait_for_status(process_id)
+
+
+def test_wait_completion_follows_descendant_tree_not_exited_leader(tmp_path):
+    sentinel = tmp_path / "natural descendant.pid"
+    process_id = process_manager.launch_argv(
+        _descendant_argv(sentinel, child_seconds=0.8, leader_seconds=0),
+        cwd=str(tmp_path),
+    )
+    descendant_pid = None
+    try:
+        assert wait_for_path(sentinel)
+        descendant_pid = int(sentinel.read_text(encoding="utf-8"))
+        with process_manager._registry_lock:
+            job = process_manager._registry[process_id]
+            lease_id = job.lease_id
+        deadline = time.monotonic() + 2
+        while job.proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert job.proc.poll() is not None
+        assert process_manager._get_internal_job_snapshot(process_id)["status"] == "running"
+        assert job.completion_event.is_set() is False
+        assert lease_id in emergency_stop._executions
+        assert process_manager._live_reserved == 1
+
+        result = process_manager.wait_for_completion(process_id, timeout=5)
+        assert result["status"] == "exited"
+        assert result["returncode"] == 0
+        assert lease_id not in emergency_stop._executions
+        assert process_manager._live_reserved == 0
+        assert not _pid_is_alive(descendant_pid)
+    finally:
+        _force_fixture_tree_dead(process_id, descendant_pid)
+
+
+def test_wait_timeout_kills_leader_and_descendant_and_waits_for_cleanup(tmp_path):
+    sentinel = tmp_path / "timeout descendant.pid"
+    process_id = process_manager.launch_argv(
+        _descendant_argv(sentinel, child_seconds=30, leader_seconds=30),
+        cwd=str(tmp_path),
+    )
+    descendant_pid = None
+    try:
+        assert wait_for_path(sentinel)
+        descendant_pid = int(sentinel.read_text(encoding="utf-8"))
+        with process_manager._registry_lock:
+            job = process_manager._registry[process_id]
+            lease_id = job.lease_id
+
+        result = process_manager.wait_for_completion(process_id, timeout=0.05)
+        assert result["status"] == "timed_out"
+        assert result["termination_reason"] == "timed_out"
+        assert result["returncode"] != 0
+        assert not _pid_is_alive(descendant_pid)
+        assert lease_id not in emergency_stop._executions
+        assert process_manager._live_reserved == 0
+        assert job.control_metadata["retired"] is True
+        assert job.completion_event.is_set()
+    finally:
+        _force_fixture_tree_dead(process_id, descendant_pid)
+
+
+def test_wait_cancellation_kills_whole_tree_and_records_cancelled(tmp_path):
+    sentinel = tmp_path / "cancel descendant.pid"
+    process_id = process_manager.launch_argv(
+        _descendant_argv(sentinel, child_seconds=30, leader_seconds=30),
+        cwd=str(tmp_path),
+    )
+    descendant_pid = None
+    cancel_event = threading.Event()
+    timer = threading.Timer(0.1, cancel_event.set)
+    try:
+        assert wait_for_path(sentinel)
+        descendant_pid = int(sentinel.read_text(encoding="utf-8"))
+        timer.start()
+        result = process_manager.wait_for_completion(
+            process_id, timeout=10, cancel_event=cancel_event
+        )
+        assert result["status"] == "cancelled"
+        assert result["termination_reason"] == "cancelled"
+        assert not _pid_is_alive(descendant_pid)
+        assert emergency_stop.snapshot()["active_execution_count"] == 0
+        assert process_manager._live_reserved == 0
+    finally:
+        timer.cancel()
+        _force_fixture_tree_dead(process_id, descendant_pid)
+
+
+def test_cancellation_set_after_normal_completion_cannot_rewrite_history(tmp_path):
+    process_id = process_manager.launch_argv(
+        _python_argv("print('done', flush=True)"), cwd=str(tmp_path)
+    )
+    first = process_manager.wait_for_completion(process_id, timeout=5)
+    cancel_event = threading.Event()
+    cancel_event.set()
+    second = process_manager.wait_for_completion(
+        process_id, timeout=0, cancel_event=cancel_event
+    )
+    assert first["status"] == second["status"] == "exited"
+    assert first["termination_reason"] is second["termination_reason"] is None
+    assert first["returncode"] == second["returncode"] == 0
+
+
+def test_internal_visibility_blocks_every_existing_model_lookup_and_control(tmp_path):
+    internal_id = process_manager.launch_argv(
+        _python_argv("import time; time.sleep(30)"), cwd=str(tmp_path)
+    )
+    public_id = process_manager.launch(
+        sleeping_python_command(30), cwd=str(tmp_path)
+    )
+    try:
+        assert process_manager.get_job_snapshot(internal_id) is None
+        assert internal_id not in process_manager.list_job_ids()
+        with pytest.raises(process_manager.ProcessNotFound):
+            process_manager.send_input(internal_id, "hidden")
+        assert process_manager.request_stop(internal_id) is False
+
+        assert process_manager.get_job_snapshot(public_id) is not None
+        assert public_id in process_manager.list_job_ids()
+        assert process_manager.request_stop(public_id) is True
+        _wait_for_status(public_id)
+    finally:
+        _force_fixture_tree_dead(internal_id)
+        process_manager.wait_for_completion(internal_id, timeout=5)
+
+
+def test_emergency_kills_internal_argv_tree_and_preserves_stale_epoch(tmp_path):
+    sentinel = tmp_path / "emergency argv descendant.pid"
+    process_id = process_manager.launch_argv(
+        _descendant_argv(sentinel, child_seconds=30, leader_seconds=30),
+        cwd=str(tmp_path),
+    )
+    descendant_pid = None
+    allow_finalization = threading.Event()
+    try:
+        assert wait_for_path(sentinel)
+        descendant_pid = int(sentinel.read_text(encoding="utf-8"))
+        with process_manager._registry_lock:
+            job = process_manager._registry[process_id]
+            old_epoch = job.epoch
+
+        real_tree_is_alive = process_control.tree_is_alive
+
+        def gated_tree_is_alive(control_metadata):
+            alive = real_tree_is_alive(control_metadata)
+            if (control_metadata is job.control_metadata and not alive
+                    and not allow_finalization.is_set()):
+                return True
+            return alive
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(process_control, "tree_is_alive", gated_tree_is_alive)
+
+            emergency_stop.latch(source="test", reason="argv emergency")
+            assert emergency_stop.can_rearm() is False
+            assert process_manager.emergency_kill_all() == 1
+            assert _wait_pid_gone(descendant_pid)
+            assert emergency_stop.can_rearm() is False
+            with pytest.raises(emergency_stop.RearmBlocked):
+                emergency_stop.rearm_local()
+
+            allow_finalization.set()
+            result = process_manager.wait_for_completion(process_id, timeout=5)
+        assert result["status"] == "emergency_killed"
+        assert result["termination_reason"] == "emergency_killed"
+        assert not _pid_is_alive(descendant_pid)
+        assert emergency_stop.can_rearm() is True
+        emergency_stop.rearm_local()
+        assert emergency_stop.execution_permitted(old_epoch) is False
+    finally:
+        allow_finalization.set()
+        _force_fixture_tree_dead(process_id, descendant_pid)
+        if emergency_stop.is_latched() and emergency_stop.can_rearm():
+            emergency_stop.rearm_local()
+
+
+def test_forget_terminal_internal_job_only_after_full_completion(tmp_path):
+    release = tmp_path / "allow internal completion"
+    internal_id = process_manager.launch_argv(
+        _python_argv(
+            "import pathlib, sys, time\n"
+            "print('harvest me', flush=True)\n"
+            "release = pathlib.Path(sys.argv[1])\n"
+            "while not release.exists():\n"
+            "    time.sleep(0.01)\n",
+            release,
+        ),
+        cwd=str(tmp_path),
+    )
+    public_id = process_manager.launch("true", cwd=str(tmp_path))
+
+    assert process_manager.forget_terminal_job(internal_id) is False
+    release.write_text("continue", encoding="utf-8")
+    result = process_manager.wait_for_completion(internal_id, timeout=5)
+    _wait_for_status(public_id)
+    assert result["stdout"]["text"] == "harvest me\n"
+    assert process_manager.forget_terminal_job(internal_id) is True
+    assert process_manager._get_internal_job_snapshot(internal_id) is None
+    with process_manager._registry_lock:
+        assert internal_id not in process_manager._registry
+    assert process_manager.forget_terminal_job(internal_id) is False
+
+    assert process_manager.forget_terminal_job(public_id) is False
+    assert process_manager.get_job_snapshot(public_id) is not None
+
+
+def test_shutdown_all_includes_internal_argv_jobs(tmp_path):
+    process_id = process_manager.launch_argv(
+        _python_argv("import time; time.sleep(30)"), cwd=str(tmp_path)
+    )
+    assert process_manager.shutdown_all(wait_seconds=5) == 1
+    result = process_manager.wait_for_completion(process_id, timeout=5)
+    assert result["status"] == "shutdown_killed"
+    assert result["termination_reason"] == "shutdown_killed"
+
+
+def test_process_manager_does_not_global_serialize_internal_argv_jobs(tmp_path):
+    first = process_manager.launch_argv(
+        _python_argv("import time; time.sleep(30)"), cwd=str(tmp_path)
+    )
+    second = process_manager.launch_argv(
+        _python_argv("import time; time.sleep(30)"), cwd=str(tmp_path)
+    )
+    try:
+        assert process_manager._live_reserved == 2
+        assert process_manager._get_internal_job_snapshot(first)["status"] == "running"
+        assert process_manager._get_internal_job_snapshot(second)["status"] == "running"
+    finally:
+        _force_fixture_tree_dead(first)
+        _force_fixture_tree_dead(second)
+        process_manager.wait_for_completion(first, timeout=5)
+        process_manager.wait_for_completion(second, timeout=5)

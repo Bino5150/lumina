@@ -155,6 +155,32 @@ def _spawn_posix(command: str, cwd: str):
     return proc, {"backend": "posix", "pgid": pgid, "retired": False}
 
 
+def _build_posix_argv_popen_kwargs(argv, cwd: str, env=None) -> dict:
+    return dict(
+        args=list(argv),
+        shell=False,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+
+
+def _spawn_posix_argv(argv, cwd: str, env=None):
+    kwargs = _build_posix_argv_popen_kwargs(argv, cwd, env)
+    proc = subprocess.Popen(**kwargs)
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = proc.pid
+    return proc, {"backend": "posix", "pgid": pgid, "retired": False}
+
+
 def _process_group_is_alive_posix(pgid) -> bool:
     """Signal-0 liveness probe -- os.killpg(pgid, 0) never actually signals
     anything, it only asks the kernel whether the target exists and
@@ -341,6 +367,29 @@ def _build_windows_popen_kwargs(command: str, cwd: str) -> dict:
     )
 
 
+def _build_windows_argv_popen_kwargs(argv, cwd: str, env=None) -> dict:
+    """Direct argv execution with the same suspended Job assignment.
+
+    ``args`` remains a list and ``shell`` remains false.  Python's Windows
+    subprocess implementation necessarily serializes that list for the native
+    CreateProcessW API, but this module never creates shell command text and
+    never routes it through cmd.exe.
+    """
+    return dict(
+        args=list(argv),
+        shell=False,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=_CREATE_NEW_PROCESS_GROUP | _CREATE_SUSPENDED,
+    )
+
+
 def _create_job_object():
     """Creates a new, unnamed Job Object and configures
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE on it: a crash-safety net only --
@@ -408,7 +457,7 @@ def _find_main_thread_id(k32, pid: int) -> int:
         k32.CloseHandle(snapshot)
 
 
-def _spawn_windows(command: str, cwd: str):
+def _spawn_windows_from_kwargs(kwargs: dict):
     """Race-free Job Object assignment via CREATE_SUSPENDED +
     AssignProcessToJobObject + ResumeThread -- see module docstring for
     why this was chosen over PROC_THREAD_ATTRIBUTE_JOB_LIST's raw
@@ -418,7 +467,6 @@ def _spawn_windows(command: str, cwd: str):
     k32 = _kernel32()
     job_handle = _create_job_object()
     try:
-        kwargs = _build_windows_popen_kwargs(command, cwd)
         proc = subprocess.Popen(**kwargs)
 
         k32.OpenProcess.restype = wintypes.HANDLE
@@ -455,6 +503,16 @@ def _spawn_windows(command: str, cwd: str):
         raise
 
     return proc, {"backend": "windows", "job_handle": job_handle, "pid": proc.pid, "retired": False}
+
+
+def _spawn_windows(command: str, cwd: str):
+    return _spawn_windows_from_kwargs(_build_windows_popen_kwargs(command, cwd))
+
+
+def _spawn_windows_argv(argv, cwd: str, env=None):
+    return _spawn_windows_from_kwargs(
+        _build_windows_argv_popen_kwargs(argv, cwd, env)
+    )
 
 
 def _tree_is_alive_windows(control_metadata: dict) -> bool:
@@ -529,6 +587,19 @@ def spawn(command: str, cwd: str):
     if backend_name() == "windows":
         return _spawn_windows(command, cwd)
     return _spawn_posix(command, cwd)
+
+
+def spawn_argv(argv, cwd: str, env=None):
+    """Spawn direct argv inside the same managed process tree as ``spawn``.
+
+    No shell is involved and argv is passed as a sequence without joining,
+    quoting, or reparsing.  The returned control metadata has the identical
+    lifecycle contract consumed by tree_is_alive(), terminate_tree(), and
+    release_control().
+    """
+    if backend_name() == "windows":
+        return _spawn_windows_argv(argv, cwd, env)
+    return _spawn_posix_argv(argv, cwd, env)
 
 
 def has_exited(proc) -> bool:

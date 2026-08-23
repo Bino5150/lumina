@@ -6,7 +6,7 @@ Owns the job registry, per-job metadata, emergency execution leases,
 reader/watcher threads, bounded output buffers, lifecycle, cleanup, and
 TTL retention for OS processes that outlive the call that launched them.
 core/process_control.py is the ONLY thing this module calls for anything
-host-specific (spawn / has_exited / terminate_tree) -- this file must
+host-specific (shell/argv spawn and managed-tree control) -- this file must
 never itself branch on platform or touch a POSIX/Windows-only API
 directly (tests/test_process_control.py's portability regression tests
 assert exactly that by grepping this file's own source).
@@ -22,17 +22,19 @@ already allow.
 
 No disk persistence, no restart reconnection, no external PID adoption --
 a process surviving a hard crash is unmanaged external OS state; this
-module (and its future A2 model-facing layer) never adopts a PID it did
+module (and its model-facing layer) never adopts a PID it did
 not itself spawn.
 """
 
+from collections.abc import Sequence
+import math
 import os
 import secrets
 import threading
 import time
 
 from core import emergency_stop, process_control
-from tools.guardrails import check_command
+from tools.guardrails import check_argv, check_command
 
 MAX_LIVE_PROCESSES = 10
 STREAM_BUFFER_MAX_CHARS = 65536
@@ -47,7 +49,11 @@ _CHUNK_SIZE = 4096  # bounded read() size -- see _drain_stream's docstring
 # only, never model-facing.
 _TREE_POLL_INTERVAL_SECONDS = 0.2
 
-_STATUSES = frozenset({"running", "exited", "stopped", "emergency_killed", "shutdown_killed"})
+_STATUSES = frozenset({
+    "running", "exited", "stopped", "emergency_killed", "shutdown_killed",
+    "timed_out", "cancelled",
+})
+_VISIBILITIES = frozenset({"model", "internal"})
 
 
 class ProcessManagerError(Exception):
@@ -59,8 +65,7 @@ class InvalidLaunchRequest(ProcessManagerError):
 
 
 class CommandBlocked(ProcessManagerError):
-    """tools.guardrails.check_command() denied this command before it
-    ever reached the OS."""
+    """The shell-text or argv guardrail denied a launch before OS spawn."""
 
 
 class LiveProcessLimitReached(ProcessManagerError):
@@ -75,6 +80,10 @@ class LaunchRefused(ProcessManagerError):
 
 class InvalidProcessInput(ProcessManagerError):
     """The requested stdin operation has an invalid argument."""
+
+
+class InvalidWaitRequest(ProcessManagerError):
+    """The requested completion wait has an invalid argument."""
 
 
 class ProcessNotFound(ProcessManagerError):
@@ -138,11 +147,15 @@ class _Job:
     (Section 15) -- cwd is captured as a concrete absolute string at
     spawn time and never follows a later Project change."""
 
-    def __init__(self, process_id, command, cwd, channel_id, epoch, lease_id, proc, control_metadata):
+    def __init__(self, process_id, command, argv, cwd, channel_id, provenance,
+                 visibility, epoch, lease_id, proc, control_metadata):
         self.process_id = process_id
         self.command = command
+        self.argv = tuple(argv) if argv is not None else None
         self.cwd = cwd
         self.channel_id = channel_id
+        self.provenance = provenance
+        self.visibility = visibility
         self.epoch = epoch
         self.lease_id = lease_id
         self.proc = proc
@@ -161,6 +174,9 @@ class _Job:
         self.stdout_thread = None
         self.stderr_thread = None
         self.watcher_thread = None
+        # Set only after tree death, complete stream drain, control retirement,
+        # final state recording, lease close, and live-slot release.
+        self.completion_event = threading.Event()
         # Guards status/returncode/finish_at/stop_reason read-modify-write.
         # Never held while spawning, waiting on the process, reading
         # output, joining threads, or calling into process_control --
@@ -265,14 +281,14 @@ def _watch_job(job: "_Job"):
     process_control.release_control(job.control_metadata)
 
     # Reader threads may still be draining pipes an inherited-fd-holding
-    # descendant kept open after the leader exited -- by the time the
-    # tree is confirmed empty, no writer can remain, so EOF should already
-    # be at hand. These joins are now a bounded defensive backstop, not
-    # the definition of "done" (that was the other half of the A1 bug).
+    # descendant kept open after the leader exited. Direct argv jobs provide
+    # the strict blocking-completion contract and therefore wait for real EOF.
+    # Legacy string jobs retain CODING-04's exact bounded defensive joins.
+    stream_join_timeout = None if job.argv is not None else 10
     if job.stdout_thread is not None:
-        job.stdout_thread.join(timeout=10)
+        job.stdout_thread.join(timeout=stream_join_timeout)
     if job.stderr_thread is not None:
-        job.stderr_thread.join(timeout=10)
+        job.stderr_thread.join(timeout=stream_join_timeout)
 
     with job.lifecycle_lock:
         job.returncode = job.proc.returncode
@@ -282,6 +298,7 @@ def _watch_job(job: "_Job"):
     _safe_close_stdin(job)
     emergency_stop.end_persistent_execution(job.lease_id)
     _release_slot()
+    job.completion_event.set()
 
 
 def _terminate_job(job: "_Job", reason: str):
@@ -295,10 +312,66 @@ def _terminate_job(job: "_Job", reason: str):
             return
         if job.stop_reason is None:
             job.stop_reason = reason
-    # terminate_tree() is called outside the lock (Section 26) and itself
-    # re-checks proc.poll() first, so redundant concurrent calls here
-    # (manual stop racing emergency kill-all, etc.) are safe.
+    # terminate_tree() is called outside the lock (Section 26). Redundant
+    # concurrent calls are safe, and a watcher-retired control identity is
+    # inert even if its old PGID/handle number is later reused.
     process_control.terminate_tree(job.proc, job.control_metadata)
+
+
+def _launch_validated(*, command, argv, cwd, env, channel_id, provenance,
+                      visibility) -> str:
+    """Shared post-admission managed lifecycle for both launch modes."""
+    _reserve_slot()
+
+    job = None
+    lease_id = None
+    try:
+        try:
+            epoch = emergency_stop.capture_epoch_for_new_work()
+        except emergency_stop.EmergencyStopError as e:
+            raise LaunchRefused(str(e)) from e
+
+        process_id = _generate_process_id()
+
+        try:
+            lease_id = emergency_stop.begin_persistent_execution(
+                kind="managed_process", label=process_id, expected_epoch=epoch,
+            )
+        except emergency_stop.EmergencyStopError as e:
+            raise LaunchRefused(str(e)) from e
+
+        if argv is None:
+            proc, control_metadata = process_control.spawn(command, cwd)
+        else:
+            proc, control_metadata = process_control.spawn_argv(argv, cwd, env=env)
+
+        job = _Job(
+            process_id=process_id, command=command, argv=argv, cwd=cwd,
+            channel_id=channel_id, provenance=provenance, visibility=visibility,
+            epoch=epoch, lease_id=lease_id, proc=proc,
+            control_metadata=control_metadata,
+        )
+        with _registry_lock:
+            _registry[process_id] = job
+
+        job.stdout_thread = threading.Thread(target=_drain_stream, args=(job, "stdout"), daemon=True)
+        job.stderr_thread = threading.Thread(target=_drain_stream, args=(job, "stderr"), daemon=True)
+        job.watcher_thread = threading.Thread(target=_watch_job, args=(job,), daemon=True)
+        job.stdout_thread.start()
+        job.stderr_thread.start()
+        job.watcher_thread.start()
+
+        if not emergency_stop.execution_permitted(epoch):
+            _terminate_job(job, reason="emergency_killed")
+
+        return process_id
+
+    except Exception:
+        if job is None:
+            if lease_id is not None:
+                emergency_stop.end_persistent_execution(lease_id)
+            _release_slot()
+        raise
 
 
 def launch(command: str, cwd: str, channel_id: str = "") -> str:
@@ -336,70 +409,63 @@ def launch(command: str, cwd: str, channel_id: str = "") -> str:
     if not os.path.isdir(cwd):
         raise InvalidLaunchRequest(f"cwd does not exist or is not a directory: {cwd!r}")
 
-    _reserve_slot()
+    return _launch_validated(
+        command=command, argv=None, cwd=cwd, env=None, channel_id=channel_id,
+        provenance=None, visibility="model",
+    )
 
-    job = None
-    lease_id = None
-    try:
-        try:
-            epoch = emergency_stop.capture_epoch_for_new_work()
-        except emergency_stop.EmergencyStopError as e:
-            raise LaunchRefused(str(e)) from e
 
-        process_id = _generate_process_id()
+def launch_argv(argv, cwd: str, env=None, provenance=None,
+                visibility: str = "internal") -> str:
+    """Launch direct argv through the existing managed-tree lifecycle.
 
-        try:
-            lease_id = emergency_stop.begin_persistent_execution(
-                kind="managed_process", label=process_id, expected_epoch=epoch,
-            )
-        except emergency_stop.EmergencyStopError as e:
-            raise LaunchRefused(str(e)) from e
+    Structural validation and the argv-aware catastrophic guardrail run
+    before a live slot, emergency execution lease, or OS process exists.
+    ``visibility`` is an internal caller decision; internal jobs remain under
+    emergency/shutdown authority but are absent from every existing
+    model-facing lookup/control path.
+    """
+    if isinstance(argv, (str, bytes, bytearray)) or not isinstance(argv, Sequence):
+        raise InvalidLaunchRequest("argv must be a sequence of strings")
+    if not argv:
+        raise InvalidLaunchRequest("argv must not be empty")
+    normalized_argv = []
+    for index, value in enumerate(argv):
+        if not isinstance(value, str):
+            raise InvalidLaunchRequest(f"argv[{index}] must be a string")
+        if "\0" in value:
+            raise InvalidLaunchRequest(f"argv[{index}] must not contain NUL")
+        normalized_argv.append(value)
+    if normalized_argv[0] == "":
+        raise InvalidLaunchRequest("argv[0] must not be empty")
+    if visibility not in _VISIBILITIES:
+        raise InvalidLaunchRequest(f"unsupported process visibility: {visibility!r}")
 
-        proc, control_metadata = process_control.spawn(command, cwd)
+    block_reason = check_argv(normalized_argv)
+    if block_reason:
+        raise CommandBlocked(block_reason)
 
-        job = _Job(
-            process_id=process_id, command=command, cwd=cwd, channel_id=channel_id,
-            epoch=epoch, lease_id=lease_id, proc=proc, control_metadata=control_metadata,
-        )
-        with _registry_lock:
-            _registry[process_id] = job
+    if not os.path.isabs(cwd):
+        raise InvalidLaunchRequest(f"cwd must be an absolute path: {cwd!r}")
+    if not os.path.isdir(cwd):
+        raise InvalidLaunchRequest(f"cwd does not exist or is not a directory: {cwd!r}")
 
-        job.stdout_thread = threading.Thread(target=_drain_stream, args=(job, "stdout"), daemon=True)
-        job.stderr_thread = threading.Thread(target=_drain_stream, args=(job, "stderr"), daemon=True)
-        job.watcher_thread = threading.Thread(target=_watch_job, args=(job,), daemon=True)
-        job.stdout_thread.start()
-        job.stderr_thread.start()
-        job.watcher_thread.start()
-
-        # Step 13: a latch that won the race any time between epoch
-        # capture and here must not leave a live, unmanaged-looking child
-        # merely because this call is about to return. The lease stays
-        # open regardless -- only the watcher observing real death closes
-        # it -- but the tree is asked to die right now.
-        if not emergency_stop.execution_permitted(epoch):
-            _terminate_job(job, reason="emergency_killed")
-
-        return process_id
-
-    except Exception:
-        if job is None:
-            # Never reached job creation/registration -- release whatever
-            # this attempt already acquired and leave zero residue.
-            if lease_id is not None:
-                emergency_stop.end_persistent_execution(lease_id)
-            _release_slot()
-        raise
+    return _launch_validated(
+        command=None, argv=tuple(normalized_argv), cwd=cwd, env=env,
+        channel_id="", provenance=provenance, visibility=visibility,
+    )
 
 
 def send_input(process_id: str, text: str = "", close_stdin: bool = False) -> dict:
     """Write exact text and/or deliver EOF to a live managed process.
 
-    This is an internal manager primitive only; CODING-04A2-B1 deliberately
-    exposes no model-facing tool.  All operations on a job's stdin share one
-    lock, so write+flush+optional-close is atomic relative to every competing
-    caller and watcher cleanup.  Emergency authority is checked both before
-    waiting for that lock and again after acquiring it: a queued writer cannot
-    regain authority after a latch advances the launching job's epoch.
+    This is the model-visible manager boundary used by send_process_input;
+    internal jobs deliberately fail its visibility lookup. All operations on
+    a public job's stdin share one lock, so write+flush+optional-close is
+    atomic relative to every competing caller and watcher cleanup. Emergency
+    authority is checked both before waiting for that lock and again after
+    acquiring it: a queued writer cannot regain authority after a latch
+    advances the launching job's epoch.
 
     No newline is appended.  The persistent process lease established at
     launch is neither replaced nor extended by input.
@@ -413,7 +479,7 @@ def send_input(process_id: str, text: str = "", close_stdin: bool = False) -> di
 
     with _registry_lock:
         job = _registry.get(process_id)
-    if job is None:
+    if job is None or job.visibility != "model":
         raise ProcessNotFound("managed process was not found")
 
     def _check_authority():
@@ -455,19 +521,96 @@ def send_input(process_id: str, text: str = "", close_stdin: bool = False) -> di
 
 
 def request_stop(process_id: str) -> bool:
-    """Internal stop core (Section 21) -- no model-facing tool calls this
-    in A1; A2 will wrap it. Idempotent: returns False for an unknown
-    process_id or one that's already terminal (including one that exited
-    naturally on its own, which is never re-signaled based on stale
-    metadata)."""
+    """Model-visible stop boundary for public jobs only.
+
+    Idempotent: returns False for an unknown/internal process_id or one that's
+    already terminal (including one that exited naturally on its own, which is
+    never re-signaled based on stale metadata).
+    """
     with _registry_lock:
         job = _registry.get(process_id)
-    if job is None:
+    if job is None or job.visibility != "model":
         return False
     with job.lifecycle_lock:
         if job.status != "running":
             return False
     _terminate_job(job, reason="stopped")
+    return True
+
+
+def wait_for_completion(process_id: str, timeout=None, cancel_event=None) -> dict:
+    """Block until a managed job has genuinely finalized.
+
+    Timeout and cooperative cancellation request whole-tree termination and
+    then continue waiting without a deadline until the watcher has observed
+    tree death, drained both streams, retired platform control identity,
+    recorded final state, closed the emergency lease, and released the live
+    slot. First terminal reason wins against stop/emergency/shutdown races.
+    """
+    if not isinstance(process_id, str) or not process_id:
+        raise InvalidWaitRequest("process_id must be a non-empty string")
+    if timeout is not None:
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout < 0):
+            raise InvalidWaitRequest("timeout must be a finite non-negative number or None")
+        timeout = float(timeout)
+    if cancel_event is not None and not callable(getattr(cancel_event, "is_set", None)):
+        raise InvalidWaitRequest("cancel_event must provide is_set()")
+
+    with _registry_lock:
+        job = _registry.get(process_id)
+    if job is None:
+        raise ProcessNotFound("managed process was not found")
+    if job.argv is None:
+        raise InvalidWaitRequest(
+            "blocking completion is available only for managed argv jobs"
+        )
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while not job.completion_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            _terminate_job(job, reason="cancelled")
+            break
+
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if not job.completion_event.is_set():
+                    _terminate_job(job, reason="timed_out")
+                break
+        else:
+            remaining = None
+
+        # Event-backed wait, not a busy spin. Cancellation needs a bounded
+        # observation cadence because Python has no native wait-any for two
+        # threading.Events.
+        wait_slice = remaining
+        if cancel_event is not None:
+            wait_slice = 0.05 if remaining is None else min(remaining, 0.05)
+        job.completion_event.wait(wait_slice)
+
+    # A kill request is not completion. Always await the sole watcher-owned
+    # finalization signal without a second timeout.
+    job.completion_event.wait()
+    return _snapshot_job(job)
+
+
+def forget_terminal_job(process_id: str) -> bool:
+    """Forget one fully finalized internal job after result harvesting.
+
+    Public jobs retain their existing TTL history. Unknown IDs, public jobs,
+    and any internal job whose completion event is not yet set fail safely.
+    """
+    if not isinstance(process_id, str) or not process_id:
+        return False
+    with _registry_lock:
+        job = _registry.get(process_id)
+        if job is None or job.visibility != "internal":
+            return False
+        with job.lifecycle_lock:
+            if job.status == "running" or not job.completion_event.is_set():
+                return False
+        del _registry[process_id]
     return True
 
 
@@ -527,8 +670,11 @@ def _snapshot_job(job: "_Job") -> dict:
         return {
             "process_id": job.process_id,
             "command": job.command,
+            "argv": list(job.argv) if job.argv is not None else None,
             "cwd": job.cwd,
             "channel_id": job.channel_id,
+            "provenance": job.provenance,
+            "visibility": job.visibility,
             "epoch": job.epoch,
             "pid": job.pid,
             "control_metadata": dict(job.control_metadata),
@@ -543,22 +689,35 @@ def _snapshot_job(job: "_Job") -> dict:
 
 
 def get_job_snapshot(process_id: str):
-    """Internal/test read API -- not model-facing. Returns None if
-    process_id is unknown or has already aged out past
-    COMPLETED_PROCESS_TTL_SECONDS."""
+    """Model-visible read boundary used by existing process tools.
+
+    Returns None for unknown, expired, or internal jobs so possession of an
+    opaque internal ID does not make that job model-addressable.
+    """
     _sweep_expired()
     with _registry_lock:
         job = _registry.get(process_id)
-    if job is None:
+    if job is None or job.visibility != "model":
         return None
     return _snapshot_job(job)
 
 
-def list_job_ids() -> list:
-    """Internal/test read API -- not model-facing."""
+def _get_internal_job_snapshot(process_id: str):
+    """Private diagnostic/test snapshot across both visibility classes."""
     _sweep_expired()
     with _registry_lock:
-        return list(_registry.keys())
+        job = _registry.get(process_id)
+    return None if job is None else _snapshot_job(job)
+
+
+def list_job_ids() -> list:
+    """Model-visible ID list used by the existing list_processes tool."""
+    _sweep_expired()
+    with _registry_lock:
+        return [
+            process_id for process_id, job in _registry.items()
+            if job.visibility == "model"
+        ]
 
 
 def _reset_for_tests():

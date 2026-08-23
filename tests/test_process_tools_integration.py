@@ -274,6 +274,31 @@ def test_process_records_are_process_global_not_channel_filtered():
     _wait_for_terminal(observer, process_id)
 
 
+def test_internal_argv_job_is_unaddressable_through_all_existing_model_tools(tmp_path):
+    agent = _agent(owner=True, channel_id="internal-visibility-proof")
+    _enable_coding(agent)
+    process_id = process_manager.launch_argv(
+        [sys.executable, "-u", "-c", "import time; time.sleep(30)"],
+        cwd=str(tmp_path),
+    )
+    try:
+        listed = json.loads(agent.registry.call("list_processes", {}))
+        assert process_id not in {
+            item["process_id"] for item in listed["processes"]
+        }
+
+        for tool_name, arguments in (
+            ("read_process", {"process_id": process_id}),
+            ("send_process_input", {"process_id": process_id, "text": "x"}),
+            ("stop_process", {"process_id": process_id}),
+        ):
+            result = json.loads(agent.registry.call(tool_name, arguments))
+            assert result["error"] == "process_not_found"
+    finally:
+        process_manager.shutdown_all(wait_seconds=5)
+        process_manager.wait_for_completion(process_id, timeout=5)
+
+
 def test_real_owner_registry_process_lifecycle_and_emergency_blast_door(tmp_path):
     agent = _agent(owner=True, channel_id="registry-smoke")
     _enable_coding(agent)

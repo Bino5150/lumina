@@ -71,6 +71,21 @@ def test_posix_popen_kwargs_shape():
     assert "creationflags" not in kwargs
 
 
+def test_posix_argv_popen_kwargs_preserve_literal_arguments_and_env():
+    argv = [
+        sys.executable, "-c", "pass", "space value", "'quotes'", "λ",
+        "$HOME", ";", "&&", "(literal)", "-leading",
+    ]
+    env = {"ARGV_TEST": "present"}
+    kwargs = process_control._build_posix_argv_popen_kwargs(argv, "/tmp", env)
+    assert kwargs["args"] == argv
+    assert kwargs["shell"] is False
+    assert kwargs["cwd"] == "/tmp"
+    assert kwargs["env"] is env
+    assert kwargs["start_new_session"] is True
+    assert "executable" not in kwargs
+
+
 def test_resolve_posix_shell_uses_path_lookup_not_hardcoded_path(monkeypatch):
     calls = []
     monkeypatch.setattr(process_control.shutil, "which",
@@ -119,6 +134,31 @@ def test_posix_live_spawn_and_has_exited():
         process_control.terminate_tree(proc, control_metadata)
         proc.wait(timeout=5)
     assert process_control.has_exited(proc) is True
+
+
+def test_posix_live_argv_spawn_has_no_shell_expansion(tmp_path):
+    sentinel = tmp_path / "must not be created"
+    literal = f"$(touch {sentinel})"
+    proc, control_metadata = process_control.spawn_argv(
+        [sys.executable, "-u", "-c", "import sys; print(repr(sys.argv[1:]))",
+         "space value", literal, ";", "&&", "λ", "-leading"],
+        str(tmp_path),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=5)
+        assert proc.returncode == 0
+        assert stderr == ""
+        assert "space value" in stdout
+        assert literal in stdout
+        assert "-leading" in stdout
+        assert not sentinel.exists()
+    finally:
+        if process_control.tree_is_alive(control_metadata):
+            process_control.terminate_tree(proc, control_metadata)
+        deadline = time.time() + 5
+        while process_control.tree_is_alive(control_metadata) and time.time() < deadline:
+            time.sleep(0.02)
+        process_control.release_control(control_metadata)
 
 
 def test_posix_live_whole_tree_termination_parent_child_grandchild():
@@ -448,11 +488,58 @@ def test_windows_popen_kwargs_shape():
     assert kwargs["errors"] == "replace"
 
 
+def test_windows_argv_popen_kwargs_preserve_sequence_without_shell_text():
+    argv = ["C:\\Python\\python.exe", "-c", "pass", "space value", "$x", ";", "-leading"]
+    env = {"ARGV_TEST": "present"}
+    kwargs = process_control._build_windows_argv_popen_kwargs(
+        argv, "C:\\Users\\lumina", env
+    )
+    assert kwargs["args"] == argv
+    assert kwargs["shell"] is False
+    assert kwargs["env"] is env
+    assert kwargs["creationflags"] & process_control._CREATE_SUSPENDED
+    assert "executable" not in kwargs
+    assert "start_new_session" not in kwargs
+
+
 def _spawn_windows_with_fake(monkeypatch, fake_kernel32, fake_proc):
     monkeypatch.setattr(process_control, "_kernel32", lambda: fake_kernel32)
     monkeypatch.setattr(process_control.subprocess, "Popen", lambda **kw: fake_proc)
     fake_kernel32._target_pid = fake_proc.pid
     return process_control._spawn_windows("dir", "C:\\Users\\lumina")
+
+
+def _spawn_windows_argv_with_fake(monkeypatch, fake_kernel32, fake_proc, argv):
+    captured = {}
+    monkeypatch.setattr(process_control, "_kernel32", lambda: fake_kernel32)
+
+    def popen(**kwargs):
+        captured.update(kwargs)
+        return fake_proc
+
+    monkeypatch.setattr(process_control.subprocess, "Popen", popen)
+    fake_kernel32._target_pid = fake_proc.pid
+    result = process_control._spawn_windows_argv(
+        argv, "C:\\Users\\lumina", env={"ARGV_TEST": "present"}
+    )
+    return result, captured
+
+
+def test_windows_argv_spawn_assigns_job_before_resume_and_never_uses_shell(monkeypatch):
+    fake_k32 = _FakeKernel32()
+    fake_proc = _FakeProc(pid=556)
+    argv = ["python.exe", "-c", "pass", "space value", ";", "$x"]
+    (proc, control_metadata), captured = _spawn_windows_argv_with_fake(
+        monkeypatch, fake_k32, fake_proc, argv
+    )
+
+    names = [call[0] for call in fake_k32.calls]
+    assert names.index("AssignProcessToJobObject") < names.index("ResumeThread")
+    assert captured["args"] == argv
+    assert captured["shell"] is False
+    assert captured["env"] == {"ARGV_TEST": "present"}
+    assert proc is fake_proc
+    assert control_metadata["backend"] == "windows"
 
 
 def test_windows_spawn_associates_job_before_resuming_thread(monkeypatch):

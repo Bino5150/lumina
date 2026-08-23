@@ -15,7 +15,7 @@ functional testing is explicitly covered — see test_block_rm_root_wildcard
 and test_block_rm_abs_path_wildcard.
 """
 import pytest
-from tools.guardrails import check_command
+from tools.guardrails import check_argv, check_command
 from tools.terminal import register_terminal_tools
 
 
@@ -110,7 +110,78 @@ class TestCheckCommandAllowed:
         assert result is None, f"False positive — '{command}' was blocked: {result}"
 
 
-# ── Part 2: run_command integration tests ─────────────────────────────────
+# ── Part 2: check_argv direct-execution guard ────────────────────────────
+
+class TestCheckArgvBlocked:
+    @pytest.mark.parametrize("argv, expected_reason", [
+        (["rm", "-rf", "/"], "recursive/force delete of root"),
+        (["/usr/bin/rm", "-fR", "/./"], "recursive/force delete of root"),
+        (["C:\\bin\\rm.exe", "--recursive", "--force", "C:\\"],
+         "recursive/force delete of root"),
+        (["dd", "if=/dev/zero", "of=/dev/sda"], "dd writing directly to a device"),
+        (["/sbin/mkfs.ext4", "/dev/sda1"], "filesystem format"),
+        (["chmod", "-R", "777", "/"], "recursive world-writable on root"),
+        (["git", "push", "-f", "origin", "main"], "force push"),
+        (["C:\\Git\\bin\\git.exe", "push", "--force", "origin", "main"], "force push"),
+        (["git", "-C", "repo", "reset", "--hard", "HEAD"],
+         "git reset --hard (discards uncommitted work)"),
+        (["git", "clean", "-fd"], "git clean with force flag (deletes untracked files)"),
+        (["git", "branch", "-D", "main"],
+         "git branch -D (force delete, discards unmerged commits)"),
+        (["gh.exe", "repo", "delete", "Bino5150/lumina", "--yes"], "gh repo delete"),
+        (["sudo", "-u", "root", "/usr/bin/rm", "-rf", "/home"], "sudo rm"),
+    ])
+    def test_direct_destructive_operation_blocked(self, argv, expected_reason):
+        assert check_argv(argv) == expected_reason
+
+    @pytest.mark.parametrize("argv, expected_reason", [
+        (["bash", "-c", "rm -rf /"], "recursive/force delete of root"),
+        (["/bin/zsh", "-lc", "git push -f origin main"], "force push"),
+        (["cmd.exe", "/C", "git reset --hard HEAD"],
+         "git reset --hard (discards uncommitted work)"),
+        (["PowerShell.EXE", "-Command", "gh repo delete owner/repo"], "gh repo delete"),
+        (["pwsh", "-c", "chmod -R 777 /"], "recursive world-writable on root"),
+    ])
+    def test_shell_inline_command_delegates_exact_text(self, argv, expected_reason):
+        assert check_argv(argv) == expected_reason
+
+
+class TestCheckArgvAllowed:
+    @pytest.mark.parametrize("literal", [
+        "; rm -rf /",
+        "$(touch /tmp/example)",
+        "&&",
+        "|",
+        "quotes ' \" and $dollars (parentheses)",
+    ])
+    def test_shell_looking_literal_is_data_for_harmless_executable(self, literal):
+        assert check_argv(["printf", "%s", literal]) is None
+
+    @pytest.mark.parametrize("argv", [
+        ["git", "push", "origin", "main"],
+        ["git", "reset", "--soft", "HEAD~1"],
+        ["git", "clean", "--dry-run"],
+        ["git", "branch", "-d", "merged"],
+        ["gh", "repo", "view", "Bino5150/lumina"],
+        ["rm", "-rf", "./build"],
+        ["echo", "data", ">", "/dev/sda"],
+        ["python", "-c", "import os; os.unlink('literal')"],
+    ])
+    def test_legitimate_direct_argv_allowed(self, argv):
+        assert check_argv(argv) is None
+
+    @pytest.mark.parametrize("argv", [
+        "rm -rf /",
+        [],
+        [""],
+        ["echo", 7],
+        ["echo", "bad\0argument"],
+    ])
+    def test_structurally_invalid_argv_rejected(self, argv):
+        assert check_argv(argv) is not None
+
+
+# ── Part 3: run_command integration tests ─────────────────────────────────
 
 class TestRunCommandGuard:
     """The guard is wired into run_command: blocked commands never reach
