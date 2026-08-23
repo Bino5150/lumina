@@ -26,6 +26,7 @@ from tools.sandbox import register_sandbox_tools
 from tools.vision import register_vision_tools
 from tools.terminal import register_terminal_tools
 from tools.processes import register_process_tools
+from tools.coding_checkpoint import register_coding_checkpoint_tools
 from tools.toolmaker import register_toolmaker_tools, load_approved_custom_tools
 from tools.palace import register_palace_tools
 from core.skills import register_skills_tools, build_skills_block, init_skills_db
@@ -213,6 +214,10 @@ class LuminaAgent:
             self.registry,
             project_state=self.project_context,
             channel_id=self.channel_id,
+        )
+        register_coding_checkpoint_tools(
+            self.registry,
+            project_state=self.project_context,
         )
         if owner:
             # Hard exclusion — for non-owner sessions, toolmaker's tools never

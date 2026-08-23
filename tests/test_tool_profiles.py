@@ -67,6 +67,7 @@ def test_coding_profile_did_not_gain_unrelated_tools():
         "read_file", "write_file", "edit_file", "list_dir", "search_files", "search_code",
         "run_python", "run_command",
         "start_process", "read_process", "send_process_input", "stop_process", "list_processes",
+        "read_coding_checkpoint", "save_coding_checkpoint",
         "activate_project", "get_active_project", "clear_active_project",
         "create_tool", "list_custom_tools", "delete_tool",
         "palace_remember", "palace_hall", "palace_recall", "palace_status",

@@ -88,6 +88,7 @@ TOOL_TIERS = {
     "list_dir": "read_only", "search_files": "read_only", "read_file": "read_only",
     "search_code": "read_only",
     "read_process": "read_only", "list_processes": "read_only",
+    "read_coding_checkpoint": "read_only",
     "start_process": "execute", "send_process_input": "execute", "stop_process": "execute",
     "palace_recall": "read_only", "palace_status": "read_only",
     "list_skills": "read_only", "recall_skill": "read_only",
@@ -113,6 +114,7 @@ TOOL_TIERS = {
     "save_knowledge": "write_local", "delete_knowledge": "write_local",
     "save_person": "write_local", "write_file": "write_local",
     "edit_file": "write_local",
+    "save_coding_checkpoint": "write_local",
     "palace_remember": "write_local", "palace_hall": "write_local",
     "save_skill": "write_local", "apply_patch": "write_local",
     "browser_navigate": "write_local", "browser_click": "write_local",
@@ -146,6 +148,10 @@ OWNER_ONLY_TOOLS = {
     # these capabilities to a non-owner session.
     "start_process", "read_process", "send_process_input",
     "stop_process", "list_processes",
+    # CODING-05A3: durable engineering checkpoint state is owner-only in v1.
+    # Profile selection, explicit grants, PIN verification, Project context,
+    # and parent ownership are separate axes and cannot restore either tool.
+    "read_coding_checkpoint", "save_coding_checkpoint",
     # CODING-02B-A: persistent machine-local configuration (writes
     # DATA_DIR/projects/<name>/binding.json) -- distinct from
     # activate_project/clear_active_project, which only ever touch the
