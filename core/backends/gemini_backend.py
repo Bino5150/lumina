@@ -83,6 +83,34 @@ _REASONING_MODELS = {
 }
 
 
+def _strip_additional_properties(schema):
+    """
+    Deep-copy `schema`, recursively dropping every "additionalProperties" key
+    at any nesting level (CODING-06A2 corrective 2). Gemini's function-
+    declaration Schema type does not support "additionalProperties" and
+    rejects a request that includes it; the canonical tool registry schemas
+    set "additionalProperties": False both at a parameters object's own top
+    level and inside nested object schemas (e.g. save_coding_checkpoint's
+    "validations" array item schema), so this has to walk the whole tree,
+    not just strip one fixed key path.
+
+    Never mutates the input in place -- the same schema object returned by
+    ToolRegistry.get_schemas() is shared with every other backend's own
+    translation, and those still need "additionalProperties" intact. Every
+    other field (type, properties, required, items, enum, minLength, etc.)
+    passes through unchanged.
+    """
+    if isinstance(schema, dict):
+        return {
+            key: _strip_additional_properties(value)
+            for key, value in schema.items()
+            if key != "additionalProperties"
+        }
+    if isinstance(schema, list):
+        return [_strip_additional_properties(item) for item in schema]
+    return schema
+
+
 def normalize_gemini_tool_result(value):
     """
     Normalize a tool result into the dict shape Gemini's functionResponse.response
@@ -305,7 +333,9 @@ class GeminiBackend(BaseLLMBackend):
             declarations.append({
                 "name": fn["name"],
                 "description": fn.get("description", ""),
-                "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                "parameters": _strip_additional_properties(
+                    fn.get("parameters", {"type": "object", "properties": {}})
+                ),
             })
         return [{"functionDeclarations": declarations}] if declarations else None
 

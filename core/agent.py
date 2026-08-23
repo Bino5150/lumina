@@ -27,6 +27,7 @@ from tools.vision import register_vision_tools
 from tools.terminal import register_terminal_tools
 from tools.processes import register_process_tools
 from tools.coding_checkpoint import register_coding_checkpoint_tools
+from tools.tests import register_tests_tools
 from tools.toolmaker import register_toolmaker_tools, load_approved_custom_tools
 from tools.palace import register_palace_tools
 from core.skills import register_skills_tools, build_skills_block, init_skills_db
@@ -58,6 +59,25 @@ class TurnCancelled(Exception):
     def __init__(self, partial_response: str = ""):
         super().__init__("foreground turn cancelled by operator")
         self.partial_response = partial_response or ""
+
+
+class TurnCancellation:
+    """Per-agent holder for the current turn's cooperative /stop cancel_event
+    (CODING-06A2). Mirrors core/project_context.py's ProjectContextState --
+    per-instance, never a process global. A tool registrar closure bound at
+    agent-construction time (before any cancel_event exists) reads .get() at
+    call time, so a blocking tool call always observes whichever cancel_event
+    is active for the turn actually running it, never a stale one from a
+    previous turn or a different agent instance."""
+
+    def __init__(self):
+        self._event = None
+
+    def get(self):
+        return self._event
+
+    def _set(self, event):
+        self._event = event
 
 
 def _cancel_requested(cancel_event) -> bool:
@@ -176,6 +196,11 @@ class LuminaAgent:
         # core/project_context.py's own module docstring for why. Two
         # LuminaAgent instances always get two distinct holders.
         self.project_context = ProjectContextState(project_context)
+        # CODING-06A2: per-instance holder for the current turn's cooperative
+        # /stop cancel_event, same per-instance-not-global convention as
+        # project_context above. Set at the top of a turn, cleared when it
+        # ends -- see chat() below.
+        self.turn_cancellation = TurnCancellation()
 
         if owner:
             # FE-09: one-time, idempotent — moves any cloud API keys still
@@ -218,6 +243,11 @@ class LuminaAgent:
         register_coding_checkpoint_tools(
             self.registry,
             project_state=self.project_context,
+        )
+        register_tests_tools(
+            self.registry,
+            project_state=self.project_context,
+            cancel_state=self.turn_cancellation,
         )
         if owner:
             # Hard exclusion — for non-owner sessions, toolmaker's tools never
@@ -347,23 +377,35 @@ class LuminaAgent:
         unrelated programmer error out of execution_scope() still surfaces
         as itself.
         """
+        # CODING-06A2: getattr-guarded, same reason as every other fake-self
+        # compatibility check in this method — lightweight test stand-ins
+        # (types.SimpleNamespace) predating this patch have no
+        # turn_cancellation attribute at all. Real LuminaAgent instances
+        # always have one, set in __init__.
+        turn_cancellation = getattr(self, "turn_cancellation", None)
+        if turn_cancellation is not None:
+            turn_cancellation._set(cancel_event)
         try:
-            with emergency_stop.execution_scope(
-                kind="foreground_turn",
-                label=getattr(self, "channel_id", "default"),
-                metadata={
-                    "channel_id": getattr(self, "channel_id", "default"),
-                    "owner": getattr(self, "owner", None),
-                    "chat_id": chat_id,
-                },
-            ):
-                return LuminaAgent._chat_impl(
-                    self, user_input, source=source, chat_id=chat_id,
-                    cancel_event=cancel_event, reasoning_effort=reasoning_effort,
-                )
-        except emergency_stop.EmergencyStopError:
-            self.ctx.add_user(user_input, source=source)
-            raise TurnCancelled()
+            try:
+                with emergency_stop.execution_scope(
+                    kind="foreground_turn",
+                    label=getattr(self, "channel_id", "default"),
+                    metadata={
+                        "channel_id": getattr(self, "channel_id", "default"),
+                        "owner": getattr(self, "owner", None),
+                        "chat_id": chat_id,
+                    },
+                ):
+                    return LuminaAgent._chat_impl(
+                        self, user_input, source=source, chat_id=chat_id,
+                        cancel_event=cancel_event, reasoning_effort=reasoning_effort,
+                    )
+            except emergency_stop.EmergencyStopError:
+                self.ctx.add_user(user_input, source=source)
+                raise TurnCancelled()
+        finally:
+            if turn_cancellation is not None:
+                turn_cancellation._set(None)
 
     def _chat_impl(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
                     cancel_event=None, reasoning_effort: Optional[str] = None) -> str:

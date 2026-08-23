@@ -20,6 +20,7 @@ from core.backends.gemini_backend import (
     GeminiBackend,
     normalize_gemini_tool_result,
     _redact_thought_signatures,
+    _strip_additional_properties,
 )
 
 
@@ -202,3 +203,123 @@ def test_parallel_tool_calls_preserve_content_as_one_unit_no_signature_copy():
     assert len(fr_turn["parts"]) == 2
     names = {p["functionResponse"]["name"] for p in fr_turn["parts"]}
     assert names == {"search_memory", "get_time"}
+
+
+# ── _strip_additional_properties / _translate_tools (CODING-06A2 corrective 2) ──
+# Gemini's function-declaration Schema type does not support
+# "additionalProperties" and 400s on a request that includes it. Confirmed by
+# source-vetting _translate_tools (it passed fn["parameters"] straight through
+# unmodified) and, before this fix, by a hermetic translation of the real
+# registered schemas for run_tests / read_coding_checkpoint /
+# save_coding_checkpoint -- no live provider/network call involved, here or
+# in the fix itself.
+
+def _real_tool_schemas():
+    """The actual canonical schemas as ToolRegistry.register() stores them --
+    not hand-rolled fakes -- for exactly the three tools the corrective
+    named. save_coding_checkpoint is the one with a NESTED
+    additionalProperties (inside its "validations" array item schema), not
+    just a top-level one."""
+    from tools.registry import ToolRegistry
+    from tools.tests import register_tests_tools
+    from tools.coding_checkpoint import register_coding_checkpoint_tools
+
+    registry = ToolRegistry()
+    register_tests_tools(registry, project_state=None, cancel_state=None)
+    register_coding_checkpoint_tools(registry, project_state=None)
+    return registry, registry.get_schemas()
+
+
+def _has_additional_properties(node) -> bool:
+    if isinstance(node, dict):
+        if "additionalProperties" in node:
+            return True
+        return any(_has_additional_properties(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_additional_properties(item) for item in node)
+    return False
+
+
+@pytest.mark.parametrize("name", ["run_tests", "read_coding_checkpoint", "save_coding_checkpoint"])
+def test_gemini_translation_strips_additional_properties(name):
+    _registry, schemas = _real_tool_schemas()
+    canonical = next(s for s in schemas if s["function"]["name"] == name)
+    # Sanity: the canonical registry schema really does carry
+    # additionalProperties (this is the condition the fix has to handle) --
+    # save_coding_checkpoint's copy is nested two levels deep.
+    assert _has_additional_properties(canonical["function"]["parameters"])
+
+    translated = GeminiBackend._translate_tools(schemas)
+    declarations = {d["name"]: d for d in translated[0]["functionDeclarations"]}
+    assert not _has_additional_properties(declarations[name]["parameters"])
+
+
+def test_gemini_translation_preserves_other_schema_fields():
+    _registry, schemas = _real_tool_schemas()
+    canonical = next(s for s in schemas if s["function"]["name"] == "save_coding_checkpoint")
+    translated = GeminiBackend._translate_tools(schemas)
+    declarations = {d["name"]: d for d in translated[0]["functionDeclarations"]}
+    params = declarations["save_coding_checkpoint"]["parameters"]
+
+    assert params["type"] == "object"
+    assert params["required"] == canonical["function"]["parameters"]["required"]
+    assert params["properties"]["task_id"] == canonical["function"]["parameters"]["properties"]["task_id"]
+    validations_items = params["properties"]["validations"]["items"]
+    assert validations_items["required"] == ["label", "outcome"]
+    assert "enum" in validations_items["properties"]["outcome"]
+    assert "additionalProperties" not in validations_items
+
+
+def test_gemini_translation_never_mutates_canonical_registry_schema():
+    """The same schema dict object is shared across every backend's own
+    translation via ToolRegistry.get_schemas() -- stripping fields for
+    Gemini must never corrupt what OpenAI/Anthropic/the registry itself see
+    on a later call."""
+    registry, schemas = _real_tool_schemas()
+    before = json.dumps(schemas, sort_keys=True)
+
+    GeminiBackend._translate_tools(schemas)
+
+    after = json.dumps(schemas, sort_keys=True)
+    assert before == after
+    # Re-fetching from the registry (a fresh get_schemas() call) still shows
+    # additionalProperties -- proves the stored schema itself, not just this
+    # local `schemas` reference, was left untouched.
+    refetched = registry.get_schemas()
+    save_schema = next(s for s in refetched if s["function"]["name"] == "save_coding_checkpoint")
+    assert _has_additional_properties(save_schema["function"]["parameters"])
+
+
+def test_other_providers_still_receive_additional_properties():
+    """Corrective 2 scope: ONLY the Gemini-bound translation strips this
+    field. Anthropic's own translator must still see it untouched."""
+    from core.backends.anthropic_backend import AnthropicBackend
+
+    _registry, schemas = _real_tool_schemas()
+    save_schema = next(s for s in schemas if s["function"]["name"] == "save_coding_checkpoint")
+
+    anthropic_tools = AnthropicBackend._translate_tools([save_schema])
+    anthropic_tool = next(t for t in anthropic_tools if t["name"] == "save_coding_checkpoint")
+    assert _has_additional_properties(anthropic_tool["input_schema"])
+
+
+def test_strip_additional_properties_unit_shape():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"label": {"type": "string"}},
+                },
+            },
+        },
+    }
+    stripped = _strip_additional_properties(schema)
+    assert not _has_additional_properties(stripped)
+    assert stripped["properties"]["items"]["items"]["properties"]["label"] == {"type": "string"}
+    # Original untouched.
+    assert _has_additional_properties(schema)

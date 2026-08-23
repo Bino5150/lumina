@@ -90,6 +90,10 @@ TOOL_TIERS = {
     "read_process": "read_only", "list_processes": "read_only",
     "read_coding_checkpoint": "read_only",
     "start_process": "execute", "send_process_input": "execute", "stop_process": "execute",
+    # CODING-06A2: pytest executes arbitrary repository Python -- materially
+    # different from a read-only code-analysis operation. execute tier plus
+    # OWNER_ONLY_TOOLS below (not PIN alone) is what actually gates it.
+    "run_tests": "execute",
     "palace_recall": "read_only", "palace_status": "read_only",
     "list_skills": "read_only", "recall_skill": "read_only",
     "search_chat_history": "read_only", "get_chat_session": "read_only",
@@ -152,6 +156,12 @@ OWNER_ONLY_TOOLS = {
     # Profile selection, explicit grants, PIN verification, Project context,
     # and parent ownership are separate axes and cannot restore either tool.
     "read_coding_checkpoint", "save_coding_checkpoint",
+    # CODING-06A2: run_tests executes arbitrary repository Python through
+    # pytest. Locked v1 product decision: owner-only, full stop. Profile
+    # selection, explicit tools_enabled grants, PIN verification, Project
+    # activation, and parent ownership are separate axes and cannot restore
+    # it for a non-owner session -- see tools/tests.py's module docstring.
+    "run_tests",
     # CODING-02B-A: persistent machine-local configuration (writes
     # DATA_DIR/projects/<name>/binding.json) -- distinct from
     # activate_project/clear_active_project, which only ever touch the
