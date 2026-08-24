@@ -11,14 +11,13 @@ import hashlib
 import json
 import os
 import stat
-import subprocess
-import threading
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Optional, Sequence
 
 import core.coding_checkpoint as checkpoint_store
 import core.coding_validation_evidence as validation_evidence
+from core.git_read import GitCommandResult, GitReadError, run_bounded_git
 from core.project_context import ProjectContext, load_project_binding
 
 
@@ -238,81 +237,25 @@ class LiveCheckpointRead:
     metadata: Optional[SafeRowMetadata] = None
 
 
-@dataclass(frozen=True)
-class _GitCommandResult:
-    returncode: int
-    stdout: bytes
-    stderr: bytes
+# CODING-08A1: the bounded argv-only subprocess boundary itself now lives in
+# core.git_read, shared with the review kernel. This stays a thin wrapper
+# binding this module's own timeout/byte bounds and translating a transport
+# failure into GitProbeError -- the domain exception every caller in this
+# module already expects. Behavior (env, bounds, exception type raised at
+# each call site) is unchanged from the pre-extraction implementation.
+_GitCommandResult = GitCommandResult
 
 
-def _bounded_reader(stream, limit: int, sink: list, overflow: threading.Event):
-    total = 0
-    while True:
-        chunk = stream.read(64 * 1024)
-        if not chunk:
-            break
-        remaining = limit - total
-        if remaining > 0:
-            sink.append(chunk[:remaining])
-        total += len(chunk)
-        if total > limit:
-            overflow.set()
-
-
-def _run_git(root: str, args: Sequence[str]) -> _GitCommandResult:
-    """Run Git with argument arrays, hard time/output bounds, and no prompts."""
-    env = os.environ.copy()
-    env.update({
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_OPTIONAL_LOCKS": "0",
-        "LC_ALL": "C",
-    })
+def _run_git(root: str, args: Sequence[str]) -> GitCommandResult:
     try:
-        process = subprocess.Popen(
-            ["git", "-C", root, *args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            env=env,
+        return run_bounded_git(
+            root, args,
+            timeout=GIT_TIMEOUT_SECONDS,
+            max_stdout_bytes=MAX_GIT_STDOUT_BYTES,
+            max_stderr_bytes=MAX_GIT_STDERR_BYTES,
         )
-    except OSError as error:
-        raise GitProbeError("Git executable is unavailable") from error
-
-    stdout_parts = []
-    stderr_parts = []
-    stdout_overflow = threading.Event()
-    stderr_overflow = threading.Event()
-    stdout_thread = threading.Thread(
-        target=_bounded_reader,
-        args=(process.stdout, MAX_GIT_STDOUT_BYTES, stdout_parts, stdout_overflow),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_bounded_reader,
-        args=(process.stderr, MAX_GIT_STDERR_BYTES, stderr_parts, stderr_overflow),
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    try:
-        process.wait(timeout=GIT_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as error:
-        process.kill()
-        process.wait()
-        stdout_thread.join()
-        stderr_thread.join()
-        raise GitProbeError("Git probe timed out") from error
-
-    stdout_thread.join()
-    stderr_thread.join()
-    if stdout_overflow.is_set() or stderr_overflow.is_set():
-        raise GitProbeError("Git probe output exceeded its bounded capture limit")
-    return _GitCommandResult(
-        returncode=process.returncode,
-        stdout=b"".join(stdout_parts),
-        stderr=b"".join(stderr_parts),
-    )
+    except GitReadError as error:
+        raise GitProbeError(str(error)) from error
 
 
 def _decode_git_data(value: bytes) -> str:
