@@ -59,6 +59,10 @@ class ProtectedRootRefused(WorktreeManagerError):
     """The source repository or portable allocation area is protected."""
 
 
+class ManagedWorktreeUnavailable(WorktreeManagerError):
+    """A retained handle cannot be proven live for isolated dispatch."""
+
+
 @dataclass(frozen=True)
 class UnknownPorcelainAttribute:
     key: str
@@ -627,6 +631,42 @@ def _removal_identity_error(
     if entry.branch != f"refs/heads/{handle.branch}" or entry.detached:
         return "managed target branch state differs from the creation handle"
     return None
+
+
+def resolve_live_worktree(worktree_id: str) -> WorktreeHandle:
+    """Return one exact current-session handle after fresh Git verification.
+
+    This is the non-mutating admission boundary used by isolated subagent
+    dispatch.  The opaque ID is only a selector: the retained creation handle,
+    Git's fresh ledger, filesystem/admin identities, HEAD, branch, and
+    locked/prunable state must all still agree.  Holding the manager lock across
+    verification prevents an in-process remove from crossing admission; no
+    worktree is adopted by path or inferred from Git's ledger.
+    """
+    if not isinstance(worktree_id, str) or not worktree_id:
+        raise InvalidWorktreeRequest("worktree_id must be a non-empty string")
+
+    with _registry_lock:
+        handle = _registry.get(worktree_id)
+        if handle is None:
+            raise ManagedWorktreeUnavailable("managed worktree was not found")
+        if worktree_id in _removing_ids:
+            raise ManagedWorktreeUnavailable("managed worktree removal is in progress")
+
+        observation = _observe_reality(handle.source_root, handle.worktree_root)
+        identity_error = _removal_identity_error(handle, observation)
+        if identity_error:
+            raise ManagedWorktreeUnavailable(identity_error)
+        entry = observation.ledger_entry
+        if entry.locked:
+            raise ManagedWorktreeUnavailable(
+                entry.locked_reason or "managed worktree is locked"
+            )
+        if entry.prunable:
+            raise ManagedWorktreeUnavailable(
+                entry.prunable_reason or "managed worktree is prunable"
+            )
+        return handle
 
 
 def _dirty_state(target: str) -> tuple[Optional[bool], Optional[str]]:

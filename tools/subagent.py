@@ -98,7 +98,7 @@ compound this into anything new; worth remembering the day parallel
 subagents or deeper delegation chains get discussed.
 """
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 import config
 from core.agent import LuminaAgent
@@ -107,11 +107,16 @@ from core.tool_profiles import apply_tool_profile
 
 
 def resolve_dispatch_project_context(project: Optional[str],
-                                      inherited_context: Optional[ProjectContext]) -> Optional[ProjectContext]:
+                                      inherited_context: Optional[ProjectContext],
+                                      worktree_id: Optional[str] = None,
+                                      worktree_resolver: Optional[
+                                          Callable[[str], ProjectContext]
+                                      ] = None) -> Optional[ProjectContext]:
     """CODING-02B-B: the one place that decides which immutable
     ProjectContext a spawned child should start with, shared by the
-    synchronous, immediate-background, and scheduled-background dispatch
-    paths so none of them re-derive this logic independently.
+    synchronous and immediate-background dispatch paths so neither re-derives
+    this logic independently. Scheduled dispatch continues to support tracked
+    Projects only; managed-worktree dispatch is deliberately unsupported.
 
     project supplied (an explicit override name) -- resolved to a real
     tracked Project + its machine-local binding RIGHT NOW, at the caller's
@@ -119,12 +124,23 @@ def resolve_dispatch_project_context(project: Optional[str],
     malformed/stale binding) -- callers decide how to surface that; this
     function never swallows a failure into a silent None.
 
-    project omitted -- the caller's own already-captured immutable snapshot
+    worktree_id supplied (CODING-07A4) -- project must be omitted and the
+    caller-bound resolver must prove the opaque ID belongs to this agent's
+    session and still matches fresh Git/filesystem identity. The returned
+    context is synthetic and ephemeral; no Project binding is read or written.
+
+    project and worktree_id omitted -- the caller's own already-captured immutable snapshot
     is used verbatim. No re-resolution, no binding.json re-read, no lookup
     by name here -- inherited_context is a ProjectContext value already
     captured via ProjectContextState.snapshot() at the true dispatch moment,
     never a name to look up later.
     """
+    if worktree_id is not None:
+        if project is not None:
+            raise ValueError("project and worktree_id are mutually exclusive")
+        if worktree_resolver is None:
+            raise ValueError("worktree dispatch is unavailable from this call path")
+        return worktree_resolver(worktree_id)
     if project is not None:
         from tools.projects import resolve_tracked_project
         return resolve_tracked_project(project)
@@ -136,8 +152,12 @@ def spawn_subagent(task: str,
                     backend: str = None,
                     tools_enabled: list = None,
                     project: str = None,
+                    worktree_id: str = None,
                     _parent_depth: int = 0,
-                    _project_context: Optional[ProjectContext] = None) -> dict:
+                    _project_context: Optional[ProjectContext] = None,
+                    _worktree_resolver: Optional[
+                        Callable[[str], ProjectContext]
+                    ] = None) -> dict:
     """
     Instantiates a headless, owner=False LuminaAgent, runs one turn, returns
     a structured result. Never raises -- a tool call should always get
@@ -154,6 +174,10 @@ def spawn_subagent(task: str,
     timely as resolving in a registrar closure would be. Wins over
     _project_context when both are given.
 
+    worktree_id (CODING-07A4): optional model-facing current-session managed
+    worktree selector. Mutually exclusive with project. It is not authority;
+    _worktree_resolver performs fresh verification before child construction.
+
     _project_context: internal only, MUST NOT appear in the registered tool
     schema. The parent's own active-Project snapshot, captured by
     register_subagent_tools()'s closure (synchronous case) or by
@@ -167,7 +191,9 @@ def spawn_subagent(task: str,
                 "error": f"Max subagent depth ({config.MAX_SUBAGENT_DEPTH}) reached."}
 
     try:
-        resolved_context = resolve_dispatch_project_context(project, _project_context)
+        resolved_context = resolve_dispatch_project_context(
+            project, _project_context, worktree_id, _worktree_resolver,
+        )
 
         sub = LuminaAgent(owner=False,
                            channel_id=f"subagent-{uuid.uuid4()}",
@@ -204,7 +230,8 @@ def spawn_subagent(task: str,
         return {"success": False, "result": "", "tool_calls_made": 0, "error": str(e)}
 
 
-def register_subagent_tools(registry, parent_depth: int, project_state=None):
+def register_subagent_tools(registry, parent_depth: int, project_state=None,
+                            worktree_resolver=None):
     """Gated at the call site (agent.py), not here -- mirrors every other
     conditional tool registration in the project.
 
@@ -223,11 +250,14 @@ def register_subagent_tools(registry, parent_depth: int, project_state=None):
     if parent_depth >= config.MAX_SUBAGENT_DEPTH:
         return
 
-    def _tool_spawn_subagent(task, persona=None, backend=None, tools_enabled=None, project=None):
+    def _tool_spawn_subagent(task, persona=None, backend=None, tools_enabled=None,
+                             project=None, worktree_id=None):
         snapshot = project_state.snapshot() if project_state is not None else None
         return spawn_subagent(task, persona=persona, backend=backend,
                                tools_enabled=tools_enabled, project=project,
-                               _parent_depth=parent_depth, _project_context=snapshot)
+                               worktree_id=worktree_id,
+                               _parent_depth=parent_depth, _project_context=snapshot,
+                               _worktree_resolver=worktree_resolver)
 
     registry.register(
         name="spawn_subagent",
@@ -250,6 +280,11 @@ def register_subagent_tools(registry, parent_depth: int, project_state=None):
                                             "grant any tool capability by itself -- it only changes which root "
                                             "project-aware tools default to, and only for tools already explicitly "
                                             "listed in tools_enabled."},
+                "worktree_id": {"type": "string", "pattern": r"^wt-[0-9a-f]{24}$",
+                                "description": "Optional current-session managed worktree ID. "
+                                               "The child receives an ephemeral context rooted at "
+                                               "the freshly verified worktree; mutually exclusive "
+                                               "with project."},
             },
             "required": ["task"],
         },

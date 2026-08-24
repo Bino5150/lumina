@@ -4,7 +4,7 @@ is the /btw pattern: dispatch a task to run in the background, return
 immediately with a task_id, let the caller check on it later (or get
 surfaced an ephemeral notice next turn -- see agent.py wiring in Part F).
 """
-from typing import Optional
+from typing import Callable, Optional
 
 import config
 from core.project_context import ProjectContext
@@ -15,7 +15,11 @@ from tools.subagent import spawn_subagent, resolve_dispatch_project_context
 def run_background_subagent(task: str, persona: str = None,
                              backend: str = None, tools_enabled: list = None,
                              project: str = None,
-                             _project_context: Optional[ProjectContext] = None) -> dict:
+                             worktree_id: str = None,
+                             _project_context: Optional[ProjectContext] = None,
+                             _worktree_resolver: Optional[
+                                 Callable[[str], ProjectContext]
+                             ] = None) -> dict:
     """Dispatches a subagent to run in the background. Returns
     {"task_id": str} immediately -- does not block. Same owner=False,
     explicit-tools-only contract as spawn_subagent(), inherited for free
@@ -33,9 +37,15 @@ def run_background_subagent(task: str, persona: str = None,
     On an invalid/unknown/unbound project override, fails closed BEFORE any
     task is enqueued: returns {"task_id": None, "error": "<reason>"}, the
     same shape a caller checks either way -- no task_id key ever silently
-    means "it dispatched, check back later" when it didn't."""
+    means "it dispatched, check back later" when it didn't.
+
+    CODING-07A4 worktree_id follows the same pre-queue rule, but resolves only
+    through the caller-bound current-session resolver. The queued call carries
+    the resulting immutable synthetic context, never the ID or resolver."""
     try:
-        resolved_context = resolve_dispatch_project_context(project, _project_context)
+        resolved_context = resolve_dispatch_project_context(
+            project, _project_context, worktree_id, _worktree_resolver,
+        )
     except Exception as e:
         return {"task_id": None, "error": str(e)}
 
@@ -57,6 +67,7 @@ def check_background_task(task_id: str) -> dict:
 def schedule_background_subagent(task: str, run_at: float, persona: str = None,
                                   backend: str = None, tools_enabled: list = None,
                                   project: str = None,
+                                  worktree_id: str = None,
                                   _project_context: Optional[ProjectContext] = None) -> dict:
     """Same as run_background_subagent but fires at run_at (unix timestamp)
     instead of immediately -- the scheduled/cron half of the same
@@ -67,7 +78,16 @@ def schedule_background_subagent(task: str, run_at: float, persona: str = None,
     re-resolved when run_at arrives. The scheduled heap entry
     (core/task_queue.py) stores this already-resolved value verbatim; the
     scheduler loop never re-derives it, no matter what the parent's active
-    Project or binding.json looks like by the time the job actually fires."""
+    Project or binding.json looks like by the time the job actually fires.
+
+    CODING-07A4 deliberately rejects worktree_id before schedule_task(). A
+    transient current-session handle cannot safely authorize whatever occupies
+    a path after an arbitrary delay, and A4 adds no persistence/adoption."""
+    if worktree_id is not None:
+        return {
+            "task_id": None,
+            "error": "scheduled worktree dispatch is unsupported",
+        }
     try:
         resolved_context = resolve_dispatch_project_context(project, _project_context)
     except Exception as e:
@@ -79,7 +99,7 @@ def schedule_background_subagent(task: str, run_at: float, persona: str = None,
     return {"task_id": task_id}
 
 
-def register_task_tools(registry, agent):
+def register_task_tools(registry, agent, worktree_resolver=None):
     """Gated at the call site on config.BACKGROUND_TASKS_ENABLED, not here --
     mirrors every other conditional registration.
 
@@ -93,19 +113,26 @@ def register_task_tools(registry, agent):
     directly unit-testable, see tests/test_tasks.py); only the registered
     tool wrappers here know about the owning agent.
     """
-    def _tool_run_background_subagent(task, persona=None, backend=None, tools_enabled=None, project=None):
+    def _tool_run_background_subagent(task, persona=None, backend=None,
+                                      tools_enabled=None, project=None,
+                                      worktree_id=None):
         snapshot = agent.project_context.snapshot()
         result = run_background_subagent(task, persona=persona, backend=backend,
                                           tools_enabled=tools_enabled, project=project,
-                                          _project_context=snapshot)
+                                          worktree_id=worktree_id,
+                                          _project_context=snapshot,
+                                          _worktree_resolver=worktree_resolver)
         if result.get("task_id"):
             agent._background_task_ids.add(result["task_id"])
         return result
 
-    def _tool_schedule_background_subagent(task, run_at, persona=None, backend=None, tools_enabled=None, project=None):
+    def _tool_schedule_background_subagent(task, run_at, persona=None, backend=None,
+                                           tools_enabled=None, project=None,
+                                           worktree_id=None):
         snapshot = agent.project_context.snapshot()
         result = schedule_background_subagent(task, run_at, persona=persona, backend=backend,
                                                tools_enabled=tools_enabled, project=project,
+                                               worktree_id=worktree_id,
                                                _project_context=snapshot)
         if result.get("task_id"):
             agent._background_task_ids.add(result["task_id"])
@@ -129,6 +156,10 @@ def register_task_tools(registry, agent):
                             "description": "Optional tracked Project name for the child. If omitted, inherits the "
                                             "parent's active Project at dispatch time. Granting a Project does not "
                                             "grant any tool capability by itself."},
+                "worktree_id": {"type": "string", "pattern": r"^wt-[0-9a-f]{24}$",
+                                "description": "Optional current-session managed worktree ID. "
+                                               "Verified before the background task is queued; "
+                                               "mutually exclusive with project."},
             },
             "required": ["task"],
         },
@@ -151,7 +182,8 @@ def register_task_tools(registry, agent):
         name="schedule_background_subagent",
         fn=_tool_schedule_background_subagent,
         description="Schedule a subagent task to run at a future unix timestamp instead of "
-                     "immediately. Returns a task_id right away; the task fires later on its own.",
+                     "immediately. Returns a task_id right away; the task fires later on its own. "
+                     "Managed-worktree dispatch is unsupported for scheduled tasks in v1.",
         parameters={
             "type": "object",
             "properties": {

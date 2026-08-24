@@ -250,7 +250,7 @@ class LuminaAgent:
             project_state=self.project_context,
             cancel_state=self.turn_cancellation,
         )
-        register_worktree_tools(
+        self._resolve_worktree_dispatch = register_worktree_tools(
             self.registry,
             project_state=self.project_context,
             cancel_state=self.turn_cancellation,
@@ -302,11 +302,18 @@ class LuminaAgent:
         # same as every other tool registered above.
         if config.SUBAGENTS_ENABLED:
             from tools.subagent import register_subagent_tools
-            register_subagent_tools(self.registry, self._subagent_depth, project_state=self.project_context)
+            register_subagent_tools(
+                self.registry, self._subagent_depth,
+                project_state=self.project_context,
+                worktree_resolver=self._resolve_worktree_dispatch,
+            )
 
         if config.BACKGROUND_TASKS_ENABLED:
             from tools.tasks import register_task_tools
-            register_task_tools(self.registry, self)
+            register_task_tools(
+                self.registry, self,
+                worktree_resolver=self._resolve_worktree_dispatch,
+            )
 
         # Default-deny resolution runs LAST — after every register_*_tools()
         # call above. Anything registered before this line and not restored

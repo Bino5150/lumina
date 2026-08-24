@@ -20,6 +20,7 @@ import threading
 import config
 import core.coding_checkpoint_observation as checkpoint_observation
 from core import worktree_manager
+from core.project_context import ProjectContext
 
 
 _WORKTREE_ID_RE = re.compile(r"^wt-[0-9a-f]{24}$")
@@ -227,9 +228,25 @@ def register_worktree_tools(registry, project_state=None, cancel_state=None):
     removing another session's managed handles even though the lower-level
     manager is process-global.  It is advisory visibility/selection state only;
     Git reality and destructive authorization remain manager decisions.
+
+    CODING-07A4 returns a closure over that same session set. Immediate
+    subagent dispatch uses it to turn an opaque ID into a freshly verified,
+    synthetic ProjectContext without exposing the set or resolver to a model.
     """
     session_ids: set[str] = set()
     session_lock = threading.RLock()
+
+    def resolve_dispatch_context(worktree_id: str) -> ProjectContext:
+        """Resolve one session-owned ID to an ephemeral, verified context."""
+        if not isinstance(worktree_id, str) or not _WORKTREE_ID_RE.fullmatch(worktree_id):
+            raise ValueError("worktree_id must be an opaque Lumina worktree ID")
+        with session_lock:
+            if worktree_id not in session_ids:
+                raise ValueError("managed worktree was not found in this session")
+            handle = worktree_manager.resolve_live_worktree(worktree_id)
+        return ProjectContext(
+            name=f"worktree-{worktree_id}", root=handle.worktree_root,
+        )
 
     def create_worktree(base="HEAD", source_repository=None, **unsupported_fields) -> str:
         if unsupported_fields:
@@ -389,4 +406,4 @@ def register_worktree_tools(registry, project_state=None, cancel_state=None):
             "additionalProperties": False,
         },
     )
-
+    return resolve_dispatch_context
