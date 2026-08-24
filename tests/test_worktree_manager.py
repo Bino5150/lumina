@@ -1,0 +1,390 @@
+"""CODING-07A1 internal worktree kernel tests.
+
+All Git mutations are confined to disposable repositories.  The production
+Lumina repositories and real DATA_DIR are never used.
+"""
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import threading
+
+import pytest
+
+from core import emergency_stop, process_manager
+import core.worktree_manager as wm
+from process_test_helpers import wait_for_path
+
+
+def _git(cwd, *args, check=True):
+    return subprocess.run(
+        ["git", *args], cwd=cwd, text=True, capture_output=True, check=check,
+    )
+
+
+def _repo(path: Path) -> Path:
+    path.mkdir()
+    _git(path, "init", "-q")
+    _git(path, "config", "user.name", "Lumina Test")
+    _git(path, "config", "user.email", "lumina-test@example.invalid")
+    (path / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _git(path, "add", "tracked.txt")
+    _git(path, "commit", "-qm", "initial")
+    return path
+
+
+def _write_hook(repo: Path, source: str):
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!{sys.executable}\n{source}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    return hook
+
+
+@pytest.fixture(autouse=True)
+def _isolated_kernel(tmp_path, monkeypatch):
+    process_manager._reset_for_tests()
+    emergency_stop._reset_for_tests()
+    wm._reset_for_tests()
+    monkeypatch.setattr(wm.config, "DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(wm, "_PROTECTED_ENGINEERING_ROOTS", frozenset())
+    yield
+    process_manager._reset_for_tests()
+    wm._reset_for_tests()
+    if emergency_stop.is_latched() and emergency_stop.can_rearm():
+        emergency_stop.rearm_local()
+    emergency_stop._reset_for_tests()
+
+
+def test_porcelain_parser_preserves_state_reasons_and_unknown_attributes(tmp_path):
+    first = tmp_path / "first path"
+    second = tmp_path / "second"
+    payload = (
+        f"worktree {first}\0"
+        "HEAD 0123456789012345678901234567890123456789\0"
+        "detached\0locked maintenance window\0"
+        "future-key future value\0future-flag\0\0"
+        f"worktree {second}\0"
+        "HEAD abcdefabcdefabcdefabcdefabcdefabcdefabcd\0"
+        "branch refs/heads/topic\0prunable gitdir file points nowhere\0\0"
+    )
+
+    entries = wm.parse_worktree_porcelain(payload)
+
+    assert len(entries) == 2
+    assert entries[0].canonical_path == os.path.realpath(first)
+    assert entries[0].detached is True
+    assert entries[0].branch is None
+    assert entries[0].locked is True
+    assert entries[0].locked_reason == "maintenance window"
+    assert entries[0].unknown_attributes == (
+        wm.UnknownPorcelainAttribute("future-key", "future value"),
+        wm.UnknownPorcelainAttribute("future-flag", None),
+    )
+    assert entries[1].branch == "refs/heads/topic"
+    assert entries[1].prunable is True
+    assert entries[1].prunable_reason == "gitdir file points nowhere"
+
+
+def test_create_real_worktree_returns_frozen_verified_handle(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    expected = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    result = wm.create_worktree(str(repo), "HEAD")
+
+    assert result.status == "created"
+    assert result.process_status == "exited"
+    assert result.returncode == 0
+    assert result.handle is not None
+    assert result.handle.worktree_id.startswith("wt-")
+    assert result.handle.source_identity.kind == "git"
+    assert result.handle.source_identity.canonical_root == os.path.realpath(repo)
+    assert result.handle.worktree_root == os.path.realpath(result.target_path)
+    assert result.handle.branch == result.branch
+    assert result.handle.base_commit == expected == result.resolved_base_commit
+    assert result.ledger_entry is not None
+    assert result.ledger_entry.head == expected
+    assert result.ledger_entry.branch == f"refs/heads/{result.branch}"
+    assert result.identity_error is None
+    assert _git(result.target_path, "rev-parse", "HEAD").stdout.strip() == expected
+    with pytest.raises(FrozenInstanceError):
+        result.handle.branch = "changed"
+
+
+def test_source_and_target_protected_roots_are_refused_before_mutation(tmp_path, monkeypatch):
+    protected_source = _repo(tmp_path / "protected-source")
+    monkeypatch.setattr(
+        wm, "_PROTECTED_ENGINEERING_ROOTS",
+        frozenset({os.path.realpath(protected_source)}),
+    )
+    with pytest.raises(wm.ProtectedRootRefused, match="source"):
+        wm.create_worktree(str(protected_source), "HEAD")
+    assert _git(protected_source, "worktree", "list", "--porcelain").stdout.count("worktree ") == 1
+
+    ordinary = _repo(tmp_path / "ordinary")
+    protected_target = tmp_path / "protected-target"
+    protected_target.mkdir()
+    monkeypatch.setattr(
+        wm, "_PROTECTED_ENGINEERING_ROOTS",
+        frozenset({os.path.realpath(protected_target)}),
+    )
+    monkeypatch.setattr(wm.config, "DATA_DIR", str(protected_target / "runtime"))
+    with pytest.raises(wm.ProtectedRootRefused, match="target area"):
+        wm.create_worktree(str(ordinary), "HEAD")
+    assert not (protected_target / "runtime" / "worktrees").exists()
+    assert _git(ordinary, "branch", "--list", "lumina/*").stdout == ""
+
+
+def test_captured_base_sha_not_later_moving_ref_is_passed_to_git(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    captured = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "branch", "moving", captured)
+    (repo / "tracked.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "second")
+    moved_to = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    seen_argv = []
+    real_launch = process_manager.launch_argv
+
+    def move_ref_then_launch(argv, **kwargs):
+        seen_argv.append(list(argv))
+        _git(repo, "branch", "-f", "moving", moved_to)
+        return real_launch(argv, **kwargs)
+
+    monkeypatch.setattr(wm.process_manager, "launch_argv", move_ref_then_launch)
+    result = wm.create_worktree(str(repo), "moving")
+
+    assert result.status == "created"
+    assert result.resolved_base_commit == captured
+    assert seen_argv[0][-1] == captured
+    assert seen_argv[0][-1] not in {"HEAD", "moving"}
+    assert _git(result.target_path, "rev-parse", "HEAD").stdout.strip() == captured
+    assert _git(repo, "rev-parse", "moving").stdout.strip() == moved_to
+
+
+def test_handle_is_not_registered_until_live_post_create_verification(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    verification_calls = []
+
+    def reject_after_check(observation, **kwargs):
+        verification_calls.append(True)
+        assert wm._registry == {}
+        assert observation.ledger_entry is not None
+        assert observation.identity is not None
+        return "injected post-create verification failure"
+
+    monkeypatch.setattr(wm, "_verification_error", reject_after_check)
+    result = wm.create_worktree(str(repo), "HEAD")
+
+    assert verification_calls == [True]
+    assert result.status == "verification_failed"
+    assert result.handle is None
+    assert wm.list_managed_worktrees() == ()
+    assert result.target_exists is True
+    assert result.ledger_entry is not None
+
+
+def test_post_create_identity_failure_prevents_registration(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    real_resolve = wm.coding_checkpoint.resolve_target_identity
+
+    def fail_new_target(path):
+        canonical = os.path.realpath(path)
+        if f"{os.sep}worktrees{os.sep}wt-" in canonical:
+            raise RuntimeError("identity probe injected failure")
+        return real_resolve(path)
+
+    monkeypatch.setattr(wm.coding_checkpoint, "resolve_target_identity", fail_new_target)
+    result = wm.create_worktree(str(repo), "HEAD")
+
+    assert result.status == "verification_failed"
+    assert result.handle is None
+    assert "identity probe injected failure" in result.identity_error
+    assert result.ledger_entry is not None
+    assert wm.list_managed_worktrees() == ()
+
+
+def test_concurrent_creation_allocates_distinct_ids_paths_and_branches(tmp_path, monkeypatch):
+    first_repo = _repo(tmp_path / "first-repo")
+    second_repo = _repo(tmp_path / "second-repo")
+    values = iter(("a" * 24, "a" * 24, "b" * 24, "c" * 24))
+    values_lock = threading.Lock()
+    real_token_hex = wm.secrets.token_hex
+
+    def colliding_tokens(size):
+        if size != 12:
+            return real_token_hex(size)
+        with values_lock:
+            return next(values)
+
+    monkeypatch.setattr(wm.secrets, "token_hex", colliding_tokens)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(
+            lambda repo: wm.create_worktree(str(repo), "HEAD"),
+            (first_repo, second_repo),
+        ))
+
+    assert {result.status for result in results} == {"created"}
+    assert len({result.handle.worktree_id for result in results}) == 2
+    assert len({result.target_path for result in results}) == 2
+    assert len({result.branch for result in results}) == 2
+    assert all(Path(result.target_path).is_dir() for result in results)
+
+
+def test_listing_requeries_git_marks_locked_stale_and_missing_and_never_adopts(tmp_path):
+    repos = [_repo(tmp_path / f"repo-{index}") for index in range(3)]
+    created = [wm.create_worktree(str(repo), "HEAD") for repo in repos]
+    assert all(result.status == "created" for result in created)
+
+    _git(repos[0], "worktree", "lock", "--reason", "external lock", created[0].target_path)
+    _git(created[1].target_path, "checkout", "-qb", "externally-altered")
+    shutil.rmtree(created[2].target_path)
+    unrelated = tmp_path / "unrelated"
+    _git(repos[0], "worktree", "add", "-q", "-b", "unrelated", str(unrelated))
+
+    statuses = {item.handle.worktree_id: item for item in wm.list_managed_worktrees()}
+
+    assert len(statuses) == 3
+    assert statuses[created[0].handle.worktree_id].state == "locked"
+    assert statuses[created[0].handle.worktree_id].ledger_entry.locked_reason == "external lock"
+    assert statuses[created[1].handle.worktree_id].state == "stale"
+    assert statuses[created[2].handle.worktree_id].state in {"externally_missing", "prunable"}
+    assert all(item.handle.worktree_root != os.path.realpath(unrelated) for item in statuses.values())
+
+
+def test_listing_does_not_trust_registry_without_fresh_git_query(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    calls = []
+    real_read = wm._read_worktree_ledger
+
+    def observed(source_root):
+        calls.append(source_root)
+        return real_read(source_root)
+
+    monkeypatch.setattr(wm, "_read_worktree_ledger", observed)
+    shutil.rmtree(created.target_path)
+    status = wm.list_managed_worktrees()[0]
+
+    assert calls == [os.path.realpath(repo)]
+    assert status.state in {"externally_missing", "prunable"}
+    assert status.state != "live"
+
+
+def test_creation_uses_internal_managed_argv_and_runs_normal_hook(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    marker = tmp_path / "hook-ran"
+    _write_hook(
+        repo,
+        "from pathlib import Path; "
+        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')",
+    )
+    launches = []
+    real_launch = process_manager.launch_argv
+
+    def observed_launch(argv, **kwargs):
+        launches.append((list(argv), kwargs.copy()))
+        return real_launch(argv, **kwargs)
+
+    monkeypatch.setattr(wm.process_manager, "launch_argv", observed_launch)
+    result = wm.create_worktree(str(repo), "HEAD")
+
+    assert result.status == "created"
+    assert marker.read_text(encoding="utf-8") == "ran"
+    assert len(launches) == 1
+    argv, kwargs = launches[0]
+    assert argv[:4] == ["git", "worktree", "add", "-b"]
+    assert argv[-1] == result.resolved_base_commit
+    assert kwargs["visibility"] == "internal"
+    assert kwargs["provenance"]["kind"] == "worktree_create"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    (("timeout", "timed_out"), ("cancel", "cancelled")),
+)
+def test_timeout_and_cancellation_reobserve_partial_git_reality(
+    tmp_path, mode, expected_status,
+):
+    repo = _repo(tmp_path / "repo")
+    marker = tmp_path / "hook-started"
+    _write_hook(
+        repo,
+        "import time; from pathlib import Path; "
+        f"Path({str(marker)!r}).write_text('started', encoding='utf-8'); time.sleep(30)",
+    )
+    cancel_event = threading.Event()
+    if mode == "cancel":
+        cancel_event.set()
+
+    result = wm.create_worktree(
+        str(repo), "HEAD", timeout=0.1 if mode == "timeout" else 30,
+        cancel_event=cancel_event,
+    )
+
+    assert result.status == expected_status
+    assert result.handle is None
+    assert result.ledger_error is None
+    if mode == "timeout":
+        assert result.target_exists is True
+        assert result.ledger_entry is not None
+    else:
+        # A pre-set cancellation may win before Git creates anything.  The
+        # truthful observation is absence, not an invented partial target.
+        assert result.target_exists is False
+        assert result.ledger_entry is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group topology proof")
+def test_emergency_kills_hook_inside_same_managed_process_tree(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    marker = tmp_path / "hook-pgid"
+    _write_hook(
+        repo,
+        "import os, time; from pathlib import Path; "
+        f"Path({str(marker)!r}).write_text(str(os.getpgrp()), encoding='utf-8'); time.sleep(30)",
+    )
+    controls = []
+    real_launch = process_manager.launch_argv
+
+    def capture_control(argv, **kwargs):
+        process_id = real_launch(argv, **kwargs)
+        controls.append(process_manager._get_internal_job_snapshot(process_id)["control_metadata"])
+        return process_id
+
+    monkeypatch.setattr(wm.process_manager, "launch_argv", capture_control)
+    holder = {}
+    thread = threading.Thread(
+        target=lambda: holder.setdefault("result", wm.create_worktree(str(repo), "HEAD")),
+    )
+    thread.start()
+    assert wait_for_path(marker)
+
+    emergency_stop.latch(source="test", reason="worktree hook boundary")
+    assert process_manager.emergency_kill_all() >= 1
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    result = holder["result"]
+    assert result.status == "emergency_killed"
+    assert result.handle is None
+    assert int(marker.read_text(encoding="utf-8")) == controls[0]["pgid"]
+    assert result.target_exists is True
+    assert result.ledger_entry is not None
+
+
+def test_nonzero_hook_exit_returns_truthful_git_failure_observation(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    _write_hook(repo, "raise SystemExit(7)")
+
+    result = wm.create_worktree(str(repo), "HEAD")
+
+    assert result.status == "git_failed"
+    assert result.process_status == "exited"
+    assert result.returncode != 0
+    assert result.handle is None
+    assert result.target_exists is True
+    assert result.ledger_entry is not None
+    assert wm.list_managed_worktrees() == ()
