@@ -153,6 +153,10 @@ class _Job:
         self.command = command
         self.argv = tuple(argv) if argv is not None else None
         self.cwd = cwd
+        # CODING-07A2: capture the resolved cwd identity at registration
+        # time. A later symlink retarget/path reuse must not rewrite where
+        # this already-running job is considered rooted.
+        self.canonical_cwd = _canonical_managed_path(cwd)
         self.channel_id = channel_id
         self.provenance = provenance
         self.visibility = visibility
@@ -201,6 +205,29 @@ class _Job:
 _registry: dict = {}
 _registry_lock = threading.RLock()
 _live_reserved = 0  # slots currently occupied: reserved-but-not-yet-a-job, or a running job
+
+
+def _canonical_managed_path(path: str, path_module=None) -> str:
+    """Canonical path key used by internal rooted-job policy.
+
+    ``path_module`` is a pure-test seam for exercising Windows ``ntpath``
+    rules on non-Windows CI. Product calls always use the host ``os.path``.
+    """
+    path_module = os.path if path_module is None else path_module
+    return path_module.normcase(
+        path_module.normpath(path_module.realpath(path))
+    )
+
+
+def _same_or_descendant(path: str, root: str, path_module=None) -> bool:
+    """True only when canonical ``path`` is ``root`` or below it."""
+    path_module = os.path if path_module is None else path_module
+    try:
+        return path_module.commonpath((path, root)) == root
+    except ValueError:
+        # Different Windows drives and otherwise incomparable path domains
+        # are never ancestry.
+        return False
 
 
 def _reserve_slot():
@@ -740,6 +767,38 @@ def _get_internal_job_snapshot(process_id: str):
     with _registry_lock:
         job = _registry.get(process_id)
     return None if job is None else _snapshot_job(job)
+
+
+def _jobs_rooted_under(root: str) -> tuple[dict, ...]:
+    """Return every live managed job rooted at or below ``root``.
+
+    Internal infrastructure boundary for worktree lifetime policy. Unlike
+    model-facing lookup/list APIs, this deliberately inspects the complete
+    registry and does not filter ``visibility="internal"`` jobs. Results are
+    live snapshots only; callers that protect a destructive boundary must
+    query again immediately before mutation.
+    """
+    if not isinstance(root, str) or not root or not os.path.isabs(root):
+        raise InvalidLaunchRequest("root must be a non-empty absolute path")
+    canonical_root = _canonical_managed_path(root)
+    matches = []
+    with _registry_lock:
+        jobs = tuple(_registry.values())
+    for job in jobs:
+        with job.lifecycle_lock:
+            if job.status != "running":
+                continue
+            if not _same_or_descendant(job.canonical_cwd, canonical_root):
+                continue
+            matches.append({
+                "process_id": job.process_id,
+                "cwd": job.cwd,
+                "canonical_cwd": job.canonical_cwd,
+                "visibility": job.visibility,
+                "provenance": job.provenance,
+                "status": job.status,
+            })
+    return tuple(matches)
 
 
 def list_job_ids() -> list:

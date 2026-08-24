@@ -6,6 +6,7 @@ Lumina repositories and real DATA_DIR are never used.
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+import ntpath
 import os
 from pathlib import Path
 import shutil
@@ -388,3 +389,359 @@ def test_nonzero_hook_exit_returns_truthful_git_failure_observation(tmp_path):
     assert result.target_exists is True
     assert result.ledger_entry is not None
     assert wm.list_managed_worktrees() == ()
+
+
+# ── CODING-07A2: process lifetime + safe removal ────────────────────────
+
+def _sleeping_argv(seconds=30):
+    return [sys.executable, "-u", "-c", "import time; time.sleep(float(__import__('sys').argv[1]))", str(seconds)]
+
+
+def _stop_all_jobs():
+    process_manager.shutdown_all(wait_seconds=5)
+
+
+def test_rooted_job_path_matching_is_canonical_and_cross_platform(tmp_path):
+    root = tmp_path / "root"
+    descendant = root / "child"
+    sibling = tmp_path / "root-sibling"
+    root.mkdir()
+    descendant.mkdir()
+    sibling.mkdir()
+
+    canonical_root = process_manager._canonical_managed_path(str(root))
+    assert process_manager._same_or_descendant(canonical_root, canonical_root)
+    assert process_manager._same_or_descendant(
+        process_manager._canonical_managed_path(str(descendant)), canonical_root,
+    )
+    assert not process_manager._same_or_descendant(
+        process_manager._canonical_managed_path(str(sibling)), canonical_root,
+    )
+
+    win_root = process_manager._canonical_managed_path(r"C:\Work\Tree", ntpath)
+    win_child = process_manager._canonical_managed_path(r"c:\work\tree\Sub", ntpath)
+    win_sibling = process_manager._canonical_managed_path(r"C:\Work\Tree-Other", ntpath)
+    other_drive = process_manager._canonical_managed_path(r"D:\Work\Tree", ntpath)
+    assert process_manager._same_or_descendant(win_child, win_root, ntpath)
+    assert not process_manager._same_or_descendant(win_sibling, win_root, ntpath)
+    assert not process_manager._same_or_descendant(other_drive, win_root, ntpath)
+
+
+def test_jobs_rooted_under_includes_model_and_internal_jobs_and_excludes_sibling(tmp_path):
+    root = tmp_path / "root"
+    child = root / "child"
+    sibling = tmp_path / "sibling"
+    child.mkdir(parents=True)
+    sibling.mkdir()
+    model_id = process_manager.launch("sleep 30", cwd=str(root))
+    internal_id = process_manager.launch_argv(
+        _sleeping_argv(), cwd=str(child), visibility="internal",
+    )
+    sibling_id = process_manager.launch_argv(
+        _sleeping_argv(), cwd=str(sibling), visibility="internal",
+    )
+    try:
+        jobs = {job["process_id"]: job for job in process_manager._jobs_rooted_under(str(root))}
+        assert set(jobs) == {model_id, internal_id}
+        assert jobs[model_id]["visibility"] == "model"
+        assert jobs[internal_id]["visibility"] == "internal"
+        assert sibling_id not in jobs
+    finally:
+        _stop_all_jobs()
+
+
+def test_rooted_job_uses_captured_cwd_when_symlink_is_retargeted(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    link = tmp_path / "current"
+    link.symlink_to(first, target_is_directory=True)
+    process_id = process_manager.launch_argv(
+        _sleeping_argv(), cwd=str(link), visibility="internal",
+    )
+    try:
+        link.unlink()
+        link.symlink_to(second, target_is_directory=True)
+        first_ids = {job["process_id"] for job in process_manager._jobs_rooted_under(str(first))}
+        second_ids = {job["process_id"] for job in process_manager._jobs_rooted_under(str(second))}
+        assert process_id in first_ids
+        assert process_id not in second_ids
+    finally:
+        _stop_all_jobs()
+
+
+def test_remove_clean_worktree_uses_managed_argv_forgets_handle_and_keeps_branch(
+    tmp_path, monkeypatch,
+):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    launches = []
+    real_launch = process_manager.launch_argv
+
+    def observed_launch(argv, **kwargs):
+        launches.append((list(argv), kwargs.copy()))
+        return real_launch(argv, **kwargs)
+
+    monkeypatch.setattr(wm.process_manager, "launch_argv", observed_launch)
+    result = wm.remove_worktree(created.handle.worktree_id)
+
+    assert result.status == "removed"
+    assert result.process_status == "exited"
+    assert result.returncode == 0
+    assert result.target_exists is False
+    assert result.ledger_entry is None
+    assert result.identity_error is None
+    assert wm.list_managed_worktrees() == ()
+    assert len(launches) == 1
+    assert launches[0][0] == ["git", "worktree", "remove", created.target_path]
+    assert launches[0][1]["visibility"] == "internal"
+    assert launches[0][1]["provenance"]["kind"] == "worktree_remove"
+    assert _git(repo, "branch", "--list", created.branch).stdout.strip()
+
+
+def test_dirty_worktree_refused_by_default_and_force_only_overrides_dirty(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    (Path(created.target_path) / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+    refused = wm.remove_worktree(created.handle.worktree_id)
+    assert refused.status == "dirty_refused"
+    assert refused.dirty is True
+    assert refused.target_exists is True
+    assert wm.list_managed_worktrees()[0].state == "live"
+
+    removed = wm.remove_worktree(created.handle.worktree_id, force=True)
+    assert removed.status == "removed"
+    assert removed.force is True
+    assert removed.dirty is True
+    assert not Path(created.target_path).exists()
+
+
+def test_locked_worktree_fails_closed_even_with_force(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    _git(repo, "worktree", "lock", "--reason", "operator lock", created.target_path)
+
+    result = wm.remove_worktree(created.handle.worktree_id, force=True)
+
+    assert result.status == "locked_refused"
+    assert result.target_exists is True
+    assert result.ledger_entry.locked is True
+    assert result.ledger_entry.locked_reason == "operator lock"
+
+
+def test_force_never_overrides_internal_live_process_in_descendant(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    child = Path(created.target_path) / "nested"
+    child.mkdir()
+    process_id = process_manager.launch_argv(
+        _sleeping_argv(), cwd=str(child), visibility="internal",
+    )
+    try:
+        result = wm.remove_worktree(created.handle.worktree_id, force=True)
+        assert result.status == "live_process_refused"
+        assert result.blocking_process_ids == (process_id,)
+        assert result.target_exists is True
+    finally:
+        _stop_all_jobs()
+
+
+def test_second_live_process_check_catches_job_started_after_dirty_check(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    real_blocking = wm._blocking_jobs
+    calls = []
+    started = []
+
+    def inject_on_second(handle):
+        calls.append(True)
+        if len(calls) == 2:
+            started.append(process_manager.launch_argv(
+                _sleeping_argv(), cwd=handle.worktree_root, visibility="internal",
+            ))
+        return real_blocking(handle)
+
+    monkeypatch.setattr(wm, "_blocking_jobs", inject_on_second)
+    try:
+        result = wm.remove_worktree(created.handle.worktree_id, force=True)
+        assert len(calls) == 2
+        assert result.status == "live_process_refused"
+        assert result.blocking_process_ids == tuple(started)
+        assert result.target_exists is True
+    finally:
+        _stop_all_jobs()
+
+
+def test_second_identity_check_catches_external_branch_change(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    real_observe = wm._observe_reality
+    calls = []
+
+    def alter_before_second(source_root, target):
+        calls.append(True)
+        if len(calls) == 2:
+            _git(target, "checkout", "-qb", "external-change")
+        return real_observe(source_root, target)
+
+    monkeypatch.setattr(wm, "_observe_reality", alter_before_second)
+    result = wm.remove_worktree(created.handle.worktree_id, force=True)
+
+    assert len(calls) == 2
+    assert result.status == "identity_refused"
+    assert "branch state" in result.diagnostic
+    assert result.target_exists is True
+
+
+def test_path_reuse_is_refused_against_captured_target_identity(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    _git(repo, "worktree", "remove", created.target_path)
+    # Recreate the same path at the same branch and HEAD. Only the captured
+    # target identity (including filesystem identity) distinguishes it.
+    _git(repo, "worktree", "add", "-q", created.target_path, created.branch)
+    launches = []
+    monkeypatch.setattr(
+        wm.process_manager, "launch_argv",
+        lambda *args, **kwargs: launches.append((args, kwargs)),
+    )
+
+    result = wm.remove_worktree(created.handle.worktree_id, force=True)
+
+    assert result.status == "identity_refused"
+    assert "target identity differs" in result.diagnostic
+    assert launches == []
+    assert Path(created.target_path).exists()
+
+
+def test_external_removal_is_reported_not_silently_adopted_or_repeated(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    _git(repo, "worktree", "remove", created.target_path)
+
+    result = wm.remove_worktree(created.handle.worktree_id)
+
+    assert result.status == "identity_refused"
+    assert result.target_exists is False
+    assert result.ledger_entry is None
+    statuses = wm.list_managed_worktrees()
+    assert len(statuses) == 1
+    assert statuses[0].state == "externally_missing"
+
+
+def test_concurrent_remove_has_single_mutator(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    entered = threading.Event()
+    release = threading.Event()
+    real_observe = wm._observe_reality
+    first = [True]
+
+    def block_first_observation(source_root, target):
+        if first[0]:
+            first[0] = False
+            entered.set()
+            assert release.wait(5)
+        return real_observe(source_root, target)
+
+    monkeypatch.setattr(wm, "_observe_reality", block_first_observation)
+    holder = {}
+    thread = threading.Thread(
+        target=lambda: holder.setdefault(
+            "first", wm.remove_worktree(created.handle.worktree_id)
+        ),
+    )
+    thread.start()
+    assert entered.wait(5)
+    second = wm.remove_worktree(created.handle.worktree_id)
+    release.set()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert second.status == "removal_in_progress"
+    assert holder["first"].status == "removed"
+
+
+def test_zero_exit_without_removal_is_verification_failure_not_success(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    real_launch = process_manager.launch_argv
+
+    def fake_success(argv, **kwargs):
+        assert argv[:3] == ["git", "worktree", "remove"]
+        return real_launch([sys.executable, "-c", "pass"], **kwargs)
+
+    monkeypatch.setattr(wm.process_manager, "launch_argv", fake_success)
+    result = wm.remove_worktree(created.handle.worktree_id)
+
+    assert result.status == "verification_failed"
+    assert result.process_status == "exited"
+    assert result.returncode == 0
+    assert result.target_exists is True
+    assert result.ledger_entry is not None
+    assert len(wm.list_managed_worktrees()) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    (("timeout", "timed_out"), ("cancel", "cancelled")),
+)
+def test_remove_timeout_and_cancel_reobserve_unchanged_reality(
+    tmp_path, monkeypatch, mode, expected,
+):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    real_launch = process_manager.launch_argv
+    cancel = threading.Event()
+    if mode == "cancel":
+        cancel.set()
+
+    def sleeping_remove(argv, **kwargs):
+        return real_launch(_sleeping_argv(), **kwargs)
+
+    monkeypatch.setattr(wm.process_manager, "launch_argv", sleeping_remove)
+    result = wm.remove_worktree(
+        created.handle.worktree_id,
+        timeout=0.1 if mode == "timeout" else 30,
+        cancel_event=cancel,
+    )
+
+    assert result.status == expected
+    assert result.target_exists is True
+    assert result.ledger_entry is not None
+    assert len(wm.list_managed_worktrees()) == 1
+
+
+def test_emergency_kills_managed_remove_and_reobserves_git_reality(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    created = wm.create_worktree(str(repo), "HEAD")
+    marker = tmp_path / "remove-started"
+    real_launch = process_manager.launch_argv
+
+    def sleeping_remove(argv, **kwargs):
+        source = (
+            "import pathlib, sys, time; "
+            "pathlib.Path(sys.argv[1]).write_text('started', encoding='utf-8'); "
+            "time.sleep(30)"
+        )
+        return real_launch([sys.executable, "-u", "-c", source, str(marker)], **kwargs)
+
+    monkeypatch.setattr(wm.process_manager, "launch_argv", sleeping_remove)
+    holder = {}
+    thread = threading.Thread(target=lambda: holder.setdefault(
+        "result", wm.remove_worktree(created.handle.worktree_id)
+    ))
+    thread.start()
+    assert wait_for_path(marker)
+    emergency_stop.latch(source="test", reason="remove boundary")
+    assert process_manager.emergency_kill_all() >= 1
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    result = holder["result"]
+    assert result.status == "emergency_killed"
+    assert result.target_exists is True
+    assert result.ledger_entry is not None
+    assert len(wm.list_managed_worktrees()) == 1
