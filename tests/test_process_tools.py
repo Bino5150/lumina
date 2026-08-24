@@ -105,6 +105,20 @@ def test_registrar_contains_all_five_tools_with_intended_tiers():
     assert TOOL_TIERS["stop_process"] == "execute"
 
 
+def test_start_process_blocks_raw_worktree_remove_before_manager_launch(monkeypatch):
+    registry = _registered()
+    launched = []
+    monkeypatch.setattr(
+        process_manager, "launch",
+        lambda *args, **kwargs: launched.append((args, kwargs)),
+    )
+    result = json.loads(registry.fns["start_process"](
+        "git worktree remove /tmp/definitely-not-run"
+    ))
+    assert result["error"] == "command_blocked"
+    assert launched == []
+
+
 def test_read_process_schema_contains_only_model_arguments():
     props = _registered().registrations["read_process"]["parameters"]["properties"]
     assert set(props) == {

@@ -28,6 +28,7 @@ from tools.terminal import register_terminal_tools
 from tools.processes import register_process_tools
 from tools.coding_checkpoint import register_coding_checkpoint_tools
 from tools.tests import register_tests_tools
+from tools.worktrees import register_worktree_tools
 from tools.toolmaker import register_toolmaker_tools, load_approved_custom_tools
 from tools.palace import register_palace_tools
 from core.skills import register_skills_tools, build_skills_block, init_skills_db
@@ -245,6 +246,11 @@ class LuminaAgent:
             project_state=self.project_context,
         )
         register_tests_tools(
+            self.registry,
+            project_state=self.project_context,
+            cancel_state=self.turn_cancellation,
+        )
+        register_worktree_tools(
             self.registry,
             project_state=self.project_context,
             cancel_state=self.turn_cancellation,

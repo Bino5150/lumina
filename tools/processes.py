@@ -12,6 +12,7 @@ import os
 
 import config
 from core import process_manager
+from tools.guardrails import check_model_command
 
 
 MAX_CHARS_PER_STREAM = 65536
@@ -214,6 +215,12 @@ def register_process_tools(registry, project_state=None, channel_id=""):
         if cwd is not None and not isinstance(cwd, str):
             return _bounded_error(
                 "invalid_launch", "cwd must be a string or null"
+            )
+
+        block_reason = check_model_command(command)
+        if block_reason:
+            return _bounded_error(
+                "command_blocked", "command was rejected by the safety guardrail"
             )
 
         if cwd is not None:

@@ -15,7 +15,7 @@ functional testing is explicitly covered — see test_block_rm_root_wildcard
 and test_block_rm_abs_path_wildcard.
 """
 import pytest
-from tools.guardrails import check_argv, check_command
+from tools.guardrails import check_argv, check_command, check_model_command
 from tools.terminal import register_terminal_tools
 
 
@@ -481,6 +481,46 @@ class TestCheckCommandAllowed:
     def test_allowed(self, command):
         result = check_command(command)
         assert result is None, f"False positive — '{command}' was blocked: {result}"
+
+
+# ── CODING-07A3: model-origin raw-worktree boundary ──────────────────────
+
+@pytest.mark.parametrize("command", [
+    "git worktree remove /tmp/wt",
+    "git -C /tmp/repo worktree remove --force /tmp/wt",
+    "git worktree prune",
+    "cd /tmp && git worktree prune --expire now",
+    "sudo git worktree remove /tmp/wt",
+])
+def test_model_command_blocks_raw_worktree_remove_and_prune(command):
+    reason = check_model_command(command)
+    assert reason is not None
+    assert "managed removal boundary" in reason
+
+
+@pytest.mark.parametrize("command", [
+    "git worktree list --porcelain",
+    "git worktree add /tmp/wt HEAD",
+    "git worktree lock /tmp/wt",
+    "git worktree unlock /tmp/wt",
+    "git worktree repair /tmp/wt",
+    "git worktree --help remove",
+])
+def test_model_command_does_not_broaden_to_other_worktree_operations(command):
+    assert check_model_command(command) is None
+
+
+def test_internal_generic_guards_still_allow_manager_owned_worktree_argv():
+    command = "git worktree remove --force /tmp/wt"
+    argv = ["git", "worktree", "remove", "--force", "/tmp/wt"]
+    assert check_command(command) is None
+    assert check_argv(argv) is None
+
+
+def test_run_command_adapter_blocks_raw_worktree_remove_before_execution(run_command):
+    result = run_command("git worktree remove /tmp/definitely-not-run")
+    assert result.startswith("[BLOCKED:")
+    assert "managed removal boundary" in result
 
 
 # ── Part 2: check_argv direct-execution guard ────────────────────────────

@@ -1,5 +1,6 @@
 """
-Deterministic pre-execution guard for tools/terminal.py::run_command.
+Deterministic pre-execution guard for model shell/process adapters and trusted
+internal argv launches.
 
 Regex denylist, not an LLM judgment call — this exists specifically so a
 hallucinating model or an injected instruction can't argue its way past it.
@@ -62,6 +63,21 @@ def check_command(command: str) -> str | None:
         return reason
 
     return None
+
+
+def check_model_command(command: str) -> str | None:
+    """Model-originated shell guard with dedicated-worktree enforcement.
+
+    ``check_command`` remains the shared catastrophic backstop used by trusted
+    internal argv operations.  The extra rule here is intentionally applied
+    only by the raw model adapters (run_command/start_process), so A2's exact,
+    manager-owned ``git worktree remove`` argv is not given a generic bypass
+    and is not accidentally blocked by a global deny rule.
+    """
+    reason = check_command(command)
+    if reason:
+        return reason
+    return _git_command_reason(command, reason_fn=_git_model_reason)
 
 
 def _argv_structure_error(argv) -> str | None:
@@ -295,6 +311,34 @@ def _git_catastrophic_reason(argv) -> str | None:
     return None
 
 
+def _git_model_worktree_reason(argv) -> str | None:
+    """Reject raw model access to destructive worktree lifecycle commands.
+
+    Git 2.43.0 accepts only the exact nested subcommands ``remove`` and
+    ``prune`` (the strict prefixes are rejected), so exact membership mirrors
+    live Git semantics without a broad substring rule.
+    """
+    subcommand, subargs = _git_subcommand(argv)
+    if subcommand != "worktree":
+        return None
+    for arg in subargs:
+        lowered = arg.casefold()
+        if lowered in {"-h", "--help", "--version"}:
+            return None
+        if arg == "--" or arg.startswith("-"):
+            continue
+        if lowered == "remove":
+            return "raw git worktree remove bypasses Lumina's managed removal boundary"
+        if lowered == "prune":
+            return "raw git worktree prune bypasses Lumina's managed removal boundary"
+        return None
+    return None
+
+
+def _git_model_reason(argv) -> str | None:
+    return _git_catastrophic_reason(argv) or _git_model_worktree_reason(argv)
+
+
 # CODING-06R.1: splits a raw shell string on chaining/pipe operators (&&,
 # ||, ;, |, &, newline) into plain-text segments -- not a real shell
 # parser, deliberately. A segment boundary inside a quoted string (e.g. a
@@ -308,7 +352,7 @@ def _shell_chain_segments(command: str):
     return [segment for segment in _SHELL_CHAIN_SPLIT_RE.split(command) if segment.strip()]
 
 
-def _git_command_reason(command: str) -> str | None:
+def _git_command_reason(command: str, reason_fn=_git_catastrophic_reason) -> str | None:
     """check_command's Git structural pass: find every "git" token inside
     each chain segment (git need not be the segment's first word --
     "sudo git push -f" is real usage) and decide it exactly like
@@ -325,7 +369,7 @@ def _git_command_reason(command: str) -> str | None:
             continue
         for index, token in enumerate(tokens):
             if _executable_basename(token) == "git":
-                reason = _git_catastrophic_reason(tokens[index:])
+                reason = reason_fn(tokens[index:])
                 if reason:
                     return reason
     return None

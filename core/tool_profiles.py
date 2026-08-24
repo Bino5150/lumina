@@ -94,6 +94,8 @@ TOOL_TIERS = {
     # different from a read-only code-analysis operation. execute tier plus
     # OWNER_ONLY_TOOLS below (not PIN alone) is what actually gates it.
     "run_tests": "execute",
+    "create_worktree": "execute", "list_worktrees": "read_only",
+    "remove_worktree": "execute",
     "palace_recall": "read_only", "palace_status": "read_only",
     "list_skills": "read_only", "recall_skill": "read_only",
     "search_chat_history": "read_only", "get_chat_session": "read_only",
@@ -162,6 +164,11 @@ OWNER_ONLY_TOOLS = {
     # activation, and parent ownership are separate axes and cannot restore
     # it for a non-owner session -- see tools/tests.py's module docstring.
     "run_tests",
+    # CODING-07A3: linked-worktree lifecycle and even its session inventory
+    # are owner-only in v1. Profile selection, explicit grants, PIN state,
+    # active Project context, cached headless state, and parent authority are
+    # all separate axes and can never restore these tools to owner=False.
+    "create_worktree", "list_worktrees", "remove_worktree",
     # CODING-02B-A: persistent machine-local configuration (writes
     # DATA_DIR/projects/<name>/binding.json) -- distinct from
     # activate_project/clear_active_project, which only ever touch the

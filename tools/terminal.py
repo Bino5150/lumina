@@ -34,7 +34,7 @@ import subprocess
 import os
 import signal
 
-from tools.guardrails import check_command
+from tools.guardrails import check_model_command
 
 
 def register_terminal_tools(registry, project_state=None):
@@ -45,7 +45,7 @@ def register_terminal_tools(registry, project_state=None):
 
     def run_command(command: str, cwd: str = None, timeout: int = 30) -> str:
         """Execute a shell command and return stdout/stderr."""
-        block_reason = check_command(command)
+        block_reason = check_model_command(command)
         if block_reason:
             return f"[BLOCKED: {block_reason} — this command was not executed]"
 
@@ -128,4 +128,3 @@ def register_terminal_tools(registry, project_state=None):
             "required": ["command"]
         }
     )
-

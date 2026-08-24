@@ -56,7 +56,8 @@ def test_coding_profile_did_not_gain_unrelated_tools():
     set_project_root -- see test_set_project_root_not_in_coding_profile
     below); CODING-03A1 added exactly search_code (search_files stays,
     additive not replaced); CODING-04A2-B4 added exactly the five managed-
-    process tools; CODING-06A2 added exactly run_tests -- this is a
+    process tools; CODING-06A2 added exactly run_tests; CODING-07A3 added
+    exactly create_worktree/list_worktrees/remove_worktree -- this is a
     regression guard against accidentally sweeping in other tools (e.g. the
     still-out-of-scope diff_texts/diff_files/git_* tools) while editing the
     same JSON file."""
@@ -69,6 +70,7 @@ def test_coding_profile_did_not_gain_unrelated_tools():
         "run_python", "run_command",
         "start_process", "read_process", "send_process_input", "stop_process", "list_processes",
         "read_coding_checkpoint", "save_coding_checkpoint", "run_tests",
+        "create_worktree", "list_worktrees", "remove_worktree",
         "activate_project", "get_active_project", "clear_active_project",
         "create_tool", "list_custom_tools", "delete_tool",
         "palace_remember", "palace_hall", "palace_recall", "palace_status",
