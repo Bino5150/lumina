@@ -179,6 +179,93 @@ def _git_subcommand(argv):
     return None, []
 
 
+# CODING-06R.3 ABBREVIATION CORRECTIVE: Git's long-option parser accepts any
+# unambiguous prefix of a long option name (e.g. `--del` for `--delete`), and
+# which prefixes are unambiguous is subcommand-specific -- it depends on what
+# *other* long options exist on that same subcommand and would collide. These
+# sets are not a generic "starts-with" rule; each is the literal, finite,
+# empirically-verified list of spellings Git itself accepts as that option on
+# that subcommand (git version 2.43.0, live-tested against a disposable local
+# repo). A prefix shorter than every entry below is ambiguous and Git itself
+# rejects it (e.g. `git branch --for` errors "ambiguous option: for (could be
+# --force or --format)"; `git push --forc` similarly errors against
+# --force-with-lease/--force-if-includes) -- such a spelling can never reach
+# a shell as a working destructive command, so it is deliberately absent from
+# every set here, per the "ambiguous-and-rejected need not be classified as
+# catastrophic" scoping for this corrective.
+#
+#   git branch --delete: --d --de --del --dele --delet --delete (all unique;
+#     no other branch long option starts with "d")
+#   git branch --force:  --forc --force (unique only from "forc" on; "--f"/
+#     "--fo"/"--for" collide with --format and are rejected by Git)
+#   git reset --hard:    --h --ha --har --hard (all unique; no other reset
+#     long option starts with "h", and single-dash "-h" is a distinct,
+#     separately-parsed help flag that this set does not include)
+#   git clean --force:   --f --fo --for --forc --force (all unique; no other
+#     clean long option starts with "f")
+#   git push --force: audited, no corrective needed -- Git requires the
+#     exact, complete spelling "--force" here (an exact match short-circuits
+#     ambiguity checking); every strict abbreviation ("--forc" and shorter)
+#     collides with --force-with-lease/--force-if-includes and Git rejects it
+#     as ambiguous. The pre-existing exact "--force" / "--force="- /
+#     "--force-with-lease"-prefixed checks in _git_catastrophic_reason
+#     already cover every spelling Git accepts.
+#
+# Residual risk, explicitly: this table is pinned to Git 2.43.0's option set.
+# A future Git version that removes a colliding option (e.g. drops
+# --format from git-branch) could make a currently-ambiguous prefix
+# unambiguous, and this table would then under-detect it until re-verified.
+# That is the accepted cost of the "no invoking Git itself to decide safety"
+# design constraint -- the alternative (shelling out to Git to resolve
+# abbreviations) would make the guardrail's own safety decision
+# non-deterministic and dependent on the host's Git binary.
+_GIT_BRANCH_DELETE_LONG_ABBREVS = frozenset({
+    "--d", "--de", "--del", "--dele", "--delet", "--delete",
+})
+_GIT_BRANCH_FORCE_LONG_ABBREVS = frozenset({"--forc", "--force"})
+_GIT_RESET_HARD_LONG_ABBREVS = frozenset({"--h", "--ha", "--har", "--hard"})
+_GIT_CLEAN_FORCE_LONG_ABBREVS = frozenset({
+    "--f", "--fo", "--for", "--forc", "--force",
+})
+
+
+def _branch_force_delete_requested(subargs) -> bool:
+    """CODING-06R.3: delete-intent and force-intent are independent axes on
+    `git branch` -- `-D` is shorthand for `-d -f` (equivalently
+    `--delete --force`), and Git treats any combination carrying both as a
+    forced, unmerged-safe delete regardless of how the two are spelled or
+    ordered (confirmed live: `git branch -d -f <unmerged>` deletes it exactly
+    like `-D` does). Deciding on delete_requested AND force_requested,
+    computed independently, is what closes the R.2-confirmed `-d -f`/`-fd`/
+    `--delete --force` bypass without regressing a plain `-d`/`--delete`
+    (safe, merge-checked) or a plain `-f` (force branch reset, not a delete)
+    to blocked. Reuses _has_short_flag exactly as the other subcommands
+    below do -- no second parser, no substring matching against arbitrary
+    argument text (a branch NAMED "force" or "delete" is a positional
+    argument, never examined by _has_short_flag or the exact-membership
+    checks here, abbreviation-aware or not).
+
+    CODING-06R.3 ABBREVIATION CORRECTIVE: the exact "--delete"/"--force"
+    membership checks alone missed a Git-accepted abbreviation like
+    `--del --forc` -- confirmed live to force-delete an unmerged branch
+    exactly like `-D` does. Membership against the finite, empirically
+    verified _GIT_BRANCH_DELETE_LONG_ABBREVS / _GIT_BRANCH_FORCE_LONG_ABBREVS
+    sets above closes that without matching any prefix Git itself would
+    reject as ambiguous.
+    """
+    delete_requested = (
+        _has_short_flag(subargs, "D")
+        or _has_short_flag(subargs, "d")
+        or any(arg in _GIT_BRANCH_DELETE_LONG_ABBREVS for arg in subargs)
+    )
+    force_requested = (
+        _has_short_flag(subargs, "D")
+        or _has_short_flag(subargs, "f")
+        or any(arg in _GIT_BRANCH_FORCE_LONG_ABBREVS for arg in subargs)
+    )
+    return delete_requested and force_requested
+
+
 def _git_catastrophic_reason(argv) -> str | None:
     """Shared by check_argv (direct) and check_command (after best-effort
     shell-string tokenization, see _git_command_reason below) so a Git
@@ -194,14 +281,16 @@ def _git_catastrophic_reason(argv) -> str | None:
     ):
         return "force push"
     if subcommand == "reset" and any(
-        arg == "--hard" or arg.startswith("--hard=") for arg in subargs
+        arg in _GIT_RESET_HARD_LONG_ABBREVS or arg.startswith("--hard=")
+        for arg in subargs
     ):
         return "git reset --hard (discards uncommitted work)"
     if subcommand == "clean" and (
-        "--force" in subargs or _has_short_flag(subargs, "f")
+        any(arg in _GIT_CLEAN_FORCE_LONG_ABBREVS for arg in subargs)
+        or _has_short_flag(subargs, "f")
     ):
         return "git clean with force flag (deletes untracked files)"
-    if subcommand == "branch" and _has_short_flag(subargs, "D"):
+    if subcommand == "branch" and _branch_force_delete_requested(subargs):
         return "git branch -D (force delete, discards unmerged commits)"
     return None
 
@@ -321,7 +410,14 @@ def _windows_destructive_reason(command: str) -> str | None:
     return None
 
 
-def _sudo_command(argv) -> str | None:
+def _sudo_effective_argv(argv):
+    """Walk past sudo's own recognized options/env-assignment prefix and
+    return the remaining argv starting at the real command's own argv[0]
+    (i.e. an argv shaped exactly like check_argv's own top-level input,
+    suitable for redispatch into another executable's catastrophic-form
+    check) -- or None if the walk never reaches a bare command, using only
+    the sudo grammar this parser already understood before CODING-06R.3.
+    """
     args = argv[1:]
     options_with_value = {
         "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
@@ -346,7 +442,12 @@ def _sudo_command(argv) -> str | None:
             index += 1
             continue
         break
-    return _executable_basename(args[index]) if index < len(args) else None
+    return args[index:] if index < len(args) else None
+
+
+def _sudo_command(argv) -> str | None:
+    sub_argv = _sudo_effective_argv(argv)
+    return _executable_basename(sub_argv[0]) if sub_argv else None
 
 
 def check_argv(argv) -> str | None:
@@ -373,8 +474,29 @@ def check_argv(argv) -> str | None:
     executable = _executable_basename(argv[0])
     args = list(argv[1:])
 
-    if executable == "sudo" and _sudo_command(argv) == "rm":
-        return "sudo rm"
+    if executable == "sudo":
+        # CODING-06R.3: redispatch sudo's own effective sub-argv through
+        # the normal per-executable checks below, narrowly, for the two
+        # executables this module already has catastrophic-form detection
+        # for (rm, git) -- not a generalized privilege-escalation policy,
+        # and not a new sudo grammar: _sudo_effective_argv() is the exact
+        # option walk this module already relied on for "sudo rm", now
+        # also handing back the real command's own argv[0:] so a wrapped
+        # "git" gets the identical _git_catastrophic_reason() decision a
+        # bare (non-sudo) argv invocation would get. Closes the R.2-found
+        # asymmetry where check_command("sudo git push -f ...") blocked
+        # (its shlex scan finds "git" at any token position) while
+        # check_argv(["sudo", "git", "push", "-f", ...]) did not (this
+        # function never looked past "sudo" for anything but "rm").
+        sub_argv = _sudo_effective_argv(argv)
+        if sub_argv:
+            sub_executable = _executable_basename(sub_argv[0])
+            if sub_executable == "rm":
+                return "sudo rm"
+            if sub_executable == "git":
+                reason = _git_catastrophic_reason(sub_argv)
+                if reason:
+                    return reason
 
     if executable == "rm":
         recursive = "--recursive" in args or _has_short_flag(args, "r") or _has_short_flag(args, "R")

@@ -114,6 +114,273 @@ class TestCheckCommandCombinedGitShortFlags:
         assert result is None, f"False positive — '{command}' was blocked: {result}"
 
 
+# ── CODING-06R.3: semantic delete+force detection on git branch ───────────
+#
+# R.2 found that checking only for a literal uppercase "D" short flag
+# missed -D's own semantic equivalents: Git treats -D as shorthand for
+# -d -f (equivalently --delete --force), and confirmed live that
+# `git branch -d -f <unmerged>` force-deletes exactly like -D does,
+# regardless of spelling or order. _branch_force_delete_requested() now
+# decides delete-intent and force-intent independently and blocks only
+# their conjunction — closing the bypass without regressing a bare
+# -d/--delete (safe, merge-checked) or a bare -f (force branch reset, not
+# delete) to blocked, and without matching branch names that merely
+# contain the words "force"/"delete".
+class TestGitBranchForceDeleteSemantics:
+    @pytest.mark.parametrize("command", [
+        "git branch -D name",
+        "git branch -d -f name",
+        "git branch -f -d name",
+        "git branch -df name",
+        "git branch -fd name",
+        "git branch --delete --force name",
+        "git branch --force --delete name",
+        "git branch -d --force name",
+        "git branch --delete -f name",
+    ])
+    def test_command_blocked(self, command):
+        assert check_command(command) == "git branch -D (force delete, discards unmerged commits)", command
+
+    @pytest.mark.parametrize("argv", [
+        ["git", "branch", "-D", "name"],
+        ["git", "branch", "-d", "-f", "name"],
+        ["git", "branch", "-f", "-d", "name"],
+        ["git", "branch", "-df", "name"],
+        ["git", "branch", "-fd", "name"],
+        ["git", "branch", "--delete", "--force", "name"],
+        ["git", "branch", "--force", "--delete", "name"],
+        ["git", "branch", "-d", "--force", "name"],
+        ["git", "branch", "--delete", "-f", "name"],
+    ])
+    def test_argv_blocked(self, argv):
+        assert check_argv(argv) == "git branch -D (force delete, discards unmerged commits)"
+
+    @pytest.mark.parametrize("command", [
+        "git branch",
+        "git branch name",
+        "git branch -d merged-branch",
+        "git branch --delete merged-branch",
+        "git branch -a",
+        "git branch -r -v",
+        "git branch -f newbranch main",       # force branch reset, not delete
+        "git branch -d my-force-branch",       # branch name merely contains "force"
+        "git branch -d delete-me",             # branch name merely contains "delete"
+        "git checkout -b feature/force-delete-ui",
+        'git commit -m "delete and force this"',
+    ])
+    def test_command_no_false_positive(self, command):
+        assert check_command(command) is None, command
+
+    @pytest.mark.parametrize("argv", [
+        ["git", "branch"],
+        ["git", "branch", "name"],
+        ["git", "branch", "-d", "merged-branch"],
+        ["git", "branch", "--delete", "merged-branch"],
+        ["git", "branch", "-f", "newbranch", "main"],
+        ["git", "branch", "-d", "my-force-branch"],
+    ])
+    def test_argv_no_false_positive(self, argv):
+        assert check_argv(argv) is None, argv
+
+
+# ── CODING-06R.3 ABBREVIATION CORRECTIVE ───────────────────────────────────
+#
+# Git's own long-option parser accepts any *unambiguous* prefix of a long
+# option name, and empirical testing (git 2.43.0, disposable local repo —
+# see the CODING-06R.3 report) found real, live-confirmed bypasses this
+# module's exact "--delete"/"--force"/"--hard" membership checks missed:
+#   `git branch --del --forc <unmerged>`  -> force-deletes, like -D
+#   `git reset --har`                     -> discards uncommitted work
+#   `git clean --f` / `--fo` / `--for` / `--forc` -> force-cleans
+# `git push --force` was separately audited and found to need no change:
+# Git requires the exact, complete "--force" spelling there (an exact match
+# short-circuits ambiguity checking), and every strict abbreviation shorter
+# than that collides with --force-with-lease/--force-if-includes, so Git
+# itself rejects it as ambiguous — no working bypass spelling exists.
+class TestGitBranchAbbreviatedDeleteForce:
+    @pytest.mark.parametrize("command", [
+        "git branch --del --forc name",
+        "git branch --d --force name",
+        "git branch --delete --forc name",
+        "git branch --dele --forc name",
+        "git branch --delet --force name",
+        "git branch --forc --del name",       # order-independent
+        "git branch --de -f name",             # mixed abbreviated long + short
+        "git branch -d --forc name",           # mixed short + abbreviated long
+    ])
+    def test_command_blocked(self, command):
+        assert check_command(command) == "git branch -D (force delete, discards unmerged commits)", command
+
+    @pytest.mark.parametrize("argv", [
+        ["git", "branch", "--del", "--forc", "name"],
+        ["git", "branch", "--d", "--force", "name"],
+        ["git", "branch", "--delete", "--forc", "name"],
+        ["git", "branch", "--forc", "--del", "name"],
+        ["git", "branch", "--de", "-f", "name"],
+        ["git", "branch", "-d", "--forc", "name"],
+    ])
+    def test_argv_blocked(self, argv):
+        assert check_argv(argv) == "git branch -D (force delete, discards unmerged commits)"
+
+    @pytest.mark.parametrize("argv", [
+        ["sudo", "git", "branch", "--del", "--forc", "name"],
+        ["sudo", "-u", "root", "git", "branch", "--delete", "--forc", "name"],
+    ])
+    def test_sudo_argv_blocked(self, argv):
+        assert check_argv(argv) == "git branch -D (force delete, discards unmerged commits)"
+
+    @pytest.mark.parametrize("command", [
+        # Plain abbreviated delete alone is still safe/merge-checked, exactly
+        # like a bare -d/--delete — confirmed live: `git branch --de <name>`
+        # on an unmerged branch is refused ("not fully merged"), not forced.
+        "git branch --de merged-feature",
+        "git branch --delet merged-feature",
+        # Plain abbreviated force alone is a force branch-reset, not a
+        # delete — mirrors the existing bare -f false-positive check.
+        "git branch --forc newbranch main",
+        "git branch --force newbranch main",
+    ])
+    def test_command_no_false_positive(self, command):
+        assert check_command(command) is None, command
+
+    @pytest.mark.parametrize("command", [
+        # Confirmed live: Git itself rejects these as ambiguous
+        # ("could be --force or --format") — they can never reach a shell
+        # as a working force-delete, so they carry no bypass risk and are
+        # deliberately not in the recognized-abbreviation set.
+        "git branch --del --f name",
+        "git branch --del --fo name",
+        "git branch --del --for name",
+    ])
+    def test_ambiguous_git_rejected_abbreviation_not_classified_catastrophic(self, command):
+        assert check_command(command) is None, command
+
+
+class TestGitResetHardAbbreviated:
+    @pytest.mark.parametrize("command", [
+        "git reset --h",
+        "git reset --ha",
+        "git reset --har HEAD",
+        "git reset --har origin/main",
+    ])
+    def test_command_blocked(self, command):
+        assert check_command(command) == "git reset --hard (discards uncommitted work)", command
+
+    @pytest.mark.parametrize("argv", [
+        ["git", "reset", "--h"],
+        ["git", "reset", "--ha"],
+        ["git", "reset", "--har", "HEAD"],
+        ["git", "-C", "repo", "reset", "--har", "origin/main"],
+    ])
+    def test_argv_blocked(self, argv):
+        assert check_argv(argv) == "git reset --hard (discards uncommitted work)"
+
+    def test_sudo_argv_blocked(self):
+        assert check_argv(["sudo", "git", "reset", "--har", "HEAD"]) == \
+            "git reset --hard (discards uncommitted work)"
+
+    @pytest.mark.parametrize("command", [
+        "git reset --soft HEAD~1",
+        "git reset --mix HEAD",   # --mixed, not --hard — unrelated abbreviation
+        "git reset HEAD file.txt",
+    ])
+    def test_command_no_false_positive(self, command):
+        assert check_command(command) is None, command
+
+
+class TestGitCleanForceAbbreviated:
+    @pytest.mark.parametrize("command", [
+        "git clean --f",
+        "git clean --fo",
+        "git clean --for",
+        "git clean --forc",
+        "git clean --forc -d",
+    ])
+    def test_command_blocked(self, command):
+        assert check_command(command) == "git clean with force flag (deletes untracked files)", command
+
+    @pytest.mark.parametrize("argv", [
+        ["git", "clean", "--f"],
+        ["git", "clean", "--fo"],
+        ["git", "clean", "--for"],
+        ["git", "clean", "--forc"],
+    ])
+    def test_argv_blocked(self, argv):
+        assert check_argv(argv) == "git clean with force flag (deletes untracked files)"
+
+    def test_sudo_argv_blocked(self):
+        assert check_argv(["sudo", "git", "clean", "--forc"]) == \
+            "git clean with force flag (deletes untracked files)"
+
+    @pytest.mark.parametrize("command", [
+        "git clean --dry-run",
+        "git clean -n",
+        "git clean --d",   # ambiguous per-clean? -d is directories-too flag on clean, not force; --d is not a recognized clean long option abbreviation this module tracks
+    ])
+    def test_command_no_false_positive(self, command):
+        assert check_command(command) is None, command
+
+
+class TestGitPushForceAbbreviationAudited:
+    """CODING-06R.3 audit: confirmed live that git push has no abbreviation
+    bypass — --force is the only unambiguous spelling short of the full
+    --force-with-lease/--force-if-includes names, because Git treats an
+    exact match to a complete option name as unambiguous even when it is
+    also a prefix of longer option names, while any *strict* abbreviation
+    (shorter than the full name) is rejected as ambiguous between --force,
+    --force-with-lease, and --force-if-includes."""
+
+    @pytest.mark.parametrize("command", [
+        "git push --forc origin main",
+        "git push --for origin main",
+        "git push --fo origin main",
+        "git push --f origin main",
+    ])
+    def test_ambiguous_git_rejected_abbreviation_not_classified_catastrophic(self, command):
+        assert check_command(command) is None, command
+
+    def test_exact_force_still_blocked(self):
+        assert check_command("git push --force origin main") == "force push"
+        assert check_argv(["git", "push", "--force", "origin", "main"]) == "force push"
+
+
+# ── CODING-06R.3: sudo -> git argv redispatch ──────────────────────────────
+#
+# R.2 found check_argv(["sudo", "git", "push", "-f", ...]) allowed while
+# the equivalent shell string was already blocked by check_command's shlex
+# scan (which finds a "git" token at any position, sudo-prefixed or not).
+# check_argv now walks past sudo's own recognized options -- the exact
+# same walk it already used to redispatch "sudo rm" -- and, when the
+# effective wrapped command is git, decides it through the identical
+# _git_catastrophic_reason() a bare (non-sudo) argv invocation would get.
+class TestSudoGitArgvRedispatch:
+    @pytest.mark.parametrize("argv, expected_reason", [
+        (["sudo", "git", "push", "-f", "origin", "main"], "force push"),
+        (["sudo", "git", "branch", "-d", "-f", "name"],
+         "git branch -D (force delete, discards unmerged commits)"),
+        (["sudo", "git", "branch", "-fD", "name"],
+         "git branch -D (force delete, discards unmerged commits)"),
+        (["sudo", "-u", "root", "git", "push", "--force", "origin", "main"], "force push"),
+        (["sudo", "git", "reset", "--hard", "HEAD"],
+         "git reset --hard (discards uncommitted work)"),
+    ])
+    def test_blocked(self, argv, expected_reason):
+        assert check_argv(argv) == expected_reason
+
+    @pytest.mark.parametrize("argv", [
+        ["sudo", "git", "status"],
+        ["sudo", "git", "branch", "-d", "merged"],
+        ["sudo", "git", "push", "origin", "main"],
+        ["sudo", "apt", "update"],
+    ])
+    def test_no_false_positive(self, argv):
+        assert check_argv(argv) is None
+
+    def test_sudo_rm_behavior_unchanged(self):
+        assert check_argv(["sudo", "rm", "-rf", "/home"]) == "sudo rm"
+        assert check_argv(["sudo", "-u", "root", "/usr/bin/rm", "-rf", "/home"]) == "sudo rm"
+
+
 # ── CODING-06R.1 Repair D: Windows-native destructive commands ────────────
 #
 # check_command previously had zero Windows-native coverage at all — on a
