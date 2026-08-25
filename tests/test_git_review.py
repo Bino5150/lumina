@@ -246,6 +246,8 @@ def submodule_context(tmp_path):
     _git(outer, "config", "user.email", "test@example.com")
     _git(outer, "config", "user.name", "Test")
     _git(outer, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "sub")
+    _git(outer / "sub", "config", "user.email", "test@example.com")
+    _git(outer / "sub", "config", "user.name", "Test")
     _git(outer, "commit", "-q", "-m", "add submodule")
     identity = cp.resolve_target_identity(str(outer))
     return outer, identity
