@@ -657,3 +657,176 @@ def test_supplied_identity_no_longer_matching_live_root_is_refused(repo_context,
     forged = dc_replace(identity, canonical_root=other_identity.canonical_root)
     with pytest.raises(gr.ReviewTargetError):
         gr.capture_review_snapshot(forged)
+
+
+# ===========================================================================
+# CODING-08R.1: core.fsmonitor and content-filter (clean/process) sentinels.
+#
+# diff.external/textconv (tested above) are not the only Git-supported
+# external-process escape hatches a status/diff invocation can reach.
+# core.fsmonitor fires on plain `status` and on `--numstat` alike (staged
+# AND unstaged); a `.gitattributes`-selected filter.<name>.clean/.process
+# driver fires on worktree-side `--numstat` (never on `--cached`, never on
+# plain `status`). See core/git_review.py's module docstring and its
+# "Filter-free content comparison" section for the full empirical record
+# and the structural (not flag-based) fix for the filter vector.
+# ===========================================================================
+
+def test_configured_fsmonitor_does_not_execute_during_status(repo_context, tmp_path):
+    root, identity = repo_context
+    sentinel = tmp_path / "fsmonitor_ran"
+    script = tmp_path / "fake_fsmonitor.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "core.fsmonitor", str(script))
+
+    (root / "tracked.txt").write_text("dirty\n")
+    gr.capture_review_snapshot(identity)
+
+    assert not sentinel.exists(), (
+        "core.fsmonitor executed during A1 status/numstat observation -- "
+        "the -c core.fsmonitor= guard did not hold"
+    )
+
+
+def test_fsmonitor_removed_flag_would_execute_helper(repo_context, tmp_path, monkeypatch):
+    """Companion proof: with the guard removed, A1's own observation path
+    DOES invoke the configured fsmonitor hook."""
+    root, identity = repo_context
+    sentinel = tmp_path / "fsmonitor_ran"
+    script = tmp_path / "fake_fsmonitor.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "core.fsmonitor", str(script))
+
+    (root / "tracked.txt").write_text("dirty\n")
+    monkeypatch.setattr(gr, "_GLOBAL_SAFE_ARGS", ("--no-pager", "-c", "color.ui=never"))
+    gr.capture_review_snapshot(identity)
+
+    assert sentinel.exists(), (
+        "expected the configured core.fsmonitor hook to run once the "
+        "guard was removed -- if it did not, the sentinel test above may "
+        "be vacuous for this Git version"
+    )
+
+
+def test_configured_content_filter_clean_does_not_execute_during_unstaged_numstat(
+    repo_context, tmp_path,
+):
+    root, identity = repo_context
+    sentinel = tmp_path / "clean_ran"
+    script = tmp_path / "fake_clean.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat\n")
+    script.chmod(0o755)
+    _git(root, "config", "filter.sentinel.clean", str(script))
+    (root / ".gitattributes").write_text("tracked.txt filter=sentinel\n")
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-q", "-m", "attrs")
+    # Git's own index-refresh during the setup `add`/`commit` above already
+    # invokes the just-configured clean filter once, empirically confirmed
+    # (CODING-08R.1) -- reset the sentinel so only OUR call under test is
+    # observed, not ordinary repository setup.
+    sentinel.unlink(missing_ok=True)
+
+    (root / "tracked.txt").write_text("line1\nCHANGED\nline3\nline4\nline5\n")
+    snap = gr.capture_review_snapshot(identity)
+    change = _by_path(snap.changes, "tracked.txt")
+
+    assert not sentinel.exists(), (
+        "filter.clean executed during A1 unstaged numstat observation -- "
+        "the filter-free comparison did not hold"
+    )
+    assert change.unstaged_diff == gr.DiffMetadata(binary=False, insertions=1, deletions=1)
+
+
+def test_configured_content_filter_process_does_not_execute(repo_context, tmp_path):
+    """The newer long-running filter-process protocol (filter.<name>.process)
+    is a structurally separate configuration key from .clean/.smudge --
+    confirmed empirically (CODING-08R) that Git still launches the process
+    even for a required filter whose protocol handshake immediately fails."""
+    root, identity = repo_context
+    sentinel = tmp_path / "process_ran"
+    script = tmp_path / "fake_process.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexec cat >/dev/null\n")
+    script.chmod(0o755)
+    # Commit the attribute assignment BEFORE the "sentinel" filter driver is
+    # even defined in Git config -- an unrecognized filter name is a no-op,
+    # so this `add`/`commit` cannot itself invoke anything. Defining the
+    # driver (with required=true) only afterward avoids Git's own
+    # `git add`/`git commit` index-refresh failing at SETUP time (a required
+    # filter that errors makes ordinary Git operations on that path fail,
+    # independent of anything under test here).
+    (root / ".gitattributes").write_text("tracked.txt filter=sentinel\n")
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-q", "-m", "attrs")
+    _git(root, "config", "filter.sentinel.process", str(script))
+    _git(root, "config", "filter.sentinel.required", "true")
+
+    (root / "tracked.txt").write_text("line1\nCHANGED\nline3\nline4\nline5\n")
+    gr.capture_review_snapshot(identity)
+
+    assert not sentinel.exists(), (
+        "filter.process executed during A1 observation -- the filter-free "
+        "comparison did not hold"
+    )
+
+
+def test_filter_free_numstat_bypassed_would_execute_clean_filter(repo_context, tmp_path, monkeypatch):
+    """Companion proof: with the filter-free comparison bypassed in favor
+    of a direct worktree-path diff (the pre-CODING-08R.1 call shape), the
+    configured clean filter DOES execute."""
+    root, identity = repo_context
+    sentinel = tmp_path / "clean_ran"
+    script = tmp_path / "fake_clean.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat\n")
+    script.chmod(0o755)
+    _git(root, "config", "filter.sentinel.clean", str(script))
+    (root / ".gitattributes").write_text("tracked.txt filter=sentinel\n")
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-q", "-m", "attrs")
+    sentinel.unlink(missing_ok=True)  # see the first clean-filter test's comment
+    (root / "tracked.txt").write_text("line1\nCHANGED\nline3\nline4\nline5\n")
+
+    def _direct_worktree_diff(root_arg, old_bytes, new_bytes, extra_args):
+        result = gr._run_git(root_arg, ["diff", *extra_args, "--", "tracked.txt"])
+        return result.stdout
+
+    monkeypatch.setattr(gr, "_filter_free_diff", _direct_worktree_diff)
+    try:
+        gr.capture_review_snapshot(identity)
+    except gr.GitReviewError:
+        # The mutated helper returns an ordinary (same-path) numstat shape,
+        # not the --no-index rename shape _parse_no_index_numstat expects --
+        # a parse failure is an expected side effect of this deliberately
+        # crude mutation, not the property under test. Only whether the
+        # external helper ran is being proven here.
+        pass
+
+    assert sentinel.exists(), (
+        "expected the configured clean filter to run once the filter-free "
+        "comparison was bypassed -- if it did not, the sentinel test above "
+        "may be vacuous"
+    )
+
+
+def test_smudge_filter_not_reachable_through_review(repo_context, tmp_path):
+    """CODING-08R.1: smudge only runs on checkout (index/HEAD -> worktree),
+    an operation review never performs. Proven, not assumed -- a smudge
+    filter must never fire anywhere in a normal capture_review_snapshot
+    cycle over a change whose smudge driver is configured."""
+    root, identity = repo_context
+    sentinel = tmp_path / "smudge_ran"
+    script = tmp_path / "fake_smudge.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat\n")
+    script.chmod(0o755)
+    _git(root, "config", "filter.sentinel.smudge", str(script))
+    _git(root, "config", "filter.sentinel.clean", "cat")
+    (root / ".gitattributes").write_text("tracked.txt filter=sentinel\n")
+    _git(root, "add", ".gitattributes", "tracked.txt")
+    _git(root, "commit", "-q", "-m", "attrs")
+    sentinel.unlink(missing_ok=True)  # see the clean-filter test's comment above
+
+    (root / "tracked.txt").write_text("line1\nCHANGED\nline3\nline4\nline5\n")
+    gr.capture_review_snapshot(identity)
+
+    assert not sentinel.exists(), "smudge executed during review -- review must never check out content"

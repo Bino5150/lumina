@@ -901,6 +901,13 @@ def test_retrieval_configured_textconv_does_not_execute(repo_context, tmp_path):
 
 
 def test_retrieval_diff_invocation_argv_carries_safety_flags(repo_context, monkeypatch):
+    """CODING-08R.1: unstaged/untracked retrieval now runs its diff-shaped
+    Git invocation through core.git_review's shared filter-free helper
+    (core.git_review._run_git -> core.git_review.run_bounded_git), not
+    through this module's own _run_git -- the temporary-directory diff
+    still needs and still carries both safety flags, it just happens via a
+    different module-level function reference. Spy on both references so
+    this test observes the real call regardless of which module made it."""
     root, identity = repo_context
     (root / "tracked.txt").write_text("changed enough to trigger a real diff\n")
     handle = grs.capture_snapshot(identity)
@@ -908,13 +915,15 @@ def test_retrieval_diff_invocation_argv_carries_safety_flags(repo_context, monke
     change_id = grs.review_change_id(change)
 
     recorded = []
-    real = grs.run_bounded_git
 
-    def spy(root_arg, args, **kwargs):
-        recorded.append(tuple(args))
-        return real(root_arg, args, **kwargs)
+    def _spy_factory(real):
+        def spy(root_arg, args, **kwargs):
+            recorded.append(tuple(args))
+            return real(root_arg, args, **kwargs)
+        return spy
 
-    monkeypatch.setattr(grs, "run_bounded_git", spy)
+    monkeypatch.setattr(grs, "run_bounded_git", _spy_factory(grs.run_bounded_git))
+    monkeypatch.setattr(gr, "run_bounded_git", _spy_factory(gr.run_bounded_git))
     grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_UNSTAGED)
 
     diff_calls = [args for args in recorded if "diff" in args]
@@ -924,12 +933,68 @@ def test_retrieval_diff_invocation_argv_carries_safety_flags(repo_context, monke
         assert "--no-textconv" in args, args
 
 
-def test_diff_external_removed_flag_would_execute_helper(repo_context, tmp_path, monkeypatch):
-    """Companion proof that the sentinel test above is genuinely
-    load-bearing (unlike A1's --numstat calls): with the safety flags
-    monkeypatched away, the SAME retrieval path DOES invoke the
-    configured external helper. This is the empirical evidence that
-    _DIFF_SAFETY_ARGS is load-bearing for this module's patch calls."""
+def test_staged_retrieval_configured_diff_external_does_not_execute(repo_context, tmp_path):
+    """CODING-08R.1: the STAGED layer still asks Git directly for the patch
+    (a --cached diff never touches worktree bytes -- see
+    core.git_review's "Filter-free content comparison" section), so it
+    still needs and still carries _DIFF_SAFETY_ARGS exactly like before this
+    repair. Companion proof (with the flag removed) follows below."""
+    root, identity = repo_context
+    sentinel = tmp_path / "diff_external_ran"
+    script = tmp_path / "fake_diff.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "diff.external", str(script))
+
+    (root / "tracked.txt").write_text("line1\nline2\n")
+    _git(root, "add", "tracked.txt")
+    handle = grs.capture_snapshot(identity)
+    change = _only_change(handle.snapshot)
+    change_id = grs.review_change_id(change)
+    grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_STAGED)
+
+    assert not sentinel.exists(), (
+        "diff.external executed during bounded STAGED retrieval -- the "
+        "--no-ext-diff guard did not hold"
+    )
+
+
+def test_staged_diff_external_removed_flag_would_execute_helper(repo_context, tmp_path, monkeypatch):
+    """Companion proof for the staged-layer test above: with the safety
+    flags monkeypatched away, staged retrieval DOES invoke the configured
+    external helper -- empirical evidence _DIFF_SAFETY_ARGS remains
+    load-bearing for the one retrieval path that still asks Git to diff the
+    real repository directly."""
+    root, identity = repo_context
+    sentinel = tmp_path / "diff_external_ran"
+    script = tmp_path / "fake_diff.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "diff.external", str(script))
+
+    (root / "tracked.txt").write_text("line1\nline2\n")
+    _git(root, "add", "tracked.txt")
+    handle = grs.capture_snapshot(identity)
+    change = _only_change(handle.snapshot)
+    change_id = grs.review_change_id(change)
+
+    monkeypatch.setattr(gr, "_DIFF_SAFETY_ARGS", ())
+    grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_STAGED)
+    assert sentinel.exists(), (
+        "expected the configured diff.external helper to run once the "
+        "safety flags were removed for the staged retrieval path -- if it "
+        "did not, the sentinel test above may be vacuous for this Git version"
+    )
+
+
+def test_unstaged_retrieval_immune_to_diff_external_even_with_flags_removed(repo_context, tmp_path, monkeypatch):
+    """CODING-08R.1: unlike the staged layer, unstaged/untracked retrieval
+    no longer depends on _DIFF_SAFETY_ARGS alone -- it never asks Git to
+    diff the real in-repository path at all, so the reviewed repository's
+    own diff.external config is structurally never loaded for this call,
+    even with the flags removed. This is a strictly STRONGER guarantee than
+    "the flag holds"; the companion proof below shows what actually IS
+    load-bearing now (temporary-directory isolation, not the flags)."""
     root, identity = repo_context
     sentinel = tmp_path / "diff_external_ran"
     script = tmp_path / "fake_diff.sh"
@@ -944,10 +1009,63 @@ def test_diff_external_removed_flag_would_execute_helper(repo_context, tmp_path,
 
     monkeypatch.setattr(gr, "_DIFF_SAFETY_ARGS", ())
     grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_UNSTAGED)
+    assert not sentinel.exists(), (
+        "diff.external executed during unstaged retrieval even with "
+        "_DIFF_SAFETY_ARGS removed -- temporary-directory isolation did "
+        "not hold"
+    )
+
+
+def test_unstaged_retrieval_temp_directory_isolation_removed_would_execute_helper(
+    repo_context, tmp_path, monkeypatch,
+):
+    """Companion proof for the isolation property above.
+
+    The unstaged/untracked retrieval path is now protected by TWO
+    independent layers: _DIFF_SAFETY_ARGS (flags) and temporary-directory
+    isolation (never diffing the real in-repo path at all) -- either one
+    alone is already sufficient, which is exactly why
+    test_unstaged_retrieval_immune_to_diff_external_even_with_flags_removed
+    stays green with only the flags removed. To see the ORIGINAL
+    CODING-08R BLOCKER reproduced (both protections absent, matching the
+    pre-repair vulnerable state exactly), this mutation removes isolation
+    -- diffing the real repository path directly, as the pre-repair code
+    did -- AND the flags together."""
+    root, identity = repo_context
+    sentinel = tmp_path / "diff_external_ran"
+    script = tmp_path / "fake_diff.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "diff.external", str(script))
+
+    (root / "tracked.txt").write_text("changed enough to trigger a real diff\n")
+    handle = grs.capture_snapshot(identity)
+    change = _only_change(handle.snapshot)
+    change_id = grs.review_change_id(change)
+
+    real_filter_free_diff = gr._filter_free_diff
+
+    def _isolation_and_flags_removed(root_arg, old_bytes, new_bytes, extra_args):
+        # retrieve_review_file() revalidates applicability before AND after
+        # retrieval, and applicability re-derives a fresh A1 snapshot each
+        # time -- which itself calls _filter_free_diff for unstaged NUMSTAT
+        # metadata. Only the PATCH-shaped call (--unified=3, from THIS
+        # test's target _run_diff_patch) is the one under test; leave the
+        # numstat-shaped revalidation calls on the real, safe implementation
+        # so this mutation isolates exactly one call site.
+        if "--unified=3" not in extra_args:
+            return real_filter_free_diff(root_arg, old_bytes, new_bytes, extra_args)
+        # Diff the REAL repository path directly, with no safety flags --
+        # exactly the pre-CODING-08R.1 vulnerable call shape.
+        result = gr._run_git(root_arg, ["diff", *extra_args, "--", "tracked.txt"])
+        return result.stdout
+
+    monkeypatch.setattr(gr, "_filter_free_diff", _isolation_and_flags_removed)
+    grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_UNSTAGED)
     assert sentinel.exists(), (
-        "expected the configured diff.external helper to run once the "
-        "safety flags were removed -- if it did not, the sentinel test "
-        "above may be vacuous for this Git version"
+        "expected the configured diff.external helper to run once both "
+        "temporary-directory isolation and the safety flags were bypassed "
+        "-- if it did not, the isolation test above may be vacuous"
     )
 
 
@@ -1081,3 +1199,134 @@ def test_capture_stale_identity_after_repository_removed_is_refused(repo_context
     shutil.rmtree(root)
     with pytest.raises(gr.ReviewTargetError):
         grs.capture_snapshot(identity)
+
+
+# ===========================================================================
+# CODING-08R.1: core.fsmonitor and content-filter sentinels at the A2 API
+# surface specifically -- A1's own suite (tests/test_git_review.py) already
+# proves the underlying mechanism; these confirm the same protection holds
+# through capture_snapshot()/retrieve_review_file(), A2's actual public
+# entry points, not merely through the A1 functions A2 happens to reuse.
+# ===========================================================================
+
+def test_capture_snapshot_configured_fsmonitor_does_not_execute(repo_context, tmp_path):
+    root, identity = repo_context
+    sentinel = tmp_path / "fsmonitor_ran"
+    script = tmp_path / "fake_fsmonitor.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "core.fsmonitor", str(script))
+
+    (root / "tracked.txt").write_text("dirty\n")
+    grs.capture_snapshot(identity)
+
+    assert not sentinel.exists(), (
+        "core.fsmonitor executed during A2 capture_snapshot -- the guard "
+        "did not hold"
+    )
+
+
+def test_retrieve_review_file_configured_fsmonitor_does_not_execute(repo_context, tmp_path):
+    root, identity = repo_context
+    (root / "tracked.txt").write_text("changed enough to trigger a real diff\n")
+    handle = grs.capture_snapshot(identity)
+    change = _only_change(handle.snapshot)
+    change_id = grs.review_change_id(change)
+
+    sentinel = tmp_path / "fsmonitor_ran"
+    script = tmp_path / "fake_fsmonitor.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "core.fsmonitor", str(script))
+
+    grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_UNSTAGED)
+
+    assert not sentinel.exists(), (
+        "core.fsmonitor executed during A2 retrieve_review_file -- the "
+        "guard did not hold"
+    )
+
+
+def test_retrieve_review_file_configured_content_filter_clean_does_not_execute(repo_context, tmp_path):
+    root, identity = repo_context
+    sentinel = tmp_path / "clean_ran"
+    script = tmp_path / "fake_clean.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat\n")
+    script.chmod(0o755)
+    (root / ".gitattributes").write_text("tracked.txt filter=sentinel\n")
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-q", "-m", "attrs")
+    _git(root, "config", "filter.sentinel.clean", str(script))
+
+    (root / "tracked.txt").write_text("line1\nCHANGED\nline3\nline4\nline5\n")
+    handle = grs.capture_snapshot(identity)
+    change = _change_by_path(handle.snapshot, "tracked.txt")
+    change_id = grs.review_change_id(change)
+    sentinel.unlink(missing_ok=True)  # capture_snapshot's own numstat pass -- see A1's suite
+
+    outcome = grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_UNSTAGED)
+
+    assert not sentinel.exists(), (
+        "filter.clean executed during A2 unstaged retrieval -- the "
+        "filter-free comparison did not hold"
+    )
+    assert outcome.status == grs.CURRENT
+    assert outcome.file is not None and not outcome.file.binary
+
+
+def test_retrieve_review_file_untracked_configured_content_filter_does_not_execute(repo_context, tmp_path):
+    """The untracked/--no-index retrieval path also needs the filter-free
+    fix -- confirmed empirically (CODING-08R) that a plain --no-index diff
+    against the real in-repo path invokes a matching .gitattributes filter
+    even though the file itself was never added."""
+    root, identity = repo_context
+    sentinel = tmp_path / "clean_ran"
+    script = tmp_path / "fake_clean.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat\n")
+    script.chmod(0o755)
+    (root / ".gitattributes").write_text("newfile.txt filter=sentinel\n")
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-q", "-m", "attrs")
+    _git(root, "config", "filter.sentinel.clean", str(script))
+
+    (root / "newfile.txt").write_text("brand new untracked content\n")
+    handle = grs.capture_snapshot(identity)
+    change = _change_by_path(handle.snapshot, "newfile.txt")
+    change_id = grs.review_change_id(change)
+    sentinel.unlink(missing_ok=True)
+
+    outcome = grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_UNSTAGED)
+
+    assert not sentinel.exists(), (
+        "filter.clean executed during untracked-file retrieval -- the "
+        "filter-free comparison did not hold"
+    )
+    assert outcome.status == grs.CURRENT
+    assert outcome.file is not None and not outcome.file.binary
+    assert outcome.file.hunks, "expected real hunk content for the new file"
+
+
+def test_retrieve_review_file_configured_content_filter_process_does_not_execute(repo_context, tmp_path):
+    root, identity = repo_context
+    sentinel = tmp_path / "process_ran"
+    script = tmp_path / "fake_process.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexec cat >/dev/null\n")
+    script.chmod(0o755)
+    (root / ".gitattributes").write_text("tracked.txt filter=sentinel\n")
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-q", "-m", "attrs")
+    _git(root, "config", "filter.sentinel.process", str(script))
+    _git(root, "config", "filter.sentinel.required", "true")
+
+    (root / "tracked.txt").write_text("line1\nCHANGED\nline3\nline4\nline5\n")
+    handle = grs.capture_snapshot(identity)
+    change = _change_by_path(handle.snapshot, "tracked.txt")
+    change_id = grs.review_change_id(change)
+
+    outcome = grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_UNSTAGED)
+
+    assert not sentinel.exists(), (
+        "filter.process executed during A2 unstaged retrieval -- the "
+        "filter-free comparison did not hold"
+    )
+    assert outcome.status == grs.CURRENT

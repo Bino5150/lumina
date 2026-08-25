@@ -908,3 +908,53 @@ def test_partially_staged_vs_unstaged_only_same_final_bytes_differs(repo_context
 
     assert mixed.head == unstaged_only.head
     assert mixed.validation_state_ref != unstaged_only.validation_state_ref
+
+
+# ===========================================================================
+# CODING-08R.1: core.fsmonitor sentinel (this module's own read-only Git
+# invocation surface shares core.git_review's exposure -- see
+# core/git_review.py's "_GLOBAL_SAFE_ARGS" comment for the full empirical
+# record). This module never calls `git diff` on worktree content (dirty
+# content hashing is a direct filesystem read -- see obs._hash_regular_file_
+# once), so the content-filter vector core.git_review needed does not apply
+# here; only fsmonitor does.
+# ===========================================================================
+
+def test_configured_fsmonitor_does_not_execute_during_live_observation(repo_context, tmp_path):
+    root, context = repo_context
+    sentinel = tmp_path / "fsmonitor_ran"
+    script = tmp_path / "fake_fsmonitor.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "core.fsmonitor", str(script))
+
+    (root / "README.md").write_text("dirty change\n")
+    obs.capture_live_observation(context)
+
+    assert not sentinel.exists(), (
+        "core.fsmonitor executed during live observation -- the "
+        "-c core.fsmonitor= guard did not hold"
+    )
+
+
+def test_fsmonitor_removed_flag_would_execute_helper(repo_context, tmp_path, monkeypatch):
+    """Companion proof: with the guard removed, the same observation path
+    DOES invoke the configured fsmonitor hook -- empirical evidence that
+    _GLOBAL_SAFE_ARGS's core.fsmonitor override is load-bearing here, not
+    merely structural."""
+    root, context = repo_context
+    sentinel = tmp_path / "fsmonitor_ran"
+    script = tmp_path / "fake_fsmonitor.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n")
+    script.chmod(0o755)
+    _git(root, "config", "core.fsmonitor", str(script))
+
+    (root / "README.md").write_text("dirty change\n")
+    monkeypatch.setattr(obs, "_GLOBAL_SAFE_ARGS", ())
+    obs.capture_live_observation(context)
+
+    assert sentinel.exists(), (
+        "expected the configured core.fsmonitor hook to run once the guard "
+        "was removed -- if it did not, the sentinel test above may be "
+        "vacuous for this Git version"
+    )

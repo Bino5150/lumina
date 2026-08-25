@@ -245,11 +245,27 @@ class LiveCheckpointRead:
 # each call site) is unchanged from the pre-extraction implementation.
 _GitCommandResult = GitCommandResult
 
+# CODING-08R.1: a repository-local core.fsmonitor value names an external
+# program Git executes on this module's own `status` call (_capture_git_
+# state below) -- confirmed empirically (CODING-08R) against real Git
+# 2.43.0, the exact same exposure found and closed in core.git_review.
+# Forced onto every invocation this module makes, mirroring
+# core.git_review._GLOBAL_SAFE_ARGS exactly, including the empty-string
+# (never "false") choice -- see that constant's own comment for the
+# Git <=2.35.1 boolean/pathname compatibility reasoning. This module never
+# calls `git diff` on worktree content (dirty-path content hashing goes
+# through direct, unconverting filesystem reads -- see _hash_regular_file_
+# once below, which mirrors core.git_review_snapshot's own fingerprinting
+# read), so the content-filter (clean/smudge/process) vector core.git_review
+# needed a structural fix for does not reach this module at all; confirmed
+# by inspection, nothing here was changed for that vector.
+_GLOBAL_SAFE_ARGS = ("-c", "core.fsmonitor=")
+
 
 def _run_git(root: str, args: Sequence[str]) -> GitCommandResult:
     try:
         return run_bounded_git(
-            root, args,
+            root, (*_GLOBAL_SAFE_ARGS, *args),
             timeout=GIT_TIMEOUT_SECONDS,
             max_stdout_bytes=MAX_GIT_STDOUT_BYTES,
             max_stderr_bytes=MAX_GIT_STDERR_BYTES,

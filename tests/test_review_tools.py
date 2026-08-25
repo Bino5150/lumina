@@ -894,6 +894,243 @@ def test_review_module_only_imports_read_kernels():
 
 
 # ===========================================================================
+# CODING-08R.1: close the R-H test-oracle gap. The static substring check
+# above only ever proves tools/review.py's own SOURCE never mentions a
+# mutation-shaped call -- CODING-08R's own literal mutation (inserting a
+# real checkpoint_store.save_checkpoint() call into review_changes) proved
+# it does not detect a genuine durable write introduced there, since it is
+# a dynamic property, not a static one. This is the dynamic regression:
+# real review_changes/review_file_diff calls against isolated on-disk
+# state, asserting no durable mutation occurred anywhere reachable --
+# checkpoint rows, evidence rows, Project binding files, or the worktree
+# manager's own runtime registry/ledger.
+# ===========================================================================
+
+def _table_row_count(table: str) -> int:
+    """0 if the table does not exist at all -- review must never even cause
+    it to be created, let alone populated."""
+    import sqlite3
+    from core.db import connect
+    try:
+        conn = connect()
+    except sqlite3.OperationalError:
+        return 0
+    try:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,),
+        )
+        if cursor.fetchone() is None:
+            return 0
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _binding_dir_snapshot(path: str) -> dict:
+    if not os.path.isdir(path):
+        return {}
+    snapshot = {}
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fname in filenames:
+            full = os.path.join(dirpath, fname)
+            snapshot[full] = (os.path.getsize(full), os.path.getmtime(full))
+    return snapshot
+
+
+def test_review_read_paths_cause_no_durable_state_mutation(managed):
+    """Defends the invariant directly, not by grepping for one specific
+    past mutation: a review READ (capture + retrieval, owner and non-owner)
+    can never acquire an undocumented durable-state side effect anywhere
+    reachable from this process."""
+    before_checkpoints = _table_row_count("coding_checkpoints")
+    before_evidence = _table_row_count("coding_validation_evidence")
+    before_bindings = _binding_dir_snapshot(project_context_module.PROJECT_BINDINGS_DIR)
+    before_registry = dict(worktree_manager._registry)
+    before_project = managed.state.snapshot()
+
+    (managed.repo / "tracked.txt").write_text("line1\nCHANGED\nline3\n", encoding="utf-8")
+    snap = _call(managed.registry, "review_changes", {})
+    assert snap["changes"], "expected a real dirty change to exercise retrieval too"
+    assert snap["status"] in ("current", "current_metadata_only")
+    for change in snap["changes"]:
+        _call(managed.registry, "review_file_diff", {
+            "snapshot_ref": snap["snapshot_ref"],
+            "change_id": change["change_id"],
+            "layer": "staged" if change["staged"] else "unstaged",
+        })
+    # Paginate too -- load_more()-shaped calls are still a "review read".
+    _call(managed.registry, "review_changes", {"snapshot_ref": snap["snapshot_ref"], "cursor": 0})
+
+    # Non-owner, through its own granted review target -- the other real
+    # entry point onto the exact same production code.
+    non_owner = _non_owner_registry(review_target_grant=cp_module_target(managed.root))
+    non_owner_snap = _call(non_owner, "review_changes", {})
+    assert non_owner_snap["status"] in ("current", "current_metadata_only")
+
+    assert _table_row_count("coding_checkpoints") == before_checkpoints, (
+        "review_changes/review_file_diff created or modified a coding_checkpoints row"
+    )
+    assert _table_row_count("coding_validation_evidence") == before_evidence, (
+        "review_changes/review_file_diff created or modified a coding_validation_evidence row"
+    )
+    assert _binding_dir_snapshot(project_context_module.PROJECT_BINDINGS_DIR) == before_bindings, (
+        "review_changes/review_file_diff wrote to a Project binding file"
+    )
+    assert dict(worktree_manager._registry) == before_registry, (
+        "review_changes/review_file_diff mutated the worktree manager's runtime registry"
+    )
+    assert managed.state.snapshot() == before_project, (
+        "review_changes/review_file_diff mutated the owner's active ProjectContextState"
+    )
+
+
+def cp_module_target(root: str):
+    import core.coding_checkpoint as checkpoint_store
+    return checkpoint_store.resolve_target_identity(root)
+
+
+def test_review_changes_durable_write_mutation_turns_red(managed, monkeypatch):
+    """Literal repeat of CODING-08R's R-H mutation: insert a real durable
+    checkpoint save into review_changes's success path and confirm the new
+    invariant test above -- not the old static substring check, which this
+    mutation does not touch at all -- turns red for the intended reason."""
+    import core.coding_checkpoint as checkpoint_store
+
+    real_bind = review_module._bind_snapshot_target
+
+    def _bind_with_side_effect(snapshot_ref, target_key):
+        real_bind(snapshot_ref, target_key)
+        try:
+            checkpoint_store.save_checkpoint(
+                "coding-08r1-mutation-probe", managed.root,
+                {"workflow": {"task_id": "r-h-mutation", "phase": "in_progress"}},
+                expected_revision=0,
+            )
+        except Exception:
+            pass
+
+    monkeypatch.setattr(review_module, "_bind_snapshot_target", _bind_with_side_effect)
+    with pytest.raises(AssertionError):
+        test_review_read_paths_cause_no_durable_state_mutation(managed)
+
+
+# ===========================================================================
+# CODING-08R.1: close the R-K test-oracle gap. Defines the CLOSED set of
+# top-level JSON keys review_changes/review_file_diff may ever emit --
+# across every degraded/error candidate the bounded-output ladder can
+# select, not merely the full/happy-path shape. An unreviewed schema
+# addition (in particular any authority/governance-shaped key) must fail
+# this test, forcing a deliberate update rather than silently shipping.
+# ===========================================================================
+
+_REVIEW_CHANGES_ALLOWED_KEYS = {
+    "status", "snapshot_ref", "repository_content_untrusted", "target",
+    "captured_at", "reasons", "head", "branch", "detached", "unborn",
+    "operation_state", "content_complete", "omissions", "total_changes",
+    "changes", "next_cursor", "complete_page", "message",
+}
+_REVIEW_CHANGE_RECORD_ALLOWED_KEYS = {
+    "change_id", "display_path", "display_original_path", "record_type",
+    "relation", "relation_score", "xy_status", "staged", "unstaged",
+    "untracked", "submodule", "head_mode", "index_mode", "worktree_mode",
+    "head_object_id", "index_object_id", "unmerged_stages", "staged_diff",
+    "unstaged_diff", "content_omission_reason",
+}
+_REVIEW_FILE_DIFF_ALLOWED_KEYS = {
+    "status", "snapshot_ref", "change_id", "layer",
+    "repository_content_untrusted", "reasons", "display_path", "binary",
+    "total_bytes", "hunks", "complete", "omitted_hunks", "omission_reason",
+    "next_cursor", "message",
+}
+# Explicitly forbidden regardless of whether they'd otherwise pass a
+# generic "unexpected key" check -- these are the specific authority/
+# governance shapes CODING-08's whole threat model says review must never
+# manufacture, named so a reviewer sees exactly what tripped the test.
+_FORBIDDEN_AUTHORITY_KEYS = {
+    "reviewed", "approved", "ready_to_commit", "commit_authorized",
+    "merge_authorized", "push_authorized", "release_authorized",
+    "checkpoint_authorized",
+}
+
+
+def _assert_closed_schema(payload: dict, allowed: set, where: str):
+    extra = set(payload.keys()) - allowed
+    assert not extra, f"{where} produced undeclared key(s): {sorted(extra)}"
+    authority_leak = set(payload.keys()) & _FORBIDDEN_AUTHORITY_KEYS
+    assert not authority_leak, f"{where} produced authority-shaped key(s): {sorted(authority_leak)}"
+
+
+def test_review_changes_json_schema_is_closed(managed):
+    snap = _call(managed.registry, "review_changes", {})
+    _assert_closed_schema(snap, _REVIEW_CHANGES_ALLOWED_KEYS, "review_changes")
+    for change in snap["changes"]:
+        _assert_closed_schema(change, _REVIEW_CHANGE_RECORD_ALLOWED_KEYS, "review_changes.changes[]")
+
+    # Degraded/error candidates: unauthorized, unknown snapshot, malformed --
+    # every branch the bounded-output ladder can actually select.
+    _assert_closed_schema(
+        _call(_non_owner_registry(), "review_changes", {"snapshot_ref": "revsnap-does-not-exist"}),
+        _REVIEW_CHANGES_ALLOWED_KEYS, "review_changes (unauthorized_target)",
+    )
+    _assert_closed_schema(
+        _call(managed.registry, "review_changes", {"snapshot_ref": "revsnap-does-not-exist"}),
+        _REVIEW_CHANGES_ALLOWED_KEYS, "review_changes (unknown_snapshot)",
+    )
+    _assert_closed_schema(
+        _call(managed.registry, "review_changes", {"cursor": -1}),
+        _REVIEW_CHANGES_ALLOWED_KEYS, "review_changes (malformed_request)",
+    )
+
+
+def test_review_file_diff_json_schema_is_closed(managed):
+    (managed.repo / "tracked.txt").write_text("line1\nCHANGED\nline3\n", encoding="utf-8")
+    snap = _call(managed.registry, "review_changes", {})
+    change = snap["changes"][0]
+    result = _call(managed.registry, "review_file_diff", {
+        "snapshot_ref": snap["snapshot_ref"], "change_id": change["change_id"],
+        "layer": "staged" if change["staged"] else "unstaged",
+    })
+    _assert_closed_schema(result, _REVIEW_FILE_DIFF_ALLOWED_KEYS, "review_file_diff")
+    for hunk in result.get("hunks", []):
+        _assert_closed_schema(
+            hunk, {"header", "lines", "byte_size", "omitted", "omission_reason"},
+            "review_file_diff.hunks[]",
+        )
+        for line in hunk.get("lines") or []:
+            _assert_closed_schema(line, {"kind", "text"}, "review_file_diff.hunks[].lines[]")
+
+    _assert_closed_schema(
+        _call(managed.registry, "review_file_diff", {
+            "snapshot_ref": "revsnap-does-not-exist", "change_id": "x" * 16, "layer": "staged",
+        }),
+        _REVIEW_FILE_DIFF_ALLOWED_KEYS, "review_file_diff (unknown_snapshot)",
+    )
+    _assert_closed_schema(
+        _call(managed.registry, "review_file_diff", {
+            "snapshot_ref": snap["snapshot_ref"], "change_id": "x" * 16, "layer": "not-a-real-layer",
+        }),
+        _REVIEW_FILE_DIFF_ALLOWED_KEYS, "review_file_diff (invalid_layer)",
+    )
+
+
+def test_review_changes_authority_key_mutation_turns_red(managed, monkeypatch):
+    """Literal repeat of CODING-08R's R-K mutation."""
+    real_render = review_module._render_review_changes
+
+    def _render_with_authority_keys(snapshot_ref, snapshot, applicability, cursor, limit):
+        import json as _json
+        encoded = real_render(snapshot_ref, snapshot, applicability, cursor, limit)
+        payload = _json.loads(encoded)
+        payload["reviewed"] = True
+        payload["ready_to_commit"] = applicability.state == git_review_snapshot.CURRENT
+        return _json.dumps(payload)
+
+    monkeypatch.setattr(review_module, "_render_review_changes", _render_with_authority_keys)
+    with pytest.raises(AssertionError):
+        test_review_changes_json_schema_is_closed(managed)
+
+
+# ===========================================================================
 # TOOL TIER / PROFILE WIRING
 # ===========================================================================
 

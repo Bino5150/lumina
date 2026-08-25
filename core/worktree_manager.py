@@ -674,7 +674,14 @@ def _dirty_state(target: str) -> tuple[Optional[bool], Optional[str]]:
     try:
         result = _run_read_only_git(
             [
-                "git", "-c", "core.fsmonitor=false", "status",
+                # CODING-08R.1: "" (never "false") -- Git <=2.35.1 does not
+                # understand the boolean form and treats the literal string
+                # "false" as a hook PATHNAME to invoke; an empty pathname
+                # cannot resolve to any executable on any Git version, so it
+                # is safe by construction rather than by favorable PATH
+                # resolution. See core.git_review._GLOBAL_SAFE_ARGS for the
+                # full empirical record (CODING-08R.1).
+                "git", "-c", "core.fsmonitor=", "status",
                 "--porcelain=v1", "-z", "--untracked-files=all",
             ],
             cwd=target,

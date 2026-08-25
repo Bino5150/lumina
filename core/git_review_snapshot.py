@@ -1102,21 +1102,52 @@ def _binary_file(change_id: str, path: str, layer: str) -> FileDiffResult:
     )
 
 
-def _run_diff_patch(root: str, path: str, layer: str, relation: str) -> bytes:
-    if relation == "untracked":
+def _run_diff_patch(root: str, change: "git_review.ReviewChange", layer: str) -> bytes:
+    """CODING-08R.1: the STAGED layer still asks Git directly for the patch
+    -- a ``--cached`` diff never touches worktree bytes or invokes a
+    ``filter.<name>.clean``/``.process`` driver (confirmed empirically; see
+    core.git_review's "Filter-free content comparison" section) -- exactly
+    the same reasoning already applied to A1's staged numstat capture.
+
+    UNSTAGED content (and untracked, which is always retrieved through the
+    'unstaged' layer -- see ``_capture_file_diff``) DOES need worktree
+    bytes, and therefore reuses the exact same filter-free temp-diff
+    primitive core.git_review's own unstaged numstat capture uses: a direct,
+    unconverting worktree read plus a pure object read for the index side
+    (empty for untracked, which has no index side at all), handed to Git's
+    own ``diff --no-index`` engine against a private temporary directory
+    that can never see the reviewed repository's own ``.gitattributes``.
+    This also removes the previous hardcoded ``/dev/null`` untracked
+    reference, which was not portable to platforms without that path.
+    """
+    if layer == LAYER_STAGED:
         args = [
-            "diff", "--no-index", *git_review._DIFF_SAFETY_ARGS,
-            "--no-renames", "--unified=3", "--", "/dev/null", path,
+            "diff", "--cached", *git_review._DIFF_SAFETY_ARGS,
+            "--no-renames", "--unified=3", "--", change.path,
         ]
+        result = _run_git(root, args)
+        if result.returncode not in (0, 1):
+            raise git_review.ReviewProbeError("Git could not produce a bounded file diff")
+        return result.stdout
+
+    try:
+        new_bytes = git_review._read_worktree_bytes_raw(root, change.path)
+    except git_review._RawContentUnavailable as error:
+        raise git_review.ReviewProbeError(
+            "worktree content changed or became unavailable during retrieval"
+        ) from error
+
+    if change.relation == "untracked":
+        old_bytes = b""
     else:
-        args = ["diff"]
-        if layer == LAYER_STAGED:
-            args += ["--cached"]
-        args += [*git_review._DIFF_SAFETY_ARGS, "--no-renames", "--unified=3", "--", path]
-    result = _run_git(root, args)
-    if result.returncode not in (0, 1):
-        raise git_review.ReviewProbeError("Git could not produce a bounded file diff")
-    return result.stdout
+        try:
+            old_bytes = git_review._read_index_blob_raw(root, change.index_object_id)
+        except git_review._RawContentUnavailable as error:
+            raise git_review.ReviewProbeError(
+                "index content became unavailable during retrieval"
+            ) from error
+
+    return git_review._filter_free_diff(root, old_bytes, new_bytes, ("--no-renames", "--unified=3"))
 
 
 def _capture_file_diff(
@@ -1149,7 +1180,7 @@ def _capture_file_diff(
     else:
         raise RetrievalLayerError(f"unsupported relation for retrieval: {change.relation!r}")
 
-    patch_bytes = _run_diff_patch(identity.canonical_root, change.path, layer, change.relation)
+    patch_bytes = _run_diff_patch(identity.canonical_root, change, layer)
     return _bound_patch(patch_bytes, change_id, change.path, layer, start_hunk_index)
 
 
