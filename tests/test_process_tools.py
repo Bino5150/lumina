@@ -92,6 +92,42 @@ def _read(monkeypatch, snapshot=None):
     return _registered().fns["read_process"], snapshot["process_id"]
 
 
+def _iter_json_keys(node):
+    """Yield every dict key appearing anywhere in a decoded JSON structure."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            yield from _iter_json_keys(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_json_keys(item)
+
+
+def _iter_json_string_values(node):
+    """Yield every string leaf value appearing anywhere in a decoded JSON
+    structure -- e.g. a legitimate `cwd` path is a value, never a key, so
+    checking key names and value content separately (CODING-08R.1C) lets a
+    real user-visible path coincidentally containing a forbidden substring
+    (e.g. ".../lumina-release/..." contains "lease") pass, while an actual
+    forbidden key or a genuinely secret value still fails."""
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from _iter_json_string_values(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_json_string_values(item)
+    elif isinstance(node, str):
+        yield node
+
+
+# Internal snapshot fields (core/process_manager.py) that model-visible tool
+# output must never expose as JSON keys, regardless of what legitimate
+# values (a cwd path, say) might incidentally contain as a substring.
+_FORBIDDEN_METADATA_KEYS = frozenset({
+    "channel_id", "epoch", "pid", "pgid", "control_metadata", "lease", "job_handle",
+})
+
+
 def test_registrar_contains_all_five_tools_with_intended_tiers():
     registry = _registered()
     assert list(registry.fns) == [
@@ -304,9 +340,15 @@ def test_read_process_reads_budget_live_after_module_import(monkeypatch):
 def test_read_process_never_leaks_internal_metadata(monkeypatch):
     read, pid = _read(monkeypatch)
     raw = read(pid)
-    for prohibited in ("channel_id", "secret-channel", "epoch", "pid", "pgid",
-                       "control_metadata", "lease", "job_handle"):
-        assert prohibited not in raw
+    result = json.loads(raw)
+
+    leaked_keys = _FORBIDDEN_METADATA_KEYS & set(_iter_json_keys(result))
+    assert not leaked_keys, f"forbidden internal keys leaked: {sorted(leaked_keys)}"
+
+    string_values = list(_iter_json_string_values(result))
+    assert not any("secret-channel" in v for v in string_values), (
+        "the bound channel_id value leaked into a visible field"
+    )
 
 
 def test_list_processes_empty_is_stable(monkeypatch):
@@ -338,10 +380,16 @@ def test_list_processes_is_compact_and_leaks_no_stream_or_control_data(monkeypat
     result = json.loads(raw)
     assert result["total"] == 1
     assert len(raw) < 500
-    for prohibited in ("stdout", "stderr", "TOP_SECRET_OUTPUT", "SECRET_ERROR",
-                       "channel_id", "secret-channel", "epoch", "pid", "pgid",
-                       "control_metadata", "lease", "job_handle"):
-        assert prohibited not in raw
+
+    forbidden_keys = _FORBIDDEN_METADATA_KEYS | {"stdout", "stderr"}
+    leaked_keys = forbidden_keys & set(_iter_json_keys(result))
+    assert not leaked_keys, f"forbidden internal keys leaked: {sorted(leaked_keys)}"
+
+    string_values = list(_iter_json_string_values(result))
+    for forbidden in ("TOP_SECRET_OUTPUT", "SECRET_ERROR", "secret-channel"):
+        assert not any(forbidden in v for v in string_values), (
+            f"{forbidden!r} leaked into a visible field"
+        )
 
 
 def test_list_processes_uses_manager_ttl_authority(monkeypatch):

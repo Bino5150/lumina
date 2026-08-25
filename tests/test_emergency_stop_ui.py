@@ -394,7 +394,12 @@ def test_on_user_message_blocked_while_latched_preserves_pending_image():
     fake = _window_fake()
     fake._pending_image = ("path.png", "b64data", "image/png")
     fake._pending_audio = None
-    fake.input = types.SimpleNamespace(toPlainText=lambda: "", setPlainText=lambda t: None)
+    # CODING-08R.1C: the real blocked-turn path restores text via
+    # QTimer.singleShot(0, lambda: self.chat_widget.input.setPlainText(...))
+    # (ui/main_window.py) -- the fake must wire .input onto chat_widget, not
+    # onto fake itself, or the deferred callback dangles against a fake that
+    # doesn't have it once something finally pumps the Qt event queue.
+    fake.chat_widget.input = types.SimpleNamespace(toPlainText=lambda: "", setPlainText=lambda t: None)
 
     LuminaWindow._on_user_message(fake, "hello while stopped")
 
