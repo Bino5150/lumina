@@ -36,6 +36,7 @@ from core.reasoning_preferences import resolve_reasoning_effort
 from core import dreaming 
 from ui.chat_widget import ChatWidget, LiveResponseBubble
 from ui.settings import SettingsPanel
+from ui.review_panel import ReviewPanel
 from tools.memory import (
     init_chat_db, create_chat, list_chats, save_chat_message,
     load_chat_messages, rename_chat, delete_chat, get_chat_name
@@ -507,6 +508,10 @@ class LuminaWindow(QMainWindow):
         prefs["window_height"] = self.height()
         persistence.save(prefs)
         browser_manager.close()
+        # CODING-08A4: invalidate the review controller's generation so any
+        # in-flight capture/retrieval worker's eventual result becomes
+        # unpublishable -- never killed unsafely, just discarded.
+        self.review_panel.shutdown()
         super().closeEvent(event)
 
     def _restore_session(self):
@@ -610,8 +615,12 @@ class LuminaWindow(QMainWindow):
         self.settings_panel.setVisible(False)
         self.settings_panel.persona_applied.connect(self._on_persona_applied)
 
+        self.review_panel = ReviewPanel(self.agent, COLORS)
+        self.review_panel.setVisible(False)
+
         main.addWidget(self.chat_widget, 1)
         main.addWidget(self.settings_panel, 1)
+        main.addWidget(self.review_panel, 1)
 
         self.status_bar = StatusBar()
         main.addWidget(self.status_bar)
@@ -710,12 +719,15 @@ class LuminaWindow(QMainWindow):
 
         self.btn_chat_nav = _nav_btn("💬", "Chat")
         self.btn_chat_nav.setChecked(True)
+        self.btn_review_nav = _nav_btn("🔍", "Review")
         self.btn_settings_nav = _nav_btn("⚙", "Settings")
 
         self.btn_chat_nav.clicked.connect(lambda: self._show_panel("chat"))
+        self.btn_review_nav.clicked.connect(lambda: self._show_panel("review"))
         self.btn_settings_nav.clicked.connect(lambda: self._show_panel("settings"))
 
         layout.addWidget(self.btn_chat_nav)
+        layout.addWidget(self.btn_review_nav)
         layout.addWidget(self.btn_settings_nav)
         layout.addStretch()
         
@@ -980,10 +992,16 @@ class LuminaWindow(QMainWindow):
 
     def _show_panel(self, panel: str):
         self.btn_chat_nav.setChecked(panel == "chat")
+        self.btn_review_nav.setChecked(panel == "review")
         self.btn_settings_nav.setChecked(panel == "settings")
         self.chat_widget.setVisible(panel == "chat")
+        self.review_panel.setVisible(panel == "review")
         self.settings_panel.setVisible(panel == "settings")
-        self.header_title.setText(config.AGENT_NAME if panel == "chat" else "Settings")
+        self.header_title.setText(
+            config.AGENT_NAME if panel == "chat"
+            else "Review" if panel == "review"
+            else "Settings"
+        )
 
     def _check_connection(self):
         try:

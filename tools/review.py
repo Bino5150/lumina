@@ -112,6 +112,7 @@ import core.coding_checkpoint as checkpoint_store
 import core.coding_checkpoint_observation as checkpoint_observation
 import core.git_review as git_review
 import core.git_review_snapshot as git_review_snapshot
+import core.review_display as review_display
 
 _WORKTREE_ID_RE = re.compile(r"^wt-[0-9a-f]{24}$")
 
@@ -181,41 +182,15 @@ def _status_json(status: str, *, snapshot_ref: Optional[str] = None,
 # just hand a decoder the real character straight back.
 # ---------------------------------------------------------------------------
 
-_BIDI_CONTROL_CHARS = "‎‏‪‫‬‭‮⁦⁧⁨⁩"
-# Unlike tools/worktrees.py's free-text _CONTROL_CHAR_RE (which deliberately
-# preserves tab/newline as legitimate formatting), tab/newline/CR are
-# explicitly in-scope here (task spec section 9: "newline; carriage return;
-# tab ambiguity") -- a tab or newline embedded in a PATH is exactly the
-# review-metadata-spoofing vector this function exists to neutralize, so
-# every C0 control character is escaped, none preserved.
-_DISPLAY_ESCAPE_RE = re.compile(
-    "[\x00-\x1f\x7f" + _BIDI_CONTROL_CHARS + "]"
-)
-MAX_DISPLAY_PATH_CHARS = 1024
-
-
-def _escape_display_char(match: "re.Match") -> str:
-    return f"\\u{ord(match.group(0)):04x}"
-
-
-def _display_path(path: str) -> str:
-    """Inert, JSON-safe rendering of a path. Surrogateescape artifacts from
-    A1's raw-byte decode (invalid non-UTF-8 path bytes) render as \\xHH;
-    C0/DEL/bidi-override codepoints render as \\uHHHH; everything else
-    passes through unchanged. Never the selector -- change_id is."""
-    out = []
-    for ch in path:
-        code = ord(ch)
-        if 0xDC80 <= code <= 0xDCFF:
-            out.append(f"\\x{code & 0xff:02x}")
-        elif _DISPLAY_ESCAPE_RE.match(ch):
-            out.append(f"\\u{code:04x}")
-        else:
-            out.append(ch)
-    text = "".join(out)
-    if len(text) > MAX_DISPLAY_PATH_CHARS:
-        text = text[:MAX_DISPLAY_PATH_CHARS] + "...[truncated]"
-    return text
+# CODING-08A4: extracted to core/review_display.py so the Qt owner-facing
+# review cockpit can reuse this exact, already-reviewed escaping logic
+# instead of creating a second, potentially-diverging sanitizer. Re-exported
+# under this module's original private name so every existing call site and
+# test (e.g. tests/test_review_tools.py's direct `review_module._display_path`
+# references) keeps working unchanged -- behavior is byte-for-byte identical,
+# only the implementation's location moved.
+_display_path = review_display.escape_display_path
+MAX_DISPLAY_PATH_CHARS = review_display.MAX_DISPLAY_PATH_CHARS
 
 
 # ---------------------------------------------------------------------------
