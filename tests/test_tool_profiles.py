@@ -57,10 +57,10 @@ def test_coding_profile_did_not_gain_unrelated_tools():
     below); CODING-03A1 added exactly search_code (search_files stays,
     additive not replaced); CODING-04A2-B4 added exactly the five managed-
     process tools; CODING-06A2 added exactly run_tests; CODING-07A3 added
-    exactly create_worktree/list_worktrees/remove_worktree -- this is a
-    regression guard against accidentally sweeping in other tools (e.g. the
-    still-out-of-scope diff_texts/diff_files/git_* tools) while editing the
-    same JSON file."""
+    exactly create_worktree/list_worktrees/remove_worktree; CODING-08A3 added
+    exactly review_changes/review_file_diff -- this is a regression guard
+    against accidentally sweeping in other tools (e.g. the still-out-of-scope
+    diff_texts/diff_files/git_* tools) while editing the same JSON file."""
     coding = next(p for p in list_profiles() if p.get("name") == "Coding")
     enabled = set(coding.get("enabled", []))
     expected = {
@@ -71,6 +71,7 @@ def test_coding_profile_did_not_gain_unrelated_tools():
         "start_process", "read_process", "send_process_input", "stop_process", "list_processes",
         "read_coding_checkpoint", "save_coding_checkpoint", "run_tests",
         "create_worktree", "list_worktrees", "remove_worktree",
+        "review_changes", "review_file_diff",
         "activate_project", "get_active_project", "clear_active_project",
         "create_tool", "list_custom_tools", "delete_tool",
         "palace_remember", "palace_hall", "palace_recall", "palace_status",

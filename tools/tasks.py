@@ -7,6 +7,7 @@ surfaced an ephemeral notice next turn -- see agent.py wiring in Part F).
 from typing import Callable, Optional
 
 import config
+import core.coding_checkpoint as checkpoint_store
 from core.project_context import ProjectContext
 from core.task_queue import submit_task, schedule_task, get_task_result
 from tools.subagent import spawn_subagent, resolve_dispatch_project_context
@@ -41,7 +42,16 @@ def run_background_subagent(task: str, persona: str = None,
 
     CODING-07A4 worktree_id follows the same pre-queue rule, but resolves only
     through the caller-bound current-session resolver. The queued call carries
-    the resulting immutable synthetic context, never the ID or resolver."""
+    the resulting immutable synthetic context, never the ID or resolver.
+
+    CODING-08A3: the child's review-target grant is resolved HERE too, at the
+    same true pre-queue dispatch instant as resolved_context above, from that
+    exact same freshly-verified worktree root -- never re-derived when the
+    queued job actually executes (worktree_id/_worktree_resolver are
+    deliberately not threaded into the queued spawn_subagent() call below, so
+    there is nothing left to re-resolve against by then). See
+    tools/subagent.py's spawn_subagent() docstring for why re-deriving from an
+    already-verified root is safe."""
     try:
         resolved_context = resolve_dispatch_project_context(
             project, _project_context, worktree_id, _worktree_resolver,
@@ -49,9 +59,16 @@ def run_background_subagent(task: str, persona: str = None,
     except Exception as e:
         return {"task_id": None, "error": str(e)}
 
+    review_target_grant = None
+    if worktree_id is not None and resolved_context is not None:
+        review_target_grant = checkpoint_store.resolve_target_identity(
+            resolved_context.root
+        )
+
     task_id = submit_task(spawn_subagent, task, persona=persona,
                            backend=backend, tools_enabled=tools_enabled,
-                           _project_context=resolved_context)
+                           _project_context=resolved_context,
+                           _review_target_grant=review_target_grant)
     return {"task_id": task_id}
 
 

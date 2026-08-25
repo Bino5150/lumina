@@ -89,6 +89,12 @@ TOOL_TIERS = {
     "search_code": "read_only",
     "read_process": "read_only", "list_processes": "read_only",
     "read_coding_checkpoint": "read_only",
+    # CODING-08A3: read-only Git review observation/retrieval. Target
+    # authorization (owner cwd/Project/worktree_id vs a non-owner's exact
+    # review_target_grant) is a separate axis enforced inside tools/review.py
+    # itself -- this tier only controls schema visibility/PIN-gating, same as
+    # every other read_only tool; it never grants a target by itself.
+    "review_changes": "read_only", "review_file_diff": "read_only",
     "start_process": "execute", "send_process_input": "execute", "stop_process": "execute",
     # CODING-06A2: pytest executes arbitrary repository Python -- materially
     # different from a read-only code-analysis operation. execute tier plus

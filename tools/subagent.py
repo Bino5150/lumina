@@ -101,6 +101,7 @@ import uuid
 from typing import Callable, Optional
 
 import config
+import core.coding_checkpoint as checkpoint_store
 from core.agent import LuminaAgent
 from core.project_context import ProjectContext
 from core.tool_profiles import apply_tool_profile
@@ -157,6 +158,9 @@ def spawn_subagent(task: str,
                     _project_context: Optional[ProjectContext] = None,
                     _worktree_resolver: Optional[
                         Callable[[str], ProjectContext]
+                    ] = None,
+                    _review_target_grant: Optional[
+                        checkpoint_store.TargetIdentity
                     ] = None) -> dict:
     """
     Instantiates a headless, owner=False LuminaAgent, runs one turn, returns
@@ -185,6 +189,18 @@ def spawn_subagent(task: str,
     real dispatch moment -- never a mutable ProjectContextState, never the
     parent LuminaAgent itself. None (default, every pre-CODING-02B-B caller)
     preserves exactly today's no-context behavior.
+
+    _review_target_grant (CODING-08A3): internal only, MUST NOT appear in the
+    registered tool schema and is never caller/model supplied. The child's
+    exact, immutable Git review-target authority -- a resolved
+    core.coding_checkpoint.TargetIdentity, or None (no review authority at
+    all). Deliberately NOT derived from the child's ProjectContext at review
+    time (a synthetic ProjectContext is ergonomic path defaulting, not
+    authority -- see tools/review.py's module docstring): computed here,
+    once, only when worktree_id names a freshly-verified managed worktree,
+    from that exact same verified root. When the background dispatch path
+    (tools/tasks.py) has already resolved this at true dispatch time, it is
+    threaded straight through unchanged rather than re-derived here.
     """
     if _parent_depth >= config.MAX_SUBAGENT_DEPTH:
         return {"success": False, "result": "", "tool_calls_made": 0,
@@ -195,11 +211,32 @@ def spawn_subagent(task: str,
             project, _project_context, worktree_id, _worktree_resolver,
         )
 
+        resolved_review_target = _review_target_grant
+        if (
+            worktree_id is not None
+            and resolved_review_target is None
+            and resolved_context is not None
+        ):
+            # resolve_dispatch_project_context() above already froze this
+            # exact worktree root through fresh worktree_manager verification
+            # (session membership, live Git ledger, identity, locked/prunable
+            # state). Re-deriving a TargetIdentity from that SAME just-verified
+            # root is safe even under a theoretical race: core.git_review /
+            # core.git_review_snapshot never trust this value blindly -- every
+            # capture independently re-probes live state and fails closed on
+            # any mismatch (see core/git_review_snapshot.py's capture_snapshot
+            # docstring). This is the child's ONLY route to review authority;
+            # project=/inherited-context dispatch never sets one.
+            resolved_review_target = checkpoint_store.resolve_target_identity(
+                resolved_context.root
+            )
+
         sub = LuminaAgent(owner=False,
                            channel_id=f"subagent-{uuid.uuid4()}",
                            backend=backend,
                            depth=_parent_depth + 1,
-                           project_context=resolved_context)
+                           project_context=resolved_context,
+                           _review_target_grant=resolved_review_target)
 
         if persona:
             from core.personas import list_personas, load_persona

@@ -10,6 +10,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import core.coding_checkpoint as checkpoint_store
 from core import emergency_stop
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager
@@ -29,6 +30,7 @@ from tools.processes import register_process_tools
 from tools.coding_checkpoint import register_coding_checkpoint_tools
 from tools.tests import register_tests_tools
 from tools.worktrees import register_worktree_tools
+from tools.review import register_review_tools
 from tools.toolmaker import register_toolmaker_tools, load_approved_custom_tools
 from tools.palace import register_palace_tools
 from core.skills import register_skills_tools, build_skills_block, init_skills_db
@@ -156,7 +158,10 @@ class LuminaAgent:
                  channel_id: str = "default",
                  depth: int = 0,
                  backend: str = None,
-                 project_context: Optional[ProjectContext] = None):
+                 project_context: Optional[ProjectContext] = None,
+                 _review_target_grant: Optional[
+                     checkpoint_store.TargetIdentity
+                 ] = None):
         """
         Streaming callbacks:
           on_tool_call(name, args)     — tool about to execute
@@ -186,6 +191,17 @@ class LuminaAgent:
             once at dispatch time and hand it straight through, rather than
             this constructor re-resolving a name (and potentially a since-
             changed binding) itself.
+        _review_target_grant (CODING-08A3): internal only, never a tool-call
+            argument. This agent's exact, immutable Git review-target
+            authority for tools/review.py's review_changes/review_file_diff,
+            or None (no review authority). The ONLY caller that ever sets
+            this to a non-None value is tools/subagent.py's spawn_subagent(),
+            for a child dispatched into an exact managed worktree -- see its
+            docstring. Deliberately a separate field from project_context:
+            a synthetic worktree ProjectContext is ergonomic path defaulting,
+            never authority (see tools/review.py's module docstring), and
+            this value is never re-read from a mutable ProjectContextState
+            that a later-granted activate_project() call could repoint.
         """
         self.llm = get_llm_backend(name=backend)
         self.owner = owner
@@ -197,6 +213,9 @@ class LuminaAgent:
         # core/project_context.py's own module docstring for why. Two
         # LuminaAgent instances always get two distinct holders.
         self.project_context = ProjectContextState(project_context)
+        # CODING-08A3: immutable for this agent's whole lifetime -- assigned
+        # exactly once, here, never reassigned by any tool or later code path.
+        self._review_target_grant = _review_target_grant
         # CODING-06A2: per-instance holder for the current turn's cooperative
         # /stop cancel_event, same per-instance-not-global convention as
         # project_context above. Set at the top of a turn, cleared when it
@@ -254,6 +273,13 @@ class LuminaAgent:
             self.registry,
             project_state=self.project_context,
             cancel_state=self.turn_cancellation,
+        )
+        register_review_tools(
+            self.registry,
+            owner=owner,
+            project_state=self.project_context,
+            worktree_resolver=self._resolve_worktree_dispatch,
+            review_target_grant=self._review_target_grant,
         )
         if owner:
             # Hard exclusion — for non-owner sessions, toolmaker's tools never

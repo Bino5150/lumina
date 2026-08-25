@@ -148,7 +148,8 @@ def test_real_agent_wires_its_worktree_session_into_dispatch(managed, monkeypatc
     children = []
 
     class _Child:
-        def __init__(self, owner, channel_id, backend, depth, project_context):
+        def __init__(self, owner, channel_id, backend, depth, project_context,
+                     _review_target_grant=None):
             self.owner = owner
             self.project_context = ProjectContextState(project_context)
             self.registry = ToolRegistry()
@@ -184,7 +185,8 @@ def test_valid_dispatch_roots_child_edits_and_preserves_owner_state(managed, mon
     children = []
 
     class _EditingChild:
-        def __init__(self, owner, channel_id, backend, depth, project_context):
+        def __init__(self, owner, channel_id, backend, depth, project_context,
+                     _review_target_grant=None):
             self.owner = owner
             self.channel_id = channel_id
             self.depth = depth
@@ -222,7 +224,8 @@ def test_dispatch_cannot_restore_owner_only_capabilities(managed, monkeypatch):
     requested = sorted(OWNER_ONLY_TOOLS)
 
     class _AuthorityChild:
-        def __init__(self, owner, channel_id, backend, depth, project_context):
+        def __init__(self, owner, channel_id, backend, depth, project_context,
+                     _review_target_grant=None):
             self.owner = owner
             self.project_context = ProjectContextState(project_context)
             self.registry = ToolRegistry()
@@ -432,7 +435,8 @@ def test_child_dispatched_managed_jobs_block_removal_after_child_finishes(manage
     process_ids = []
 
     class _ProcessChild:
-        def __init__(self, owner, channel_id, backend, depth, project_context):
+        def __init__(self, owner, channel_id, backend, depth, project_context,
+                     _review_target_grant=None):
             self.owner = owner
             self.project_context = ProjectContextState(project_context)
             self.registry = ToolRegistry()
@@ -467,7 +471,8 @@ def test_emergency_kills_child_rooted_work_but_preserves_worktree(managed, monke
     process_ids = []
 
     class _ProcessChild:
-        def __init__(self, owner, channel_id, backend, depth, project_context):
+        def __init__(self, owner, channel_id, backend, depth, project_context,
+                     _review_target_grant=None):
             self.owner = owner
             self.project_context = ProjectContextState(project_context)
             self.registry = ToolRegistry()

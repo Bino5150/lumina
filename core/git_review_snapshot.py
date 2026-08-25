@@ -890,6 +890,22 @@ def _live_applicability(snapshot: BoundedSnapshot) -> ReviewApplicability:
     return ReviewApplicability(CURRENT_METADATA_ONLY, snapshot.fingerprint.omissions)
 
 
+def get_snapshot(snapshot_ref: str) -> BoundedSnapshot:
+    """Return the currently-registered ``BoundedSnapshot`` for ``snapshot_ref``
+    exactly as captured -- never re-verified against live state here (see
+    ``resolve_review_applicability`` for that). Mirrors the identical
+    registry-lookup path ``resolve_review_applicability``/
+    ``retrieve_review_file`` already use internally; this is the same
+    read-only lookup made public so a caller (A3) can render a snapshot's
+    own captured facts without duplicating the registry itself."""
+    with _registry_lock:
+        _evict_expired_locked()
+        entry = _registry.get(snapshot_ref)
+        if entry is None:
+            raise UnknownSnapshot(f"unknown or expired snapshot reference: {snapshot_ref!r}")
+        return entry.snapshot
+
+
 def resolve_review_applicability(snapshot_ref: str) -> ReviewApplicability:
     """Non-mutating: does this already-captured snapshot still match live
     reality right now? Never recaptures, never re-registers. Once this
