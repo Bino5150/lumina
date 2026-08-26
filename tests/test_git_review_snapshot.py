@@ -180,6 +180,62 @@ def test_symlink_retarget_is_stale(repo_context):
     assert grs.resolve_review_applicability(handle.snapshot_ref).state == grs.STALE
 
 
+def test_unstaged_symlink_retrieval_never_follows_target_content(repo_context, tmp_path):
+    """CODING-08R.2 MB-45: content-level regression for the live raw-worktree
+    reader the real unstaged retrieval path uses
+    (core.git_review._read_worktree_bytes_raw). The only other symlink
+    coverage in this codebase (test_symlink_fingerprint_ignores_target_file_
+    content_changes below) exercises a structurally SEPARATE function --
+    core.git_review_snapshot._fingerprint_worktree_path, used only for the
+    staleness fingerprint -- and would not have caught CODING-08R.2's
+    mutation E (following the symlink's target in the DIFF-CONTENT path).
+    This test exercises the real, public retrieve_review_file() entry
+    point end-to-end so a future regression of either implementation is
+    caught regardless of which one drifts.
+    """
+    root, identity = repo_context
+    # A sentinel target OUTSIDE the reviewed repository, with unmistakable
+    # content a correct implementation must never surface.
+    sensitive_target = tmp_path / "outside_sensitive_file.txt"
+    sensitive_target.write_text(
+        "UNMISTAKABLE-SENTINEL-CONTENT-that-must-never-appear-in-a-review\n"
+    )
+
+    (root / "tracked.txt").write_text("original tracked content\n")
+    _git(root, "add", "tracked.txt")
+    _git(root, "commit", "-q", "-m", "base")
+
+    # A tracked regular file is REPLACED by a symlink pointing at the
+    # sentinel target outside the repository -- the real attack shape:
+    # repository content controlling what a raw filesystem read touches.
+    (root / "tracked.txt").unlink()
+    os.symlink(str(sensitive_target), root / "tracked.txt")
+
+    handle = grs.capture_snapshot(identity)
+    change = _change_by_path(handle.snapshot, "tracked.txt")
+    assert change.worktree_mode == "120000"
+    change_id = grs.review_change_id(change)
+
+    outcome = grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_UNSTAGED)
+    assert outcome.status in (grs.CURRENT, grs.CURRENT_METADATA_ONLY)
+    assert outcome.file is not None and not outcome.file.binary
+    rendered = "\n".join(line.text for hunk in outcome.file.hunks for line in hunk.lines)
+
+    assert str(sensitive_target) in rendered, (
+        "expected the symlink's own target TEXT to appear in the review diff"
+    )
+    assert "UNMISTAKABLE-SENTINEL-CONTENT" not in rendered, (
+        "the symlink's TARGET FILE's content leaked into the review diff -- "
+        "the raw-worktree reader followed the link instead of reading its "
+        "own target text"
+    )
+
+    # Supplementary direct proof at the lower-level reader retrieval itself
+    # calls -- never a replacement for the end-to-end assertion above.
+    raw = gr._read_worktree_bytes_raw(str(root), "tracked.txt")
+    assert raw.decode("utf-8", errors="surrogateescape") == str(sensitive_target)
+
+
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX file modes only")
 def test_mode_only_change_captured(repo_context):
     root, identity = repo_context
@@ -984,6 +1040,76 @@ def test_staged_diff_external_removed_flag_would_execute_helper(repo_context, tm
         "expected the configured diff.external helper to run once the "
         "safety flags were removed for the staged retrieval path -- if it "
         "did not, the sentinel test above may be vacuous for this Git version"
+    )
+
+
+def test_staged_retrieval_configured_textconv_does_not_execute(repo_context, tmp_path):
+    """CODING-08R.2 MB-44: the STAGED layer's real ``git diff --cached``
+    call is where a repository's own tracked ``.gitattributes`` genuinely
+    applies (see the diff.external sentinel pair immediately above) -- and
+    unlike A1's ``--numstat`` calls (immune by output mode) and A2's
+    UNSTAGED retrieval (immune by temp-directory isolation, never touching
+    the real in-repo path at all), STAGED retrieval's only defense against
+    a ``.gitattributes``-selected ``diff.<driver>.textconv`` is the
+    ``--no-textconv`` flag itself. Confirmed during CODING-08R.2's mutation
+    audit: removing that flag causes STAGED retrieval to execute the
+    configured textconv helper for real (see the companion proof below) --
+    this sentinel test is what would have caught that mutation."""
+    root, identity = repo_context
+    sentinel = tmp_path / "textconv_ran"
+    script = tmp_path / "fake_textconv.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat \"$1\"\n")
+    script.chmod(0o755)
+    (root / ".gitattributes").write_text("tracked.txt diff=fake\n")
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-q", "-m", "attrs")
+    _git(root, "config", "diff.fake.textconv", str(script))
+
+    (root / "tracked.txt").write_text("line1\nCHANGED\nline3\n")
+    _git(root, "add", "tracked.txt")
+    handle = grs.capture_snapshot(identity)
+    change = _change_by_path(handle.snapshot, "tracked.txt")
+    change_id = grs.review_change_id(change)
+    outcome = grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_STAGED)
+
+    assert outcome.status in (grs.CURRENT, grs.CURRENT_METADATA_ONLY)
+    assert outcome.file is not None and not outcome.file.binary
+    rendered = {line.text for hunk in outcome.file.hunks for line in hunk.lines}
+    assert "CHANGED" in rendered, "STAGED retrieval did not produce the real diff content"
+    assert not sentinel.exists(), (
+        "textconv executed during bounded STAGED retrieval -- the "
+        "--no-textconv guard did not hold"
+    )
+
+
+def test_staged_textconv_removed_flag_would_execute_helper(repo_context, tmp_path, monkeypatch):
+    """Companion proof for the staged-layer textconv test above: with
+    _DIFF_SAFETY_ARGS monkeypatched away, staged retrieval DOES invoke the
+    configured textconv helper -- empirical evidence the flag remains
+    load-bearing for this exact retrieval path, and proof the sentinel test
+    above is not vacuous for this Git version."""
+    root, identity = repo_context
+    sentinel = tmp_path / "textconv_ran"
+    script = tmp_path / "fake_textconv.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat \"$1\"\n")
+    script.chmod(0o755)
+    (root / ".gitattributes").write_text("tracked.txt diff=fake\n")
+    _git(root, "add", ".gitattributes")
+    _git(root, "commit", "-q", "-m", "attrs")
+    _git(root, "config", "diff.fake.textconv", str(script))
+
+    (root / "tracked.txt").write_text("line1\nCHANGED\nline3\n")
+    _git(root, "add", "tracked.txt")
+    handle = grs.capture_snapshot(identity)
+    change = _change_by_path(handle.snapshot, "tracked.txt")
+    change_id = grs.review_change_id(change)
+
+    monkeypatch.setattr(gr, "_DIFF_SAFETY_ARGS", ())
+    grs.retrieve_review_file(handle.snapshot_ref, change_id, grs.LAYER_STAGED)
+    assert sentinel.exists(), (
+        "expected the configured textconv helper to run once the safety "
+        "flags were removed for the staged retrieval path -- if it did "
+        "not, the sentinel test above may be vacuous for this Git version"
     )
 
 
