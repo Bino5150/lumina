@@ -56,6 +56,12 @@ class GeneralTab(QWidget):
         self._reasoning_probes: dict = {}
         self._build()
 
+    def _wlbl(self, text: str) -> QLabel:
+        """Word-wrapping label for descriptive copy, not field labels."""
+        lbl = _lbl(text, self.c)
+        lbl.setWordWrap(True)
+        return lbl
+
     def _build(self):
         outer = QWidget()
         outer.setStyleSheet(f"background:{self.c['bg_deep']};")
@@ -150,12 +156,12 @@ class GeneralTab(QWidget):
         # much the model reasons in the first place -- two independent
         # facts, never merged into one control.
         layout.addWidget(_sec("REASONING EFFORT", self.c))
-        layout.addWidget(_lbl(
+        layout.addWidget(self._wlbl(
             "How much some models reason before answering, when the "
             "backend/model exposes a selectable control. Remembered per "
             "backend and model, independently of everything else on this "
             "tab -- switching backends or models above recalls each one's "
-            "own saved choice.", self.c
+            "own saved choice."
         ))
         reasoning_row = QHBoxLayout()
         reasoning_col = QVBoxLayout()
@@ -182,10 +188,10 @@ class GeneralTab(QWidget):
         self._refresh_reasoning_row()  # set initial state
 
         layout.addWidget(_sec("CONTEXT WINDOW", self.c))
-        layout.addWidget(_lbl(
+        layout.addWidget(self._wlbl(
             "Max Context Tokens, Memory Inject Limit, and Tool Result Max Chars "
             "are saved per-backend — switching backends above recalls that "
-            "backend's own values.", self.c
+            "backend's own values."
         ))
         row1 = QHBoxLayout()
         row1.setSpacing(16)
@@ -240,10 +246,10 @@ class GeneralTab(QWidget):
 
         # ── Dreaming ──
         layout.addWidget(_sec("DREAMING", self.c))
-        layout.addWidget(_lbl(
+        layout.addWidget(self._wlbl(
             "Idle-sweep background summarization — writes brief session recaps "
             "into memory after a chat sits idle. Was previously only "
-            "configurable by editing config.py directly.", self.c
+            "configurable by editing config.py directly."
         ))
         row3 = QHBoxLayout()
         row3.setSpacing(16)
