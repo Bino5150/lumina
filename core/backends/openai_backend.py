@@ -39,6 +39,7 @@ class OpenAIBackend(LMStudioBackend):
     name = "openai"
     display_name = "OpenAI"
     default_url = "https://api.openai.com/v1"
+    endpoint_configurable = False
 
     KNOWN_MODELS = [
         "gpt-4o",

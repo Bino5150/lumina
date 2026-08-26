@@ -116,6 +116,14 @@ STT_DEVICE  = _p.get("stt_device", "cpu")
 # Cloud Model
 LLM_BACKEND     = _p.get("llm_backend", "llamacpp")
 LLM_BACKEND_URL = _p.get("llm_backend_url", "http://localhost:8080/v1")
+# BACKEND-CONTRACT-01A: user-controlled endpoints are keyed by configurable
+# backend.  The legacy generic value above remains as bounded migration/read
+# compatibility only; backend construction never treats it as universal
+# runtime authority.  The loader owns classification and performs the one-time
+# migration because config cannot import backend classes without a cycle.
+_saved_backend_endpoints = _p.get("backend_endpoints", {})
+BACKEND_ENDPOINTS = dict(_saved_backend_endpoints) if isinstance(_saved_backend_endpoints, dict) else {}
+BACKEND_ENDPOINTS_MIGRATED = bool(_p.get("backend_endpoints_migrated", False))
 CUSTOM_DEFAULT_MODEL = _p.get("custom_default_model", "")
 # OmniRoute (github.com/diegosouzapw/OmniRoute) — a separate slot from
 # "custom" on purpose: both are OpenAI-compatible endpoints under the hood,
@@ -301,4 +309,4 @@ def register_my_tool_tool(registry):
         }
     )""")
 
-del _p
+del _p, _saved_backend_endpoints

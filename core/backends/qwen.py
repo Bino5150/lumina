@@ -123,6 +123,7 @@ class QwenBackend(LMStudioBackend):
     name = "qwen"
     display_name = "Qwen (DashScope)"
     default_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    endpoint_configurable = False
 
     KNOWN_MODELS = [
         "qwen3.5-max",

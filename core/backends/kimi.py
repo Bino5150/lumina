@@ -21,6 +21,7 @@ class KimiBackend(LMStudioBackend):
     name = "kimi"
     display_name = "Kimi (Moonshot AI)"
     default_url = "https://api.moonshot.cn/v1"
+    endpoint_configurable = False
 
     KNOWN_MODELS = [
         "moonshot-v1-8k",

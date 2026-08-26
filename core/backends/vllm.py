@@ -6,7 +6,6 @@ Designed for V100+ class hardware.
 """
 
 from .lmstudio import LMStudioBackend
-import config
 
 
 class VLLMBackend(LMStudioBackend):
@@ -20,6 +19,5 @@ class VLLMBackend(LMStudioBackend):
     default_url = "http://localhost:8000/v1"
 
     def __init__(self, base_url=None):
-        super().__init__(base_url=base_url or config.LLM_BACKEND_URL)
-        self.base_url = (base_url or config.LLM_BACKEND_URL or self.default_url).rstrip("/")
+        super().__init__(base_url=base_url)
         # vLLM doesn't require an api_key but accepts one — keep header for compat

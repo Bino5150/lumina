@@ -11,6 +11,38 @@ from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
 class BaseLLMBackend(ABC):
 
+    # Endpoint ownership contract.  Provider backends are fixed by default;
+    # only explicitly self-hosted/configurable subclasses opt in below.  The
+    # guarded property makes that classification load-bearing at the request
+    # layer: stale Settings state and post-construction assignments cannot
+    # redirect a fixed provider's credential-bearing requests.
+    default_url = ""
+    endpoint_configurable = False
+
+    @property
+    def base_url(self) -> str:
+        if not self.endpoint_configurable:
+            return self.default_url.rstrip("/")
+        return getattr(self, "_base_url", self.default_url).rstrip("/")
+
+    @base_url.setter
+    def base_url(self, value: Optional[str]) -> None:
+        if self.endpoint_configurable:
+            # None means "use this backend's default"; an explicit empty
+            # string remains empty so Custom/unconfigured validation still
+            # fails before any network request is attempted.
+            self._base_url = (self.default_url if value is None else value).rstrip("/")
+        else:
+            # Fixed providers own their endpoint.  Silently retaining the
+            # declared endpoint preserves constructor interface parity while
+            # refusing generic/user-controlled redirection.
+            self._base_url = self.default_url.rstrip("/")
+
+    @property
+    def current_endpoint(self) -> str:
+        """Endpoint Settings should display and requests should consume."""
+        return self.base_url
+
     @abstractmethod
     def get_model(self) -> str:
         """Return the active model ID. Auto-detect if not set."""

@@ -36,7 +36,7 @@ class OmniRouteBackend(LMStudioBackend):
     default_url = "http://localhost:20128/v1"
 
     def __init__(self, base_url: Optional[str] = None):
-        self.base_url = (base_url or config.LLM_BACKEND_URL or self.default_url).rstrip("/")
+        self.base_url = base_url
         key = getattr(config, "OMNIROUTE_API_KEY", "").strip()
         self.headers = {
             "Content-Type": "application/json",

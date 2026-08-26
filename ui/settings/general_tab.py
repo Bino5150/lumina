@@ -80,7 +80,7 @@ class GeneralTab(QWidget):
         be_col.addWidget(self.backend_combo)
         url_col = QVBoxLayout()
         url_col.addWidget(_lbl("Server URL", self.c))
-        self.url = _le(config.LLM_BACKEND_URL, self.c)
+        self.url = _le("", self.c)
         url_col.addWidget(self.url)
         backend_row.addLayout(be_col, 1)
         backend_row.addLayout(url_col, 3)
@@ -143,7 +143,7 @@ class GeneralTab(QWidget):
         cloud_layout.addLayout(model_col, 2)
         layout.addWidget(self.cloud_widget)
         self._refresh_cloud_row(config.LLM_BACKEND)  # set initial state
-        self.url.setReadOnly(config.LLM_BACKEND not in ("custom", "omniroute"))
+        self._refresh_endpoint_row(config.LLM_BACKEND)
 
         # ── Reasoning Effort (Patch 3A.4 Part 5) ──
         # Always visible regardless of backend -- unlike cloud_widget/
@@ -307,7 +307,6 @@ class GeneralTab(QWidget):
     def _refresh_cloud_row(self, backend: str):
         is_cloud = backend in self.CLOUD_BACKENDS
         self.cloud_widget.setVisible(is_cloud)
-        self.url.setEnabled(not is_cloud)  # URL field irrelevant for cloud
         if is_cloud:
             key_attr = f"{backend.upper()}_API_KEY"
             model_attr = f"{backend.upper()}_DEFAULT_MODEL"
@@ -347,21 +346,22 @@ class GeneralTab(QWidget):
             self._apply_feedback.success("No change")
         self.status_lbl.setText("")
 
-    _BACKEND_URLS = {
-        "llamacpp":  "http://localhost:8080/v1",
-        "lmstudio":  "http://localhost:1234/v1",
-        "ollama":    "http://localhost:11434/v1",
-        "vllm":      "http://localhost:8000/v1",
-        "custom":    "",
-        "omniroute": "http://localhost:20128/v1",
-    }
+    def _refresh_endpoint_row(self, backend: str):
+        """Render endpoint truth from the backend contract, not UI tables."""
+        from core.backends.loader import endpoint_is_configurable, get_backend_endpoint
+
+        configurable = endpoint_is_configurable(backend)
+        self.url.setText(get_backend_endpoint(backend))
+        self.url.setEnabled(True)
+        self.url.setReadOnly(not configurable)
+        self.url.setPlaceholderText(
+            "Enter your OpenAI-compatible endpoint URL" if configurable else ""
+        )
 
     def _on_backend_changed(self, name: str):
         self._refresh_cloud_row(name)
-        self.url.setText(self._BACKEND_URLS.get(name, ""))
+        self._refresh_endpoint_row(name)
         is_freeform = name in ("custom", "omniroute")
-        self.url.setReadOnly(not is_freeform)
-        self.url.setPlaceholderText("Enter your OpenAI-compatible endpoint URL" if is_freeform else "")
         self.custom_model_widget.setVisible(is_freeform)
         if name == "omniroute":
             self.custom_model.setText(config.OMNIROUTE_DEFAULT_MODEL)
@@ -681,7 +681,17 @@ class GeneralTab(QWidget):
         self._refresh_reasoning_row()
 
     def _save(self):
-        from core.backends.loader import get_llm_backend
+        from core.backends.loader import (
+            BACKENDS,
+            endpoint_is_configurable,
+            get_backend_endpoint,
+            get_llm_backend,
+            migrate_legacy_backend_endpoint,
+        )
+        # Consume the old universal URL against the backend it originally
+        # accompanied before changing the selected backend below.  This is a
+        # one-time no-op after migration.
+        migrate_legacy_backend_endpoint(persist=False)
         new_system_prompt = self.prompt.toPlainText().strip()
         if new_system_prompt:
             config.SYSTEM_PROMPT = new_system_prompt
@@ -696,7 +706,24 @@ class GeneralTab(QWidget):
         config.DREAM_IDLE_MINUTES = self.dream_idle_spin.value()
         config.SHOW_THINK_BLOCKS = self.show_think_cb.isChecked()
         config.LLM_BACKEND = self.backend_combo.currentText()
-        config.LLM_BACKEND_URL = self.url.text().strip()
+        backend_endpoints = {
+            name: value
+            for name, value in getattr(config, "BACKEND_ENDPOINTS", {}).items()
+            if name in BACKENDS
+            and BACKENDS[name].endpoint_configurable
+            and isinstance(value, str)
+        }
+        if endpoint_is_configurable(config.LLM_BACKEND):
+            backend_endpoints[config.LLM_BACKEND] = self.url.text().strip()
+        config.BACKEND_ENDPOINTS = backend_endpoints
+        config.BACKEND_ENDPOINTS_MIGRATED = True
+        # Compatibility snapshot only.  Backend construction no longer reads
+        # this as universal endpoint authority.
+        config.LLM_BACKEND_URL = (
+            backend_endpoints[config.LLM_BACKEND]
+            if endpoint_is_configurable(config.LLM_BACKEND)
+            else get_backend_endpoint(config.LLM_BACKEND)
+        )
         config.LM_STUDIO_BASE_URL = config.LLM_BACKEND_URL
 
         # Cloud credentials
@@ -711,6 +738,8 @@ class GeneralTab(QWidget):
         prefs = load_prefs()
         prefs["llm_backend"] = config.LLM_BACKEND
         prefs["llm_backend_url"] = config.LLM_BACKEND_URL
+        prefs["backend_endpoints"] = backend_endpoints
+        prefs["backend_endpoints_migrated"] = True
 
         # Context/memory settings — max_tool_iterations and
         # response_reserve_tokens are global; max_context_tokens,
@@ -861,7 +890,6 @@ class GeneralTab(QWidget):
         # so rather than reporting it as an outright Save failure.
         try:
             self.agent.llm = get_llm_backend()
-            self.agent.llm.base_url = config.LLM_BACKEND_URL
 
             # Apply context/memory settings to the live agent immediately —
             # no restart needed, matching the backend-swap precedent above.

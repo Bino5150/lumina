@@ -15,6 +15,7 @@ class DeepSeekBackend(LMStudioBackend):
     name = "deepseek"
     display_name = "DeepSeek"
     default_url = "https://api.deepseek.com/v1"
+    endpoint_configurable = False
 
     KNOWN_MODELS = [
         "deepseek-v4-flash",    # DeepSeek-V4-Flash — fast, cheap, thinking mode default

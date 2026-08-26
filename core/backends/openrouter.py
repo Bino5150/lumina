@@ -27,6 +27,7 @@ class OpenRouterBackend(LMStudioBackend):
     name = "openrouter"
     display_name = "OpenRouter"
     default_url = "https://openrouter.ai/api/v1"
+    endpoint_configurable = False
 
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = (base_url or self.default_url).rstrip("/")

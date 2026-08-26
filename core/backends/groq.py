@@ -52,6 +52,7 @@ class GroqBackend(LMStudioBackend):
     name = "groq"
     display_name = "Groq"
     default_url = "https://api.groq.com/openai/v1"
+    endpoint_configurable = False
 
     KNOWN_MODELS = [
         "llama-3.3-70b-versatile",

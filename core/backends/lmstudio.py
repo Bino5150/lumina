@@ -114,9 +114,10 @@ class LMStudioBackend(BaseLLMBackend):
     name = "lmstudio"
     display_name = "LM Studio"
     default_url = "http://localhost:1234/v1"
+    endpoint_configurable = True
 
     def __init__(self, base_url: Optional[str] = None):
-        self.base_url = (base_url or config.LLM_BACKEND_URL or self.default_url).rstrip("/")
+        self.base_url = base_url
         self.api_key = "lm-studio"
         self.headers = {
             "Content-Type": "application/json",

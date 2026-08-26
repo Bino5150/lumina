@@ -18,9 +18,10 @@ class OllamaBackend(BaseLLMBackend):
     name = "ollama"
     display_name = "Ollama"
     default_url = "http://localhost:11434/v1"
+    endpoint_configurable = True
 
     def __init__(self, base_url: Optional[str] = None):
-        self.base_url = (base_url or config.LLM_BACKEND_URL or self.default_url).rstrip("/")
+        self.base_url = base_url
         self.headers = {"Content-Type": "application/json"}
         self._model = config.DEFAULT_MODEL
 
