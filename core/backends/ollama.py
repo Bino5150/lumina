@@ -9,7 +9,8 @@ defaults and no api_key requirement.
 import json
 import requests
 from typing import Optional, Generator
-from .base import BaseLLMBackend
+from .base import BaseLLMBackend, ModelDiscoveryResult
+from .lmstudio import discover_openai_compatible_models
 import config
 
 
@@ -39,11 +40,11 @@ class OllamaBackend(BaseLLMBackend):
         raise ConnectionError("No models found in Ollama.")
 
     def list_models(self) -> list[str]:
-        try:
-            resp = requests.get(f"{self.base_url}/models", headers=self.headers, timeout=5)
-            return [m["id"] for m in resp.json().get("data", [])]
-        except Exception:
-            return []
+        """Compatibility output: live IDs on success, otherwise empty."""
+        return list(self.discover_models().models)
+
+    def discover_models(self) -> ModelDiscoveryResult:
+        return discover_openai_compatible_models(self, timeout=5)
 
     def health_check(self) -> tuple[bool, str]:
         try:

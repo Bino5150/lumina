@@ -5,7 +5,8 @@ Set GROQ_API_KEY in config.py
 """
 
 from typing import Optional
-from .lmstudio import LMStudioBackend
+from .lmstudio import LMStudioBackend, discover_openai_compatible_models
+from .base import ModelDiscoveryOutcome, ModelDiscoveryResult
 from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 import config
 
@@ -54,6 +55,7 @@ class GroqBackend(LMStudioBackend):
     default_url = "https://api.groq.com/openai/v1"
     endpoint_configurable = False
 
+    # Offline suggestions only; never evidence of a successful refresh.
     KNOWN_MODELS = [
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
@@ -63,9 +65,9 @@ class GroqBackend(LMStudioBackend):
         "gemma2-9b-it",
     ]
 
-    def __init__(self, base_url: Optional[str] = None):
+    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
         self.base_url = (base_url or self.default_url).rstrip("/")
-        self.api_key = getattr(config, "GROQ_API_KEY", "")
+        self.api_key = getattr(config, "GROQ_API_KEY", "") if api_key is None else api_key
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -76,16 +78,16 @@ class GroqBackend(LMStudioBackend):
         return self._model
 
     def list_models(self) -> list[str]:
-        """Groq supports /models endpoint too."""
-        import requests
-        try:
-            resp = requests.get(f"{self.base_url}/models", headers=self.headers, timeout=10)
-            data = resp.json().get("data", [])
-            if data:
-                return [m["id"] for m in data]
-        except Exception:
-            pass
-        return self.KNOWN_MODELS
+        """Compatibility output: live IDs, else explicit offline suggestions."""
+        result = self.discover_models()
+        if result.outcome is ModelDiscoveryOutcome.SUCCESS:
+            return list(result.models)
+        return list(result.offline_suggestions)
+
+    def discover_models(self) -> ModelDiscoveryResult:
+        return discover_openai_compatible_models(
+            self, offline_suggestions=self.KNOWN_MODELS
+        )
 
     def health_check(self) -> tuple[bool, str]:
         if not self.api_key:

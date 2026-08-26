@@ -35,11 +35,23 @@ import requests
 from typing import Optional
 
 import config
-from core.backends.base import BaseLLMBackend
+from core.backends.base import (
+    BaseLLMBackend,
+    ModelDiscoveryOutcome,
+    ModelDiscoveryResult,
+)
 from core.backends.reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
 ANTHROPIC_VERSION = "2023-06-01"  # required header, independent of model version
-API_BASE = "https://api.anthropic.com/v1/messages"
+API_ROOT = "https://api.anthropic.com/v1"
+API_BASE = f"{API_ROOT}/messages"
+
+# Offline suggestions only; never evidence of a successful refresh.
+KNOWN_MODELS = (
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+)
 
 # Patch 3A.4 Part 2A -- per-model reasoning-effort capability data.
 #
@@ -138,10 +150,11 @@ class AnthropicBackend(BaseLLMBackend):
     display_name = "Anthropic (Claude)"
     default_url = API_BASE  # not user-editable; kept for UI consistency with other backends
 
-    def __init__(self, base_url: str = None):
+    def __init__(self, base_url: str = None, api_key: Optional[str] = None):
         # base_url is accepted for interface parity with other backends but ignored —
         # Anthropic's endpoint is fixed, unlike self-hosted/custom backends.
-        self.api_key = getattr(config, "ANTHROPIC_API_KEY", "").strip()
+        configured_key = getattr(config, "ANTHROPIC_API_KEY", "") if api_key is None else api_key
+        self.api_key = configured_key.strip()
         self.default_model = getattr(config, "ANTHROPIC_DEFAULT_MODEL", "claude-sonnet-4-6")
         self.headers = {
             "Content-Type": "application/json",
@@ -166,13 +179,49 @@ class AnthropicBackend(BaseLLMBackend):
         return self.default_model
 
     def list_models(self):
-        # Static list — Anthropic's /v1/models endpoint exists but pinning to known-good
-        # model strings avoids surfacing deprecated/preview names Lumina can't actually use.
-        return [
-            "claude-opus-4-7",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5-20251001",
-        ]
+        """Compatibility output: live IDs, else explicit offline suggestions."""
+        result = self.discover_models()
+        if result.outcome is ModelDiscoveryOutcome.SUCCESS:
+            return list(result.models)
+        return list(result.offline_suggestions)
+
+    def discover_models(self) -> ModelDiscoveryResult:
+        try:
+            resp = requests.get(f"{API_ROOT}/models", headers=self.headers, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                raise ValueError("invalid model-list response structure")
+            models = tuple(
+                entry["id"]
+                for entry in payload["data"]
+                if isinstance(entry, dict)
+                and isinstance(entry.get("id"), str)
+                and entry["id"].strip()
+            )
+        except Exception as exc:
+            status = getattr(locals().get("resp"), "status_code", None)
+            suffix = f" (HTTP {status})" if isinstance(status, int) else ""
+            return ModelDiscoveryResult(
+                ModelDiscoveryOutcome.FAILED,
+                offline_suggestions=KNOWN_MODELS,
+                diagnostic=(
+                    f"Anthropic model discovery failed{suffix} "
+                    f"({type(exc).__name__})."
+                ),
+            )
+        if not models:
+            return ModelDiscoveryResult(
+                ModelDiscoveryOutcome.EMPTY,
+                offline_suggestions=KNOWN_MODELS,
+                diagnostic="Anthropic returned no usable models.",
+            )
+        return ModelDiscoveryResult(
+            ModelDiscoveryOutcome.SUCCESS,
+            models=models,
+            offline_suggestions=KNOWN_MODELS,
+            diagnostic=f"Anthropic returned {len(models)} model(s).",
+        )
 
     def configured_model(self) -> Optional[str]:
         """

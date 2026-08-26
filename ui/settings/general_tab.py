@@ -1,6 +1,8 @@
 from typing import Optional
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLineEdit, QLabel
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLineEdit, QLabel, QCompleter,
+)
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -54,6 +56,10 @@ class GeneralTab(QWidget):
         # exist before _build() runs, since _build() populates the
         # reasoning row immediately.
         self._reasoning_probes: dict = {}
+        # Successful provider results only, keyed by backend. This keeps a
+        # failed refresh useful without ever carrying provider A's models
+        # into provider B's UI.
+        self._discovered_models: dict[str, tuple[str, ...]] = {}
         self._build()
 
     def _wlbl(self, text: str) -> QLabel:
@@ -102,7 +108,17 @@ class GeneralTab(QWidget):
                           else getattr(config, "CUSTOM_DEFAULT_MODEL", ""))
         self.custom_model = _le(_initial_model, self.c)
         self.custom_model.setPlaceholderText("e.g. mistral-7b-instruct")
-        cm_col.addWidget(self.custom_model)
+        custom_model_row = QHBoxLayout()
+        custom_model_row.setSpacing(6)
+        custom_model_row.addWidget(self.custom_model, 1)
+        self.custom_refresh_models_btn = _btn("⟳", self.c)
+        self.custom_refresh_models_btn.setFixedWidth(36)
+        self.custom_refresh_models_btn.setToolTip(
+            "Fetch models from this server without saving the endpoint or API key"
+        )
+        self.custom_refresh_models_btn.clicked.connect(self._refresh_models)
+        custom_model_row.addWidget(self.custom_refresh_models_btn)
+        cm_col.addLayout(custom_model_row)
         cm_layout.addLayout(cm_col, 2)
         cm_key_col = QVBoxLayout()
         cm_key_col.addWidget(_lbl("API Key (optional)", self.c))
@@ -133,11 +149,11 @@ class GeneralTab(QWidget):
         self.cloud_model = _combo(self.c)
         self.cloud_model.setEditable(True)
         model_row.addWidget(self.cloud_model, 1)
-        refresh_models_btn = _btn("⟳", self.c)
-        refresh_models_btn.setFixedWidth(36)
-        refresh_models_btn.setToolTip("Fetch available models from this backend using the API key above")
-        refresh_models_btn.clicked.connect(self._refresh_models)
-        model_row.addWidget(refresh_models_btn)
+        self.refresh_models_btn = _btn("⟳", self.c)
+        self.refresh_models_btn.setFixedWidth(36)
+        self.refresh_models_btn.setToolTip("Fetch available models from this backend using the API key above")
+        self.refresh_models_btn.clicked.connect(self._refresh_models)
+        model_row.addWidget(self.refresh_models_btn)
         model_col.addLayout(model_row)
         cloud_layout.addLayout(key_col, 2)
         cloud_layout.addLayout(model_col, 2)
@@ -311,7 +327,17 @@ class GeneralTab(QWidget):
             key_attr = f"{backend.upper()}_API_KEY"
             model_attr = f"{backend.upper()}_DEFAULT_MODEL"
             self.cloud_key.setText(getattr(config, key_attr, ""))
-            self.cloud_model.setCurrentText(getattr(config, model_attr, ""))
+            current = getattr(config, model_attr, "")
+            self.cloud_model.clear()
+            self.cloud_model.addItems(list(self._discovered_models.get(backend, ())))
+            self.cloud_model.setCurrentText(current)
+
+    def _refresh_freeform_model_suggestions(self, backend: str):
+        """Attach only this backend's last successful IDs as completions."""
+        models = list(self._discovered_models.get(backend, ()))
+        self.custom_model.setCompleter(
+            QCompleter(models, self.custom_model) if models else None
+        )
     def _apply_prompt(self) -> bool:
         """Pure action, no feedback -- called both by the Apply Change click
         handler and (unconditionally, when the field is non-empty) from
@@ -371,6 +397,8 @@ class GeneralTab(QWidget):
             self.custom_model.setText(getattr(config, "CUSTOM_DEFAULT_MODEL", ""))
             self.custom_api_key.setText(getattr(config, "CUSTOM_API_KEY", ""))
             self.custom_model.setPlaceholderText("e.g. mistral-7b-instruct")
+        if is_freeform:
+            self._refresh_freeform_model_suggestions(name)
         self._refresh_context_row(name)
         # Patch 3A.4 Part 5 -- after the model field for the new backend
         # has been populated above, so this reads the right model text.
@@ -495,31 +523,28 @@ class GeneralTab(QWidget):
         point: OpenRouterBackend's capability cache (Part 2B) lives on the
         instance itself, so a fresh construct would silently reset it to
         empty/not-ready every time, defeating both the no-redundant-HTTP
-        guarantee and the point of the Refresh Models button. Mirrors
-        _refresh_models()'s existing temporarily-set-then-restore
-        credential contract for cloud backends -- constructing this probe
-        must never itself count as a save, and must never leave config.*
-        mutated afterward.
+        guarantee and the point of the Refresh Models button. Credentials
+        typed in Settings are passed directly to the probe constructor;
+        constructing it must never count as a save or create a process-
+        global config mutation window.
         """
         probe = self._reasoning_probes.get(backend_name)
         if probe is not None:
             return probe
         from core.backends.loader import get_llm_backend
+        credential = None
         if backend_name in self.CLOUD_BACKENDS:
-            key_attr = f"{backend_name.upper()}_API_KEY"
-            prev_key = getattr(config, key_attr, "")
-            setattr(config, key_attr, self.cloud_key.text().strip())
-            try:
-                probe = get_llm_backend(name=backend_name)
-            except Exception:
-                probe = None
-            finally:
-                setattr(config, key_attr, prev_key)
-        else:
-            try:
-                probe = get_llm_backend(name=backend_name)
-            except Exception:
-                probe = None
+            credential = self.cloud_key.text().strip()
+        elif backend_name in ("custom", "omniroute"):
+            credential = self.custom_api_key.text().strip()
+        try:
+            probe = get_llm_backend(
+                name=backend_name,
+                url=self.url.text().strip(),
+                api_key=credential,
+            )
+        except Exception:
+            probe = None
         if probe is not None:
             self._reasoning_probes[backend_name] = probe
         return probe
@@ -635,48 +660,63 @@ class GeneralTab(QWidget):
         self._populate_reasoning_combo(efforts=caps.efforts, selected=selected, enabled=True, tooltip=tooltip)
 
     def _refresh_models(self):
-        """Probe the currently-selected cloud backend for its available
-        models using whatever API key is typed right now — not necessarily
-        saved yet. Backends read their key from the config module at
-        construction time (see loader.py), so this temporarily sets
-        config.<BACKEND>_API_KEY for the probe call only and restores the
-        previous value afterward. Clicking Refresh must have no persistent
-        effect until Save is actually pressed — same principle the rest of
-        this tab already follows for cloud credentials."""
+        """Run truthful live discovery without persisting draft settings."""
         backend_name = self.backend_combo.currentText()
-        if backend_name not in self.CLOUD_BACKENDS:
-            return
-        key_attr = f"{backend_name.upper()}_API_KEY"
-        prev_key = getattr(config, key_attr, "")
-        setattr(config, key_attr, self.cloud_key.text().strip())
-        probe = None
+        credential = None
+        if backend_name in self.CLOUD_BACKENDS:
+            credential = self.cloud_key.text().strip()
+        elif backend_name in ("custom", "omniroute"):
+            credential = self.custom_api_key.text().strip()
         try:
             from core.backends.loader import get_llm_backend
-            probe = get_llm_backend(name=backend_name)
-            models = probe.list_models()
-        except Exception:
-            models = []
-        finally:
-            setattr(config, key_attr, prev_key)
+            from core.backends.base import ModelDiscoveryOutcome
+            probe = get_llm_backend(
+                name=backend_name,
+                url=self.url.text().strip(),
+                api_key=credential,
+            )
+            result = probe.discover_models()
+        except Exception as exc:
+            from core.backends.base import ModelDiscoveryOutcome, ModelDiscoveryResult
+            probe = None
+            result = ModelDiscoveryResult(
+                ModelDiscoveryOutcome.FAILED,
+                diagnostic=f"Model discovery could not start ({type(exc).__name__}).",
+            )
 
-        # Patch 3A.4 Part 5 -- retain the probe (keyed by backend), stored
-        # BEFORE touching cloud_model's text below, so its reasoning-
-        # capability cache (list_models() above already populated it for
-        # OpenRouter) survives after this method returns. Storing it first
-        # also means the clear()/addItems()/setCurrentText() calls right
-        # below -- which fire cloud_model's currentTextChanged and
-        # therefore transiently re-run _refresh_reasoning_row() -- reuse
-        # this exact freshly-discovered instance instead of constructing a
-        # second, cold one and risking a redundant discovery HTTP call.
-        if probe is not None:
+        # Only a valid response replaces the retained capability probe. A
+        # failed refresh must preserve OpenRouter's previous good cache.
+        if probe is not None and result.outcome in (
+            ModelDiscoveryOutcome.SUCCESS,
+            ModelDiscoveryOutcome.EMPTY,
+        ):
             self._reasoning_probes[backend_name] = probe
 
-        current = self.cloud_model.currentText()
-        self.cloud_model.clear()
-        if models:
-            self.cloud_model.addItems(models)
-        if current:
-            self.cloud_model.setCurrentText(current)
+        if result.outcome is ModelDiscoveryOutcome.SUCCESS:
+            self._discovered_models[backend_name] = result.models
+            if backend_name in self.CLOUD_BACKENDS:
+                current = self.cloud_model.currentText()
+                self.cloud_model.clear()
+                self.cloud_model.addItems(list(result.models))
+                if current:
+                    self.cloud_model.setCurrentText(current)
+            elif backend_name in ("custom", "omniroute"):
+                self._refresh_freeform_model_suggestions(backend_name)
+            self.status_lbl.setText(result.diagnostic)
+        elif result.outcome is ModelDiscoveryOutcome.EMPTY:
+            self.status_lbl.setText(result.diagnostic)
+        elif result.outcome is ModelDiscoveryOutcome.FAILED:
+            suffix = (
+                " Offline suggestions are available, but were not shown as provider results."
+                if result.offline_suggestions else ""
+            )
+            self.status_lbl.setText(result.diagnostic + suffix)
+        else:
+            suffix = (
+                " Offline suggestions are available, but live enumeration is unsupported."
+                if result.offline_suggestions else ""
+            )
+            self.status_lbl.setText(result.diagnostic + suffix)
 
         self._refresh_reasoning_row()
 

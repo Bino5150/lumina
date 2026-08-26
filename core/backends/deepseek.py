@@ -6,7 +6,8 @@ Set DEEPSEEK_API_KEY in config.py
 """
 
 from typing import Optional
-from .lmstudio import LMStudioBackend
+from .lmstudio import LMStudioBackend, discover_openai_compatible_models
+from .base import ModelDiscoveryOutcome, ModelDiscoveryResult
 import config
 
 
@@ -17,6 +18,7 @@ class DeepSeekBackend(LMStudioBackend):
     default_url = "https://api.deepseek.com/v1"
     endpoint_configurable = False
 
+    # Offline suggestions only; never evidence of a successful refresh.
     KNOWN_MODELS = [
         "deepseek-v4-flash",    # DeepSeek-V4-Flash — fast, cheap, thinking mode default
         "deepseek-v4-pro",      # DeepSeek-V4-Pro — higher quality, slower
@@ -24,9 +26,9 @@ class DeepSeekBackend(LMStudioBackend):
         "deepseek-reasoner",    # deprecated 2026-07-24 (alias for v4-flash thinking)
     ]
 
-    def __init__(self, base_url: Optional[str] = None):
+    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
         self.base_url = (base_url or self.default_url).rstrip("/")
-        self.api_key = getattr(config, "DEEPSEEK_API_KEY", "")
+        self.api_key = getattr(config, "DEEPSEEK_API_KEY", "") if api_key is None else api_key
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -37,7 +39,15 @@ class DeepSeekBackend(LMStudioBackend):
         return self._model
 
     def list_models(self) -> list[str]:
-        return self.KNOWN_MODELS
+        result = self.discover_models()
+        if result.outcome is ModelDiscoveryOutcome.SUCCESS:
+            return list(result.models)
+        return list(result.offline_suggestions)
+
+    def discover_models(self) -> ModelDiscoveryResult:
+        return discover_openai_compatible_models(
+            self, offline_suggestions=self.KNOWN_MODELS
+        )
 
     def health_check(self) -> tuple[bool, str]:
         if not self.api_key:

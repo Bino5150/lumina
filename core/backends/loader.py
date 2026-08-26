@@ -29,10 +29,11 @@ class CustomBackend(LMStudioBackend):
     display_name = "Custom (OpenAI-compatible)"
     default_url = ""
 
-    def __init__(self, base_url: str = None):
+    def __init__(self, base_url: str = None, api_key: str = None):
         super().__init__(base_url=base_url)
         self._model = getattr(config, "CUSTOM_DEFAULT_MODEL", "")
-        key = getattr(config, "CUSTOM_API_KEY", "").strip()
+        configured_key = getattr(config, "CUSTOM_API_KEY", "") if api_key is None else api_key
+        key = configured_key.strip()
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {key}" if key else "Bearer lumina",
@@ -154,7 +155,7 @@ def get_backend_endpoint(name: str) -> str:
             return legacy_url.rstrip("/")
     return cls.default_url.rstrip("/")
 
-def get_llm_backend(name: str = None, url: str = None):
+def get_llm_backend(name: str = None, url: str = None, api_key: str = None):
     """
     Instantiate and return a backend by name.
     Falls back to config.LLM_BACKEND, then 'llamacpp'.
@@ -174,4 +175,9 @@ def get_llm_backend(name: str = None, url: str = None):
         if cls.endpoint_configurable
         else cls.default_url
     )
+    if api_key is not None and backend_name in {
+        "openrouter", "deepseek", "groq", "openai", "anthropic",
+        "gemini", "kimi", "qwen", "custom", "omniroute",
+    }:
+        return cls(base_url=endpoint, api_key=api_key)
     return cls(base_url=endpoint)

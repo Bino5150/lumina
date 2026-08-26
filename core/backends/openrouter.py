@@ -10,14 +10,15 @@ OpenRouter's own /models response can carry a per-model "reasoning" object
 models pass through OpenRouter and that set changes over time, so unlike
 every other Part 2A/2B provider in this patch, capability data here is NOT
 a hardcoded table -- it's discovered live and cached per-instance. See
-_reasoning_cache / list_models() / reasoning_capabilities() below for the
-exact contract: list_models() is the only method that ever performs HTTP
-for this; reasoning_capabilities() only ever reads whatever that last
-successful call cached.
+_reasoning_cache / discover_models() / reasoning_capabilities() below for
+the exact contract: discover_models() performs HTTP, the legacy
+list_models() wrapper delegates to it, and reasoning_capabilities() only
+reads whatever the last successful structured discovery cached.
 """
 
 from typing import Optional, Generator
 from .lmstudio import LMStudioBackend
+from .base import ModelDiscoveryOutcome, ModelDiscoveryResult
 from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 import config
 
@@ -29,9 +30,9 @@ class OpenRouterBackend(LMStudioBackend):
     default_url = "https://openrouter.ai/api/v1"
     endpoint_configurable = False
 
-    def __init__(self, base_url: Optional[str] = None):
+    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
         self.base_url = (base_url or self.default_url).rstrip("/")
-        self.api_key = getattr(config, "OPENROUTER_API_KEY", "")
+        self.api_key = getattr(config, "OPENROUTER_API_KEY", "") if api_key is None else api_key
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -42,8 +43,8 @@ class OpenRouterBackend(LMStudioBackend):
         # Patch 3A.4 Part 2B -- per-instance reasoning-capability cache.
         # Empty at construction time: __init__ does zero network work, same
         # as every other backend, so constructing this class never triggers
-        # capability discovery on its own -- only a successful list_models()
-        # call (below) ever populates this. Keyed by model id string ->
+        # capability discovery on its own -- only a successful structured
+        # discovery call below ever populates this. Keyed by model id string ->
         # ReasoningCapabilities; a model absent from this dict has either
         # never been seen by a successful discovery response, or was seen
         # and had no positively-advertised "reasoning" metadata -- both
@@ -52,7 +53,7 @@ class OpenRouterBackend(LMStudioBackend):
         self._reasoning_cache: dict = {}
         # Patch 3A.4 Part 4 -- readiness/refresh seam state.
         #
-        # _reasoning_cache_ready: True once ANY list_models() call has ever
+        # _reasoning_cache_ready: True once ANY discover_models() call has ever
         # completed successfully on this instance (i.e. reached the
         # `self._reasoning_cache = new_cache` assignment below), False
         # until then. Never reset back to False by a later failed refresh
@@ -61,7 +62,7 @@ class OpenRouterBackend(LMStudioBackend):
         # (avoids redundant re-discovery once we already have real data).
         #
         # _last_discovery_succeeded: tracks ONLY the outcome of the most
-        # recently completed list_models() call, regardless of prior
+        # recently completed discover_models() call, regardless of prior
         # history -- this is what lets refresh_reasoning_capabilities()
         # give an honest per-attempt answer even in the (currently
         # unexercised, but not assumed away) case where a LATER refresh
@@ -76,33 +77,48 @@ class OpenRouterBackend(LMStudioBackend):
         return self._model
 
     def list_models(self) -> list[str]:
-        """
-        Fetch live model list from OpenRouter. Return contract is UNCHANGED
-        from before Part 2B: same list[str] of model ids, same fallback to
-        [self._model] on any exception (network error, non-2xx, malformed
-        JSON, a model entry missing "id", etc.) -- that fallback trigger
-        condition is exactly the original try/except's, untouched.
+        """Compatibility output: live IDs or the configured-model fallback."""
+        result = self.discover_models()
+        if result.outcome in (
+            ModelDiscoveryOutcome.SUCCESS,
+            ModelDiscoveryOutcome.EMPTY,
+        ):
+            return list(result.models)
+        return [self._model]
 
-        On success ONLY, this also rebuilds the reasoning-capability cache
-        from the same response's per-model "reasoning" objects (see
-        _parse_reasoning_metadata below) -- no extra HTTP request, just
-        additional parsing of data already fetched. A failed refresh (this
-        method's except branch) returns early before touching
-        self._reasoning_cache at all, so the existing cache -- whatever it
-        was, including still-empty on a first-ever call -- is left
-        completely untouched.
-        """
+    def discover_models(self) -> ModelDiscoveryResult:
+        """Fetch OpenRouter models and atomically refresh reasoning metadata."""
         import requests
         try:
             resp = requests.get(f"{self.base_url}/models", headers=self.headers, timeout=10)
-            data = resp.json().get("data", [])
+            raise_for_status = getattr(resp, "raise_for_status", None)
+            if callable(raise_for_status):
+                raise_for_status()
+            elif getattr(resp, "status_code", 200) >= 400:
+                raise requests.exceptions.HTTPError()
+            payload = resp.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                raise ValueError("invalid model-list response structure")
+            data = payload["data"]
+            if not all(
+                isinstance(entry, dict)
+                and isinstance(entry.get("id"), str)
+                and entry["id"].strip()
+                for entry in data
+            ):
+                raise ValueError("invalid model entry")
             models = [m["id"] for m in data]
-        except Exception:
-            # Patch 3A.4 Part 4 -- this attempt failed; _reasoning_cache_ready
-            # is deliberately left untouched (stays True if it already was),
-            # only _last_discovery_succeeded reflects THIS attempt.
+        except Exception as exc:
             self._last_discovery_succeeded = False
-            return [self._model]
+            status = getattr(locals().get("resp"), "status_code", None)
+            suffix = f" (HTTP {status})" if isinstance(status, int) else ""
+            return ModelDiscoveryResult(
+                ModelDiscoveryOutcome.FAILED,
+                diagnostic=(
+                    f"{self.display_name} model discovery failed{suffix} "
+                    f"({type(exc).__name__})."
+                ),
+            )
 
         # Build the new cache fully in a local variable first -- only
         # assign it to self._reasoning_cache after the loop completes, so
@@ -132,8 +148,16 @@ class OpenRouterBackend(LMStudioBackend):
         # this call reached a full success, so both flags reflect that.
         self._reasoning_cache_ready = True
         self._last_discovery_succeeded = True
-
-        return models
+        if not models:
+            return ModelDiscoveryResult(
+                ModelDiscoveryOutcome.EMPTY,
+                diagnostic=f"{self.display_name} returned no usable models.",
+            )
+        return ModelDiscoveryResult(
+            ModelDiscoveryOutcome.SUCCESS,
+            models=tuple(models),
+            diagnostic=f"{self.display_name} returned {len(models)} model(s).",
+        )
 
     @staticmethod
     def _parse_reasoning_metadata(entry: dict) -> Optional[ReasoningCapabilities]:
@@ -218,7 +242,7 @@ class OpenRouterBackend(LMStudioBackend):
         """
         Patch 3A.4 Part 2B -- reads the per-instance discovery cache ONLY.
         Zero HTTP here, ever: the cache is populated exclusively by a
-        prior successful list_models() call (see above). `model=None`
+        prior successful discover_models() call (see above). `model=None`
         always falls through to NO_REASONING_CONTROL, matching every other
         backend's contract in this patch. An unpopulated cache (discovery
         never run on this instance), an unrecognized model, and a model
@@ -233,7 +257,7 @@ class OpenRouterBackend(LMStudioBackend):
 
     def reasoning_capabilities_ready(self, model: Optional[str] = None) -> bool:
         """
-        Patch 3A.4 Part 4 override -- reports whether ANY list_models()
+        Patch 3A.4 Part 4 override -- reports whether ANY discover_models()
         call has ever completed successfully on this instance (see the
         _reasoning_cache_ready docstring in __init__). `model` is accepted
         for interface parity with the base seam but not consulted: OpenRouter
@@ -244,12 +268,11 @@ class OpenRouterBackend(LMStudioBackend):
 
     def refresh_reasoning_capabilities(self) -> bool:
         """
-        Patch 3A.4 Part 4 override -- performs the real list_models()
-        discovery HTTP call and reports whether THIS specific attempt
-        succeeded (via _last_discovery_succeeded, set precisely by
-        list_models() itself right above -- see its True/False assignment
-        sites). Deliberately delegates to list_models() rather than
-        duplicating its request/parsing logic. Stays fully separate from
+        Patch 3A.4 Part 4 override -- performs real structured model
+        discovery and reports whether THIS specific attempt succeeded via
+        _last_discovery_succeeded. It delegates through list_models() for
+        compatibility; that wrapper delegates to discover_models(), so the
+        request/parsing logic still has one owner. Stays fully separate from
         reasoning_capabilities(), which never performs I/O.
         """
         self.list_models()

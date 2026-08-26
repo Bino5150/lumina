@@ -6,7 +6,7 @@ Default port: 1234
 import json
 import requests
 from typing import Optional, Generator
-from .base import BaseLLMBackend
+from .base import BaseLLMBackend, ModelDiscoveryOutcome, ModelDiscoveryResult
 import config
 
 
@@ -40,6 +40,67 @@ def join_endpoint(base_url: str, path: str) -> str:
     if base_url.endswith("/" + path):
         return base_url
     return f"{base_url}/{path}"
+
+
+def discover_openai_compatible_models(
+    backend: BaseLLMBackend,
+    *,
+    timeout: int = 10,
+    offline_suggestions=(),
+) -> ModelDiscoveryResult:
+    """Enumerate a genuine OpenAI-compatible ``GET /models`` surface.
+
+    The response must be HTTP-successful and shaped as ``{"data": list}``.
+    Raw bodies and exception messages are deliberately excluded from the
+    diagnostic because this result is rendered directly in Settings.
+    """
+    suggestions = tuple(offline_suggestions)
+    try:
+        base_url = validate_base_url(backend.base_url, backend.display_name)
+        resp = requests.get(
+            join_endpoint(base_url, "models"),
+            headers=backend.headers,
+            timeout=timeout,
+        )
+        raise_for_status = getattr(resp, "raise_for_status", None)
+        if callable(raise_for_status):
+            raise_for_status()
+        elif getattr(resp, "status_code", 200) >= 400:
+            raise requests.exceptions.HTTPError()
+        payload = resp.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError("invalid model-list response structure")
+        models = tuple(
+            entry["id"]
+            for entry in payload["data"]
+            if isinstance(entry, dict)
+            and isinstance(entry.get("id"), str)
+            and entry["id"].strip()
+        )
+    except Exception as exc:
+        status = getattr(locals().get("resp"), "status_code", None)
+        suffix = f" (HTTP {status})" if isinstance(status, int) else ""
+        return ModelDiscoveryResult(
+            ModelDiscoveryOutcome.FAILED,
+            offline_suggestions=suggestions,
+            diagnostic=(
+                f"{backend.display_name} model discovery failed{suffix} "
+                f"({type(exc).__name__})."
+            ),
+        )
+
+    if not models:
+        return ModelDiscoveryResult(
+            ModelDiscoveryOutcome.EMPTY,
+            offline_suggestions=suggestions,
+            diagnostic=f"{backend.display_name} returned no usable models.",
+        )
+    return ModelDiscoveryResult(
+        ModelDiscoveryOutcome.SUCCESS,
+        models=models,
+        offline_suggestions=suggestions,
+        diagnostic=f"{backend.display_name} returned {len(models)} model(s).",
+    )
 
 
 def classify_provider_error(status_code, raw_body: str) -> dict:
@@ -140,12 +201,11 @@ class LMStudioBackend(BaseLLMBackend):
         raise ConnectionError(f"No models loaded in {self.display_name}.")
 
     def list_models(self) -> list[str]:
-        try:
-            base_url = validate_base_url(self.base_url, self.display_name)
-            resp = requests.get(join_endpoint(base_url, "models"), headers=self.headers, timeout=5)
-            return [m["id"] for m in resp.json().get("data", [])]
-        except Exception:
-            return []
+        """Compatibility output: live IDs on success, otherwise an empty list."""
+        return list(self.discover_models().models)
+
+    def discover_models(self) -> ModelDiscoveryResult:
+        return discover_openai_compatible_models(self, timeout=5)
 
     def health_check(self) -> tuple[bool, str]:
         try:

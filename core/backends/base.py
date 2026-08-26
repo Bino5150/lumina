@@ -4,9 +4,37 @@ BaseLLMBackend — abstract interface all LLM backends must implement.
 
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional, Generator
 
 from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
+
+
+class ModelDiscoveryOutcome(str, Enum):
+    """Truthful result of one live provider/server enumeration attempt."""
+
+    SUCCESS = "success"
+    EMPTY = "empty"
+    FAILED = "failed"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True)
+class ModelDiscoveryResult:
+    """Structured model discovery result consumed by Settings.
+
+    ``models`` contains only IDs returned by a successful live request.
+    Static catalogs belong in ``offline_suggestions`` and can therefore
+    never be mistaken for provider results. ``diagnostic`` must already be
+    safe for direct UI display: no raw response bodies, credentials, or
+    provider exception text.
+    """
+
+    outcome: ModelDiscoveryOutcome
+    models: tuple[str, ...] = ()
+    offline_suggestions: tuple[str, ...] = ()
+    diagnostic: str = ""
 
 
 class BaseLLMBackend(ABC):
@@ -50,8 +78,21 @@ class BaseLLMBackend(ABC):
 
     @abstractmethod
     def list_models(self) -> list[str]:
-        """Return all available model IDs from this backend."""
+        """Return compatibility model output for non-Settings callers.
+
+        This legacy surface is intentionally not the source of truth for a
+        Refresh action: implementations may return offline suggestions or a
+        configured-model fallback when live discovery fails. Call
+        ``discover_models()`` whenever the distinction matters.
+        """
         ...
+
+    def discover_models(self) -> ModelDiscoveryResult:
+        """Attempt live enumeration, or explicitly report it unsupported."""
+        return ModelDiscoveryResult(
+            ModelDiscoveryOutcome.UNSUPPORTED,
+            diagnostic=f"{self.display_name} does not support live model enumeration.",
+        )
 
     @abstractmethod
     def health_check(self) -> tuple[bool, str]:
@@ -218,7 +259,7 @@ class BaseLLMBackend(ABC):
         NO_REASONING_CONTROL) that is always immediately available -- there
         is nothing to discover, so there is nothing to ever be "not ready"
         for. OpenRouterBackend overrides this to report whether a
-        successful list_models()-driven capability-cache refresh has ever
+        successful discover_models()-driven capability-cache refresh has ever
         happened on this instance (see core/backends/openrouter.py).
 
         Side-effect-free: must never perform I/O itself, only report state.
@@ -232,7 +273,7 @@ class BaseLLMBackend(ABC):
         Base/static default: nothing to refresh, so this is a no-op that
         always reports success (True) without touching the network.
         OpenRouterBackend overrides this to actually perform its
-        list_models()-driven discovery and report whether THIS refresh
+        discover_models()-driven discovery and report whether THIS refresh
         attempt specifically succeeded (see core/backends/openrouter.py).
 
         Stays fully separate from reasoning_capabilities(), which remains a

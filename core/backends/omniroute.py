@@ -35,9 +35,10 @@ class OmniRouteBackend(LMStudioBackend):
     display_name = "OmniRoute (self-hosted gateway)"
     default_url = "http://localhost:20128/v1"
 
-    def __init__(self, base_url: Optional[str] = None):
+    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
         self.base_url = base_url
-        key = getattr(config, "OMNIROUTE_API_KEY", "").strip()
+        configured_key = getattr(config, "OMNIROUTE_API_KEY", "") if api_key is None else api_key
+        key = configured_key.strip()
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {key}" if key else "Bearer lumina",

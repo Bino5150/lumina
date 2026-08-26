@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import sys
 import tempfile
 import zipfile
+from unittest.mock import patch
 
 PASS, FAIL = [], []
 
@@ -56,12 +57,25 @@ def main():
     check("cloud_model is editable (manual entry still works)",
           gt.cloud_model.isEditable())
 
-    # Refresh with no key set on a cloud backend must not throw, must not
-    # leave a persistent config mutation behind.
+    # A failed live refresh must not throw, must not mutate config, and must
+    # not populate Anthropic's offline suggestions as provider results.
     gt.backend_combo.setCurrentText("anthropic")
     prev = getattr(config, "ANTHROPIC_API_KEY", "")
+    prior_count = gt.cloud_model.count()
+
+    class _FailedResponse:
+        status_code = 401
+
+        def raise_for_status(self):
+            import requests
+            raise requests.exceptions.HTTPError()
+
+        def json(self):
+            return {"error": {"message": "not authorized"}}
+
     try:
-        gt._refresh_models()
+        with patch("requests.get", return_value=_FailedResponse()):
+            gt._refresh_models()
         refresh_ok = True
     except Exception as e:
         refresh_ok = False
@@ -70,10 +84,12 @@ def main():
     check("_refresh_models(): does not leave a stray config mutation behind",
           getattr(config, "ANTHROPIC_API_KEY", "") == prev)
 
-    # Anthropic's list_models() is a static pinned list — should populate
-    # even with no key, since it's not actually a network call.
-    check("_refresh_models(): Anthropic's static list populated the combo",
-          gt.cloud_model.count() > 0, f"count={gt.cloud_model.count()}")
+    check("_refresh_models(): failed live discovery preserves the prior list",
+          gt.cloud_model.count() == prior_count, f"count={gt.cloud_model.count()}")
+    check("_refresh_models(): offline suggestions are not provider results",
+          gt.cloud_model.findText("claude-opus-4-7") == -1)
+    check("_refresh_models(): failure is surfaced truthfully",
+          "failed" in gt.status_lbl.text().lower(), gt.status_lbl.text())
 
     # ── memory backup ─────────────────────────────────────────────────
     tmp_data_dir = tempfile.mkdtemp()

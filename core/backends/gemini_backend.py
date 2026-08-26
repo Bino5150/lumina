@@ -47,10 +47,21 @@ import requests
 from typing import Optional
 
 import config
-from core.backends.base import BaseLLMBackend
+from core.backends.base import (
+    BaseLLMBackend,
+    ModelDiscoveryOutcome,
+    ModelDiscoveryResult,
+)
 from core.backends.reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
+
+# Offline suggestions only; never evidence of a successful refresh.
+KNOWN_MODELS = (
+    "gemini-3.5-pro",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+)
 
 # Patch 3A.4 Part 2A -- per-model reasoning ("thinking level") capability
 # data. Model-specific matrix, not a provider-wide list -- Gemini's own
@@ -208,10 +219,11 @@ class GeminiBackend(BaseLLMBackend):
     display_name = "Gemini (Google)"
     default_url = API_ROOT  # fixed endpoint, not user-editable — kept for UI parity
 
-    def __init__(self, base_url: str = None):
+    def __init__(self, base_url: str = None, api_key: Optional[str] = None):
         # base_url accepted for interface parity with other backends but ignored,
         # same convention as AnthropicBackend.
-        self.api_key = getattr(config, "GEMINI_API_KEY", "").strip()
+        configured_key = getattr(config, "GEMINI_API_KEY", "") if api_key is None else api_key
+        self.api_key = configured_key.strip()
         self.default_model = getattr(config, "GEMINI_DEFAULT_MODEL", "gemini-3.5-flash")
         self.headers = {
             "Content-Type": "application/json",
@@ -234,17 +246,56 @@ class GeminiBackend(BaseLLMBackend):
         return self.default_model
 
     def list_models(self):
-        # Static known-good list, same rationale as anthropic_backend.py: Gemini's
-        # /v1beta/models list endpoint exists but includes tuned/deprecated/preview
-        # entries Lumina can't necessarily use. Verify against a live `curl
-        # {API_ROOT}/models?key=...` before wiring into the Settings dropdown —
-        # model naming on this surface (gemini-3.5-flash family per current docs)
-        # moves faster than Anthropic's or OpenAI's.
-        return [
-            "gemini-3.5-pro",
-            "gemini-3.5-flash",
-            "gemini-3.5-flash-lite",
-        ]
+        """Compatibility output: live generation IDs, else offline suggestions."""
+        result = self.discover_models()
+        if result.outcome is ModelDiscoveryOutcome.SUCCESS:
+            return list(result.models)
+        return list(result.offline_suggestions)
+
+    def discover_models(self) -> ModelDiscoveryResult:
+        try:
+            resp = requests.get(f"{API_ROOT}/models", headers=self.headers, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+                raise ValueError("invalid model-list response structure")
+            discovered = []
+            for entry in payload["models"]:
+                if not isinstance(entry, dict):
+                    continue
+                raw_name = entry.get("name")
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    continue
+                methods = entry.get("supportedGenerationMethods")
+                if isinstance(methods, list) and "generateContent" not in methods:
+                    continue
+                model_id = raw_name.removeprefix("models/")
+                if model_id:
+                    discovered.append(model_id)
+            models = tuple(discovered)
+        except Exception as exc:
+            status = getattr(locals().get("resp"), "status_code", None)
+            suffix = f" (HTTP {status})" if isinstance(status, int) else ""
+            return ModelDiscoveryResult(
+                ModelDiscoveryOutcome.FAILED,
+                offline_suggestions=KNOWN_MODELS,
+                diagnostic=(
+                    f"Gemini model discovery failed{suffix} "
+                    f"({type(exc).__name__})."
+                ),
+            )
+        if not models:
+            return ModelDiscoveryResult(
+                ModelDiscoveryOutcome.EMPTY,
+                offline_suggestions=KNOWN_MODELS,
+                diagnostic="Gemini returned no generateContent models.",
+            )
+        return ModelDiscoveryResult(
+            ModelDiscoveryOutcome.SUCCESS,
+            models=models,
+            offline_suggestions=KNOWN_MODELS,
+            diagnostic=f"Gemini returned {len(models)} generation model(s).",
+        )
 
     def configured_model(self) -> Optional[str]:
         """
