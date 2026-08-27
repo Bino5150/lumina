@@ -586,7 +586,11 @@ class ChatWidget(QWidget):
 
         content = QLabel(text)
         content.setWordWrap(True)
-        content.setAlignment(Qt.AlignRight)
+        # UI-TRUST-01A: text inside the user bubble reads left-to-right from
+        # the card's LEFT edge (prose, task blocks, lists, code). The bubble
+        # itself keeps its right-side visual identity via the header row and
+        # corner styling above -- only the inner text alignment changes here.
+        content.setAlignment(Qt.AlignLeft)
         content.setTextInteractionFlags(Qt.TextSelectableByMouse)
         content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         content.setStyleSheet(f"background:{self.colors['user_bubble']};color:{self.colors['text_primary']};padding:10px 14px;border-radius:12px 4px 12px 12px;border:1px solid {self.colors['border']};font-size:13px;")

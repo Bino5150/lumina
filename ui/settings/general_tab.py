@@ -4,6 +4,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLineEdit, QLabel, QCompleter,
 )
 
+from PySide6.QtCore import Signal
+
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
@@ -16,6 +18,11 @@ from ._widgets import _sec, _lbl, _te, _le, _btn, _spin, _combo, _scroll_wrap, B
 # ── Tab: General ───────────────────────────────────────────────────────────────
 
 class GeneralTab(QWidget):
+    # UI-TRUST-01B: emitted whenever this tab's Save path has live-applied
+    # (or attempted to live-apply) a backend/model change -- i.e. whenever
+    # the previously displayed connection status may have gone stale.
+    # Carries no payload; consumers re-read truth from the live agent.
+    backend_connection_changed = Signal()
     CLOUD_BACKENDS = {"openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen"}
 
     # Patch 3A.4 Part 5 -- raw provider value -> display label. Case-
@@ -898,6 +905,11 @@ class GeneralTab(QWidget):
             self.status_lbl.setText(msg)
             return
 
+        # UI-TRUST-01B: custom/omniroute already mutated agent.llm._model
+        # inside the credential block above, so the status bar may be stale
+        # from this point on -- even if prefs persistence fails below.
+        self.backend_connection_changed.emit()
+
         # persistence.save() reports failure via its return value, not an
         # exception (core/persistence.py) -- it was previously called here
         # and ignored, so a failed write looked identical to a successful
@@ -944,7 +956,12 @@ class GeneralTab(QWidget):
         except Exception as e:
             self._save_feedback.failure("⚠ Partial")
             self.status_lbl.setText(f"Settings saved; live backend apply failed: {e}")
+            # UI-TRUST-01B: the backend swap may have half-completed -- refresh
+            # so the operator sees the NEW state's truth, never old green text.
+            self.backend_connection_changed.emit()
             return
 
+        # UI-TRUST-01B: live backend/model state changed successfully.
+        self.backend_connection_changed.emit()
         self._save_feedback.success("✓ Saved")
         self.status_lbl.setText("Settings saved.")

@@ -18,6 +18,7 @@ from .coming_soon_tab import ComingSoonTab
 
 class SettingsPanel(QWidget):
     persona_applied = Signal(str, str)  # (agent_name, avatar_path)
+    backend_connection_changed = Signal()  # UI-TRUST-01B: relayed from GeneralTab
     def __init__(self, agent, colors: dict, parent=None):
         super().__init__(parent)
         self.agent = agent
@@ -57,7 +58,8 @@ class SettingsPanel(QWidget):
         """)
 
         c = self.colors
-        tabs.addTab(GeneralTab(self.agent, c),      "⚙  General")
+        self.general_tab = GeneralTab(self.agent, c)
+        tabs.addTab(self.general_tab,      "⚙  General")
         tabs.addTab(UserProfileTab(self.agent, c),  "👤  User Profile")
         self.personas_tab = PersonasTab(self.agent, c)
         self.tts_tab = TTSTab(self.agent, c)
@@ -69,6 +71,9 @@ class SettingsPanel(QWidget):
         tabs.addTab(ScheduledTasksTab(self.agent, c), "🗓  Scheduled Tasks")
         tabs.addTab(self.tts_tab,                   "🔊  TTS")
         self.tts_tab.backend_changed.connect(self.personas_tab.refresh_voices)
+        self.general_tab.backend_connection_changed.connect(
+            self.backend_connection_changed
+        )
         tabs.addTab(ComingSoonTab("Image Generation", "Native inline image generation — local and cloud backends. Tracked as MB-21.", c), "🎨  Image Gen")
         tabs.addTab(ComingSoonTab("Oracle", "A performance-oriented, full featured local inference server with integrated dashboard.", c), "🔮  Oracle")
         tabs.addTab(AboutTab(c),                    "✨  About")

@@ -354,6 +354,13 @@ class StatusBar(QFrame):
         self.dot.setStyleSheet(f"color:{COLORS['danger']};font-size:10px;background:transparent;")
         self.model_lbl.setText(msg)
 
+    def set_checking(self, msg: str = "Checking connection..."):
+        """UI-TRUST-01B: truthful transitional state while the live backend
+        is being re-checked after a settings change. Neutral dot -- neither
+        the old green nor an alarming red."""
+        self.dot.setStyleSheet(f"color:{COLORS['text_dim']};font-size:10px;background:transparent;")
+        self.model_lbl.setText(msg)
+
     @staticmethod
     def _fmt_tokens(count: int) -> str:
         count = max(0, int(count or 0))
@@ -617,6 +624,9 @@ class LuminaWindow(QMainWindow):
         self.settings_panel = SettingsPanel(self.agent, COLORS)
         self.settings_panel.setVisible(False)
         self.settings_panel.persona_applied.connect(self._on_persona_applied)
+        self.settings_panel.backend_connection_changed.connect(
+            self._on_backend_connection_changed
+        )
 
         self.review_panel = ReviewPanel(self.agent, COLORS)
         self.review_panel.setVisible(False)
@@ -1008,13 +1018,27 @@ class LuminaWindow(QMainWindow):
             else "Settings"
         )
 
+    def _on_backend_connection_changed(self):
+        """UI-TRUST-01B: Settings live-applied a backend/model change.
+        Invalidate the previously displayed state immediately, then
+        re-report truth from the live agent object -- never from whatever
+        Settings merely has typed into its fields."""
+        self.status_bar.set_checking()
+        self._check_connection()
+
     def _check_connection(self):
+        """Display the live agent's actual backend health truthfully:
+        green only for a passing check, red with the real reason on
+        failure -- never a stale previous provider/model."""
         try:
-            result = self.agent.test_connection()
-            model = result.replace("Connected — model: ", "")
-            self.status_bar.set_connected(model)
+            ok, msg = self.agent.llm.health_check()
         except Exception:
             self.status_bar.set_error("No backend connected — go to Settings to configure")
+            return
+        if ok:
+            self.status_bar.set_connected(msg.replace("Connected — model: ", ""))
+        else:
+            self.status_bar.set_error(msg)
 
     def _tracked_operator_task_ids(self):
         """Union model-dispatched tasks with UI-only /btw sidequests."""
