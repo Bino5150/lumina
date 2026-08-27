@@ -92,6 +92,7 @@ class OllamaBackend(BaseLLMBackend):
         effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
         self.apply_reasoning(payload, effective_effort, model=model)
 
+        resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
             resp = requests.post(
                 f"{self.base_url}/chat/completions",
@@ -107,7 +108,11 @@ class OllamaBackend(BaseLLMBackend):
         except requests.exceptions.HTTPError as e:
             # Bounded -- was an unbounded raw-body print, same hygiene gap
             # anthropic_backend.py's equivalent had before this pass.
-            print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
+            # BACKEND-ERROR-01: an HTTPError that escaped the transport call
+            # itself (custom adapter/hook/test double) has no response to
+            # print -- str(e) below still carries the original failure.
+            if resp is not None:
+                print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
             raise RuntimeError(f"Ollama HTTP error: {e}")
 
     def chat_stream(self, messages: list, max_tokens: int = 1024,
@@ -124,6 +129,7 @@ class OllamaBackend(BaseLLMBackend):
         # See chat()'s comment above -- always a no-op today (no disable_thinking
         # on this signature, matching the abstract contract, so no precedence guard needed).
         self.apply_reasoning(payload, reasoning_effort, model=model)
+        resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
             resp = requests.post(
                 f"{self.base_url}/chat/completions",
@@ -148,7 +154,8 @@ class OllamaBackend(BaseLLMBackend):
             # No quota/billing concept for a local backend, so unlike the two
             # cloud backends this stays unclassified, matching chat()'s own
             # existing style here.
-            print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
+            if resp is not None:
+                print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
             raise RuntimeError(f"Ollama HTTP error: {e}")
 
         buffer = ""

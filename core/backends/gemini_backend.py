@@ -587,6 +587,7 @@ class GeminiBackend(BaseLLMBackend):
         effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
         self.apply_reasoning(payload, effective_effort, model=self.default_model)
         url = f"{API_ROOT}/models/{self.default_model}:generateContent"
+        resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
             resp = requests.post(url, headers=self.headers, json=payload, timeout=self.timeout)
             resp.raise_for_status()
@@ -601,6 +602,12 @@ class GeminiBackend(BaseLLMBackend):
             # visible) -- then classify off the full redacted body so a
             # quota/rate-limit/auth message longer than the 500-char log
             # preview still gets read correctly.
+            if resp is None:
+                # HTTPError escaped the transport call itself (custom adapter,
+                # session hook, or strict-provider test double) — never
+                # dereference an unbound response; diagnose from the
+                # exception, which stays preserved as __context__.
+                raise RuntimeError(format_gemini_error(None, "", str(e)))
             redacted = _redact_thought_signatures(resp.text)
             print(f"[HTTP ERROR BODY] model={self.default_model} status={resp.status_code} body={redacted[:500]}", flush=True)
             raise RuntimeError(format_gemini_error(resp.status_code, redacted, str(e)))
@@ -679,6 +686,7 @@ class GeminiBackend(BaseLLMBackend):
         self.apply_reasoning(payload, reasoning_effort, model=self.default_model)
         url = f"{API_ROOT}/models/{self.default_model}:streamGenerateContent"
 
+        resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
             resp = requests.post(
                 url,
@@ -705,6 +713,10 @@ class GeminiBackend(BaseLLMBackend):
             # that path entirely and fell through to a cruder top-level
             # handler instead. Same shape as chat()'s handling, just also
             # applied here.
+            if resp is None:
+                # See chat(): HTTPError from the transport call itself must
+                # never dereference an unbound response.
+                raise RuntimeError(format_gemini_error(None, "", str(e)))
             redacted = _redact_thought_signatures(resp.text)
             print(f"[HTTP ERROR BODY] model={self.default_model} status={resp.status_code} body={redacted[:500]}", flush=True)
             raise RuntimeError(format_gemini_error(resp.status_code, redacted, str(e)))

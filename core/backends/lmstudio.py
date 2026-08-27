@@ -293,6 +293,7 @@ class LMStudioBackend(BaseLLMBackend):
             self._apply_disable_thinking(payload)
 
         base_url = validate_base_url(self.base_url, self.display_name)
+        resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
             resp = requests.post(
                 join_endpoint(base_url, "chat/completions"),
@@ -306,6 +307,12 @@ class LMStudioBackend(BaseLLMBackend):
         except requests.exceptions.Timeout:
             raise TimeoutError(f"{self.display_name} request timed out.")
         except requests.exceptions.HTTPError as e:
+            if resp is None:
+                # HTTPError escaped the transport call itself (custom adapter,
+                # session hook, or strict-provider test double) — never
+                # dereference an unbound response; diagnose from the
+                # exception, which stays preserved as __context__.
+                raise RuntimeError(format_provider_error(self.display_name, None, "", str(e)))
             print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
             raise RuntimeError(format_provider_error(self.display_name, resp.status_code, resp.text, str(e)))
 
@@ -324,6 +331,7 @@ class LMStudioBackend(BaseLLMBackend):
         # reasoning_effort straight through, no precedence guard needed.
         self.apply_reasoning(payload, reasoning_effort, model=model)
         base_url = validate_base_url(self.base_url, self.display_name)
+        resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
             resp = requests.post(
                 join_endpoint(base_url, "chat/completions"),
@@ -337,6 +345,10 @@ class LMStudioBackend(BaseLLMBackend):
         except requests.exceptions.Timeout:
             raise TimeoutError(f"{self.display_name} request timed out.")
         except requests.exceptions.HTTPError as e:
+            if resp is None:
+                # See chat(): HTTPError from the transport call itself must
+                # never dereference an unbound response.
+                raise RuntimeError(format_provider_error(self.display_name, None, "", str(e)))
             raise RuntimeError(format_provider_error(self.display_name, resp.status_code, resp.text, str(e)))
 
         buffer = ""
