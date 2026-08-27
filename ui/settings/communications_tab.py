@@ -194,8 +194,12 @@ class CommunicationsTab(QWidget):
         return value used to be discarded outright; now it's read, but every
         step that used to run unconditionally still runs unconditionally."""
         chat_id = self.tg_chat_id.text().strip()
-        self._prefs["telegram_owner_chat_id"] = chat_id
-        prefs_ok = persistence.save(self._prefs)
+        # PREFS-STALE-WRITE-01: publish only the owned key via a fresh-load
+        # transaction — this tab's startup-era snapshot must never republish
+        # whole (it used to restore revoked Telegram bindings and revert
+        # unrelated settings).
+        self._prefs["telegram_owner_chat_id"] = chat_id  # read-cache only
+        prefs_ok = persistence.update({"telegram_owner_chat_id": chat_id})
         config.TELEGRAM_OWNER_CHAT_ID = chat_id or None
         token = self.tg_token.text().strip()
         secret_error = None
@@ -347,8 +351,8 @@ class CommunicationsTab(QWidget):
 
     # ── Public bio autosave ──
     def _autosave_public_bio(self):
-        self._prefs["human_bio_public"] = self.public_bio.toPlainText().strip()
-        persistence.save(self._prefs)
+        self._prefs["human_bio_public"] = self.public_bio.toPlainText().strip()  # read-cache only
+        persistence.update({"human_bio_public": self._prefs["human_bio_public"]})
 
 
 def get_secret_safe(key: str):

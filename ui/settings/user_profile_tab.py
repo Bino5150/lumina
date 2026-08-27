@@ -116,8 +116,8 @@ class UserProfileTab(QWidget):
             self, f"Select {name} Avatar", "", "Images (*.png *.jpg *.jpeg *.webp)"
         )
         if path:
-            self._prefs[key] = path
-            persistence.save(self._prefs)
+            self._prefs[key] = path  # read-cache only — PREFS-STALE-WRITE-01
+            persistence.update({key: path})
             pix = make_round_pixmap(path, 100)
             btn.setIcon(QIcon(pix))
             btn.setIconSize(pix.size())
@@ -133,9 +133,14 @@ class UserProfileTab(QWidget):
         # attempted -- a failure here does not roll that back, so the
         # failure message must not imply nothing changed.
         config.USER_NAME = self.user_name.text().strip() or config.USER_NAME
-        self._prefs["user_name"] = config.USER_NAME
-        self._prefs["human_bio"] = self.human_bio.toPlainText().strip()
-        if persistence.save(self._prefs):
+        updates = {
+            "user_name": config.USER_NAME,
+            "human_bio": self.human_bio.toPlainText().strip(),
+        }
+        # PREFS-STALE-WRITE-01: publish only the keys this tab owns via a
+        # fresh-load transaction; never the startup-era whole snapshot.
+        self._prefs.update(updates)  # read-cache only
+        if persistence.update(updates):
             self._save_feedback.success("✓ Saved")
             self.save_status_lbl.setText("")
         else:
@@ -146,12 +151,12 @@ class UserProfileTab(QWidget):
             )
 
     def _autosave_bio(self):
-        self._prefs["human_bio"] = self.human_bio.toPlainText().strip()
-        persistence.save(self._prefs)
+        self._prefs["human_bio"] = self.human_bio.toPlainText().strip()  # read-cache only
+        persistence.update({"human_bio": self._prefs["human_bio"]})
 
     def _autosave_curated_profile(self):
-        self._prefs["human_profile_curated"] = self.human_profile_curated.toPlainText().strip()
-        persistence.save(self._prefs)
+        self._prefs["human_profile_curated"] = self.human_profile_curated.toPlainText().strip()  # read-cache only
+        persistence.update({"human_profile_curated": self._prefs["human_profile_curated"]})
 
     def _on_curation_toggled(self, checked: bool):
         """HUMAN_PROFILE_CURATION_ENABLED -- same live-apply pattern as

@@ -58,3 +58,22 @@ def set(key: str, value):
     prefs = load()
     prefs[key] = value
     save(prefs)
+
+def update(mapping: dict) -> bool:
+    """PREFS-STALE-WRITE-01 repair primitive: fresh-load -> mutate owned keys
+    -> atomic save, in ONE disk transaction.
+
+    Invariant: no long-lived component may publish an authoritative
+    whole-document prefs snapshot it loaded at an earlier time (MainWindow
+    and the settings tabs used to hold startup-era self._prefs and republish
+    it on New Chat / chat switch / persona switch / avatar change / My Human
+    autosaves, silently reverting backend, model, per-backend context,
+    disabled_tools, Telegram owner binding, and curated-profile state
+    written after their snapshot was taken). The load() inside this function
+    is the only authoritative read, so keys written by other components
+    after the caller's snapshot can never be reverted. Callers may keep a
+    local prefs dict as a READ cache, but must never persistence.save() it
+    whole. Returns True on success (save()'s convention)."""
+    prefs = load()
+    prefs.update(mapping)
+    return save(prefs)

@@ -797,14 +797,17 @@ class LuminaWindow(QMainWindow):
         """)
 
     def _apply_user_avatar(self, path: str):
+        # PREFS-STALE-WRITE-01: self._prefs is a startup-era READ cache.
+        # Never publish it whole — fresh-load, mutate the owned key, atomic
+        # save, or unrelated newer settings get reverted.
         self._prefs["user_avatar_path"] = path
-        persistence.save(self._prefs)
+        persistence.update({"user_avatar_path": path})
         self.chat_widget.user_avatar_path = path
     def _pick_avatar(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Lumina Avatar", "", "Images (*.png *.jpg *.jpeg *.webp)")
         if path:
-            self._prefs["avatar_path"] = path
-            persistence.save(self._prefs)
+            self._prefs["avatar_path"] = path  # read-cache only
+            persistence.update({"avatar_path": path})
             self._apply_avatar(path)
 
     def _build_header(self):
@@ -851,8 +854,8 @@ class LuminaWindow(QMainWindow):
 
     def _new_chat(self):
         self._current_chat_id = create_chat()
-        self._prefs["last_chat_id"] = self._current_chat_id
-        persistence.save(self._prefs)
+        self._prefs["last_chat_id"] = self._current_chat_id  # read-cache only
+        persistence.update({"last_chat_id": self._current_chat_id})
         self.agent.ctx.clear()
         # Re-apply active persona so new chat inherits identity
         path = self.persona_combo.currentData()
@@ -869,8 +872,8 @@ class LuminaWindow(QMainWindow):
 
     def _load_chat(self, chat_id: int):
         self._current_chat_id = chat_id
-        self._prefs["last_chat_id"] = chat_id
-        persistence.save(self._prefs)
+        self._prefs["last_chat_id"] = chat_id  # read-cache only
+        persistence.update({"last_chat_id": chat_id})
         self.agent.ctx.clear()
         self.chat_widget.clear_messages()
         msgs = load_chat_messages(chat_id)
@@ -913,8 +916,8 @@ class LuminaWindow(QMainWindow):
         print(f"[PERSONA] combo selected idx={idx} path={self.persona_combo.itemData(idx)}", flush=True)
         path = self.persona_combo.itemData(idx)
         if path:
-            self._prefs["last_persona"] = path
-            persistence.save(self._prefs)
+            self._prefs["last_persona"] = path  # read-cache only
+            persistence.update({"last_persona": path})
             self._load_persona_from_file(path)
         else:
             self.agent.clear_persona_speech_suppression()
