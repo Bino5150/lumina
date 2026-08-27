@@ -30,9 +30,26 @@ import types
 
 import pytest
 
-import core.dreaming as dreaming
-import ui.main_window as main_window
-from ui.main_window import LuminaWindow
+import core.dreaming as dreaming  # Qt-free — the core sweep logic runs anywhere
+
+# F-13 CI contract (see .github/workflows/tests.yml): the backend-logic
+# suite deliberately does NOT install PySide6, so Qt-dependent tests must
+# skip, never hard-fail collection (same contract as the module-level
+# importorskip guards in the older UI test files and the function-level
+# guard in test_utility_runtime_01.py). Narrowest guard here: only the 13
+# tests that drive LuminaWindow lifecycle methods are marked — the
+# core-Dream structured-outcome test stays runnable on CI.
+try:
+    import ui.main_window as main_window
+    from ui.main_window import LuminaWindow
+except ModuleNotFoundError:  # PySide6 absent (F-13 CI backend-logic suite)
+    main_window = None
+    LuminaWindow = None
+
+_qt = pytest.mark.skipif(
+    LuminaWindow is None,
+    reason="PySide6 not installed (F-13 CI runs the backend-logic suite without Qt)",
+)
 
 # Captured BEFORE any test patches threading.Thread — the fake uses this
 # to spawn real threads for the concurrency test.
@@ -165,6 +182,7 @@ def sweep_env(monkeypatch):
 
 # ── A. ineligible first idle check must not consume the window ──────────
 
+@_qt
 def test_ineligible_sweep_does_not_consume_idle_window(monkeypatch, sweep_env):
     """THE defect: an under-threshold probe returns ineligible, and the
     window must remain admit-able — the next tick re-admits. Pre-repair
@@ -188,6 +206,7 @@ def test_ineligible_sweep_does_not_consume_idle_window(monkeypatch, sweep_env):
 
 # ── B. later eligibility in the same window admitted exactly once ───────
 
+@_qt
 def test_later_eligibility_same_window_admitted_exactly_once(monkeypatch, sweep_env):
     """Eligibility CAN change mid-window (here: Dream enabled at runtime via
     Settings). First tick ineligible, second tick eligible -> admitted, and
@@ -213,6 +232,7 @@ def test_later_eligibility_same_window_admitted_exactly_once(monkeypatch, sweep_
 
 # ── C. successful sweep: one worker, write, watermark, consumed ─────────
 
+@_qt
 def test_successful_sweep_sets_consumed_and_advances_watermark(monkeypatch, sweep_env):
     RecordingThread, created = make_thread_factory(run_real=False)
     monkeypatch.setattr(threading, "Thread", RecordingThread)
@@ -232,6 +252,7 @@ def test_successful_sweep_sets_consumed_and_advances_watermark(monkeypatch, swee
 
 # ── D. utility failure: no watermark, lifecycle recovers ────────────────
 
+@_qt
 def test_utility_failure_no_watermark_and_retry_admitted(monkeypatch, sweep_env):
     sweep_env.backend.raises = True  # complete_utility -> None
     RecordingThread, created = make_thread_factory(run_real=False)
@@ -250,6 +271,7 @@ def test_utility_failure_no_watermark_and_retry_admitted(monkeypatch, sweep_env)
 
 # ── E. palace failure: no false completion/watermark, recoverable ───────
 
+@_qt
 def test_palace_failure_no_false_completion(monkeypatch, sweep_env):
     def exploding_palace(**kw):
         raise RuntimeError("palace db locked")
@@ -269,6 +291,7 @@ def test_palace_failure_no_false_completion(monkeypatch, sweep_env):
 
 # ── F. concurrent timer ticks: exactly one worker ───────────────────────
 
+@_qt
 def test_concurrent_timer_ticks_launch_exactly_one_worker(monkeypatch, sweep_env):
     """Real-thread + Event barrier: while sweep one is in flight, tick B
     must not launch a second worker. Deterministic — no sleeps."""
@@ -298,6 +321,7 @@ def test_concurrent_timer_ticks_launch_exactly_one_worker(monkeypatch, sweep_env
 
 # ── G. user-turn reset clears only window-scoped state ──────────────────
 
+@_qt
 def test_user_turn_reset_clears_only_window_scoped_state():
     """The turn-start reset clears idle-window admission state; an in-flight
     sweep worker's single-flight flag must survive the turn boundary until
@@ -308,6 +332,7 @@ def test_user_turn_reset_clears_only_window_scoped_state():
     assert w._dream_sweep_in_flight is True  # worker-scoped: untouched
 
 
+@_qt
 def test_fresh_window_starts_with_clean_lifecycle_state():
     """Both lifecycle flags initialize False on window construction."""
     import inspect
@@ -318,6 +343,7 @@ def test_fresh_window_starts_with_clean_lifecycle_state():
 
 # ── H. emergency cancel: no stuck lifecycle state ───────────────────────
 
+@_qt
 def test_emergency_cancel_leaves_no_stuck_state(monkeypatch, sweep_env):
     """Epoch latched before admission -> sweep cancelled. Lifecycle must
     stay recoverable: in-flight cleared, window not consumed, next tick
@@ -345,6 +371,7 @@ def test_emergency_cancel_leaves_no_stuck_state(monkeypatch, sweep_env):
 
 # ── I. curation composition ─────────────────────────────────────────────
 
+@_qt
 def test_curation_runs_exactly_once_after_palace_on_success(monkeypatch, sweep_env):
     monkeypatch.setattr(dreaming.config, "HUMAN_PROFILE_CURATION_ENABLED", True)
     RecordingThread, created = make_thread_factory(run_real=False)
@@ -358,6 +385,7 @@ def test_curation_runs_exactly_once_after_palace_on_success(monkeypatch, sweep_e
     assert 42 in dreaming._last_dream_sweep            # watermark after both
 
 
+@_qt
 def test_curation_never_runs_without_valid_dream_cycle(monkeypatch, sweep_env):
     """Ineligible and failed sweeps must not reach curation."""
     monkeypatch.setattr(dreaming.config, "HUMAN_PROFILE_CURATION_ENABLED", True)
@@ -380,6 +408,7 @@ def test_curation_never_runs_without_valid_dream_cycle(monkeypatch, sweep_env):
 
 # ── UTILITY-RUNTIME-01 integration controls ─────────────────────────────
 
+@_qt
 def test_dream_sweep_reaches_complete_utility_provider_neutral_route(monkeypatch, sweep_env):
     """The sweep must reach the provider-neutral utility contract
     (run_summarization_call -> complete_utility), never a bypass."""
@@ -393,6 +422,7 @@ def test_dream_sweep_reaches_complete_utility_provider_neutral_route(monkeypatch
     assert sweep_env.backend.calls[0]["prefill"] == "SUMMARY:"
 
 
+@_qt
 def test_early_gates_consume_nothing(monkeypatch, sweep_env):
     """Worker-busy and below-idle-threshold ticks must not spawn, consume,
     or touch any lifecycle state (preserves the documented gate-3/4
