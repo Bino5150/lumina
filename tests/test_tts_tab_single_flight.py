@@ -157,6 +157,7 @@ def test_r3_repeated_save_does_not_queue_a_second_reload_or_repeat_persistence(
     monkeypatch.setattr(persistence, "save", spy_save)
 
     tab = _make_tab(monkeypatch, agent_tts=_FakeTTSBackend())
+    tab.tts_backend_combo.setCurrentText("voicebox")
 
     tab._save()
     assert not tab.test_btn.isEnabled()
@@ -209,6 +210,7 @@ def test_r5_test_blocked_while_save_in_flight(qapp, monkeypatch, _config_snapsho
     monkeypatch.setattr(persistence, "save", lambda prefs: True)
 
     tab = _make_tab(monkeypatch, agent_tts=_FakeTTSBackend())
+    tab.tts_backend_combo.setCurrentText("voicebox")
 
     tab._save()
     assert entered.wait(timeout=5)
@@ -276,6 +278,7 @@ def test_r7_save_swap_failure_after_persistence_reports_truthfully(
     monkeypatch.setattr(loader_module, "get_tts_backend", failing_loader)
 
     tab = _make_tab(monkeypatch, agent_tts=_FakeTTSBackend())
+    tab.tts_backend_combo.setCurrentText("voicebox")
     tab._save()
 
     assert _pump_until(lambda: tab.test_btn.isEnabled() and tab.save_btn.isEnabled())
@@ -290,7 +293,7 @@ def test_r7_save_swap_failure_after_persistence_reports_truthfully(
     with open(persistence.PREFS_PATH) as f:
         import json
         saved = json.load(f)
-    assert saved["tts_backend"] == "kokoro"
+    assert saved["tts_backend"] == "voicebox"
 
 
 # ── R8: Persistence failure BEFORE worker launch ────────────────────────
@@ -424,6 +427,7 @@ def test_r11_stale_test_reset_does_not_overwrite_in_flight_save(
     # Operation B: Save, accepted and held before A's 30ms timer can fire.
     hold_fn, entered, release, hold_state = _make_holding_loader()
     monkeypatch.setattr(loader_module, "get_tts_backend", hold_fn)
+    tab.tts_backend_combo.setCurrentText("voicebox")
 
     tab._save()
     assert entered.wait(timeout=5), "Save never reached the loader"
@@ -468,6 +472,7 @@ def test_r11_stale_save_reset_does_not_overwrite_in_flight_test(
     )
 
     tab = _make_tab(monkeypatch, agent_tts=_FakeTTSBackend())
+    tab.tts_backend_combo.setCurrentText("voicebox")
 
     # Operation A: Save (agent.tts truthy -> async swap path, but the loader
     # is fast/non-holding here), completes immediately and schedules its own

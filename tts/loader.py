@@ -28,6 +28,64 @@ _backend_instance = None
 # assigned, never something in between.
 _backend_lock = threading.RLock()
 
+
+def _dispose_backend(backend):
+    """Best-effort teardown for one detached backend.
+
+    Every concrete backend has stop() directly or through BaseTTSBackend.
+    Chatterbox additionally owns an asynchronous model load and possibly a
+    CUDA model; preserve the loader's existing replacement cleanup for both
+    explicit unload and force-reload.
+    """
+    if backend is None:
+        return
+
+    set_enabled = getattr(backend, "set_enabled", None)
+    try:
+        if callable(set_enabled):
+            set_enabled(False)
+        elif hasattr(backend, "enabled"):
+            backend.enabled = False
+    except Exception as exc:
+        print(f"[TTS] Failed to disable detached backend: {exc}", file=sys.stderr)
+
+    stop = getattr(backend, "stop", None)
+    if callable(stop):
+        try:
+            stop()
+        except Exception as exc:
+            print(f"[TTS] Failed to stop detached backend: {exc}", file=sys.stderr)
+
+    load_thread = getattr(backend, "_load_thread", None)
+    if load_thread is not None and load_thread.is_alive():
+        print("[TTS] Waiting for backend model load before release...", file=sys.stderr)
+        load_thread.join()
+
+    model = getattr(backend, "_model", None)
+    if model is not None and getattr(model, "device", None) == "cuda":
+        backend._model = None
+        import torch
+        torch.cuda.empty_cache()
+
+
+def unload_tts_backend(backend=None) -> bool:
+    """Stop/release a backend and clear the loader singleton when applicable.
+
+    Passing None unloads the current singleton. Passing an explicitly detached
+    agent backend also supports shutdown/tests where it is not the singleton.
+    Returns whether a backend existed to release.
+    """
+    global _backend_instance
+    with _backend_lock:
+        target = backend if backend is not None else _backend_instance
+        if target is None:
+            return False
+        if target is _backend_instance:
+            _backend_instance = None
+        _dispose_backend(target)
+        return True
+
+
 def get_tts_backend(force_reload: bool = False):
     global _backend_instance
     with _backend_lock:
@@ -35,28 +93,9 @@ def get_tts_backend(force_reload: bool = False):
             return _backend_instance
 
         if force_reload and _backend_instance is not None:
-            # If the backend being replaced has its own in-flight load thread
-            # (e.g. ChatterboxBridge loading a model onto the GPU), wait it
-            # out before starting a new one -- two concurrent loads racing
-            # for the same GPU is what actually OOMs. This protects every
-            # force_reload caller, not just Settings' Apply/Save sequence.
-            old_thread = getattr(_backend_instance, "_load_thread", None)
-            if old_thread is not None and old_thread.is_alive():
-                print("[TTS] Waiting for previous backend's load to finish before replacing it...",
-                      file=sys.stderr)
-                old_thread.join()
-
-            # Only now -- after the old load has settled, one way or the other --
-            # do we know whether it actually finished (GPU-resident, needs
-            # freeing) or failed (nothing to free). Checking before the join
-            # above is useless: the old model doesn't exist yet at that point.
-            old_model = getattr(_backend_instance, "_model", None)
-            if old_model is not None and getattr(old_model, "device", None) == "cuda":
-                # Set to None rather than del -- callers like ChatterboxBridge.test()
-                # do `self._model is not None` and expect the attribute to exist.
-                _backend_instance._model = None
-                import torch
-                torch.cuda.empty_cache()
+            old_backend = _backend_instance
+            _backend_instance = None
+            _dispose_backend(old_backend)
 
         backend_name = getattr(config, "TTS_BACKEND", "kokoro").lower().strip()
 

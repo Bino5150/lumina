@@ -59,8 +59,41 @@ class TTSTab(QWidget):
     def _leave_busy(self):
         with self._op_lock:
             self._busy = False
-        self.test_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
+        self._sync_tts_test_enabled()
+
+    def _sync_tts_test_enabled(self):
+        if hasattr(self, "test_btn"):
+            self.test_btn.setEnabled(
+                not self._busy
+                and bool(getattr(config, "TTS_ENABLED", True))
+                and self.enabled_cb.isChecked()
+            )
+
+    def _attach_backend(self, backend):
+        attach = getattr(self.agent, "attach_tts_backend", None)
+        if callable(attach):
+            attach(backend)
+        else:
+            self.agent.tts = backend
+
+    @staticmethod
+    def _apply_live_backend_config(backend):
+        if backend is None:
+            return
+        set_enabled = getattr(backend, "set_enabled", None)
+        if callable(set_enabled):
+            set_enabled(True)
+        elif hasattr(backend, "enabled"):
+            backend.enabled = True
+
+        backend_name = getattr(config, "TTS_BACKEND", "kokoro")
+        if backend_name == "voicebox" and hasattr(backend, "host"):
+            backend.host = config.VOICEBOX_HOST
+        elif backend_name != "elevenlabs" and hasattr(backend, "host"):
+            backend.host = config.TTS_HOST
+        if backend_name == "elevenlabs" and hasattr(backend, "api_key"):
+            backend.api_key = config.ELEVENLABS_API_KEY
 
     def _schedule_feedback_reset(self, fn):
         """Delay-run fn() after _RESULT_HOLD_MS, but only if no newer
@@ -186,6 +219,8 @@ class TTSTab(QWidget):
         btn_row.addStretch()
         btn_row.addWidget(self.save_btn)
         layout.addLayout(btn_row)
+        self.enabled_cb.toggled.connect(self._sync_tts_test_enabled)
+        self._sync_tts_test_enabled()
 
         self.status_lbl = QLabel("")
         self.status_lbl.setStyleSheet(f"color:{self.c['text_muted']};font-size:11px;background:transparent;")
@@ -227,6 +262,10 @@ class TTSTab(QWidget):
 
 
     def _test_tts(self):
+        if not config.TTS_ENABLED or not self.enabled_cb.isChecked():
+            self.status_lbl.setText("Enable and save TTS before testing the backend.")
+            self._sync_tts_test_enabled()
+            return
         if not self._try_enter_busy():
             return
         self.test_btn.setEnabled(False)
@@ -255,7 +294,8 @@ class TTSTab(QWidget):
             try:
                 from tts.loader import get_tts_backend
                 bridge = get_tts_backend(force_reload=True)
-                bridge.enabled = True
+                self._apply_live_backend_config(bridge)
+                self._attach_backend(bridge)
                 if bridge.test():
                     bridge.speak("Lumina TTS test successful.", blocking=False)
                     self._tts_test_result.emit(True, "✓ TTS server reachable — playing test audio.")
@@ -280,12 +320,16 @@ class TTSTab(QWidget):
         self.save_btn.setText("Saving…")
         self.status_lbl.setText("Saving…")
 
+        was_tts_enabled = bool(getattr(config, "TTS_ENABLED", True))
+        previous_tts_backend = getattr(config, "TTS_BACKEND", "kokoro")
         config.TTS_ENABLED = self.enabled_cb.isChecked()
         config.TTS_BACKEND = self.tts_backend_combo.currentText()
         # ElevenLabs is cloud-only -- the URL field doesn't apply to it and
         # must not stomp TTS_HOST with an empty string, same corruption
         # class VOICEBOX_HOST already guards against elsewhere in this tab.
-        if config.TTS_BACKEND != "elevenlabs":
+        if config.TTS_BACKEND == "voicebox":
+            config.VOICEBOX_HOST = self.url.text().strip()
+        elif config.TTS_BACKEND != "elevenlabs":
             config.TTS_HOST = self.url.text().strip()
         # Tracked so the failure message below can be truthful: this write
         # lands in a separate durable file (core/secrets.py, deliberately
@@ -336,25 +380,50 @@ class TTSTab(QWidget):
             self._leave_busy()
             return
 
-        if self.agent.tts:
-            self.agent.tts.enabled = config.TTS_ENABLED
+        if not config.TTS_ENABLED:
+            # Detach first: future response/replay speech is suppressed before
+            # any potentially blocking backend cleanup begins.
+            old_backend = self.agent.tts
+            self.agent.tts = None
 
-            def worker():
+            def disable_worker():
+                try:
+                    from tts.loader import unload_tts_backend
+                    unload_tts_backend(old_backend)
+                    self._tts_swap_done.emit(True, "Settings saved; TTS disabled.")
+                except Exception as e:
+                    self._tts_swap_done.emit(False, f"Settings saved; TTS cleanup failed: {e}")
+
+            self.status_lbl.setText("Settings saved (finishing TTS shutdown...)")
+            threading.Thread(target=disable_worker, daemon=True).start()
+            return
+
+        backend_changed = previous_tts_backend != config.TTS_BACKEND
+        needs_backend = self.agent.tts is None
+        if needs_backend or backend_changed:
+            if backend_changed:
+                # The loader will dispose the old singleton during reload; do
+                # not leave the agent pointing at that detached instance.
+                self.agent.tts = None
+
+            def enable_worker():
                 # Settings are already persisted at this point -- a failure
                 # here is a hot-swap failure, not a "nothing was saved"
-                # failure (case B), and must say so rather than stranding
-                # the controls in "Saving..." with no exception handling
-                # around force_reload, as the old worker did.
+                # failure (case B).
                 try:
                     from tts.loader import get_tts_backend
-                    self.agent.tts = get_tts_backend(force_reload=True)
-                    self._tts_swap_done.emit(True, "Settings saved.")
+                    bridge = get_tts_backend(force_reload=backend_changed)
+                    self._apply_live_backend_config(bridge)
+                    self._attach_backend(bridge)
+                    self._tts_swap_done.emit(True, "Settings saved; TTS enabled.")
                 except Exception as e:
                     self._tts_swap_done.emit(False, f"Settings saved; TTS backend swap failed: {e}")
 
-            self.status_lbl.setText("Settings saved (finishing TTS backend swap...)")
-            threading.Thread(target=worker, daemon=True).start()
+            action = "load" if not was_tts_enabled or needs_backend else "swap"
+            self.status_lbl.setText(f"Settings saved (finishing TTS backend {action}...)")
+            threading.Thread(target=enable_worker, daemon=True).start()
         else:
+            self._apply_live_backend_config(self.agent.tts)
             self.save_btn.setText("✓ Saved")
             self.status_lbl.setText("Settings saved.")
             self._schedule_feedback_reset(lambda: self.save_btn.setText("Save Settings"))

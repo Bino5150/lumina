@@ -171,9 +171,10 @@ def run_gui():
             break
 
     # Create agent — wire tool calls to UI later via signals
-    from tts.loader import get_tts_backend
+    import importlib
+    tts_loader = importlib.import_module("tts.loader")
     from stt.whisper_bridge import WhisperBridge
-    tts = get_tts_backend()
+    tts = tts_loader.get_tts_backend() if config.TTS_ENABLED else None
     # FE-16: this used to hardcode base/cpu regardless of what the Settings
     # tab persisted (STT_MODEL/STT_DEVICE), and never checked STT_ENABLED.
     stt = WhisperBridge(model_size=config.STT_MODEL, device=config.STT_DEVICE) if config.STT_ENABLED else None
@@ -193,7 +194,12 @@ def run_gui():
     finally:
         # Canonical GUI lifecycle boundary: runs on normal event-loop return
         # and on adjacent GUI cleanup/event-loop exceptions alike.
-        process_manager.shutdown_all()
+        backend = getattr(agent, "tts", None)
+        setattr(agent, "tts", None)
+        try:
+            tts_loader.unload_tts_backend(backend)
+        finally:
+            process_manager.shutdown_all()
     sys.exit(exit_code)
 
 

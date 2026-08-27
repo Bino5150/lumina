@@ -666,6 +666,8 @@ class PersonasTab(QWidget):
     def _fetch_voices(self) -> list:
         fallback = ["af_bella", "af_sarah", "af_nicole", "af_sky",
                     "am_adam", "am_michael", "bf_emma", "bf_isabella", "bf_lily"]
+        if not getattr(config, "TTS_ENABLED", True):
+            return fallback
         try:
             backend = getattr(config, "TTS_BACKEND", "kokoro")
             if backend in ("voicebox", "elevenlabs"):

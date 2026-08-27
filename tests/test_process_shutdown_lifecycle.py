@@ -152,6 +152,7 @@ def _install_fake_gui_modules(monkeypatch, exec_behavior):
     window_module.LuminaWindow = FakeWindow
     tts_module = types.ModuleType("tts.loader")
     tts_module.get_tts_backend = lambda: object()
+    tts_module.unload_tts_backend = lambda backend=None: None
     stt_module = types.ModuleType("stt.whisper_bridge")
     stt_module.WhisperBridge = lambda **kwargs: object()
 

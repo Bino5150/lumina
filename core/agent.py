@@ -793,6 +793,34 @@ class LuminaAgent:
     def clear_persona_speech_suppression(self):
         """Restore ordinary speech when no persona is active."""
         self._persona_speech_suppressed = False
+
+    def _apply_persona_tts_settings(self, persona: dict):
+        """Apply persona audio settings to an already-loaded backend."""
+        if not self.tts:
+            return
+        if "tts_voice" in persona and persona["tts_voice"] is not None:
+            if hasattr(self.tts, 'set_profile'):
+                self.tts.set_profile(persona["tts_voice"])
+            elif hasattr(self.tts, 'set_voice'):
+                self.tts.set_voice(persona["tts_voice"])
+        if "tts_speed" in persona:
+            self.tts.speed = persona["tts_speed"]
+        if "tts_pitch" in persona:
+            self.tts.pitch = persona["tts_pitch"]
+        if "tts_volume" in persona:
+            self.tts.volume = persona["tts_volume"]
+
+    def attach_tts_backend(self, backend):
+        """Attach a globally enabled backend while preserving persona policy."""
+        self.tts = backend
+        persona = getattr(self, "current_persona", None)
+        if persona is not None:
+            self._persona_speech_suppressed = (
+                "tts_voice" in persona and persona["tts_voice"] is None
+            )
+            LuminaAgent._apply_persona_tts_settings(self, persona)
+        else:
+            self._persona_speech_suppressed = False
     
     def apply_persona(self, persona: dict):
         """Hot-swap agent identity from a persona dict."""
@@ -837,18 +865,7 @@ class LuminaAgent:
         self._persona_speech_suppressed = (
             "tts_voice" in persona and persona["tts_voice"] is None
         )
-        if self.tts:
-            if "tts_voice" in persona and persona["tts_voice"] is not None:
-                if hasattr(self.tts, 'set_profile'):
-                    self.tts.set_profile(persona["tts_voice"])
-                elif hasattr(self.tts, 'set_voice'):
-                    self.tts.set_voice(persona["tts_voice"])
-            if "tts_speed" in persona:
-                self.tts.speed = persona["tts_speed"]
-            if "tts_pitch" in persona:
-                self.tts.pitch = persona["tts_pitch"]
-            if "tts_volume" in persona:
-                self.tts.volume = persona["tts_volume"]
+        LuminaAgent._apply_persona_tts_settings(self, persona)
 
         print(f"[PERSONA] Applied: {persona.get('name', 'unknown')}", flush=True)
 
