@@ -77,6 +77,18 @@ class OpenAIBackend(LMStudioBackend):
             return False, "OPENAI_API_KEY not set in config.py"
         return True, f"Configured — {self._model}"
 
+    def _apply_output_token_limit(self, payload: dict, max_tokens: int,
+                                  model: Optional[str] = None) -> None:
+        """Use OpenAI's current Chat Completions output-budget field.
+
+        ``max_completion_tokens`` is the provider-wide replacement for the
+        deprecated ``max_tokens`` field. Keep Lumina's internal argument name
+        provider-neutral and translate only at this backend boundary so every
+        OpenAI chat, utility completion, tool continuation, and final stream
+        gets the same wire contract without changing compatible siblings.
+        """
+        payload["max_completion_tokens"] = max_tokens
+
     # ------------------------------------------------------------------
     # Patch 3A.4 Part 2A -- reasoning-effort capability + wire translation
     # ------------------------------------------------------------------

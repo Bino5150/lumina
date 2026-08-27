@@ -214,6 +214,18 @@ class LMStudioBackend(BaseLLMBackend):
         except Exception as e:
             return False, str(e)
 
+    def _apply_output_token_limit(self, payload: dict, max_tokens: int,
+                                  model: Optional[str] = None) -> None:
+        """Translate Lumina's provider-neutral output budget to the wire.
+
+        OpenAI-compatible servers traditionally accept ``max_tokens``, so
+        that remains the shared-family default. Concrete providers whose
+        native Chat Completions contract uses a different field override
+        this hook without leaking provider rules into LuminaAgent or sibling
+        backends.
+        """
+        payload["max_tokens"] = max_tokens
+
     def chat(self, messages: list, tools: Optional[list] = None,
              temperature: float = 0.7, max_tokens: int = 4096,
              disable_thinking: bool = False,
@@ -223,9 +235,9 @@ class LMStudioBackend(BaseLLMBackend):
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
             "stream": False,
         }
+        self._apply_output_token_limit(payload, max_tokens, model=model)
         has_vision = any(isinstance(m.get("content"), list) for m in messages)
         if tools and not has_vision:
             payload["tools"] = tools
@@ -284,9 +296,9 @@ class LMStudioBackend(BaseLLMBackend):
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
             "stream": True,
         }
+        self._apply_output_token_limit(payload, max_tokens, model=model)
         # No disable_thinking on this signature (never had one) -- forward
         # reasoning_effort straight through, no precedence guard needed.
         self.apply_reasoning(payload, reasoning_effort, model=model)
