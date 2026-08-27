@@ -236,6 +236,10 @@ class LuminaAgent:
         self.on_think_end     = on_think_end     or (lambda: None)
         self.on_response_token = on_response_token or (lambda t: None)
         self.tts = tts
+        # Persona-local speech policy. This stays independent of the
+        # backend/global TTS enabled state so another persona can reuse the
+        # already-loaded backend immediately.
+        self._persona_speech_suppressed = False
         self.persona_avatar = None  # set by apply_persona()
         self.current_persona = None  # set by apply_persona() -- lets Settings recombine the global prompt + persona identity when the global prompt is live-edited
         self._session_tool_calls = 0       # total tool calls this session
@@ -782,9 +786,13 @@ class LuminaAgent:
 
         content = "".join(full_response).strip()
         self.ctx.add_assistant(content)
-        if self.tts and content:
+        if self.tts and content and not getattr(self, "_persona_speech_suppressed", False):
             self.tts.speak(content)
         return content
+
+    def clear_persona_speech_suppression(self):
+        """Restore ordinary speech when no persona is active."""
+        self._persona_speech_suppressed = False
     
     def apply_persona(self, persona: dict):
         """Hot-swap agent identity from a persona dict."""
@@ -823,9 +831,14 @@ class LuminaAgent:
                 owner=self.owner,
             )
 
-        # 4. TTS voice + settings
+        # 4. Persona-local speech policy, then TTS voice + settings. Missing
+        # tts_voice is the legacy voiced behavior; explicit None alone means
+        # silent and must never be forwarded to a backend setter.
+        self._persona_speech_suppressed = (
+            "tts_voice" in persona and persona["tts_voice"] is None
+        )
         if self.tts:
-            if "tts_voice" in persona:
+            if "tts_voice" in persona and persona["tts_voice"] is not None:
                 if hasattr(self.tts, 'set_profile'):
                     self.tts.set_profile(persona["tts_voice"])
                 elif hasattr(self.tts, 'set_voice'):

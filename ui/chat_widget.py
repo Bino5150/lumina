@@ -115,9 +115,11 @@ class ToolRow(QFrame):
 # ── Token Metrics Bar ──────────────────────────────────────────────────────────
 
 class MetricsBar(QFrame):
-    def __init__(self, colors: dict, avatar_path: str = None, tts=None, parent=None):
+    def __init__(self, colors: dict, avatar_path: str = None, tts=None,
+                 tts_speech_allowed=None, parent=None):
         self.avatar_path = avatar_path
         self._tts = tts
+        self._tts_speech_allowed = tts_speech_allowed or (lambda: True)
         self._response_text = ""
         super().__init__(parent)
         self.colors = colors
@@ -145,7 +147,7 @@ class MetricsBar(QFrame):
         self.setStyleSheet("background:transparent;border:none;")
 
     def _replay(self):
-        if self._tts and self._response_text:
+        if self._tts and self._response_text and self._tts_speech_allowed():
             self.replay_btn.setEnabled(False)
             self.replay_btn.setText("⏳")
             self._tts.speak(self._response_text, blocking=False, on_done=self._replay_done)
@@ -183,10 +185,12 @@ class MetricsBar(QFrame):
 # ── Live Response Bubble ───────────────────────────────────────────────────────
 
 class LiveResponseBubble(QFrame):
-    def __init__(self, colors: dict, avatar_path: str = None, agent_name: str = None, tts=None, parent=None):
+    def __init__(self, colors: dict, avatar_path: str = None, agent_name: str = None,
+                 tts=None, tts_speech_allowed=None, parent=None):
         self.avatar_path = avatar_path
         self._agent_name = agent_name or config.AGENT_NAME
         self._tts = tts
+        self._tts_speech_allowed = tts_speech_allowed
         super().__init__(parent)
         self.colors = colors
         self._think_block = None
@@ -247,7 +251,10 @@ class LiveResponseBubble(QFrame):
         self.bubble_layout.addWidget(self.stream_lbl)
 
         # Metrics bar (hidden until finalized)
-        self.metrics = MetricsBar(self.colors, tts=self._tts)
+        self.metrics = MetricsBar(
+            self.colors, tts=self._tts,
+            tts_speech_allowed=self._tts_speech_allowed,
+        )
         self.metrics.setVisible(False)
         self.bubble_layout.addWidget(self.metrics)
 
@@ -443,13 +450,15 @@ class ChatWidget(QWidget):
     audio_preview_cancelled = Signal()
     mic_pressed = Signal()
 
-    def __init__(self, colors: dict, avatar_path: str = None, user_avatar_path: str = None, tts = None, parent=None):
+    def __init__(self, colors: dict, avatar_path: str = None, user_avatar_path: str = None,
+                 tts=None, tts_speech_allowed=None, parent=None):
         super().__init__(parent)
         self.colors = colors
         self.avatar_path = avatar_path
         self._persona_name = config.AGENT_NAME
         self.user_avatar_path = user_avatar_path
         self._tts = tts
+        self._tts_speech_allowed = tts_speech_allowed
         self._preview_frame = None
         self._build()
 
@@ -611,7 +620,8 @@ class ChatWidget(QWidget):
     def create_live_bubble(self) -> LiveResponseBubble:
         bubble = LiveResponseBubble(self.colors, avatar_path=self.avatar_path,
                                     agent_name=getattr(self, '_persona_name', config.AGENT_NAME),
-                                    tts=self._tts)
+                                    tts=self._tts,
+                                    tts_speech_allowed=self._tts_speech_allowed)
         self._insert(bubble)
         return bubble
 

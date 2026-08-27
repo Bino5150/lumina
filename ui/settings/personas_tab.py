@@ -12,6 +12,8 @@ import config
 
 from ._widgets import _sec, _lbl, _te, _le, _btn, _combo, make_round_pixmap, ButtonFeedback
 
+PERSONA_SILENT_LABEL = "None"
+
 
 # ── Tab: Personas ─────────────────────────────────────────────────────────────
 
@@ -360,10 +362,19 @@ class PersonasTab(QWidget):
         self.rp_voice = _combo(c)
         self.rp_voice.setFixedHeight(34)
         voices = self._fetch_voices()
-        self.rp_voice.addItems(voices)
-        current_voice = persona.get("tts_voice", config.TTS_VOICE)
-        if current_voice in voices:
-            self.rp_voice.setCurrentText(current_voice)
+        self.rp_voice.addItem(PERSONA_SILENT_LABEL, None)
+        for voice in voices:
+            self.rp_voice.addItem(voice, voice)
+        if "tts_voice" in persona and persona["tts_voice"] is None:
+            self.rp_voice.setCurrentIndex(0)
+        else:
+            current_voice = persona.get("tts_voice", config.TTS_VOICE)
+            if current_voice in voices:
+                self.rp_voice.setCurrentText(current_voice)
+            elif voices:
+                # Preserve the historical unknown/missing-field fallback to
+                # the first real backend voice, never the None sentinel.
+                self.rp_voice.setCurrentIndex(1)
         voice_col.addWidget(self.rp_voice)
         tts_row.addLayout(voice_col, 2)
 
@@ -424,9 +435,11 @@ class PersonasTab(QWidget):
 
         # TTS test button
         tts_btn_row = QHBoxLayout()
-        test_tts_btn = _btn("▶ Test Voice", c)
-        test_tts_btn.clicked.connect(self._test_tts)
-        tts_btn_row.addWidget(test_tts_btn)
+        self.rp_test_tts_btn = _btn("▶ Test Voice", c)
+        self.rp_test_tts_btn.clicked.connect(self._test_tts)
+        self.rp_voice.currentIndexChanged.connect(self._sync_test_voice_enabled)
+        self._sync_test_voice_enabled()
+        tts_btn_row.addWidget(self.rp_test_tts_btn)
         tts_btn_row.addStretch()
         layout.addLayout(tts_btn_row)
 
@@ -456,11 +469,22 @@ class PersonasTab(QWidget):
         if not hasattr(self, 'rp_voice'):
             return
         voices = self._fetch_voices()
-        current = self.rp_voice.currentText()
+        current = self.rp_voice.currentData()
         self.rp_voice.clear()
-        self.rp_voice.addItems(voices)
+        self.rp_voice.addItem(PERSONA_SILENT_LABEL, None)
+        for voice in voices:
+            self.rp_voice.addItem(voice, voice)
         if current in voices:
             self.rp_voice.setCurrentText(current)
+        elif current is None:
+            self.rp_voice.setCurrentIndex(0)
+        elif voices:
+            self.rp_voice.setCurrentIndex(1)
+        self._sync_test_voice_enabled()
+
+    def _sync_test_voice_enabled(self):
+        if hasattr(self, 'rp_test_tts_btn'):
+            self.rp_test_tts_btn.setEnabled(self.rp_voice.currentData() is not None)
     # ── Actions ───────────────────────────────────────────────────────────────
 
     def _pick_avatar(self):
@@ -496,7 +520,7 @@ class PersonasTab(QWidget):
             "avatar": self._current_persona.get("avatar", ""),
             "system_prompt": self.rp_prompt.toPlainText().strip(),
             "tools_profile": tools_profile_name,
-            "tts_voice": self.rp_voice.currentText(),
+            "tts_voice": self.rp_voice.currentData(),
             "tts_speed": self.rp_speed.value() / 100.0,
             "tts_pitch": self.rp_pitch.value() / 100.0,
             "tts_volume": self.rp_vol.value() / 100.0,
@@ -626,7 +650,9 @@ class PersonasTab(QWidget):
         if not self.agent.tts:
             return
         tts = self.agent.tts
-        voice = self.rp_voice.currentText()
+        voice = self.rp_voice.currentData()
+        if voice is None:
+            return
         # Backend-aware voice assignment
         if hasattr(tts, 'set_profile'):
             tts.set_profile(voice)

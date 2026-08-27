@@ -609,7 +609,10 @@ class LuminaWindow(QMainWindow):
             COLORS,
             avatar_path=self._prefs.get("avatar_path"),
             user_avatar_path=self._prefs.get("user_avatar_path"),
-            tts=self.agent.tts
+            tts=self.agent.tts,
+            tts_speech_allowed=lambda: not getattr(
+                self.agent, "_persona_speech_suppressed", False
+            ),
         )
         self.settings_panel = SettingsPanel(self.agent, COLORS)
         self.settings_panel.setVisible(False)
@@ -902,7 +905,9 @@ class LuminaWindow(QMainWindow):
         if path:
             self._prefs["last_persona"] = path
             persistence.save(self._prefs)
-            self._load_persona_from_file(path)        
+            self._load_persona_from_file(path)
+        else:
+            self.agent.clear_persona_speech_suppression()
 
     def _rename_chat(self):
         if not self._current_chat_id:
