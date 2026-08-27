@@ -214,3 +214,20 @@ class QwenBackend(LMStudioBackend):
             payload["enable_thinking"] = False
         elif effort == "enabled":
             payload["enable_thinking"] = True
+
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """No local thinking-disable wire fields on DashScope's transport.
+
+        UTILITY-RUNTIME-01: LM Studio's local `thinking` /
+        `chat_template_kwargs` fields are not part of DashScope's
+        OpenAI-compatible contract. DashScope DOES have its own native
+        `enable_thinking` control (translated above for conversational
+        requests), but auto-emitting it on utility calls would be new,
+        unverified provider behavior beyond this slice's repair scope --
+        whether a prefilled utility turn against a hybrid-thinking Qwen
+        model needs it is a separate, live-verification question. The
+        conservative contract holds: emit nothing, and
+        complete_utility()'s assistant-prefill plus output-side
+        think-strip remain the anti-bleed defense.
+        """
+        return None

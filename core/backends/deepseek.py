@@ -53,3 +53,16 @@ class DeepSeekBackend(LMStudioBackend):
         if not self.api_key:
             return False, "DEEPSEEK_API_KEY not set in config.py"
         return True, f"Configured — {self._model}"
+
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """No local thinking-disable wire fields on DeepSeek's transport.
+
+        UTILITY-RUNTIME-01: DeepSeek's OpenAI-compatible API does not
+        document LM Studio's local `thinking` / `chat_template_kwargs`
+        fields; utility requests must carry only documented fields.
+        complete_utility()'s assistant-prefill plus its own output-side
+        think-strip remain the anti-bleed defense here. (DeepSeek's own
+        thinking controls are model-selection-driven -- v4-flash vs
+        v4-pro -- not per-request fields.)
+        """
+        return None

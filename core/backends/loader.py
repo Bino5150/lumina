@@ -39,6 +39,21 @@ class CustomBackend(LMStudioBackend):
             "Authorization": f"Bearer {key}" if key else "Bearer lumina",
         }
 
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """No local thinking-disable wire fields on a custom endpoint.
+
+        UTILITY-RUNTIME-01: a custom endpoint's wire contract is unknown --
+        it may be a strict cloud-compatible server that rejects
+        unrecognized arguments, or a local server that accepts them. The
+        safe default for an unverified transport is to emit only standard
+        OpenAI-compatible fields; complete_utility()'s assistant-prefill
+        plus output-side think-strip remain the anti-bleed defense. (A
+        per-endpoint capability declaration so a custom endpoint CAN opt
+        into LM Studio-style fields is future work, not part of this
+        contract repair.)
+        """
+        return None
+
 BACKENDS = {
     "lmstudio":   LMStudioBackend,
     "ollama":     OllamaBackend,

@@ -51,3 +51,15 @@ class OmniRouteBackend(LMStudioBackend):
             return True, f"Connected — {model}"
         except Exception as e:
             return False, f"{e} (is OmniRoute running at {self.base_url}?)"
+
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """No local thinking-disable wire fields through the gateway.
+
+        UTILITY-RUNTIME-01: OmniRoute routes to 200+ upstream providers;
+        LM Studio's local `thinking` / `chat_template_kwargs` fields are
+        not part of its request contract and would leak through to
+        upstreams that reject them. complete_utility()'s assistant-prefill
+        plus its own output-side think-strip remain the anti-bleed defense
+        here.
+        """
+        return None

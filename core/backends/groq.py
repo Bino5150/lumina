@@ -122,3 +122,16 @@ class GroqBackend(LMStudioBackend):
         returns early on None before calling here).
         """
         payload["reasoning_effort"] = effort
+
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """No local thinking-disable wire fields on Groq's transport.
+
+        UTILITY-RUNTIME-01: Groq's OpenAI-compatible API rejects
+        unrecognized arguments; LM Studio's local `thinking` /
+        `chat_template_kwargs` fields are not part of its contract.
+        complete_utility()'s assistant-prefill plus its own output-side
+        think-strip remain the anti-bleed defense here. Groq's reasoning
+        control is reasoning_effort (translated above), a separate
+        conversational mechanism that utility calls never set.
+        """
+        return None

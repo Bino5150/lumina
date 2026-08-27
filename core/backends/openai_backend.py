@@ -89,6 +89,21 @@ class OpenAIBackend(LMStudioBackend):
         """
         payload["max_completion_tokens"] = max_tokens
 
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """No local thinking-disable wire fields on OpenAI's transport.
+
+        UTILITY-RUNTIME-01: OpenAI's Chat Completions API rejects
+        unrecognized arguments outright (HTTP 400), and LM Studio's local
+        `thinking` / `chat_template_kwargs` fields are not part of its
+        contract. complete_utility()'s assistant-prefill plus its own
+        output-side think-strip remain the anti-bleed defense here. This
+        backend otherwise inherits LMStudioBackend.chat() unmodified, so
+        without this boundary override every background utility job
+        (auto-name, dream summarization, My Human curation, compaction)
+        silently died on a 400 that complete_utility() swallowed into None.
+        """
+        return None
+
     # ------------------------------------------------------------------
     # Patch 3A.4 Part 2A -- reasoning-effort capability + wire translation
     # ------------------------------------------------------------------

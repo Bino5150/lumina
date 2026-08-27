@@ -295,6 +295,18 @@ class OpenRouterBackend(LMStudioBackend):
         reasoning = payload.setdefault("reasoning", {})
         reasoning["effort"] = effort
 
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """No local thinking-disable wire fields on OpenRouter's transport.
+
+        UTILITY-RUNTIME-01: OpenRouter forwards requests to hundreds of
+        upstream providers; LM Studio's local `thinking` /
+        `chat_template_kwargs` fields are not part of its documented
+        request contract and at minimum leak through to upstreams that
+        reject them. complete_utility()'s assistant-prefill plus its own
+        output-side think-strip remain the anti-bleed defense here.
+        """
+        return None
+
     def health_check(self) -> tuple[bool, str]:
         if not self.api_key:
             return False, "OPENROUTER_API_KEY not set in config.py"

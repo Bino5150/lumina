@@ -226,6 +226,21 @@ class LMStudioBackend(BaseLLMBackend):
         """
         payload["max_tokens"] = max_tokens
 
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """
+        LM Studio / local-server wire translation for the disable_thinking
+        intent (UTILITY-RUNTIME-01). Both fields are load-bearing here: the
+        server 400s on a prefilled assistant turn while thinking is enabled
+        (see the S41 correction comment in chat() above). Inherited unchanged
+        by LlamaCppBackend and VLLMBackend -- llama.cpp-server and vLLM both
+        natively support chat_template_kwargs and tolerate the extra field,
+        and the same prefill-vs-thinking conflict applies. Cloud subclasses
+        (OpenAI, OpenRouter, DeepSeek, Groq, Kimi, Qwen, OmniRoute, Custom)
+        override this with a no-op -- their transports reject these fields.
+        """
+        payload["thinking"] = {"type": "disabled"}
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+
     def chat(self, messages: list, tools: Optional[list] = None,
              temperature: float = 0.7, max_tokens: int = 4096,
              disable_thinking: bool = False,
@@ -267,9 +282,15 @@ class LMStudioBackend(BaseLLMBackend):
         # together. Restored as an explicit opt-in param instead of
         # silently baked into every call, so normal tool-calling turns
         # (which never prefill) are unaffected.
+        #
+        # UTILITY-RUNTIME-01: the wire translation now lives in the
+        # _apply_disable_thinking() provider-boundary hook instead of being
+        # inlined here. This class's implementation below emits LM Studio's
+        # local fields (correct for this server); cloud OpenAI-compatible
+        # subclasses that inherit this chat() override the hook to a no-op
+        # so they never transmit fields their provider rejects.
         if disable_thinking:
-            payload["thinking"] = {"type": "disabled"}
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            self._apply_disable_thinking(payload)
 
         base_url = validate_base_url(self.base_url, self.display_name)
         try:

@@ -60,3 +60,14 @@ class KimiBackend(LMStudioBackend):
         if not self.api_key:
             return False, "KIMI_API_KEY not set in config.py"
         return True, f"Configured — {self._model}"
+
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """No local thinking-disable wire fields on Kimi's transport.
+
+        UTILITY-RUNTIME-01: Moonshot's OpenAI-compatible API does not
+        document LM Studio's local `thinking` / `chat_template_kwargs`
+        fields; utility requests must carry only documented fields.
+        complete_utility()'s assistant-prefill plus its own output-side
+        think-strip remain the anti-bleed defense here.
+        """
+        return None

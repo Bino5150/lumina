@@ -115,7 +115,11 @@ class BaseLLMBackend(ABC):
         rejects (or silently mishandles) an assistant-prefill turn while
         thinking/reasoning mode is active — see complete_utility() below,
         which is the only caller that sets this True. Backends that don't
-        have this failure mode may ignore it.
+        have this failure mode may ignore it. How the intent reaches the
+        wire is decided per transport by _apply_disable_thinking() --
+        never by inlining provider-specific fields into a shared chat()
+        body (UTILITY-RUNTIME-01: the LM Studio fields were once inlined
+        here and leaked to every cloud subclass).
         reasoning_effort: Patch 3A.4 Part 3 -- the caller's raw requested
         reasoning-effort selection for this turn (or None for Provider
         Default), forwarded unchanged from LuminaAgent.chat(). Per-call
@@ -282,6 +286,36 @@ class BaseLLMBackend(ABC):
         and only when a caller explicitly invokes it.
         """
         return True
+
+    def _apply_disable_thinking(self, payload: dict) -> None:
+        """
+        UTILITY-RUNTIME-01 -- provider-boundary wire translation for the
+        disable_thinking intent.
+
+        complete_utility() expresses a provider-neutral intent: "suppress
+        thinking/reasoning for this background completion." HOW that intent
+        reaches the wire is transport-specific: LM Studio's server needs its
+        local `thinking` + `chat_template_kwargs` fields (without them it
+        400s on a prefilled assistant turn while thinking is enabled -- the
+        S41 correction), while cloud OpenAI-compatible providers (OpenAI,
+        OpenRouter, DeepSeek, Groq, Kimi, Qwen DashScope, gateways, custom
+        endpoints) reject those same fields as unrecognized arguments.
+        Ollama/Anthropic/Gemini implement chat() themselves and neither
+        accept nor need a translation today.
+
+        Contract: translate the intent into THIS transport's wire syntax, or
+        do nothing when the transport has no supported syntax for it. A no-op
+        is always safe: the assistant-prefill + output-side <think>-strip
+        (complete_utility's S23 defense) remains the universal anti-bleed
+        mechanism, so suppressing the local fields never reintroduces bleed.
+
+        Mirrors _apply_output_token_limit(): a hook called from the shared
+        request builder, implemented (or no-op'd) at each provider boundary.
+        Never called when disable_thinking is False, so ordinary chat turns
+        are structurally unreachable from this hook. Side-effect-free apart
+        from mutating `payload` in place -- no HTTP, no prefs, no I/O.
+        """
+        return None
 
     def _effective_reasoning_effort(self, reasoning_effort: Optional[str],
                                      disable_thinking: bool) -> Optional[str]:
