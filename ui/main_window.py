@@ -467,7 +467,11 @@ class LuminaWindow(QMainWindow):
         self._current_chat_id = None
         self._prefs = persistence.load()
         self._last_activity = time.time()
-        self._dream_fired_this_idle = False
+        # DREAM-LIFECYCLE-01: two orthogonal lifecycle states replace the old
+        # conflated _dream_fired_this_idle boolean. in-flight = worker-lifetime
+        # single-flight; consumed = idle-window admission state.
+        self._dream_sweep_in_flight = False
+        self._dream_idle_consumed = False
         self._operator_turn_started_at = None
         self._operator_last_progress_at = None
         self._operator_phase = "idle"
@@ -1577,7 +1581,16 @@ class LuminaWindow(QMainWindow):
     # ── Dreaming ────────────────────────────────────────────────────────────────
 
     def _check_dream_idle(self):
-        if self._dream_fired_this_idle or not self._current_chat_id:
+        # DREAM-LIFECYCLE-01: _dream_sweep_in_flight (worker-lifetime) and
+        # _dream_idle_consumed (idle-window admission) are orthogonal. An
+        # ineligible/failed/cancelled probe consumes nothing — eligibility
+        # can legitimately change mid-window (Settings writes
+        # DREAM_SWEEP_ENABLED live, transient provider failures recover,
+        # emergency stops get released) — while only a completed sweep
+        # consumes the window, exactly once. Single-flight is enforced by
+        # the in-flight flag, never by consumption.
+        if self._dream_sweep_in_flight or self._dream_idle_consumed \
+                or not self._current_chat_id:
             return
         if self.worker is not None and self.worker.isRunning():
             # Agent is actively mid-turn — _last_activity only updates when a
@@ -1586,22 +1599,57 @@ class LuminaWindow(QMainWindow):
             # Without this check, a dream sweep can fire while the model is
             # still busy generating, queue behind the live turn on
             # llama-server's single inference slot, and hit a read timeout.
-            # Don't mark _dream_fired_this_idle here — let it check again
-            # next tick once the turn actually finishes.
+            # Consume nothing here — let it check again next tick once the
+            # turn actually finishes.
             return
         idle_minutes = getattr(config, "DREAM_IDLE_MINUTES", 20)
         if time.time() - self._last_activity >= idle_minutes * 60:
-            self._dream_fired_this_idle = True
+            self._dream_sweep_in_flight = True
             chat_id = self._current_chat_id
             # 3A.2 Part H — epoch captured here, on the Qt main thread,
             # BEFORE the daemon thread is created. dreaming.on_session_idle()
             # runs the whole sweep inside an execution_scope pinned to this
             # exact epoch, so a stale/latched epoch admits no work at all.
             epoch = emergency_stop.current_epoch()
-            threading.Thread(
-                target=lambda: dreaming.on_session_idle(chat_id, expected_epoch=epoch),
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._run_dream_sweep, args=(chat_id, epoch),
+                    daemon=True,
+                ).start()
+            except BaseException:
+                # Never stick lifecycle state on a spawn failure.
+                self._dream_sweep_in_flight = False
+                raise
+
+    def _run_dream_sweep(self, chat_id: int, expected_epoch):
+        """Daemon-thread body for one Dream sweep (DREAM-LIFECYCLE-01).
+
+        Outcome mapping: only DREAM_COMPLETED consumes the idle window —
+        ineligible/failed/cancelled probes leave it admit-able for the next
+        timer tick. The in-flight flag is cleared in finally regardless of
+        outcome or exception, so no worker failure can permanently stick
+        lifecycle state (a hung provider call is bounded by the backend's
+        own request timeout). Cross-thread flag writes are plain attribute
+        assignments (GIL-atomic); ticks serialize on the Qt thread, so no
+        duplicate-admission race exists."""
+        try:
+            outcome = dreaming.on_session_idle(chat_id, expected_epoch=expected_epoch)
+            if outcome == dreaming.DREAM_COMPLETED:
+                self._dream_idle_consumed = True
+        except Exception as e:
+            # A dead sweep thread must never masquerade as a completed one;
+            # print for terminal observability, leave the window admit-able.
+            print(f"[DREAM] sweep error: {e}", flush=True)
+        finally:
+            self._dream_sweep_in_flight = False
+
+    def _reset_dream_window_state(self):
+        """User-turn reset (DREAM-LIFECYCLE-01): clears idle-window-scoped
+        Dream admission state only. _dream_sweep_in_flight is
+        worker-lifetime-scoped and is intentionally NOT touched here — an
+        in-flight sweep stays single-flight across the turn boundary until
+        the worker itself finishes."""
+        self._dream_idle_consumed = False
 
     # ── Compaction ─────────────────────────────────────────────────────────────
 
@@ -1711,7 +1759,7 @@ class LuminaWindow(QMainWindow):
         self.worker = None
         
         self._last_activity = time.time()
-        self._dream_fired_this_idle = False
+        self._reset_dream_window_state()
         self._operator_turn_started_at = time.time()
         self._mark_operator_progress("processing")
 

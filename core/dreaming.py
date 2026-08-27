@@ -10,6 +10,14 @@ from core.backends.loader import get_llm_backend
 from datetime import datetime
 import config
 
+# DREAM-LIFECYCLE-01: structured sweep outcomes. The UI layer maps only
+# DREAM_COMPLETED to "idle window consumed"; ineligible/failed/cancelled
+# probes must remain admit-able on a later timer tick in the same window.
+DREAM_COMPLETED = "completed"
+DREAM_INELIGIBLE = "ineligible"
+DREAM_FAILED = "failed"
+DREAM_CANCELLED = "cancelled"
+
 DREAM_PROMPT = (
     "Summarize this conversation from the USER's perspective — what they said, "
     "asked for, decided, or worked on. Concrete facts, decisions, discoveries, "
@@ -93,9 +101,15 @@ def run_summarization_call(raw_text: str, prompt: str = DREAM_PROMPT, max_tokens
         print(f"[DREAMING] summarization call failed: {e}", flush=True)
         return None
 
-def on_session_idle(chat_id: int, expected_epoch: int = None):
+def on_session_idle(chat_id: int, expected_epoch: int = None) -> str:
     """Called when a desktop chat session goes idle. Sweeps new messages
     since the last sweep, writes an L2 nightstand entry if worth it.
+
+    DREAM-LIFECYCLE-01: returns a structured lifecycle outcome
+    (DREAM_COMPLETED / DREAM_INELIGIBLE / DREAM_FAILED / DREAM_CANCELLED)
+    so the caller can distinguish "this idle window was validly consumed
+    by a completed sweep" from "this probe was ineligible, failed, or
+    cancelled" — the latter must stay admit-able on a later tick.
 
     expected_epoch (3A.2 Part H): the emergency-stop epoch the caller
     captured BEFORE spawning this onto its own background thread (see
@@ -108,23 +122,23 @@ def on_session_idle(chat_id: int, expected_epoch: int = None):
     summarizer/profile-curation calls are in flight) discards their
     output before either persistent write rather than trusting it."""
     if not getattr(config, "DREAM_SWEEP_ENABLED", False) or not chat_id:
-        return
+        return DREAM_INELIGIBLE
 
     if expected_epoch is None:
-        _run_session_idle_sweep(chat_id, expected_epoch=None)
-        return
+        return _run_session_idle_sweep(chat_id, expected_epoch=None)
 
     from core import emergency_stop
     try:
         with emergency_stop.execution_scope(
             kind="dream_sweep", label=str(chat_id), expected_epoch=expected_epoch,
         ):
-            _run_session_idle_sweep(chat_id, expected_epoch=expected_epoch)
+            return _run_session_idle_sweep(chat_id, expected_epoch=expected_epoch)
     except emergency_stop.EmergencyStopError:
-        return  # stale/latched before admission -- no summarizer call, no writes
+        # stale/latched before admission -- no summarizer call, no writes
+        return DREAM_CANCELLED
 
 
-def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None):
+def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None) -> str:
     msgs = load_chat_messages(chat_id)
     last = _last_dream_sweep.get(chat_id)
     # FE-29: last is datetime.now().isoformat() — local time, no tz offset —
@@ -136,15 +150,15 @@ def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None):
     if last:
         msgs = [m for m in msgs if m.get("created_at", "") > last]
     if not msgs:
-        return
+        return DREAM_INELIGIBLE
 
     raw_text = "\n".join(f"{m['role']}: {m['content']}" for m in msgs[-40:] if m.get("content"))
     if estimate_tokens(raw_text) < getattr(config, "DREAM_MIN_TOKENS", 800):
-        return
+        return DREAM_INELIGIBLE
 
     summary = run_summarization_call(raw_text)
     if not summary:
-        return
+        return DREAM_FAILED
 
     if expected_epoch is not None:
         from core import emergency_stop
@@ -152,15 +166,22 @@ def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None):
             # Latched/stale while the summarizer call was blocked -- allowed
             # to return, but its output is discarded here, before the
             # Palace write, and the watermark below is never advanced.
-            return
+            return DREAM_CANCELLED
 
-    palace_store(
-        content=summary,
-        wing="nightstand",
-        room=str(chat_id),
-        layer=2,
-        tags=["dream-sweep", f"session:{chat_id}"]
-    )
+    try:
+        palace_store(
+            content=summary,
+            wing="nightstand",
+            room=str(chat_id),
+            layer=2,
+            tags=["dream-sweep", f"session:{chat_id}"]
+        )
+    except Exception as e:
+        # DREAM-LIFECYCLE-01: a failed persistence attempt is a FAILED
+        # outcome, not a crash — the watermark below is never advanced and
+        # the window stays admit-able for a later retry.
+        print(f"[DREAMING] palace write failed: {e}", flush=True)
+        return DREAM_FAILED
 
     if getattr(config, "HUMAN_PROFILE_CURATION_ENABLED", False):
         from core.persistence import load as load_prefs, save as save_prefs
@@ -179,3 +200,4 @@ def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None):
 
     _last_dream_sweep[chat_id] = datetime.now().isoformat()
     print(f"[DREAMING] session {chat_id} swept into nightstand", flush=True)
+    return DREAM_COMPLETED
