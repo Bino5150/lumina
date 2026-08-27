@@ -154,8 +154,12 @@ AAAK_ABBREV = {
     "completed":    "DONE",
     "in progress":  "WIP",
     "working on":   "WIP",
-    "Bino":         "BIN",
-    "Lumina":       "LUM",
+    # NOTE (UI-TRUST-01 follow-up, 2026-08-27): Bino/Lumina name
+    # abbreviations were deliberately removed. They mangled identity
+    # strings wherever AAAK ran -- including commit-trailer emails
+    # (therealagentlumina@gmail.com -> therealagentLUM@gmail.com), which
+    # then propagated onto real git commits. Identities are never
+    # compressed.
     "local":        "LOC",
     "database":     "DB",
     "filesystem":   "FS",
@@ -176,24 +180,76 @@ AAAK_ABBREV = {
 }
 
 
+# Identifier-shaped spans protected from ALL compression (UI-TRUST-01
+# follow-up, Sol 5.6 corrective): whole-word lookarounds stop shredding
+# plain English words but cannot protect opaque identifiers, because
+# '@', '.', '/', ':' are non-word boundaries -- e.g. "local"->LOC would
+# legally match inside user@local.com or /srv/local/project. These spans
+# are stashed verbatim before abbreviation and restored after.
+_IDENTIFIER_SPANS = [
+    # order matters: email before handle (both contain @),
+    # url before path ("://" contains "/")
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",   # emails
+    r"(?:https?|ftp)://[^\s]+",                              # URLs
+    r"\bwww\.[^\s]+",                                        # bare www
+    r"`[^`]+`",                                              # code spans
+    r"(?:/[\w.\-]+)+/?",                                    # unix paths
+    r"\b[0-9a-fA-F]{7,64}\b",                                # git SHAs / hashes
+    r"(?<![\w@])@[A-Za-z0-9_]+",                             # @handles
+]
+_IDENTIFIER_RE = re.compile("|".join(_IDENTIFIER_SPANS))
+_PLACEHOLDER_RE = re.compile(r"\x00(\d+)\x00")
+
+
+def _mask_identifiers(text: str):
+    """Stash identifier-shaped spans verbatim; return (masked_text, stash)."""
+    stash = []
+
+    def _keep(m):
+        stash.append(m.group(0))
+        return f"\x00{len(stash) - 1}\x00"
+
+    return _IDENTIFIER_RE.sub(_keep, text), stash
+
+
+def _unmask_identifiers(text: str, stash) -> str:
+    return _PLACEHOLDER_RE.sub(lambda m: stash[int(m.group(1))], text)
+
+
 def aaak_compress(text: str, label: str = None) -> str:
     """
     Compress text into AAAK format — AI-readable shorthand.
     ~30x reduction on verbose prose. No decoder needed; Lumina reads it natively.
 
+    INVARIANT (UI-TRUST-01 follow-up, 2026-08-27): compression may abbreviate
+    CONCEPTS only -- never proper names, identity fields, email addresses,
+    usernames, URLs, hashes, or other opaque identifiers. Those must survive
+    verbatim. Violations of this rule mangled co-author commit trailers for a
+    month before being caught (see tests/test_aaak_identity_safety.py).
+    All abbreviations are applied whole-word via lookarounds; word interiors
+    are never touched. Identifier-shaped tokens (emails, URLs, paths, git
+    SHAs, code spans, handles) are additionally stashed verbatim around the
+    entire transformation -- see _IDENTIFIER_SPANS.
+
     Output examples:
-      "BIN pref: dark-mode+vim-bindings | PROJ: LUMINA(LOC.ai.agent) WIP"
+      "Bino pref: dark-mode+vim-bindings | PROJ: Lumina(LOC.ai.agent) WIP"
       "DISC: qwen3 uses reasoning_content field NOT inline think tags"
       "SESS:2026-04-08 — added FS+sandbox+terminal+toolmaker tools; 20 tools total"
     """
     if not text:
         return ""
 
-    result = text.strip()
+    result, stash = _mask_identifiers(text.strip())
 
-    # Apply abbreviations (longest match first to avoid partial replacements)
+    # Apply abbreviations (longest match first to avoid partial replacements).
+    # Lookarounds keep matches whole-word: without them, "and"->"+" shredded
+    # interior letters of unrelated words (standard -> st+ard, handoff ->
+    # h+off, candidate -> c+idate, sandbox -> s+box) and substrings of names
+    # and emails got rewritten too -- the root cause of the UI-TRUST-01
+    # co-author-trailer corruption. Standalone words still compress normally.
     for full, abbr in sorted(AAAK_ABBREV.items(), key=lambda x: -len(x[0])):
-        result = re.sub(re.escape(full), abbr, result, flags=re.IGNORECASE)
+        pattern = rf"(?<!\w){re.escape(full)}(?!\w)"
+        result = re.sub(pattern, lambda _m, _a=abbr: _a, result, flags=re.IGNORECASE)
 
     # Collapse whitespace
     result = re.sub(r'\s+', ' ', result).strip()
@@ -207,7 +263,7 @@ def aaak_compress(text: str, label: str = None) -> str:
     if label:
         result = f"{label.upper()}: {result}"
 
-    return result
+    return _unmask_identifiers(result, stash)
 
 
 def aaak_compress_list(items: list[str], label: str = None) -> str:
