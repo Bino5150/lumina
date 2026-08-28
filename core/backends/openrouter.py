@@ -30,6 +30,15 @@ class OpenRouterBackend(LMStudioBackend):
     default_url = "https://openrouter.ai/api/v1"
     endpoint_configurable = False
 
+    # AGENT-CONTINUATION-01B -- live-verified 2026-08-28: a real
+    # /chat/completions request against z-ai/glm-5.3-flash with
+    # {"tool_choice": "required"} returned HTTP 200 with
+    # finish_reason="tool_calls" and a genuine forced tool call (not a
+    # transport error, not silently ignored). Inherits LMStudioBackend.chat()
+    # unmodified -- this flag alone is what makes that shared chat()
+    # actually emit "required" instead of "auto" for this backend.
+    supports_required_tool_choice = True
+
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
         self.base_url = (base_url or self.default_url).rstrip("/")
         self.api_key = getattr(config, "OPENROUTER_API_KEY", "") if api_key is None else api_key

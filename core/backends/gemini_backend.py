@@ -52,6 +52,7 @@ from core.backends.base import (
     ModelDiscoveryOutcome,
     ModelDiscoveryResult,
     TerminationStatus,
+    ToolChoiceMode,
 )
 from core.backends.reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
@@ -219,6 +220,12 @@ class GeminiBackend(BaseLLMBackend):
     name = "gemini"
     display_name = "Gemini (Google)"
     default_url = API_ROOT  # fixed endpoint, not user-editable — kept for UI parity
+
+    # AGENT-CONTINUATION-01B -- live-verified 2026-08-28: a real
+    # generateContent request with tool_config.function_calling_config.mode
+    # = "ANY" returned HTTP 200 with a genuine forced functionCall part
+    # (finishReason="STOP", not an error).
+    supports_required_tool_choice = True
 
     def __init__(self, base_url: str = None, api_key: Optional[str] = None):
         # base_url accepted for interface parity with other backends but ignored,
@@ -550,7 +557,8 @@ class GeminiBackend(BaseLLMBackend):
             parts.append({"text": ""})
         return parts
 
-    def _build_payload(self, messages, tools=None, max_tokens=1024, temperature=0.7):
+    def _build_payload(self, messages, tools=None, max_tokens=1024, temperature=0.7,
+                        tool_choice_mode=None):
         system_instruction, convo = self._split_system(messages)
         payload = {
             "contents": self._translate_messages(convo),
@@ -564,6 +572,11 @@ class GeminiBackend(BaseLLMBackend):
         translated_tools = self._translate_tools(tools)
         if translated_tools:
             payload["tools"] = translated_tools
+            # AGENT-CONTINUATION-01B -- only added when resolved REQUIRED;
+            # AUTO omits this field entirely, same as every pre-01B
+            # payload (Gemini's own implicit default is AUTO already).
+            if self._resolve_tool_choice_mode(tool_choice_mode) == ToolChoiceMode.REQUIRED:
+                payload["tool_config"] = {"function_calling_config": {"mode": "ANY"}}
         return payload
 
     # ------------------------------------------------------------------
@@ -572,14 +585,16 @@ class GeminiBackend(BaseLLMBackend):
 
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=1024,
              disable_thinking: bool = False,
-             reasoning_effort: Optional[str] = None):
+             reasoning_effort: Optional[str] = None,
+             tool_choice_mode: Optional[ToolChoiceMode] = None):
         # disable_thinking accepted for interface consistency with
         # complete_utility() but not acted on here for THINKING itself —
         # same reasoning as AnthropicBackend: this backend doesn't enable
         # Gemini's thinking mode by default, so the conflict doesn't apply
         # today. Still routed through _effective_reasoning_effort() below
         # so the disable_thinking-wins precedence contract holds regardless.
-        payload = self._build_payload(messages, tools, max_tokens, temperature)
+        payload = self._build_payload(messages, tools, max_tokens, temperature,
+                                       tool_choice_mode=tool_choice_mode)
         # Patch 3A.4 Part 3 -- apply the already-verified native translation
         # (Part 2A's thinkingConfig.thinkingLevel) after the payload is
         # fully built, before the HTTP call. self.default_model is a stable

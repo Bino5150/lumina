@@ -9,7 +9,7 @@ defaults and no api_key requirement.
 import json
 import requests
 from typing import Optional, Generator
-from .base import BaseLLMBackend, ModelDiscoveryResult
+from .base import BaseLLMBackend, ModelDiscoveryResult, ToolChoiceMode
 from .lmstudio import discover_openai_compatible_models
 import config
 
@@ -56,7 +56,8 @@ class OllamaBackend(BaseLLMBackend):
     def chat(self, messages: list, tools: Optional[list] = None,
              temperature: float = 0.7, max_tokens: int = 1024,
              disable_thinking: bool = False,
-             reasoning_effort: Optional[str] = None) -> dict:
+             reasoning_effort: Optional[str] = None,
+             tool_choice_mode: Optional[ToolChoiceMode] = None) -> dict:
         model = self.get_model()
         payload = {
             "model": model,
@@ -67,7 +68,12 @@ class OllamaBackend(BaseLLMBackend):
         }
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            # AGENT-CONTINUATION-01B -- no local Ollama server has been
+            # live-verified to accept "required" (supports_required_tool_
+            # choice stays the base-class False), so this always resolves
+            # to "auto" -- byte-identical to pre-01B behavior.
+            resolved = self._resolve_tool_choice_mode(tool_choice_mode)
+            payload["tool_choice"] = "required" if resolved == ToolChoiceMode.REQUIRED else "auto"
         # disable_thinking accepted for interface consistency with
         # complete_utility() but not yet acted on here — Ollama has its own
         # newer "think": false option for supporting models, but this

@@ -40,6 +40,12 @@ class OpenAIBackend(LMStudioBackend):
     default_url = "https://api.openai.com/v1"
     endpoint_configurable = False
 
+    # AGENT-CONTINUATION-01B -- live-verified 2026-08-28: a real
+    # /chat/completions request against gpt-4o-mini with
+    # {"tool_choice": "required"} returned HTTP 200 with
+    # finish_reason="tool_calls" and a genuine forced tool call.
+    supports_required_tool_choice = True
+
     # Offline suggestions only; never evidence of a successful refresh.
     KNOWN_MODELS = [
         "gpt-4o",

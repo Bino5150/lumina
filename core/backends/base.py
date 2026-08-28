@@ -20,6 +20,31 @@ class ModelDiscoveryOutcome(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
+class ToolChoiceMode(str, Enum):
+    """AGENT-CONTINUATION-01B -- provider-neutral tool-selection intent the
+    agent layer requests on a given chat() call. Purely a request-side
+    signal (contrast TerminationStatus, which reads a response) -- what it
+    actually does to the wire payload is entirely up to
+    BaseLLMBackend._resolve_tool_choice_mode()/each backend's own request
+    translation, never inspected or branched on by core/agent.py itself.
+
+    AUTO: today's existing behavior -- the model may call zero or more of
+    the offered tools, or none at all. This is what every chat() call
+    already does before this patch; requesting it explicitly changes
+    nothing about the wire payload.
+    REQUIRED: the agent has already begun tool work this turn and wants
+    the transport to structurally guarantee a tool call (whichever tool,
+    including the finish_tool_work sentinel) rather than allowing a bare
+    prose-only response. Only ever honored by a backend whose
+    supports_required_tool_choice is True (live-verified support, not
+    assumed) -- every other backend silently treats this exactly like
+    AUTO, which is the safe, unchanged-behavior fallback.
+    """
+
+    AUTO = "auto"
+    REQUIRED = "required"
+
+
 class TerminationStatus(str, Enum):
     """AGENT-CONTINUATION-01A -- provider-neutral classification of why one
     non-streaming generation ended, independent of whether it contained a
@@ -70,6 +95,13 @@ class BaseLLMBackend(ABC):
     # redirect a fixed provider's credential-bearing requests.
     default_url = ""
     endpoint_configurable = False
+
+    # AGENT-CONTINUATION-01B -- live-verified capability flag, False (safe
+    # default) unless a subclass has been individually confirmed to accept
+    # a required/forced tool-choice mode against its real production
+    # transport. See _resolve_tool_choice_mode() below and each override
+    # site's own comment for exactly what was verified and how.
+    supports_required_tool_choice: bool = False
 
     @property
     def base_url(self) -> str:
@@ -131,10 +163,20 @@ class BaseLLMBackend(ABC):
     def chat(self, messages: list, tools: Optional[list] = None,
              temperature: float = 0.7, max_tokens: int = 1024,
              disable_thinking: bool = False,
-             reasoning_effort: Optional[str] = None) -> dict:
+             reasoning_effort: Optional[str] = None,
+             tool_choice_mode: Optional["ToolChoiceMode"] = None) -> dict:
         """
         Non-streaming chat. Used for tool call turns.
         Returns raw response dict with OpenAI-compatible shape.
+        tool_choice_mode (AGENT-CONTINUATION-01B): the agent's requested
+        ToolChoiceMode for this call, or None -- None and AUTO are always
+        equivalent to each other and to every pre-01B caller's behavior
+        (omitting the argument entirely reproduces today's exact wire
+        payload on every backend). Only a backend with
+        supports_required_tool_choice = True does anything different for
+        REQUIRED; see _resolve_tool_choice_mode() below. Never inspected
+        by core/agent.py -- it only ever sets the value it wants and lets
+        each backend's own resolution decide the wire representation.
         disable_thinking: best-effort hint for backends whose server
         rejects (or silently mishandles) an assistant-prefill turn while
         thinking/reasoning mode is active — see complete_utility() below,
@@ -170,6 +212,21 @@ class BaseLLMBackend(ABC):
         ...
 
     # --- Helpers (concrete, shared across all backends) ---
+
+    def _resolve_tool_choice_mode(self, tool_choice_mode: Optional["ToolChoiceMode"]) -> "ToolChoiceMode":
+        """AGENT-CONTINUATION-01B -- resolve the agent's requested mode
+        against this backend's live-verified capability. REQUIRED only
+        survives the resolution if supports_required_tool_choice is True;
+        None, AUTO, or an unsupported REQUIRED request all resolve to
+        AUTO -- the safe, unchanged-behavior default every backend already
+        implements today. Each concrete chat()/_build_payload() calls this
+        once and translates ONLY the REQUIRED case onto its own wire shape
+        (a bare string for OpenAI-compatible transports, a nested object
+        for Anthropic/Gemini-shaped ones) -- AUTO never adds or changes a
+        field versus pre-01B payloads."""
+        if tool_choice_mode == ToolChoiceMode.REQUIRED and self.supports_required_tool_choice:
+            return ToolChoiceMode.REQUIRED
+        return ToolChoiceMode.AUTO
 
     def reasoning_capabilities(self, model: Optional[str] = None) -> ReasoningCapabilities:
         """

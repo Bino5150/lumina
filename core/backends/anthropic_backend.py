@@ -40,6 +40,7 @@ from core.backends.base import (
     ModelDiscoveryOutcome,
     ModelDiscoveryResult,
     TerminationStatus,
+    ToolChoiceMode,
 )
 from core.backends.reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
@@ -401,7 +402,8 @@ class AnthropicBackend(BaseLLMBackend):
 
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=1024,
              disable_thinking: bool = False,
-             reasoning_effort: Optional[str] = None):
+             reasoning_effort: Optional[str] = None,
+             tool_choice_mode: Optional[ToolChoiceMode] = None):
         # disable_thinking accepted for interface consistency with
         # complete_utility() but not acted on here for THINKING itself —
         # this backend doesn't enable Anthropic's extended-thinking mode by
@@ -411,6 +413,15 @@ class AnthropicBackend(BaseLLMBackend):
         # similar constraint around prefill and extended thinking. Still
         # routed through _effective_reasoning_effort() below so the
         # disable_thinking-wins precedence contract holds regardless.
+        #
+        # tool_choice_mode (AGENT-CONTINUATION-01B) accepted for interface
+        # consistency but INERT here, same convention as disable_thinking
+        # above -- supports_required_tool_choice is not overridden on this
+        # class (stays the BaseLLMBackend False default), because Anthropic's
+        # real tool_choice contract (documented as {"type": "any"}) has not
+        # been live-verified against a real Anthropic API key in this
+        # environment. Left unimplemented rather than guessed -- see
+        # AGENT-CONTINUATION-01B's provider support matrix.
         payload = self._build_payload(messages, tools, max_tokens, temperature, stream=False)
         # Patch 3A.4 Part 3 -- apply the already-verified native translation
         # (Part 2A's output_config.effort) after the payload is fully built,

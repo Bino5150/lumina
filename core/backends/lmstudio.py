@@ -6,7 +6,7 @@ Default port: 1234
 import json
 import requests
 from typing import Optional, Generator
-from .base import BaseLLMBackend, ModelDiscoveryOutcome, ModelDiscoveryResult
+from .base import BaseLLMBackend, ModelDiscoveryOutcome, ModelDiscoveryResult, ToolChoiceMode
 import config
 
 
@@ -244,7 +244,8 @@ class LMStudioBackend(BaseLLMBackend):
     def chat(self, messages: list, tools: Optional[list] = None,
              temperature: float = 0.7, max_tokens: int = 4096,
              disable_thinking: bool = False,
-             reasoning_effort: Optional[str] = None) -> dict:
+             reasoning_effort: Optional[str] = None,
+             tool_choice_mode: Optional[ToolChoiceMode] = None) -> dict:
         model = self.get_model()
         payload = {
             "model": model,
@@ -256,7 +257,13 @@ class LMStudioBackend(BaseLLMBackend):
         has_vision = any(isinstance(m.get("content"), list) for m in messages)
         if tools and not has_vision:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            # AGENT-CONTINUATION-01B -- "required" only ever reaches the
+            # wire for a subclass with live-verified support (see
+            # supports_required_tool_choice overrides); every other
+            # OpenAI-compatible descendant (local servers included) keeps
+            # emitting exactly "auto", byte-identical to pre-01B payloads.
+            resolved = self._resolve_tool_choice_mode(tool_choice_mode)
+            payload["tool_choice"] = "required" if resolved == ToolChoiceMode.REQUIRED else "auto"
 
         # Patch 3A.4 Part 3 -- generic polymorphic reasoning translation.
         # This does NOT give LMStudioBackend itself reasoning semantics --

@@ -3,6 +3,7 @@ Lumina Agent Loop
 Full turn cycle: receive → think → tool calls → stream final response.
 """
 
+import inspect
 import re
 import sys
 import os
@@ -12,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import core.coding_checkpoint as checkpoint_store
 from core import emergency_stop
-from core.backends.base import TerminationStatus
+from core.backends.base import TerminationStatus, ToolChoiceMode
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager
 from core.project_context import ProjectContext, ProjectContextState
@@ -90,6 +91,26 @@ def _extract_finish_tool_work(llm, tool_calls: list):
         if name == FINISH_TOOL_WORK_NAME:
             return tc
     return None
+
+
+def _accepts_tool_choice_mode(llm) -> bool:
+    """AGENT-CONTINUATION-01B — True if llm.chat() will accept a
+    tool_choice_mode= keyword without raising TypeError: either it
+    declares the parameter explicitly (every real backend, post-01B), or
+    it accepts **kwargs. Section 7's explicit requirement: "ordinary
+    callers need no migration unless necessary" — dozens of hand-rolled
+    fake LLM doubles across the test suite predate this parameter with
+    fixed positional/keyword chat() signatures; calling them with an
+    unexpected kwarg would crash every one of them for no behavioral
+    benefit (a fake has no real transport to request anything of).
+    Introspection, not a network call — nothing here talks to a provider."""
+    try:
+        params = inspect.signature(llm.chat).parameters
+    except (TypeError, ValueError):
+        return False
+    if "tool_choice_mode" in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 # S51 Part D — how many turns a completed background-task note gets
@@ -657,13 +678,31 @@ class LuminaAgent:
             if _cancel_requested(cancel_event):
                 raise TurnCancelled()
 
-            try:
-                response = self.llm.chat(
-                    messages=messages,
-                    tools=tool_schemas,
-                    max_tokens=config.RESPONSE_RESERVE_TOKENS,
-                    reasoning_effort=reasoning_effort,
+            # AGENT-CONTINUATION-01B — REQUIRED once tool work is under way,
+            # so a backend with live-verified support (see
+            # supports_required_tool_choice overrides) can structurally
+            # rule out the prose-only continuation live acceptance actually
+            # observed from GLM in 01A, instead of relying on prompting
+            # alone. Never inspected by this method afterwards — a backend
+            # that doesn't support it silently falls back to AUTO
+            # (_resolve_tool_choice_mode), and the existing ambiguous/
+            # corrective-retry/terminal-notice logic below is UNCHANGED and
+            # remains the safety net either way (section 12: a supported
+            # backend that still returns no tool call is a genuine contract
+            # violation, not something to paper over with new logic here).
+            chat_kwargs = dict(
+                messages=messages,
+                tools=tool_schemas,
+                max_tokens=config.RESPONSE_RESERVE_TOKENS,
+                reasoning_effort=reasoning_effort,
+            )
+            if _accepts_tool_choice_mode(self.llm):
+                chat_kwargs["tool_choice_mode"] = (
+                    ToolChoiceMode.REQUIRED if in_tool_work_phase else ToolChoiceMode.AUTO
                 )
+
+            try:
+                response = self.llm.chat(**chat_kwargs)
             except Exception as e:
                 if _cancel_requested(cancel_event):
                     raise TurnCancelled()

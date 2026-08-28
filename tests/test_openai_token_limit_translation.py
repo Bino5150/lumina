@@ -317,6 +317,10 @@ def test_complete_openai_tool_loop_uses_correct_field_on_every_request(
         t["function"]["name"] for t in payloads[1]["tools"] if t != tool_schema
     ]
     assert sentinel_names == ["finish_tool_work"]
-    assert payloads[1]["tool_choice"] == "auto"
+    # AGENT-CONTINUATION-01B: OpenAIBackend has live-verified support for
+    # required tool-choice, so a continuation round (real tool already ran)
+    # requests it structurally instead of leaving the model free to answer
+    # in prose with no tool call at all.
+    assert payloads[1]["tool_choice"] == "required"
     assert "tools" not in payloads[2]
     assert "tool_choice" not in payloads[2]
