@@ -63,6 +63,18 @@ class _RecordingLLM:
                 "tool_calls": [{"id": f"c{n}", "type": "function",
                                  "function": {"name": self.tool_name, "arguments": "{}"}}],
             }
+        if self.tool_call_rounds > 0:
+            # AGENT-CONTINUATION-01A: at least one real tool already ran
+            # this turn, so the harness now requires an explicit
+            # finish_tool_work completion signal instead of inferring
+            # "done" from a bare no-tool-calls response -- see
+            # core/agent.py's tool loop. A bare no-tool-calls message here
+            # would (correctly, per the new contract) no longer finalize.
+            return {
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": "finish", "type": "function",
+                                 "function": {"name": "finish_tool_work", "arguments": "{}"}}],
+            }
         return {"role": "assistant", "content": "no tools needed"}
 
     def is_tool_call(self, message):

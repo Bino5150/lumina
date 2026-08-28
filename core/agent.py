@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import core.coding_checkpoint as checkpoint_store
 from core import emergency_stop
+from core.backends.base import TerminationStatus
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager
 from core.project_context import ProjectContext, ProjectContextState
@@ -47,6 +48,49 @@ from tools.git_branches import register_git_branches_tool
 
 
 CHAIN_BLOCKED_AFTER_SEARCH = {"get_website", "web_search"}
+
+# AGENT-CONTINUATION-01A — explicit tool-work completion control token.
+# Not a product tool: never registered in ToolRegistry, never appears in
+# tool inventories/profiles, never reaches registry.call(). Constructed
+# locally here and appended to the tool_schemas list _chat_impl() sends to
+# the provider ONLY once real tool work has begun this turn (tools_used_
+# this_turn non-empty) — see _chat_impl()'s tool loop. Flows through every
+# backend's existing extract_message()/is_tool_call()/get_tool_calls()/
+# parse_tool_call() unmodified, the same OpenAI-shaped
+# {"type":"function","function":{...}} schema every registered tool
+# already uses, which is exactly why this needs zero backend-specific code
+# to work identically across the OpenAI-compatible family, Anthropic, and
+# Gemini.
+FINISH_TOOL_WORK_NAME = "finish_tool_work"
+
+_FINISH_TOOL_WORK_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": FINISH_TOOL_WORK_NAME,
+        "description": (
+            "Call this when tool work for this turn is complete and you are "
+            "ready to give your final answer, instead of just stopping. Do "
+            "not call any other tool in the same response as this one."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
+def _extract_finish_tool_work(llm, tool_calls: list):
+    """Return the finish_tool_work tool_call dict if present in
+    `tool_calls`, else None. Goes through the backend's own
+    parse_tool_call() rather than name-matching a raw provider-specific
+    shape, so this works identically across every backend family."""
+    for tc in tool_calls:
+        try:
+            name, _ = llm.parse_tool_call(tc)
+        except Exception:
+            continue
+        if name == FINISH_TOOL_WORK_NAME:
+            return tc
+    return None
+
 
 # S51 Part D — how many turns a completed background-task note gets
 # re-injected via push_ephemeral() before chat() gives up trying to surface
@@ -454,6 +498,13 @@ class LuminaAgent:
                     cancel_event=None, reasoning_effort: Optional[str] = None) -> str:
         tools_used_this_turn = set()
         think_step = [0]
+        # AGENT-CONTINUATION-01A — per-turn bound on the corrective retry
+        # below, not per-occurrence: this whole foreground turn gets at
+        # most one automatic "you didn't call a tool or confirm completion"
+        # nudge, ever, however many ambiguous moments it hits. A second
+        # occurrence after the retry has already been spent goes straight
+        # to the visible non-success path instead of ping-ponging retries.
+        corrective_retry_used = False
 
         # Preserve the user's submitted turn even in the tiny race where /stop
         # lands before this worker gets past chat()'s prologue. Do not run any
@@ -593,7 +644,14 @@ class LuminaAgent:
                   f"({len(self.registry.list_enabled())} enabled tools)", flush=True)
 
         for iteration in range(config.MAX_TOOL_ITERATIONS):
+            in_tool_work_phase = bool(tools_used_this_turn)
             tool_schemas = self.registry.get_schemas()
+            if in_tool_work_phase:
+                # See FINISH_TOOL_WORK_SCHEMA docstring above — only offered
+                # once real tool work has actually begun this turn. An
+                # ordinary first-round answer that needs no tool never sees
+                # this and is never required to call it.
+                tool_schemas = tool_schemas + [_FINISH_TOOL_WORK_SCHEMA]
             tool_token_estimate = self.registry.schema_token_estimate()
             messages = self.ctx.build_messages(tool_budget=tool_token_estimate, chat_id=chat_id)
             if _cancel_requested(cancel_event):
@@ -645,18 +703,98 @@ class LuminaAgent:
             if _cancel_requested(cancel_event):
                 raise TurnCancelled()
             message = self.llm.extract_message(response)
+            # getattr-guarded like every other optional-capability check in
+            # this method (see chat()'s own docstring) -- extract_termination
+            # is new with AGENT-CONTINUATION-01A. Every real backend has it
+            # (concrete BaseLLMBackend default, or an override), but the
+            # hand-rolled fake LLM doubles several existing tests construct
+            # predate it; UNKNOWN is the correct fallback for those, not a
+            # crash, since UNKNOWN never blocks finalization on its own.
+            _extract_termination = getattr(self.llm, "extract_termination", None)
+            termination = (_extract_termination(response) if callable(_extract_termination)
+                           else TerminationStatus.UNKNOWN)
+            has_tool_calls = self.llm.is_tool_call(message)
+            tool_calls = self.llm.get_tool_calls(message) if has_tool_calls else []
 
-            # No tool calls — stream the final response
-            if not self.llm.is_tool_call(message):
+            # AGENT-CONTINUATION-01A — explicit completion signal. The
+            # response containing it is discarded exactly like today's
+            # ordinary "no tool_calls" final case below (never persisted to
+            # ctx, never dispatched through registry.call()) and the turn
+            # proceeds straight into the same _stream_final() regeneration
+            # pass every final turn already goes through — see module
+            # docstring on _FINISH_TOOL_WORK_SCHEMA for why chat_stream()
+            # itself is deliberately left tool-less (section 7 of the
+            # continuation-contract design: that boundary stays put). Any
+            # real tool_calls present in the same response are deliberately
+            # NOT executed — the model declared tool work complete in the
+            # same breath, so nothing runs "after" that declaration.
+            finished_call = _extract_finish_tool_work(self.llm, tool_calls)
+            if finished_call is not None:
                 return self._stream_final(messages, think_step, cancel_event=cancel_event,
                                            reasoning_effort=reasoning_effort)
 
-            # Has tool calls
+            if not has_tool_calls:
+                # No real tool call and no explicit completion signal. Old
+                # rule (implicit "no tool_calls == finished") only still
+                # applies to a genuine first-round answer that is positively
+                # NOT truncated — Design Law: silence is not completion.
+                ambiguous = in_tool_work_phase or termination == TerminationStatus.INCOMPLETE
+                if not ambiguous:
+                    return self._stream_final(messages, think_step, cancel_event=cancel_event,
+                                               reasoning_effort=reasoning_effort)
+
+                if _cancel_requested(cancel_event):
+                    raise TurnCancelled()
+
+                if not corrective_retry_used:
+                    corrective_retry_used = True
+                    if in_tool_work_phase:
+                        reason = "no tool call or finish_tool_work while tool work is active"
+                        nudge = (
+                            "## Tool-work continuation\n"
+                            "Tool work is active this turn. Either call another tool if "
+                            "work remains, or call finish_tool_work if tool work is "
+                            "complete and you are ready to give your final answer."
+                        )
+                    else:
+                        reason = f"initial response termination={termination.value}"
+                        nudge = (
+                            "## Continuation\n"
+                            "Your previous response ended before it was complete. "
+                            "Continue: call a tool if one is needed, or give your "
+                            "complete final answer now."
+                        )
+                    print(f"[AGENT] continuation ambiguity ({reason}) — "
+                          f"one bounded corrective retry", flush=True)
+                    self.ctx.push_ephemeral(nudge)
+                    continue
+
+                # Corrective retry already spent this turn — never launder
+                # this into a silent final answer. Same non-persistence
+                # convention as the provider-continuation-failure path
+                # above: surfaced live via on_response_token, not written
+                # into ctx history as if it were genuine assistant content
+                # (see AGENT-CONTINUATION-01A section 9/10 — this is a
+                # distinct condition from a raised provider exception and
+                # must stay visibly distinguishable from one).
+                if in_tool_work_phase:
+                    notice = "[Lumina: tool-work continuation ended without confirming completion.]"
+                else:
+                    notice = "[Lumina: response was cut off before it could be confirmed complete.]"
+                print(f"[AGENT] continuation contract violated after corrective retry "
+                      f"(in_tool_work_phase={in_tool_work_phase}, "
+                      f"termination={termination.value})", flush=True)
+                on_response_token = getattr(self, "on_response_token", None)
+                if callable(on_response_token):
+                    on_response_token(notice)
+                return notice
+
+            # Has one or more real tool calls (finish_tool_work already
+            # ruled out above).
             if message.get("content"):
                 message["content"] = strip_think_blocks(message["content"])
 
             self.ctx.add_tool_call(message)
-            tool_calls = self.llm.get_tool_calls(message)
 
             for index, tc in enumerate(tool_calls):
                 if _cancel_requested(cancel_event):

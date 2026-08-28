@@ -51,6 +51,7 @@ from core.backends.base import (
     BaseLLMBackend,
     ModelDiscoveryOutcome,
     ModelDiscoveryResult,
+    TerminationStatus,
 )
 from core.backends.reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
@@ -662,6 +663,26 @@ class GeminiBackend(BaseLLMBackend):
             # for. See _translate_messages' docstring for the read side.
             message["provider_metadata"] = {"gemini_content": candidate["content"]}
         return message
+
+    # AGENT-CONTINUATION-01A -- repo-local precedent check found zero prior
+    # references to Gemini's finishReason anywhere in this codebase. Sourced
+    # from Gemini's own stable public generateContent contract, deliberately
+    # narrow to the two values load-bearing for this contract. SAFETY,
+    # RECITATION, MALFORMED_FUNCTION_CALL, OTHER, and anything unrecognized
+    # fall through to UNKNOWN rather than a guessed classification.
+    _COMPLETE_FINISH_REASONS = frozenset({"STOP"})
+    _INCOMPLETE_FINISH_REASONS = frozenset({"MAX_TOKENS"})
+
+    def extract_termination(self, response) -> TerminationStatus:
+        try:
+            finish_reason = response["candidates"][0].get("finishReason")
+        except (KeyError, IndexError, TypeError):
+            return TerminationStatus.UNKNOWN
+        if finish_reason in self._COMPLETE_FINISH_REASONS:
+            return TerminationStatus.COMPLETE
+        if finish_reason in self._INCOMPLETE_FINISH_REASONS:
+            return TerminationStatus.INCOMPLETE
+        return TerminationStatus.UNKNOWN
 
     # ------------------------------------------------------------------
     # Streaming chat

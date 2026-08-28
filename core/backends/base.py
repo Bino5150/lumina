@@ -20,6 +20,30 @@ class ModelDiscoveryOutcome(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
+class TerminationStatus(str, Enum):
+    """AGENT-CONTINUATION-01A -- provider-neutral classification of why one
+    non-streaming generation ended, independent of whether it contained a
+    tool call. Exists so core/agent.py's tool loop can tell a positively
+    truncated generation apart from a clean stop without string-matching a
+    provider's raw finish/stop-reason vocabulary at the call site.
+
+    COMPLETE: the provider positively reports the generation ended cleanly
+    (a normal stop, or a clean stop into a tool call).
+    INCOMPLETE: the provider positively reports the generation was cut off
+    before the model chose to stop (token-budget truncation). A message in
+    this state must never be treated as a genuine final answer, regardless
+    of what content it happens to contain.
+    UNKNOWN: no positively-understood signal either way (missing field,
+    unrecognized value, malformed response). Never treated as an all-clear
+    for anything beyond "the INCOMPLETE guard does not apply" -- UNKNOWN is
+    not treated as proof of completion by any caller.
+    """
+
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class ModelDiscoveryResult:
     """Structured model discovery result consumed by Settings.
@@ -365,6 +389,36 @@ class BaseLLMBackend(ABC):
         except json.JSONDecodeError:
             args = {}
         return name, args
+
+    # OpenAI-compatible-family finish_reason vocabulary this codebase has
+    # actually observed or already encoded elsewhere -- "stop"/"length"/"eos"
+    # mirror lmstudio.py chat_stream()'s own `finish_reason in ("stop",
+    # "length", "eos")` grouping; "tool_calls" and "length" were both
+    # directly captured live against the real OpenRouter/GLM path during
+    # AGENT-CONTINUATION-01. Deliberately narrow -- anything else (missing
+    # field, "content_filter", a future provider value) stays UNKNOWN rather
+    # than guessed. Concrete default: every LMStudioBackend descendant
+    # (DeepSeek/Groq/Kimi/LlamaCpp/OmniRoute/OpenAI/OpenRouter/Qwen/VLLM/
+    # Custom) and OllamaBackend (also OpenAI-shaped, never overrides
+    # extract_message either) get this for free with zero per-file changes.
+    _OAI_COMPLETE_FINISH_REASONS = frozenset({"stop", "eos", "tool_calls"})
+    _OAI_INCOMPLETE_FINISH_REASONS = frozenset({"length"})
+
+    def extract_termination(self, response: dict) -> "TerminationStatus":
+        """AGENT-CONTINUATION-01A -- see TerminationStatus docstring above.
+        Reads the raw response, NOT the already-normalized extract_message()
+        output -- finish_reason lives on the response, not the message dict,
+        and normalization elsewhere in this class deliberately does not
+        carry it forward."""
+        try:
+            finish_reason = response["choices"][0].get("finish_reason")
+        except (KeyError, IndexError, TypeError):
+            return TerminationStatus.UNKNOWN
+        if finish_reason in self._OAI_COMPLETE_FINISH_REASONS:
+            return TerminationStatus.COMPLETE
+        if finish_reason in self._OAI_INCOMPLETE_FINISH_REASONS:
+            return TerminationStatus.INCOMPLETE
+        return TerminationStatus.UNKNOWN
 
     def complete_utility(self, prompt: str, prefill: str = "",
                           max_tokens: int = 500, temperature: float = 0.3) -> Optional[str]:

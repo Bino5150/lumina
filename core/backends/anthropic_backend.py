@@ -39,6 +39,7 @@ from core.backends.base import (
     BaseLLMBackend,
     ModelDiscoveryOutcome,
     ModelDiscoveryResult,
+    TerminationStatus,
 )
 from core.backends.reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
@@ -471,6 +472,25 @@ class AnthropicBackend(BaseLLMBackend):
         if tool_calls:
             message["tool_calls"] = tool_calls
         return message
+
+    # AGENT-CONTINUATION-01A -- repo-local precedent check found zero prior
+    # references to Anthropic's stop_reason anywhere in this codebase (no
+    # fixture, no test, no comment), so this mapping is sourced from
+    # Anthropic's own stable public Messages API contract rather than any
+    # local prior art. Deliberately narrow to the two values load-bearing
+    # for this contract (a clean stop, and truncation) -- stop_sequence,
+    # pause_turn, refusal, and anything unrecognized fall through to
+    # UNKNOWN rather than a guessed classification.
+    _COMPLETE_STOP_REASONS = frozenset({"end_turn", "tool_use"})
+    _INCOMPLETE_STOP_REASONS = frozenset({"max_tokens"})
+
+    def extract_termination(self, response) -> TerminationStatus:
+        stop_reason = response.get("stop_reason") if isinstance(response, dict) else None
+        if stop_reason in self._COMPLETE_STOP_REASONS:
+            return TerminationStatus.COMPLETE
+        if stop_reason in self._INCOMPLETE_STOP_REASONS:
+            return TerminationStatus.INCOMPLETE
+        return TerminationStatus.UNKNOWN
 
     # ------------------------------------------------------------------
     # Streaming chat

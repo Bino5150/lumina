@@ -254,9 +254,23 @@ def test_complete_openai_tool_loop_uses_correct_field_on_every_request(
             },
         }],
     })
+    # AGENT-CONTINUATION-01A: a real tool already ran (round 1), so the
+    # harness now requires an explicit finish_tool_work completion signal
+    # on the continuation round instead of inferring "done" from a bare
+    # no-tool-calls message -- see core/agent.py's tool loop. A bare
+    # content-only response here would (correctly) trigger the bounded
+    # corrective retry instead of proceeding straight to _stream_final().
     continuation_response = _FakeResponse({
         "choices": [{
-            "message": {"role": "assistant", "content": "ready to answer"},
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "finish_tool_work", "arguments": "{}"},
+                }],
+            },
         }],
     })
     stream_response = _FakeResponse(stream_lines=(
@@ -294,7 +308,15 @@ def test_complete_openai_tool_loop_uses_correct_field_on_every_request(
         assert payload["reasoning_effort"] == "none"
     assert payloads[0]["tools"] == [tool_schema]
     assert payloads[0]["tool_choice"] == "auto"
-    assert payloads[1]["tools"] == [tool_schema]
+    # Round 2 is a continuation after a real tool already ran, so it also
+    # carries the finish_tool_work sentinel (AGENT-CONTINUATION-01A) --
+    # tool_schema plus exactly one more entry named finish_tool_work.
+    assert tool_schema in payloads[1]["tools"]
+    assert len(payloads[1]["tools"]) == 2
+    sentinel_names = [
+        t["function"]["name"] for t in payloads[1]["tools"] if t != tool_schema
+    ]
+    assert sentinel_names == ["finish_tool_work"]
     assert payloads[1]["tool_choice"] == "auto"
     assert "tools" not in payloads[2]
     assert "tool_choice" not in payloads[2]
