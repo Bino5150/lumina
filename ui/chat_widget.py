@@ -6,13 +6,14 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
     QScrollArea, QLabel, QFrame, QSizePolicy, QTextBrowser, QApplication
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QMimeData, QEvent, QEventLoop
+from PySide6.QtCore import Qt, Signal, QTimer, QMimeData, QEvent, QEventLoop, QSize
 from PySide6.QtGui import QKeyEvent, QDragEnterEvent, QDropEvent, QPixmap, QAction, QTextCursor
 
-import re 
+import re
 import time
-import sys 
+import sys
 import os
+import math
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import shiboken6
@@ -182,6 +183,51 @@ class MetricsBar(QFrame):
             self.replay_btn.setVisible(True)
 
 
+# ── Response Browser ───────────────────────────────────────────────────────────
+
+class ResponseBrowser(QTextBrowser):
+    """QTextBrowser for a finalized response bubble: lays its document out at
+    its own real width and reports a truthful height-for-width, so the parent
+    layout sizes it to actual rendered content -- both at first layout and
+    after later window resizes -- instead of a one-shot measurement frozen at
+    a hardcoded reference width (UI-CHAT-BUBBLE-HEIGHT-01: setTextWidth(900)
+    + setFixedHeight() froze the widget at whatever height that measurement
+    produced; real widget width later diverges from 900 in either direction,
+    leaving content clipped (real width < 900) or a stale blank tail (real
+    width > 900), and no resize afterward ever recomputed it."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+        policy = self.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Expanding)
+        policy.setVerticalPolicy(QSizePolicy.Minimum)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        if width <= 0:
+            return 0
+        doc = self.document()
+        if doc.textWidth() != width:
+            doc.setTextWidth(width)
+        return math.ceil(doc.size().height())
+
+    def sizeHint(self):
+        width = self.viewport().width() or self.width()
+        return QSize(width, self.heightForWidth(width))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        width = self.viewport().width()
+        if width > 0 and self.document().textWidth() != width:
+            self.document().setTextWidth(width)
+            self.updateGeometry()
+
+
 # ── Live Response Bubble ───────────────────────────────────────────────────────
 
 class LiveResponseBubble(QFrame):
@@ -319,13 +365,14 @@ class LiveResponseBubble(QFrame):
         elapsed = time.time() - self._start_time
 
         if self._response_text.strip():
-            # Swap streaming label for rendered QTextBrowser
-            browser = QTextBrowser()
+            # Swap streaming label for a rendered ResponseBrowser -- content-
+            # sized and width-responsive (UI-CHAT-BUBBLE-HEIGHT-01): no fixed
+            # height, no hardcoded reference width.
+            browser = ResponseBrowser()
             browser.setOpenExternalLinks(True)
             browser.setReadOnly(True)
             browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            browser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
             html = md_to_html(self._response_text, self.colors)
             browser.setHtml(f"""<html><body style="
                 background:{self.colors['ai_bubble']};color:{self.colors['text_primary']};
@@ -333,9 +380,6 @@ class LiveResponseBubble(QFrame):
                 font-size:13px;line-height:1.6;margin:0;padding:0;">
                 {html}</body></html>""")
             browser.setStyleSheet("QTextBrowser{background:transparent;border:none;padding:0;}")
-            browser.document().setTextWidth(900)
-            h = int(browser.document().size().height()) + 16
-            browser.setFixedHeight(max(h, 30))
 
             idx = self.bubble_layout.indexOf(self.stream_lbl)
             self.bubble_layout.removeWidget(self.stream_lbl)
