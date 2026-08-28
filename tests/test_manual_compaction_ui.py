@@ -27,8 +27,11 @@ class _ChatWidget:
     def clear_messages(self):
         self.rendered.clear()
 
-    def add_user_message(self, content):
+    def add_user_message(self, content, mode="passive"):
         self.rendered.append(("user", content))
+
+    def scroll_to_bottom_now(self):
+        pass
 
     def create_live_bubble(self):
         return _Bubble(self.rendered)

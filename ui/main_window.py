@@ -898,7 +898,10 @@ class LuminaWindow(QMainWindow):
             if not content:
                 continue
             if role == "user":
-                self.chat_widget.add_user_message(content)
+                # UI-CHAT-SCROLL-01: restore inserts never scroll; one
+                # explicit layout-settled positioning after the loop owns
+                # the final viewport.
+                self.chat_widget.add_user_message(content, mode="none")
                 if restore_to_context:
                     self.agent.ctx.add_user(content)
             elif role == "assistant":
@@ -907,6 +910,10 @@ class LuminaWindow(QMainWindow):
                 bubble.finalize()
                 if restore_to_context:
                     self.agent.ctx.add_assistant(content)
+        # UI-CHAT-SCROLL-01: one intentional layout-settled positioning for
+        # the whole restore -- history reopens at the latest turn without
+        # dozens of per-message scroll timers racing each other.
+        self.chat_widget.scroll_to_bottom_now()
         self._refresh_chat_list()
 
     def _on_chat_selected(self, idx: int):
@@ -1791,7 +1798,10 @@ class LuminaWindow(QMainWindow):
         else:
             content = text
 
-        self.chat_widget.add_user_message(display_text)
+        # UI-CHAT-SCROLL-01: a foreground send anchors the new turn -- the
+        # submitted card's start stays visible with response space below,
+        # instead of the old delayed teleport to absolute transcript bottom.
+        self.chat_widget.add_user_message(display_text, mode="anchor")
         self.chat_widget.set_turn_running(True)
         self.status_lbl.setText("processing...")
         if self._current_chat_id:

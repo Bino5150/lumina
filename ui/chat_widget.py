@@ -4,9 +4,9 @@ Chat Widget — live streaming bubble, token metrics, think blocks, tool indicat
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
-    QScrollArea, QLabel, QFrame, QSizePolicy, QTextBrowser
+    QScrollArea, QLabel, QFrame, QSizePolicy, QTextBrowser, QApplication
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QMimeData
+from PySide6.QtCore import Qt, Signal, QTimer, QMimeData, QEvent, QEventLoop
 from PySide6.QtGui import QKeyEvent, QDragEnterEvent, QDropEvent, QPixmap, QAction, QTextCursor
 
 import re 
@@ -532,9 +532,77 @@ class ChatWidget(QWidget):
             self.message_submitted.emit(text)
             self.input.clear()
 
-    def _insert(self, widget: QWidget):
+    # ── UI-CHAT-SCROLL-01: insertion scroll intents ─────────────────────────
+    # Every insertion used to schedule a delayed unconditional jump to the
+    # absolute transcript bottom. That teleported the viewport past the
+    # beginning of a just-submitted turn (the operator had to scroll back up
+    # to read their own message) and yanked operators who had deliberately
+    # scrolled upward whenever passive system/operator content arrived.
+    # Insertion intent is explicit now:
+    #   "anchor"  -- foreground send: present the new turn from the top of
+    #                the submitted card, live response area below it
+    #   "passive" -- background/system/operator content: follow the tail
+    #                only if the operator was already near it, else preserve
+    #                the viewport exactly
+    #   "none"    -- pure insertion; positioning belongs to an explicit
+    #                caller operation (e.g. history-restore end positioning)
+    FOLLOW_THRESHOLD = 200  # px of tail proximity; same heuristic as streaming follow
+
+    def _insert(self, widget: QWidget, mode: str = "passive"):
+        bar = self.scroll.verticalScrollBar()
+        # Follow decision uses PRE-insert geometry: this widget's own growth
+        # must not push an already-following operator out of the window.
+        follow = (mode == "passive"
+                  and bar.maximum() - bar.value() <= self.FOLLOW_THRESHOLD)
         self.msgs_layout.insertWidget(self.msgs_layout.count()-1, widget)
-        QTimer.singleShot(80, self._scroll_to_bottom)
+        if mode == "anchor":
+            self._anchor_new_turn(widget)
+        elif follow:
+            self._scroll_to_bottom_settled()
+        # "none" and non-following "passive": preserve the viewport exactly.
+
+    def _settle_layout(self):
+        """Synchronously settle transcript layout to its final state so
+        scrollbar ranges and child geometry are trustworthy before any
+        scroll decision. Empirically (verified against real Qt, offscreen):
+        the first event-loop pass delivers the posted LayoutRequest and
+        fixes child positions, the second lets widgetResizable grow the
+        transcript container and finalize the scrollbar ranges -- so this
+        replays the real mechanism (processEvents, user input excluded)
+        until container height and scrollbar maximum reach a fixed point,
+        instead of emulating Qt internals with activate()/adjustSize()
+        (which produce transient squeezed geometry) or the old 80 ms
+        fire-and-hope timer, which raced this exact settlement and let
+        whichever delayed callback happened to fire last win."""
+        bar = self.scroll.verticalScrollBar()
+        last = None
+        for _ in range(5):
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            state = (self.msgs_container.height(), bar.maximum())
+            if state == last:
+                break
+            last = state
+
+    def _scroll_to_bottom_settled(self):
+        self._settle_layout()
+        self._scroll_to_bottom()
+
+    def _anchor_new_turn(self, widget: QWidget):
+        """Present a newly submitted turn from the top of its own card: the
+        beginning of what the operator sent stays visible, with the live
+        response area beginning right below it. A card taller than the
+        viewport shows its start (the only coherent anchor); a short turn
+        keeps the previous tail visible above it. Never a blind teleport to
+        absolute transcript bottom."""
+        self._settle_layout()
+        bar = self.scroll.verticalScrollBar()
+        target = max(0, widget.geometry().top() - 12)
+        bar.setValue(min(target, bar.maximum()))
+
+    def scroll_to_bottom_now(self):
+        """One intentional layout-settled positioning for a finished bulk
+        operation (history restore, chat switch)."""
+        self._scroll_to_bottom_settled()
 
     def _scroll_to_bottom(self):
         self.scroll.verticalScrollBar().setValue(
@@ -546,7 +614,7 @@ class ChatWidget(QWidget):
         if bar.maximum() - bar.value() < 200:
             bar.setValue(bar.maximum())    
 
-    def add_user_message(self, text: str):
+    def add_user_message(self, text: str, mode: str = "passive"):
         frame = QFrame()
         frame.setStyleSheet("background:transparent;border:none;")
         fl = QVBoxLayout(frame)
@@ -595,7 +663,7 @@ class ChatWidget(QWidget):
         content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         content.setStyleSheet(f"background:{self.colors['user_bubble']};color:{self.colors['text_primary']};padding:10px 14px;border-radius:12px 4px 12px 12px;border:1px solid {self.colors['border']};font-size:13px;")
         fl.addWidget(content)
-        self._insert(frame)
+        self._insert(frame, mode)
 
     def add_system_message(self, text: str):
         lbl = QLabel(text)
@@ -626,7 +694,10 @@ class ChatWidget(QWidget):
                                     agent_name=getattr(self, '_persona_name', config.AGENT_NAME),
                                     tts=self._tts,
                                     tts_speech_allowed=self._tts_speech_allowed)
-        self._insert(bubble)
+        # "none": bubble creation never repositions the viewport. During a
+        # foreground send the just-anchored user card owns the position;
+        # during history restore the explicit end-positioning owns it.
+        self._insert(bubble, "none")
         return bubble
 
     def set_input_enabled(self, enabled: bool):
