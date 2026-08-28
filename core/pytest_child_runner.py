@@ -6,10 +6,29 @@ not a model tool and it deliberately contains no project/default-cwd logic.
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
+
+# TEST-RUNTIME-01: this file is executed by absolute path from the managing
+# checkout's core/ directory, so CPython inserts that directory as
+# sys.path[0] -- ahead of the standard library. Left in place, any
+# stdlib-colliding module in the managing tree's core/ (core/secrets.py is
+# the real historical case) shadows the true stdlib for every import in
+# this child, contaminating a run of ANY target checkout with the managing
+# checkout's code. Remove this script's own directory before importing
+# anything else. Target-project imports are the target's own responsibility
+# (its conftest inserts its root); this child needs nothing from the
+# managing tree. Inherited PYTHONPATH policy is owned by the parent-side
+# kernel (core/test_runner.py), not here -- the two boundaries stay
+# independently testable.
+_SELF_DIR = str(Path(__file__).resolve().parent)
+sys.path[:] = [
+    entry for entry in sys.path
+    if entry == "" or os.path.abspath(entry) != _SELF_DIR
+]
+
+import json
 
 import pytest
 

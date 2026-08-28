@@ -66,6 +66,33 @@ class _ReportError(Exception):
         self.state = state
 
 
+def _sanitize_inherited_pythonpath(env: dict) -> None:
+    """TEST-RUNTIME-01: the managed pytest child runs with a clean inherited
+    import surface -- PYTHONPATH is not inherited at all.
+
+    Why clean-slate rather than selective filtering: PYTHONPATH is
+    parent-runtime launch state, never target intent, and every inherited
+    entry lands on the child's sys.path AHEAD of the standard library.
+    There is no trustworthy way to distinguish a "legitimate dependency
+    path" from "another checkout's package dir" by inspecting parent env
+    state -- and the proven defect class is exactly a foreign checkout's
+    module shadowing stdlib names (core/secrets.py shadowing stdlib
+    secrets is the real historical case, reproduced with sentinels in
+    tests/test_test_runtime_01.py). The child's legitimate import surface
+    is exactly: the interpreter's stdlib and site-packages, plus whatever
+    the TARGET checkout constructs for itself (its conftest.py /
+    pytest.ini pythonpath). Target-project imports never depended on
+    inherited PYTHONPATH; source-vet found no production consumer that
+    sets it for the kernel child.
+
+    Blast radius is exactly this one variable: every other environment
+    variable (PATH, HOME, QT_*, locale, credentials) passes through
+    untouched. Child-side script-directory insertion is handled by
+    core/pytest_child_runner.py; the two boundaries stay independently
+    testable. Cross-platform by construction."""
+    env.pop("PYTHONPATH", None)
+
+
 def _validate_selectors(selectors) -> tuple[str, ...]:
     if isinstance(selectors, (str, bytes, bytearray)) or not isinstance(selectors, Sequence):
         raise ValueError("selectors must be a sequence of strings")
@@ -346,6 +373,7 @@ class TestRunner:
                 env["GIT_TERMINAL_PROMPT"] = "0"
                 env["GCM_INTERACTIVE"] = "Never"
                 env["PYTHONPYCACHEPREFIX"] = str(temporary_path / "pycache")
+                _sanitize_inherited_pythonpath(env)
 
                 try:
                     process_id = process_manager.launch_argv(
