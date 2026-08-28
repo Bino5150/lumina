@@ -142,6 +142,7 @@ class StreamSignals(QObject):
     think_chunk    = Signal(str)   # batched, not per-character
     think_end      = Signal()
     response_chunk = Signal(str)   # batched response text
+    commentary     = Signal(str)   # AGENT-COMMENTARY-01A: whole event per provider decision, never batched
     finished       = Signal(str)
     error          = Signal(str)
     cancelled      = Signal(str)
@@ -239,12 +240,23 @@ class AgentWorker(QThread):
         def on_tool_result(n, r):
             self.signals.tool_result.emit(n, r)
 
+        def on_commentary(text):
+            # Same flush-before-emit discipline as on_tool_call above, so
+            # any buffered think/response text from an earlier stage lands
+            # in the UI before this event, even though in practice nothing
+            # is streaming concurrently at the point this fires (see
+            # core/agent.py's on_commentary docstring).
+            self._flush_think()
+            self._flush_resp()
+            self.signals.commentary.emit(text)
+
         self.agent.on_tool_call      = on_tool_call
         self.agent.on_tool_result    = on_tool_result
         self.agent.on_think_start    = on_think_start
         self.agent.on_think_token    = on_think_token
         self.agent.on_think_end      = on_think_end
         self.agent.on_response_token = on_response_token
+        self.agent.on_commentary     = on_commentary
 
         try:
             kwargs = {"chat_id": self.chat_id}
@@ -836,6 +848,7 @@ class LuminaWindow(QMainWindow):
         self.signals.think_chunk.connect(self._on_think_chunk)
         self.signals.think_end.connect(self._on_think_end)
         self.signals.response_chunk.connect(self._on_response_chunk)
+        self.signals.commentary.connect(self._on_commentary)
         self.signals.finished.connect(self._on_finished)
         self.signals.error.connect(self._on_error)
         self.signals.cancelled.connect(self._on_cancelled)
@@ -1953,7 +1966,16 @@ class LuminaWindow(QMainWindow):
         if self._live_bubble:
             self._live_bubble.append_response_token(chunk)
             self.chat_widget._scroll_to_bottom_if_near()
-            
+
+    def _on_commentary(self, text: str):
+        """AGENT-COMMENTARY-01A. No explicit scroll call here, deliberately
+        matching _on_tool_call/_on_think_chunk above (not _on_response_chunk):
+        commentary is a tool-phase event, not final-response streaming, so it
+        follows the same UI-CHAT-SCROLL-01 "passive" viewport behavior those
+        already have rather than force-following the tail."""
+        self._mark_operator_progress("commentary")
+        if self._live_bubble:
+            self._live_bubble.add_commentary(text)
 
     def _on_finished(self, response: str):
         

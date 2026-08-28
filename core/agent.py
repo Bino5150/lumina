@@ -93,6 +93,20 @@ def _extract_finish_tool_work(llm, tool_calls: list):
     return None
 
 
+def _extract_commentary(message: dict) -> str:
+    """AGENT-COMMENTARY-01A -- return the outward, operator-facing text
+    embedded in a tool-bearing (or finish_tool_work-bearing) assistant
+    response, or "" if none. Applies the same <think> stripping already
+    used for the persisted tool-call message content (strip_think_blocks),
+    so hidden reasoning markup never reaches on_commentary(). Pure
+    extraction -- never mutates `message`; callers decide whether/when to
+    emit and whether the message itself gets persisted to ctx."""
+    content = message.get("content")
+    if not content:
+        return ""
+    return strip_think_blocks(content).strip()
+
+
 def _accepts_tool_choice_mode(llm) -> bool:
     """AGENT-CONTINUATION-01B — True if llm.chat() will accept a
     tool_choice_mode= keyword without raising TypeError: either it
@@ -218,6 +232,7 @@ class LuminaAgent:
                  on_think_token=None,
                  on_think_end=None,
                  on_response_token=None,
+                 on_commentary=None,
                  tts=None,
                  owner: bool = True,
                  channel_id: str = "default",
@@ -235,6 +250,17 @@ class LuminaAgent:
           on_think_token(token)        — character inside think block
           on_think_end()               — </think> block closed
           on_response_token(token)     — final response token streaming
+          on_commentary(text)          — AGENT-COMMENTARY-01A: brief
+              operator-facing narration the model gave alongside a
+              structured tool decision (a real tool call, or
+              finish_tool_work). Fires once per provider response that
+              carries such narration, BEFORE the tool call(s) it
+              describes execute. Distinct from on_response_token (final
+              answer only) and from the Think callbacks above (provider
+              reasoning telemetry, not present at all on this
+              non-streaming tool-decision path — see _chat_impl()).
+              Display-only: never fed back into the model, never
+              persisted as a synthetic message. See _extract_commentary().
 
         owner: True for the desktop app (you). False for ANY agent constructed
         on behalf of a channel, subagent, or scheduled task — no implicit
@@ -300,6 +326,7 @@ class LuminaAgent:
         self.on_think_token   = on_think_token   or (lambda t: None)
         self.on_think_end     = on_think_end     or (lambda: None)
         self.on_response_token = on_response_token or (lambda t: None)
+        self.on_commentary    = on_commentary    or (lambda t: None)
         self.tts = tts
         # Persona-local speech policy. This stays independent of the
         # backend/global TTS enabled state so another persona can reuse the
@@ -769,6 +796,11 @@ class LuminaAgent:
             # same breath, so nothing runs "after" that declaration.
             finished_call = _extract_finish_tool_work(self.llm, tool_calls)
             if finished_call is not None:
+                commentary = _extract_commentary(message)
+                if commentary:
+                    on_commentary = getattr(self, "on_commentary", None)
+                    if callable(on_commentary):
+                        on_commentary(commentary)
                 return self._stream_final(messages, think_step, cancel_event=cancel_event,
                                            reasoning_effort=reasoning_effort)
 
@@ -832,6 +864,18 @@ class LuminaAgent:
             # ruled out above).
             if message.get("content"):
                 message["content"] = strip_think_blocks(message["content"])
+
+            # AGENT-COMMENTARY-01A — read from the already-stripped content
+            # that's about to be persisted via add_tool_call() below; this
+            # is a UI observation of that real assistant message, not a new
+            # synthetic one (see _extract_commentary()/on_commentary
+            # docstrings). Emitted once per response, before the tool-call
+            # loop below dispatches any of the tools it describes.
+            commentary = (message.get("content") or "").strip()
+            if commentary:
+                on_commentary = getattr(self, "on_commentary", None)
+                if callable(on_commentary):
+                    on_commentary(commentary)
 
             self.ctx.add_tool_call(message)
 

@@ -113,6 +113,31 @@ class ToolRow(QFrame):
         self.setStyleSheet(f"QFrame{{background:{colors['tool_bg']};border-left:2px solid {colors['accent_dim']};border-radius:0 4px 4px 0;margin:1px 0;}}")
 
 
+# ── Commentary Row ─────────────────────────────────────────────────────────────
+# AGENT-COMMENTARY-01A. Deliberately its own widget, not a reuse of ToolRow
+# (tiny monospace metadata) or ThinkBlock (collapsed-by-default reasoning
+# evidence): commentary is operator-facing narration meant to be read
+# naturally as work unfolds, so it renders as plain wrapped prose -- visible
+# immediately, no expand/collapse -- softer than the final answer (muted
+# color, no bubble fill) but with more presence than a tool metadata line
+# (a full-width readable line, not truncated args).
+
+class CommentaryRow(QFrame):
+    def __init__(self, text: str, colors: dict, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 3, 10, 3)
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        lbl.setStyleSheet(f"color:{colors['text_muted']};font-size:12px;background:transparent;border:none;")
+        layout.addWidget(lbl)
+        self.setStyleSheet(
+            f"QFrame{{background:transparent;border-left:2px solid {colors['accent_dim']};margin:1px 0;}}"
+        )
+
+
 # ── Token Metrics Bar ──────────────────────────────────────────────────────────
 
 class MetricsBar(QFrame):
@@ -344,6 +369,20 @@ class LiveResponseBubble(QFrame):
             return
         self._tool_calls += 1
         row = ToolRow(name, args, self.colors)
+        idx = self.bubble_layout.indexOf(self.stream_lbl)
+        self.bubble_layout.insertWidget(idx, row)
+
+    def add_commentary(self, text: str):
+        """AGENT-COMMENTARY-01A. Same insert-before-stream_lbl positioning
+        as add_tool_call()/open_think_block() above, so ordering in the live
+        timeline always matches emission order. Deliberately does NOT touch
+        self._response_text, self._tok_out, or any metrics accounting --
+        commentary stays outside every value finalize() later hands to
+        MetricsBar (copy/replay/token-count isolation, see core/agent.py's
+        on_commentary docstring)."""
+        if not shiboken6.isValid(self.bubble_layout):
+            return
+        row = CommentaryRow(text, self.colors)
         idx = self.bubble_layout.indexOf(self.stream_lbl)
         self.bubble_layout.insertWidget(idx, row)
 
