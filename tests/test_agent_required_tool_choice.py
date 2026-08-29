@@ -34,7 +34,7 @@ this file).
 """
 import types
 
-from core.agent import LuminaAgent, FINISH_TOOL_WORK_NAME
+from core.agent import LuminaAgent, FINISH_TOOL_WORK_NAME, CONTINUE_TOOL_WORK_NAME
 from core.backends.base import TerminationStatus, ToolChoiceMode
 
 
@@ -193,22 +193,33 @@ def test_B_initial_round_does_not_expose_finish_tool_work():
 
 # ── C/D/E/F. Continuation requests REQUIRED, sentinel still works ──────
 
-def test_C_continuation_after_one_tool_requests_required():
+def test_C_gate_request_after_work_phase_no_tool_response_requests_required():
+    """AGENT-CONTINUATION-CONTROL-GATE-01A -- REQUIRED is requested ONLY
+    for the completion-control gate now, never for an ordinary WORK round,
+    however many real tools already ran this turn."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
 
     LuminaAgent.chat(fake, "find it")
 
-    assert llm.tool_choice_modes_seen == [ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED]
+    assert llm.tool_choice_modes_seen == [
+        ToolChoiceMode.AUTO, ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED,
+    ]
 
 
-def test_D_tool_a_then_tool_b_continuation_remains_required():
+def test_D_tool_a_then_tool_b_work_rounds_both_stay_auto():
+    """The core semantic flip from AGENT-REQUIRED-FULL-SCHEMA-01A's finding:
+    every WORK-phase round requests AUTO now, including the second and
+    third real tool calls in a chain -- REQUIRED never applies to the full
+    product-tool selection surface, only to the tiny two-control gate."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("tool_a")]},
         {"tool_calls": [_tc("tool_b")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -216,13 +227,14 @@ def test_D_tool_a_then_tool_b_continuation_remains_required():
     LuminaAgent.chat(fake, "chain two tools")
 
     assert llm.tool_choice_modes_seen == [
-        ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED, ToolChoiceMode.REQUIRED,
+        ToolChoiceMode.AUTO, ToolChoiceMode.AUTO, ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED,
     ]
 
 
 def test_E_finish_tool_work_transitions_to_stream_final_exactly_once():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -230,7 +242,7 @@ def test_E_finish_tool_work_transitions_to_stream_final_exactly_once():
     result = LuminaAgent.chat(fake, "find it")
 
     assert result == "final streamed response"
-    assert llm.call_count == 2
+    assert llm.call_count == 3
 
 
 def test_F_required_mode_never_requested_by_final_streaming():
@@ -247,14 +259,14 @@ def test_F_required_mode_never_requested_by_final_streaming():
 # ── G/H/I. Unsupported-backend fallback ─────────────────────────────────
 
 def test_G_unsupported_backend_preserves_01a_bounded_retry():
-    """supports_required_tool_choice = False on this instance -- even
-    though the fake DOES accept the tool_choice_mode kwarg (proving the
-    resolver, not signature absence, is what keeps it on AUTO), a
-    prose-only continuation still gets exactly the 01A corrective-retry
-    treatment."""
+    """supports_required_tool_choice = False on this instance -- the AGENT
+    still unconditionally REQUESTS REQUIRED for the gate call (resolution
+    against backend capability is the backend layer's job, never the
+    agent's -- see _run_tool_work_control_gate()'s comment), and the gate
+    still reaches a decision, completing the turn."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
-        {"content": "hmm", "termination": TerminationStatus.COMPLETE},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     llm.supports_required_tool_choice = False
@@ -263,11 +275,9 @@ def test_G_unsupported_backend_preserves_01a_bounded_retry():
     result = LuminaAgent.chat(fake, "find it")
 
     assert result == "final streamed response"
-    assert len(calls["ephemeral"]) == 1
-    # Requested REQUIRED, but the backend's own resolver kept it on AUTO --
-    # proves resolution authority lives with the backend, not the caller.
+    assert len(calls["ephemeral"]) == 1  # the gate's own single instruction
     assert llm.tool_choice_modes_seen == [
-        ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED, ToolChoiceMode.REQUIRED,
+        ToolChoiceMode.AUTO, ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED,
     ]
 
 
@@ -278,6 +288,7 @@ def test_H_preO1B_fake_never_receives_the_new_kwarg_at_all():
     for a backend that doesn't even know the concept exists."""
     llm = _PreO1BScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -287,9 +298,10 @@ def test_H_preO1B_fake_never_receives_the_new_kwarg_at_all():
     assert result == "final streamed response"  # would have raised TypeError otherwise
 
 
-def test_I_unsupported_backend_can_still_complete_via_voluntary_sentinel():
+def test_I_unsupported_backend_can_still_complete_via_a_single_gate_round():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     llm.supports_required_tool_choice = False
@@ -298,7 +310,9 @@ def test_I_unsupported_backend_can_still_complete_via_voluntary_sentinel():
     result = LuminaAgent.chat(fake, "find it")
 
     assert result == "final streamed response"
-    assert calls["ephemeral"] == []  # never even needed the retry
+    # The gate's own instruction is its own single ephemeral push -- not a
+    # corrective retry. No corrective-retry nudge was ever needed.
+    assert len(calls["ephemeral"]) == 1
 
 
 # ── J/K. Isolation -- not sticky ─────────────────────────────────────────
@@ -310,6 +324,7 @@ def test_J_required_mode_is_per_round_not_sticky():
     every time, never cached on the backend."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
         {"content": "second turn, no tool needed", "termination": TerminationStatus.COMPLETE},
     ])
@@ -319,7 +334,7 @@ def test_J_required_mode_is_per_round_not_sticky():
     LuminaAgent.chat(fake, "unrelated new question")
 
     assert llm.tool_choice_modes_seen == [
-        ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED, ToolChoiceMode.AUTO,
+        ToolChoiceMode.AUTO, ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED, ToolChoiceMode.AUTO,
     ]
 
 
@@ -359,6 +374,7 @@ def test_M_reasoning_settings_unaffected(monkeypatch):
     two concerns are threaded independently, not coupled."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -376,20 +392,24 @@ def test_M_reasoning_settings_unaffected(monkeypatch):
 
     LuminaAgent.chat(fake, "find it", reasoning_effort="high")
 
-    assert reasoning_effort_seen == ["high", "high"]
-    assert llm.tool_choice_modes_seen == [ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED]
+    assert reasoning_effort_seen == ["high", "high", "high"]
+    assert llm.tool_choice_modes_seen == [
+        ToolChoiceMode.AUTO, ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED,
+    ]
 
 
 def test_N_registry_schema_content_unaffected_by_tool_choice_mode():
     """The REGISTRY's own get_schemas() output (tool profile membership) is
-    identical regardless of tool_choice_mode -- REQUIRED only constrains
-    the CHOICE among whatever the registry already offered plus the
-    locally-appended sentinel, it never changes what the registry itself
-    returns."""
+    identical across every WORK round regardless of tool_choice_mode -- and
+    the control gate NEVER mixes a product tool into its own request at
+    all, proving work-selection and completion-control are two
+    structurally disjoint tool lists (AGENT-CONTINUATION-CONTROL-GATE-01A),
+    not one combined list gated only by tool_choice."""
     fixed_schema = {"type": "function", "function": {
         "name": "search_memory", "description": "", "parameters": {}}}
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -398,7 +418,9 @@ def test_N_registry_schema_content_unaffected_by_tool_choice_mode():
     LuminaAgent.chat(fake, "find it")
 
     assert llm.tools_seen[0] == ["search_memory"]
-    assert llm.tools_seen[1] == ["search_memory", FINISH_TOOL_WORK_NAME]
+    assert llm.tools_seen[1] == ["search_memory"]
+    assert set(llm.tools_seen[2]) == {CONTINUE_TOOL_WORK_NAME, FINISH_TOOL_WORK_NAME}
+    assert "search_memory" not in llm.tools_seen[2]
 
 
 # ── O. Provider exception stays distinguishable ─────────────────────────

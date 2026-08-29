@@ -50,19 +50,35 @@ from tools.git_branches import register_git_branches_tool
 
 CHAIN_BLOCKED_AFTER_SEARCH = {"get_website", "web_search"}
 
-# AGENT-CONTINUATION-01A — explicit tool-work completion control token.
-# Not a product tool: never registered in ToolRegistry, never appears in
-# tool inventories/profiles, never reaches registry.call(). Constructed
-# locally here and appended to the tool_schemas list _chat_impl() sends to
-# the provider ONLY once real tool work has begun this turn (tools_used_
-# this_turn non-empty) — see _chat_impl()'s tool loop. Flows through every
-# backend's existing extract_message()/is_tool_call()/get_tool_calls()/
-# parse_tool_call() unmodified, the same OpenAI-shaped
+# AGENT-CONTINUATION-CONTROL-GATE-01A — two internal continuation-control
+# primitives, never product tools: neither is ever registered in
+# ToolRegistry, appears in tool inventories/Tool Profiles, or reaches
+# registry.call(). Constructed locally here, never offered alongside any
+# enabled product tool (see _run_tool_work_control_gate() below) — the
+# work-selection request and the completion-control request are two
+# structurally separate provider calls with two disjoint tool lists.
+#
+# This replaces AGENT-REQUIRED-FULL-SCHEMA-01A's live-verified finding:
+# offering finish_tool_work alongside the full ~88-tool owner profile under
+# REQUIRED made completion an ~89-way forced-choice contest that
+# z-ai/glm-5.3-flash intermittently lost to an irrelevant ordinary tool
+# (distractor loops, wasted redundant calls, occasionally MAX_TOOL_
+# ITERATIONS). A disposable live matrix ruled out repositioning/rewording
+# the sentinel within that same forced-choice contest as a fix (moving it
+# to the front of the list made things WORSE, not better) — the only
+# reliable live fix was removing it from that contest entirely. This is
+# that: full product profile + AUTO for real work, then a tiny two-choice
+# REQUIRED gate asking only "continue or finish" once a work-selection
+# round returns no real tool call. See _run_tool_work_control_gate()'s
+# docstring for the full state machine.
+#
+# Flows through every backend's existing extract_message()/is_tool_call()/
+# get_tool_calls()/parse_tool_call() unmodified, the same OpenAI-shaped
 # {"type":"function","function":{...}} schema every registered tool
-# already uses, which is exactly why this needs zero backend-specific code
-# to work identically across the OpenAI-compatible family, Anthropic, and
-# Gemini.
+# already uses — zero backend-specific code needed across the OpenAI-
+# compatible family, Anthropic, and Gemini.
 FINISH_TOOL_WORK_NAME = "finish_tool_work"
+CONTINUE_TOOL_WORK_NAME = "continue_tool_work"
 
 _FINISH_TOOL_WORK_SCHEMA = {
     "type": "function",
@@ -77,18 +93,40 @@ _FINISH_TOOL_WORK_SCHEMA = {
     },
 }
 
+_CONTINUE_TOOL_WORK_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": CONTINUE_TOOL_WORK_NAME,
+        "description": (
+            "Choose this only if additional real tool work is required "
+            "before answering. After choosing it, the full enabled tool "
+            "set becomes available again."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
 
-def _extract_finish_tool_work(llm, tool_calls: list):
-    """Return the finish_tool_work tool_call dict if present in
-    `tool_calls`, else None. Goes through the backend's own
-    parse_tool_call() rather than name-matching a raw provider-specific
-    shape, so this works identically across every backend family."""
+# Sent ONLY by _run_tool_work_control_gate() below — never merged with, or
+# offered alongside, the registry's own product-tool schemas. Order is not
+# load-bearing here (unlike the old design this replaces): both are tiny,
+# and there is no large candidate set for position to matter within.
+_CONTROL_GATE_SCHEMAS = [_CONTINUE_TOOL_WORK_SCHEMA, _FINISH_TOOL_WORK_SCHEMA]
+
+
+def _find_control_call(llm, tool_calls: list, name: str):
+    """Return the tool_call dict named `name` if present in `tool_calls`,
+    else None. Goes through the backend's own parse_tool_call() rather
+    than name-matching a raw provider-specific shape, so this works
+    identically across every backend family. Only ever called with
+    FINISH_TOOL_WORK_NAME/CONTINUE_TOOL_WORK_NAME by
+    _run_tool_work_control_gate() below — the two internal control
+    primitives never appear in an ordinary work-selection response."""
     for tc in tool_calls:
         try:
-            name, _ = llm.parse_tool_call(tc)
+            n, _ = llm.parse_tool_call(tc)
         except Exception:
             continue
-        if name == FINISH_TOOL_WORK_NAME:
+        if n == name:
             return tc
     return None
 
@@ -182,6 +220,164 @@ def _close_cancelled_tool_calls(agent, tool_calls):
         except Exception:
             name = "cancelled_tool"
         agent.ctx.add_cancelled_tool_result(tool_id, name)
+
+
+def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_this_turn: set):
+    """Call agent.llm.chat(**chat_kwargs); on success return (response,
+    None). On a genuine provider exception, print the same diagnostic the
+    tool loop has always printed and return (None, error_text) -- ready to
+    return directly from chat(), never raised further (chat() never raises
+    for a provider failure -- see its own docstring). Cancellation observed
+    while the exception is being handled still raises TurnCancelled,
+    exactly as before this helper existed.
+
+    Module-level and duck-typed against `agent` (never a bound method),
+    same convention as _close_cancelled_tool_calls() above -- so the
+    existing types.SimpleNamespace fake-agent pattern across this file's
+    tests keeps working with zero extra method-binding, only real llm/ctx/
+    on_response_token attributes.
+
+    Shared by both the WORK-phase request and _run_tool_work_control_gate()
+    below, so a provider rejecting either one gets identical "tool already
+    ran, provider rejected the continuation" observability -- the gate's
+    own request IS a tool-continuation request, same as the old design's
+    post-tool round was, so tools_used_this_turn is always already
+    non-empty by the time this is called for a gate request."""
+    try:
+        return agent.llm.chat(**chat_kwargs), None
+    except Exception as e:
+        if _cancel_requested(cancel_event):
+            raise TurnCancelled()
+        provider = getattr(agent.llm, "display_name", None) or getattr(agent.llm, "name", "the provider")
+        get_model = getattr(agent.llm, "get_model", None)
+        model = get_model() if callable(get_model) else "unknown"
+        stage = "tool_continuation" if tools_used_this_turn else "initial_request"
+        print(f"[AGENT ERROR] provider={provider} model={model} "
+              f"stage={stage} {type(e).__name__}: {e}", flush=True)
+        if tools_used_this_turn:
+            # A tool already ran successfully this turn — the failure is
+            # the PROVIDER rejecting the continuation request, not a
+            # silent hang. Name it explicitly so this doesn't read as
+            # "the model just stopped responding" — the actual symptom
+            # Bug B produced before the thoughtSignature-preservation
+            # fix in gemini_backend.py. Streamed via on_response_token
+            # (the same path _stream_final's own error handler already
+            # uses) rather than just returned, because agent.chat()
+            # deliberately never raises — main.py's CLI loop calls it
+            # with no try/except around the call, relying on that
+            # contract — so the only way to make this visible in the
+            # GUI without touching that contract is to push it through
+            # the token-streaming callback the GUI already renders live
+            # (AgentWorker → _on_response_chunk → the live bubble),
+            # rather than routing through the separate signals.error /
+            # _on_error path, which only fires on a raised exception and
+            # is never reached from inside this try/except at all.
+            just_ran = ", ".join(f"`{n}`" for n in sorted(tools_used_this_turn))
+            err = f"[Tool {just_ran} completed, but {provider} rejected the continuation: {e}]"
+        else:
+            err = f"[Lumina error: {e}]"
+        on_response_token = getattr(agent, "on_response_token", None)
+        if callable(on_response_token):
+            on_response_token(err)
+        return None, err
+
+
+def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
+                                 reasoning_effort, chat_id):
+    """AGENT-CONTINUATION-CONTROL-GATE-01A -- ask ONLY the two internal
+    continuation-control primitives (_CONTROL_GATE_SCHEMAS — never a
+    product tool) whether real tool work for this turn is complete. Only
+    ever called by _chat_impl()'s tool loop after at least one real tool
+    has already executed this turn and a WORK round returned no real tool
+    call — never on a genuine first-round answer.
+
+    Module-level and duck-typed against `agent`, same convention as
+    _provider_chat_or_error() above -- no method binding needed on a fake.
+
+    Returns (outcome, error_text):
+      ("finish", None)      -- stream the final answer
+      ("continue", None)    -- return to a full-profile WORK round
+      ("malformed", None)   -- both or neither control selected
+      ("incomplete", None)  -- response was positively truncated
+      ("cancelled", None)   -- caller must raise TurnCancelled
+      ("error", text)       -- provider exception; text is ready to
+                                return directly from chat()
+
+    Uses the existing one-turn ephemeral system-prompt injection
+    (ctx.push_ephemeral/build_messages) for the gate's own instruction --
+    consumed by this call's own build_messages() and gone by the time any
+    later request is built, exactly like every other ephemeral nudge in
+    this file, so it never leaks into a later WORK round or the final
+    stream. Never persists a synthetic user or assistant message, never
+    dispatches through registry.call(), never touches _session_tool_calls
+    or the skill-nudge threshold, never fires on_tool_call/on_tool_result
+    -- the isolation contract AGENT-CONTINUATION-01A established for
+    finish_tool_work applies identically to both primitives here."""
+    agent.ctx.push_ephemeral(
+        "## Tool-work completion gate\n"
+        "Decide whether additional real tool work is required. "
+        "Call continue_tool_work if more tool work is needed. "
+        "Call finish_tool_work if tool work is complete. "
+        "Choose exactly one."
+    )
+    gate_budget = sum(len(str(s)) // 4 for s in _CONTROL_GATE_SCHEMAS)
+    messages = agent.ctx.build_messages(tool_budget=gate_budget, chat_id=chat_id)
+    if _cancel_requested(cancel_event):
+        return "cancelled", None
+
+    chat_kwargs = dict(
+        messages=messages,
+        tools=_CONTROL_GATE_SCHEMAS,
+        max_tokens=config.RESPONSE_RESERVE_TOKENS,
+        reasoning_effort=reasoning_effort,
+    )
+    if _accepts_tool_choice_mode(agent.llm):
+        # Always REQUEST required here -- resolution against this
+        # backend's live-verified capability is the backend layer's job
+        # (BaseLLMBackend._resolve_tool_choice_mode / each concrete
+        # chat()), exactly the separation of concerns AGENT-CONTINUATION-
+        # 01B established: the agent expresses intent, only a backend with
+        # supports_required_tool_choice = True does anything different
+        # with it; every other backend silently keeps this on AUTO. This
+        # is now the ONLY place in the whole tool loop that ever requests
+        # REQUIRED.
+        chat_kwargs["tool_choice_mode"] = ToolChoiceMode.REQUIRED
+
+    response, err = _provider_chat_or_error(agent, chat_kwargs, cancel_event, tools_used_this_turn)
+    if err is not None:
+        return "error", err
+    if _cancel_requested(cancel_event):
+        return "cancelled", None
+
+    message = agent.llm.extract_message(response)
+    _extract_termination = getattr(agent.llm, "extract_termination", None)
+    termination = (_extract_termination(response) if callable(_extract_termination)
+                   else TerminationStatus.UNKNOWN)
+    if termination == TerminationStatus.INCOMPLETE:
+        return "incomplete", None
+
+    has_tool_calls = agent.llm.is_tool_call(message)
+    tool_calls = agent.llm.get_tool_calls(message) if has_tool_calls else []
+    finish_call = _find_control_call(agent.llm, tool_calls, FINISH_TOOL_WORK_NAME)
+    continue_call = _find_control_call(agent.llm, tool_calls, CONTINUE_TOOL_WORK_NAME)
+
+    if finish_call is not None and continue_call is not None:
+        outcome = "malformed"
+    elif finish_call is not None:
+        outcome = "finish"
+    elif continue_call is not None:
+        outcome = "continue"
+    else:
+        outcome = "malformed"
+
+    if outcome in ("finish", "continue"):
+        commentary = _extract_commentary(message)
+        if commentary:
+            on_commentary = getattr(agent, "on_commentary", None)
+            if callable(on_commentary):
+                on_commentary(commentary)
+
+    return outcome, None
 
 
 def strip_think_blocks(text: str) -> str:
@@ -691,32 +887,95 @@ class LuminaAgent:
                   f"{config.TOOL_BUDGET_TOKENS} configured ceiling "
                   f"({len(self.registry.list_enabled())} enabled tools)", flush=True)
 
+        # AGENT-CONTINUATION-CONTROL-GATE-01A -- explicit state for which
+        # request this iteration sends: "work" (full enabled product
+        # profile, AUTO) or "gate" (the two internal continuation-control
+        # primitives only, REQUIRED where supported). A malformed/
+        # incomplete GATE response retries the GATE itself (re-asks the
+        # same two-choice question) rather than falling through to a WORK
+        # round that doesn't even offer continue/finish -- see
+        # _run_tool_work_control_gate()'s docstring.
+        next_action = "work"
+        # Section 13's ping-pong bound: a SECOND consecutive gate:continue
+        # with no real tool executed in between means the model
+        # contradicted its own decision -- one contradiction gets a fresh
+        # WORK round anyway (benefit of the doubt), a second does not.
+        # Deliberately a separate counter from corrective_retry_used
+        # above/below -- a different situation from truncation recovery or
+        # a malformed gate response, not sharing that budget.
+        consecutive_gate_continues = 0
+
         for iteration in range(config.MAX_TOOL_ITERATIONS):
+            if next_action == "gate":
+                next_action = "work"
+                outcome, gate_error = _run_tool_work_control_gate(
+                    self, tools_used_this_turn, cancel_event, reasoning_effort, chat_id,
+                )
+                if outcome == "cancelled":
+                    raise TurnCancelled()
+                if outcome == "error":
+                    return gate_error
+
+                if outcome == "finish":
+                    # The gate's own ephemeral instruction was already
+                    # consumed by its build_messages() call -- build fresh,
+                    # clean messages here so it can never leak into the
+                    # final stream.
+                    clean_messages = self.ctx.build_messages(chat_id=chat_id)
+                    return self._stream_final(clean_messages, think_step, cancel_event=cancel_event,
+                                               reasoning_effort=reasoning_effort)
+
+                if outcome == "continue":
+                    consecutive_gate_continues += 1
+                    if consecutive_gate_continues > 1:
+                        print(f"[AGENT] tool-work completion gate contradicted its own "
+                              f"continue decision twice in a row — visible non-success", flush=True)
+                        notice = "[Lumina: tool-work continuation ended without confirming completion.]"
+                        on_response_token = getattr(self, "on_response_token", None)
+                        if callable(on_response_token):
+                            on_response_token(notice)
+                        return notice
+                    self.ctx.push_ephemeral(
+                        "## Tool-work continuation\n"
+                        "The completion gate confirmed additional tool work is "
+                        "required. Continue by selecting any enabled real tool "
+                        "needed to complete the task."
+                    )
+                    continue
+
+                # "malformed" (both or neither control selected) or
+                # "incomplete" (positively truncated) -- bounded retry of
+                # the GATE itself, sharing corrective_retry_used's one-shot
+                # budget with the ordinary truncation-recovery path below
+                # rather than a competing counter. No separate ephemeral
+                # push needed here -- _run_tool_work_control_gate() pushes
+                # its own instruction fresh on every call it makes
+                # (including this retry), and push_ephemeral() OVERWRITES
+                # rather than appends, so a second nudge pushed here would
+                # only ever be silently clobbered before the model ever
+                # saw it.
+                if not corrective_retry_used:
+                    corrective_retry_used = True
+                    print(f"[AGENT] tool-work completion gate ambiguity (outcome={outcome}) — "
+                          f"one bounded corrective retry", flush=True)
+                    next_action = "gate"
+                    continue
+                notice = "[Lumina: tool-work continuation ended without confirming completion.]"
+                print(f"[AGENT] tool-work completion gate contract violated after "
+                      f"corrective retry (outcome={outcome})", flush=True)
+                on_response_token = getattr(self, "on_response_token", None)
+                if callable(on_response_token):
+                    on_response_token(notice)
+                return notice
+
+            # ── WORK round: full enabled product profile, AUTO. ──────────
             in_tool_work_phase = bool(tools_used_this_turn)
-            tool_schemas = self.registry.get_schemas()
-            if in_tool_work_phase:
-                # See FINISH_TOOL_WORK_SCHEMA docstring above — only offered
-                # once real tool work has actually begun this turn. An
-                # ordinary first-round answer that needs no tool never sees
-                # this and is never required to call it.
-                tool_schemas = tool_schemas + [_FINISH_TOOL_WORK_SCHEMA]
+            tool_schemas = self.registry.get_schemas()  # never the two control primitives
             tool_token_estimate = self.registry.schema_token_estimate()
             messages = self.ctx.build_messages(tool_budget=tool_token_estimate, chat_id=chat_id)
             if _cancel_requested(cancel_event):
                 raise TurnCancelled()
 
-            # AGENT-CONTINUATION-01B — REQUIRED once tool work is under way,
-            # so a backend with live-verified support (see
-            # supports_required_tool_choice overrides) can structurally
-            # rule out the prose-only continuation live acceptance actually
-            # observed from GLM in 01A, instead of relying on prompting
-            # alone. Never inspected by this method afterwards — a backend
-            # that doesn't support it silently falls back to AUTO
-            # (_resolve_tool_choice_mode), and the existing ambiguous/
-            # corrective-retry/terminal-notice logic below is UNCHANGED and
-            # remains the safety net either way (section 12: a supported
-            # backend that still returns no tool call is a genuine contract
-            # violation, not something to paper over with new logic here).
             chat_kwargs = dict(
                 messages=messages,
                 tools=tool_schemas,
@@ -724,46 +983,16 @@ class LuminaAgent:
                 reasoning_effort=reasoning_effort,
             )
             if _accepts_tool_choice_mode(self.llm):
-                chat_kwargs["tool_choice_mode"] = (
-                    ToolChoiceMode.REQUIRED if in_tool_work_phase else ToolChoiceMode.AUTO
-                )
+                # AGENT-CONTINUATION-CONTROL-GATE-01A -- always AUTO here,
+                # every round, work-phase or not. REQUIRED now applies only
+                # inside _run_tool_work_control_gate() above/below -- see
+                # this method's module-level docstring on
+                # _CONTROL_GATE_SCHEMAS for why offering finish_tool_work
+                # inside this same full-profile request was replaced.
+                chat_kwargs["tool_choice_mode"] = ToolChoiceMode.AUTO
 
-            try:
-                response = self.llm.chat(**chat_kwargs)
-            except Exception as e:
-                if _cancel_requested(cancel_event):
-                    raise TurnCancelled()
-                provider = getattr(self.llm, "display_name", None) or getattr(self.llm, "name", "the provider")
-                get_model = getattr(self.llm, "get_model", None)
-                model = get_model() if callable(get_model) else "unknown"
-                stage = "tool_continuation" if tools_used_this_turn else "initial_request"
-                print(f"[AGENT ERROR] provider={provider} model={model} "
-                      f"stage={stage} {type(e).__name__}: {e}", flush=True)
-                if tools_used_this_turn:
-                    # A tool already ran successfully this turn — the failure is
-                    # the PROVIDER rejecting the continuation request, not a
-                    # silent hang. Name it explicitly so this doesn't read as
-                    # "the model just stopped responding" — the actual symptom
-                    # Bug B produced before the thoughtSignature-preservation
-                    # fix in gemini_backend.py. Streamed via on_response_token
-                    # (the same path _stream_final's own error handler already
-                    # uses below) rather than just returned, because agent.chat()
-                    # deliberately never raises — main.py's CLI loop calls it
-                    # with no try/except around the call, relying on that
-                    # contract — so the only way to make this visible in the
-                    # GUI without touching that contract is to push it through
-                    # the token-streaming callback the GUI already renders live
-                    # (AgentWorker → _on_response_chunk → the live bubble),
-                    # rather than routing through the separate signals.error /
-                    # _on_error path, which only fires on a raised exception and
-                    # is never reached from inside this try/except at all.
-                    just_ran = ", ".join(f"`{n}`" for n in sorted(tools_used_this_turn))
-                    err = f"[Tool {just_ran} completed, but {provider} rejected the continuation: {e}]"
-                else:
-                    err = f"[Lumina error: {e}]"
-                on_response_token = getattr(self, "on_response_token", None)
-                if callable(on_response_token):
-                    on_response_token(err)
+            response, err = _provider_chat_or_error(self, chat_kwargs, cancel_event, tools_used_this_turn)
+            if err is not None:
                 return err
 
             if _cancel_requested(cancel_event):
@@ -782,86 +1011,79 @@ class LuminaAgent:
             has_tool_calls = self.llm.is_tool_call(message)
             tool_calls = self.llm.get_tool_calls(message) if has_tool_calls else []
 
-            # AGENT-CONTINUATION-01A — explicit completion signal. The
-            # response containing it is discarded exactly like today's
-            # ordinary "no tool_calls" final case below (never persisted to
-            # ctx, never dispatched through registry.call()) and the turn
-            # proceeds straight into the same _stream_final() regeneration
-            # pass every final turn already goes through — see module
-            # docstring on _FINISH_TOOL_WORK_SCHEMA for why chat_stream()
-            # itself is deliberately left tool-less (section 7 of the
-            # continuation-contract design: that boundary stays put). Any
-            # real tool_calls present in the same response are deliberately
-            # NOT executed — the model declared tool work complete in the
-            # same breath, so nothing runs "after" that declaration.
-            finished_call = _extract_finish_tool_work(self.llm, tool_calls)
-            if finished_call is not None:
-                commentary = _extract_commentary(message)
-                if commentary:
-                    on_commentary = getattr(self, "on_commentary", None)
-                    if callable(on_commentary):
-                        on_commentary(commentary)
-                return self._stream_final(messages, think_step, cancel_event=cancel_event,
-                                           reasoning_effort=reasoning_effort)
-
             if not has_tool_calls:
-                # No real tool call and no explicit completion signal. Old
-                # rule (implicit "no tool_calls == finished") only still
-                # applies to a genuine first-round answer that is positively
-                # NOT truncated — Design Law: silence is not completion.
-                ambiguous = in_tool_work_phase or termination == TerminationStatus.INCOMPLETE
-                if not ambiguous:
-                    return self._stream_final(messages, think_step, cancel_event=cancel_event,
-                                               reasoning_effort=reasoning_effort)
+                if not in_tool_work_phase:
+                    # Ordinary first-round path -- entirely unchanged: no
+                    # tool work has occurred yet, so the completion gate
+                    # never applies here (Design Law: silence is not
+                    # completion, but an initial genuinely-complete answer
+                    # still needs no tool and no gate).
+                    if termination != TerminationStatus.INCOMPLETE:
+                        return self._stream_final(messages, think_step, cancel_event=cancel_event,
+                                                   reasoning_effort=reasoning_effort)
 
-                if _cancel_requested(cancel_event):
-                    raise TurnCancelled()
+                    if _cancel_requested(cancel_event):
+                        raise TurnCancelled()
 
-                if not corrective_retry_used:
-                    corrective_retry_used = True
-                    if in_tool_work_phase:
-                        reason = "no tool call or finish_tool_work while tool work is active"
-                        nudge = (
-                            "## Tool-work continuation\n"
-                            "Tool work is active this turn. Either call another tool if "
-                            "work remains, or call finish_tool_work if tool work is "
-                            "complete and you are ready to give your final answer."
-                        )
-                    else:
-                        reason = f"initial response termination={termination.value}"
-                        nudge = (
+                    if not corrective_retry_used:
+                        corrective_retry_used = True
+                        print(f"[AGENT] continuation ambiguity (initial response "
+                              f"termination={termination.value}) — one bounded "
+                              f"corrective retry", flush=True)
+                        self.ctx.push_ephemeral(
                             "## Continuation\n"
                             "Your previous response ended before it was complete. "
                             "Continue: call a tool if one is needed, or give your "
                             "complete final answer now."
                         )
-                    print(f"[AGENT] continuation ambiguity ({reason}) — "
-                          f"one bounded corrective retry", flush=True)
-                    self.ctx.push_ephemeral(nudge)
-                    continue
+                        continue
 
-                # Corrective retry already spent this turn — never launder
-                # this into a silent final answer. Same non-persistence
-                # convention as the provider-continuation-failure path
-                # above: surfaced live via on_response_token, not written
-                # into ctx history as if it were genuine assistant content
-                # (see AGENT-CONTINUATION-01A section 9/10 — this is a
-                # distinct condition from a raised provider exception and
-                # must stay visibly distinguishable from one).
-                if in_tool_work_phase:
-                    notice = "[Lumina: tool-work continuation ended without confirming completion.]"
-                else:
                     notice = "[Lumina: response was cut off before it could be confirmed complete.]"
-                print(f"[AGENT] continuation contract violated after corrective retry "
-                      f"(in_tool_work_phase={in_tool_work_phase}, "
-                      f"termination={termination.value})", flush=True)
-                on_response_token = getattr(self, "on_response_token", None)
-                if callable(on_response_token):
-                    on_response_token(notice)
-                return notice
+                    print(f"[AGENT] continuation contract violated after corrective retry "
+                          f"(in_tool_work_phase=False, termination={termination.value})", flush=True)
+                    on_response_token = getattr(self, "on_response_token", None)
+                    if callable(on_response_token):
+                        on_response_token(notice)
+                    return notice
 
-            # Has one or more real tool calls (finish_tool_work already
-            # ruled out above).
+                # In tool work phase, no real tool call this round.
+                if termination == TerminationStatus.INCOMPLETE:
+                    if _cancel_requested(cancel_event):
+                        raise TurnCancelled()
+
+                    if not corrective_retry_used:
+                        corrective_retry_used = True
+                        print(f"[AGENT] continuation ambiguity (no tool call while tool "
+                              f"work is active, termination=incomplete) — one bounded "
+                              f"corrective retry", flush=True)
+                        self.ctx.push_ephemeral(
+                            "## Tool-work continuation\n"
+                            "Your previous response ended before it was complete. "
+                            "Continue tool work or give your final answer."
+                        )
+                        continue
+
+                    notice = "[Lumina: tool-work continuation ended without confirming completion.]"
+                    print(f"[AGENT] continuation contract violated after corrective retry "
+                          f"(in_tool_work_phase=True, termination=incomplete)", flush=True)
+                    on_response_token = getattr(self, "on_response_token", None)
+                    if callable(on_response_token):
+                        on_response_token(notice)
+                    return notice
+
+                # COMPLETE/UNKNOWN, in tool work phase, no real tool call:
+                # this is NOT completion and NOT ordinary commentary (see
+                # this method's module docstring) -- it is an unresolved
+                # work-phase response. Whatever content it carries is
+                # discarded here; only the completion gate decides whether
+                # work is actually done.
+                if _cancel_requested(cancel_event):
+                    raise TurnCancelled()
+                next_action = "gate"
+                continue
+
+            # Has one or more real tool calls.
+            consecutive_gate_continues = 0  # real work happened -- ping-pong bound resets
             if message.get("content"):
                 message["content"] = strip_think_blocks(message["content"])
 

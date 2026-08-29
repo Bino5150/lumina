@@ -169,6 +169,7 @@ def test_A_ordinary_no_tool_answer_emits_zero_commentary():
 def test_B_one_tool_with_commentary_fires_once_before_tool_call():
     llm = _ScriptedLLM([
         {"content": "Checking memory for that.", "tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -191,6 +192,7 @@ def test_C_multi_tool_response_emits_commentary_exactly_once():
     llm = _ScriptedLLM([
         {"content": "Doing three things at once.",
          "tool_calls": [_tc("tool_a"), _tc("tool_b"), _tc("tool_c")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -251,6 +253,7 @@ def test_F_embedded_think_block_stripped_outward_content_preserved():
 def test_G_commentary_with_finish_tool_work_emits_then_streams_final():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"content": "That confirms it. I have enough evidence now.",
          "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
@@ -280,6 +283,7 @@ def test_G2_finish_tool_work_commentary_also_strips_embedded_think_block():
     branches must not silently diverge on this."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"content": "<think>weighing options</think>That confirms it.",
          "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
@@ -374,6 +378,7 @@ def test_K_cancellation_after_commentary_before_tool_dispatch():
 def test_L_commentary_does_not_affect_session_tool_calls():
     llm = _ScriptedLLM([
         {"content": "Running the search.", "tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -389,6 +394,7 @@ def test_L_commentary_does_not_affect_session_tool_calls():
 def test_M_commentary_not_duplicated_in_ctx_history():
     llm = _ScriptedLLM([
         {"content": "Running the search.", "tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)

@@ -254,13 +254,18 @@ def test_complete_openai_tool_loop_uses_correct_field_on_every_request(
             },
         }],
     })
-    # AGENT-CONTINUATION-01A: a real tool already ran (round 1), so the
-    # harness now requires an explicit finish_tool_work completion signal
-    # on the continuation round instead of inferring "done" from a bare
-    # no-tool-calls message -- see core/agent.py's tool loop. A bare
-    # content-only response here would (correctly) trigger the bounded
-    # corrective retry instead of proceeding straight to _stream_final().
-    continuation_response = _FakeResponse({
+    # AGENT-CONTINUATION-CONTROL-GATE-01A: a real tool already ran (round
+    # 1), so the next WORK round (round 2) stays AUTO and offers only the
+    # product tool schema -- no completion control mixed in. It returns no
+    # real tool call, which triggers the completion-control gate (round 3):
+    # a REQUIRED request offering ONLY the two internal control
+    # primitives, never the product tool schema.
+    work_no_tool_response = _FakeResponse({
+        "choices": [{
+            "message": {"role": "assistant", "content": ""},
+        }],
+    })
+    gate_response = _FakeResponse({
         "choices": [{
             "message": {
                 "role": "assistant",
@@ -279,7 +284,7 @@ def test_complete_openai_tool_loop_uses_correct_field_on_every_request(
     ))
     payloads = _capture_posts(
         monkeypatch,
-        responses=(tool_call_response, continuation_response, stream_response),
+        responses=(tool_call_response, work_no_tool_response, gate_response, stream_response),
     )
     monkeypatch.setattr("core.agent.build_skills_block", lambda user_input: "")
 
@@ -300,27 +305,26 @@ def test_complete_openai_tool_loop_uses_correct_field_on_every_request(
 
     assert result == "final answer"
     assert tool_calls == [("lookup", {})]
-    assert len(payloads) == 3
-    assert [payload["stream"] for payload in payloads] == [False, False, True]
+    assert len(payloads) == 4
+    assert [payload["stream"] for payload in payloads] == [False, False, False, True]
     for payload in payloads:
         assert payload["max_completion_tokens"] > 0
         assert "max_tokens" not in payload
         assert payload["reasoning_effort"] == "none"
     assert payloads[0]["tools"] == [tool_schema]
     assert payloads[0]["tool_choice"] == "auto"
-    # Round 2 is a continuation after a real tool already ran, so it also
-    # carries the finish_tool_work sentinel (AGENT-CONTINUATION-01A) --
-    # tool_schema plus exactly one more entry named finish_tool_work.
-    assert tool_schema in payloads[1]["tools"]
-    assert len(payloads[1]["tools"]) == 2
-    sentinel_names = [
-        t["function"]["name"] for t in payloads[1]["tools"] if t != tool_schema
-    ]
-    assert sentinel_names == ["finish_tool_work"]
-    # AGENT-CONTINUATION-01B: OpenAIBackend has live-verified support for
-    # required tool-choice, so a continuation round (real tool already ran)
-    # requests it structurally instead of leaving the model free to answer
-    # in prose with no tool call at all.
-    assert payloads[1]["tool_choice"] == "required"
-    assert "tools" not in payloads[2]
-    assert "tool_choice" not in payloads[2]
+    # Round 2 (the WORK round right after a real tool ran) stays AUTO and
+    # offers ONLY the product tool schema -- no completion control mixed
+    # in (AGENT-CONTINUATION-CONTROL-GATE-01A replaces the old design's
+    # finish_tool_work-appended-to-the-full-schema shape).
+    assert payloads[1]["tools"] == [tool_schema]
+    assert payloads[1]["tool_choice"] == "auto"
+    # Round 3 is the completion-control gate: ONLY the two internal
+    # control primitives, REQUIRED (OpenAIBackend has live-verified
+    # support), never the product tool schema.
+    assert tool_schema not in payloads[2]["tools"]
+    gate_names = {t["function"]["name"] for t in payloads[2]["tools"]}
+    assert gate_names == {"continue_tool_work", "finish_tool_work"}
+    assert payloads[2]["tool_choice"] == "required"
+    assert "tools" not in payloads[3]
+    assert "tool_choice" not in payloads[3]

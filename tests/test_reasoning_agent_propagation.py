@@ -53,6 +53,8 @@ class _RecordingLLM:
         self._chat_count += 1
         if self._chat_count <= self.tool_call_rounds:
             return {"_round": self._chat_count}
+        if self.tool_call_rounds > 0 and self._chat_count == self.tool_call_rounds + 1:
+            return {"_gate_trigger": True}
         return {"_final": True}
 
     def extract_message(self, response):
@@ -63,13 +65,18 @@ class _RecordingLLM:
                 "tool_calls": [{"id": f"c{n}", "type": "function",
                                  "function": {"name": self.tool_name, "arguments": "{}"}}],
             }
+        if "_gate_trigger" in response:
+            # AGENT-CONTINUATION-CONTROL-GATE-01A: the WORK round right
+            # after the last real tool call returns no tool call at all --
+            # the trigger into the completion-control gate. Content-only,
+            # no tool_calls key, exactly like a genuine "nothing more to
+            # do" response.
+            return {"role": "assistant", "content": ""}
         if self.tool_call_rounds > 0:
-            # AGENT-CONTINUATION-01A: at least one real tool already ran
-            # this turn, so the harness now requires an explicit
-            # finish_tool_work completion signal instead of inferring
-            # "done" from a bare no-tool-calls response -- see
-            # core/agent.py's tool loop. A bare no-tool-calls message here
-            # would (correctly, per the new contract) no longer finalize.
+            # This response IS the completion-control gate's own request
+            # now (offered only continue_tool_work/finish_tool_work), so
+            # returning finish_tool_work here is the gate's completion
+            # signal, not an ordinary WORK-round tool call.
             return {
                 "role": "assistant", "content": "",
                 "tool_calls": [{"id": "finish", "type": "function",
@@ -163,7 +170,7 @@ def test_tool_turn_forwards_reasoning_effort_to_every_call():
 
     result = LuminaAgent.chat(fake_self, "do something", reasoning_effort="high")
 
-    assert llm.chat_calls == ["high", "high"]
+    assert llm.chat_calls == ["high", "high", "high"]
     assert llm.stream_calls == ["high"]
     assert result == "final streamed response"
 
@@ -176,7 +183,7 @@ def test_provider_default_none_propagates_through_tool_loop_and_stream():
 
     LuminaAgent.chat(fake_self, "do something", reasoning_effort=None)
 
-    assert llm.chat_calls == [None, None]
+    assert llm.chat_calls == [None, None, None]
     assert llm.stream_calls == [None]
 
 

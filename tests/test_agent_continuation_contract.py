@@ -30,7 +30,7 @@ success path genuinely streams rather than being mocked away.
 """
 import types
 
-from core.agent import LuminaAgent, FINISH_TOOL_WORK_NAME
+from core.agent import LuminaAgent, FINISH_TOOL_WORK_NAME, CONTINUE_TOOL_WORK_NAME
 from core.backends.base import TerminationStatus
 
 
@@ -182,6 +182,7 @@ def test_B_initial_no_tool_incomplete_does_not_silently_finalize():
 def test_C_tool_then_finish_tool_work_streams_final_exactly_once():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -189,17 +190,21 @@ def test_C_tool_then_finish_tool_work_streams_final_exactly_once():
     result = LuminaAgent.chat(fake, "find it")
 
     assert result == "final streamed response"
-    assert llm.call_count == 2
+    assert llm.call_count == 3
     assert calls["registry_calls"] == ["search_memory"]
-    # Sentinel offered starting the round AFTER the first real tool ran.
+    # The two internal control primitives are offered ONLY at the gate --
+    # never on a WORK round, real-tool or not.
     assert FINISH_TOOL_WORK_NAME not in llm.tools_seen[0]
-    assert FINISH_TOOL_WORK_NAME in llm.tools_seen[1]
+    assert FINISH_TOOL_WORK_NAME not in llm.tools_seen[1]
+    assert FINISH_TOOL_WORK_NAME in llm.tools_seen[2]
+    assert CONTINUE_TOOL_WORK_NAME in llm.tools_seen[2]
 
 
 def test_D_two_tools_then_finish_tool_work_both_run_then_final():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("tool_a")]},
         {"tool_calls": [_tc("tool_b")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -208,7 +213,7 @@ def test_D_two_tools_then_finish_tool_work_both_run_then_final():
 
     assert result == "final streamed response"
     assert calls["registry_calls"] == ["tool_a", "tool_b"]
-    assert llm.call_count == 3
+    assert llm.call_count == 4
 
 
 def test_E_tool_result_then_another_real_tool_remains_in_tool_work_phase():
@@ -218,10 +223,12 @@ def test_E_tool_result_then_another_real_tool_remains_in_tool_work_phase():
     ])
     fake, calls = _fake_agent(llm)
 
-    # Third call would raise if reached with no scripted turn -- proves the
-    # loop is still correctly mid-tool-work after two real tool calls
+    # Further calls would raise if reached with no scripted turn -- proves
+    # the loop is still correctly mid-tool-work after two real tool calls
     # rather than having (wrongly) finalized already. We stop it here by
-    # scripting a finish so the turn can complete for the assertion below.
+    # scripting a no-tool round (triggers the gate) then a finish so the
+    # turn can complete for the assertion below.
+    llm.turns.append({"content": "", "termination": TerminationStatus.COMPLETE})
     llm.turns.append({"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]})
 
     result = LuminaAgent.chat(fake, "chain two tools")
@@ -261,12 +268,14 @@ def test_G_corrective_retry_then_finish_tool_work_streams_final():
     assert result == "final streamed response"
 
 
-def test_H_corrective_retry_then_real_tool_executes_and_continues():
+def test_H_gate_continue_then_real_tool_executes_and_continues():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
-        {"content": "hmm", "termination": TerminationStatus.COMPLETE},
-        {"tool_calls": [_tc("read_file")]},
-        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+        {"content": "hmm", "termination": TerminationStatus.COMPLETE},  # WORK -> gate
+        {"tool_calls": [_tc(CONTINUE_TOOL_WORK_NAME)]},                  # GATE -> continue
+        {"tool_calls": [_tc("read_file")]},                              # WORK (restored) -> real tool
+        {"content": "", "termination": TerminationStatus.COMPLETE},      # WORK -> gate
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},                    # GATE -> finish
     ])
     fake, calls = _fake_agent(llm)
 
@@ -276,18 +285,19 @@ def test_H_corrective_retry_then_real_tool_executes_and_continues():
     assert result == "final streamed response"
 
 
-def test_I_second_ambiguous_response_after_retry_is_visible_non_success():
+def test_I_second_ambiguous_gate_response_after_retry_is_visible_non_success():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
-        {"content": "hmm", "termination": TerminationStatus.COMPLETE},
-        {"content": "still hmm", "termination": TerminationStatus.COMPLETE},
+        {"content": "hmm", "termination": TerminationStatus.COMPLETE},        # WORK -> gate
+        {"content": "still hmm", "termination": TerminationStatus.COMPLETE},  # GATE -> malformed, 1 retry spent
+        {"content": "still hmm again", "termination": TerminationStatus.COMPLETE},  # GATE retry -> malformed, budget gone
     ])
     fake, calls = _fake_agent(llm)
 
     result = LuminaAgent.chat(fake, "find it")
 
-    assert llm.call_count == 3
-    assert len(calls["ephemeral"]) == 1  # exactly one retry, not two
+    assert llm.call_count == 4
+    assert len(calls["ephemeral"]) == 2  # the gate's own instruction, then its one retry nudge
     assert "confirming completion" in result
     assert result.startswith("[Lumina:")
     # Streamed live, same convention as the provider-continuation-failure
@@ -301,14 +311,15 @@ def test_I_second_ambiguous_response_after_retry_is_visible_non_success():
 def test_J_incomplete_continuation_after_tool_never_finalizes_silently():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
-        {"content": "The answer is", "termination": TerminationStatus.INCOMPLETE},
-        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+        {"content": "The answer is", "termination": TerminationStatus.INCOMPLETE},  # WORK -> truncation retry
+        {"content": "", "termination": TerminationStatus.COMPLETE},                  # WORK retry -> gate
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},                                # GATE -> finish
     ])
     fake, calls = _fake_agent(llm)
 
     result = LuminaAgent.chat(fake, "find it")
 
-    assert llm.call_count == 3
+    assert llm.call_count == 4
     assert result == "final streamed response"
 
 
@@ -348,6 +359,7 @@ def test_L_initial_generation_incomplete_cannot_silently_finalize():
 def test_MNPQR_finish_tool_work_never_touches_registry_callbacks_or_accounting():
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -397,6 +409,7 @@ def test_Q_skill_nudge_not_triggered_by_finish_tool_work_alone(monkeypatch):
     monkeypatch.setattr(agent_module.config, "SKILLS_TRIGGER_THRESHOLD", 1)
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
@@ -416,6 +429,7 @@ def test_TU_anomaly_notice_is_textually_distinct_from_provider_exception_notice(
         {"tool_calls": [_tc("search_memory")]},
         {"content": "hmm", "termination": TerminationStatus.COMPLETE},
         {"content": "still hmm", "termination": TerminationStatus.COMPLETE},
+        {"content": "still hmm again", "termination": TerminationStatus.COMPLETE},
     ])
     fake, calls = _fake_agent(llm)
 
@@ -427,14 +441,13 @@ def test_TU_anomaly_notice_is_textually_distinct_from_provider_exception_notice(
 
 # ── V/W/X. Cancellation around the new branches ─────────────────────────
 
-def test_V_cancel_before_corrective_retry_raises_turn_cancelled():
+def test_V_cancel_before_control_gate_entry_raises_turn_cancelled():
     """Isolates the specific cancellation check guarding entry into the
-    corrective-retry branch (added right before `if not
-    corrective_retry_used:` in core/agent.py) from the pre-existing check
-    immediately after self.llm.chat() returns. Flips the event inside
-    is_tool_call() -- which runs strictly after that pre-existing check and
-    strictly before the new one -- so only the new check can be what
-    raises here."""
+    completion-control gate (added right before `next_action = "gate"` in
+    core/agent.py) from the pre-existing check immediately after
+    self.llm.chat() returns. Flips the event inside is_tool_call() -- which
+    runs strictly after that pre-existing check and strictly before the new
+    one -- so only the new check can be what raises here."""
     import threading
     import pytest
     from core.agent import TurnCancelled
@@ -450,7 +463,7 @@ def test_V_cancel_before_corrective_retry_raises_turn_cancelled():
 
     def is_tool_call_then_maybe_cancel(message):
         result = real_is_tool_call(message)
-        if llm.call_count == 2:  # the ambiguous continuation round
+        if llm.call_count == 2:  # the WORK round about to trigger the gate
             event.set()
         return result
 
@@ -459,7 +472,7 @@ def test_V_cancel_before_corrective_retry_raises_turn_cancelled():
     with pytest.raises(TurnCancelled):
         LuminaAgent.chat(fake, "find it", cancel_event=event)
 
-    # Never reached the corrective-retry ephemeral push or a third call.
+    # Never reached the control gate's own ephemeral push or a third call.
     assert calls["ephemeral"] == []
     assert llm.call_count == 2
 
