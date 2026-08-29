@@ -17,7 +17,8 @@ import os
 import config
 
 
-def connect(path: str = None, row_factory: bool = True, foreign_keys: bool = True) -> sqlite3.Connection:
+def connect(path: str = None, row_factory: bool = True, foreign_keys: bool = True,
+            check_same_thread: bool = True) -> sqlite3.Connection:
     """
     Open a SQLite connection with WAL mode and busy_timeout already set.
 
@@ -28,10 +29,22 @@ def connect(path: str = None, row_factory: bool = True, foreign_keys: bool = Tru
                      (dict-like access) instead of plain tuples.
         foreign_keys: if True (default), enables FK enforcement for this
                       connection. SQLite requires this per-connection.
+        check_same_thread: AGENT-FLIGHT-RECORDER-01A1 -- True (default)
+                      preserves every existing caller's behavior exactly
+                      (a connection usable only from the thread that opened
+                      it -- sqlite3's own default). Pass False ONLY when
+                      the caller holds one persistent connection open
+                      across multiple threads AND serializes every use of
+                      it with its own lock -- core/flight_recorder.py's
+                      FlightRecorder is the first such caller, per its own
+                      docstring; this is exactly the pattern Python's
+                      sqlite3 docs describe as safe under check_same_
+                      thread=False ("ensure serialized access ... with a
+                      lock or similar").
     """
     db_path = path or config.DB_PATH
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     if foreign_keys:

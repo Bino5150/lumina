@@ -17,10 +17,28 @@ def _build_memory_backup(data_dir: str, dest_path: str):
     testable without a modal QFileDialog in the way. Deliberately does NOT
     touch ~/.config/lumina/credentials.json — that lives outside
     config.DATA_DIR entirely, so this can't leak an API key even though it
-    grabs everything else without exceptions."""
+    grabs everything else without exceptions.
+
+    AGENT-FLIGHT-RECORDER-01A1 -- no separate backup button, per that
+    mission's explicit requirement: the recorder's SQLite db already lives
+    under DATA_DIR/telemetry/ (see core/flight_recorder.py), so the
+    os.walk() below already sweeps it in with zero changes needed here.
+    The only real addition is this second checkpoint call, for the same
+    reason the main db gets one two lines up -- an un-checkpointed WAL
+    file would still be a coherent recover-from-crash state, but zipping a
+    stale/un-flushed one one is worse than a deliberate flush costs. Best-
+    effort: a recorder that failed to init (or was never touched this
+    process) has nothing to checkpoint, and checkpoint() itself never
+    raises -- backup must not fail because telemetry happened to be
+    unavailable."""
     conn = _db()
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.close()
+    try:
+        from core import flight_recorder
+        flight_recorder.checkpoint()
+    except Exception:
+        pass
     with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, _dirs, files in os.walk(data_dir):
             for fname in files:

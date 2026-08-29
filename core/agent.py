@@ -7,16 +7,19 @@ import inspect
 import re
 import sys
 import os
+import time
 from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 import core.coding_checkpoint as checkpoint_store
 from core import emergency_stop
+from core import flight_recorder
 from core.backends.base import TerminationStatus, ToolChoiceMode
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager
 from core.project_context import ProjectContext, ProjectContextState
+from core.tool_profiles import TOOL_TIERS
 from tools.registry import ToolRegistry
 from tools.meta import register_meta_tools
 from tools.memory import register_memory_tools, init_memory_db, init_chat_db
@@ -283,7 +286,8 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
 
 
 def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
-                                 reasoning_effort, chat_id, think_step: list):
+                                 reasoning_effort, chat_id, think_step: list,
+                                 turn_id: Optional[str] = None):
     """AGENT-CONTINUATION-CONTROL-GATE-01A -- ask ONLY the two internal
     continuation-control primitives (_CONTROL_GATE_SCHEMAS — never a
     product tool) whether real tool work for this turn is complete. Only
@@ -388,7 +392,7 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
         # a malformed/incomplete gate response gets retried, never
         # surfaced as if it were a real tool-decision round.
         reasoning = _collect_tool_round_reasoning(agent.llm, response, message)
-        _emit_tool_round_think(agent, think_step, reasoning)
+        _emit_tool_round_think(agent, think_step, reasoning, turn_id=turn_id)
         if _cancel_requested(cancel_event):
             return "cancelled", None
 
@@ -397,6 +401,7 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
             on_commentary = getattr(agent, "on_commentary", None)
             if callable(on_commentary):
                 on_commentary(commentary)
+            _fr_model(agent, "turn.commentary", commentary, turn_id=turn_id)
 
     return outcome, None
 
@@ -468,7 +473,8 @@ def _collect_tool_round_reasoning(llm, response, message: dict) -> Optional[str]
     return "\n\n".join(parts)
 
 
-def _emit_tool_round_think(agent, think_step: list, reasoning: Optional[str]) -> None:
+def _emit_tool_round_think(agent, think_step: list, reasoning: Optional[str],
+                            turn_id: Optional[str] = None) -> None:
     """AGENT-TOOL-THINK-TELEMETRY-01A1 -- fire one bulk Think event
     (start/one token/end) for a tool-decision round's already-collected
     reasoning, using the SAME shared `think_step` counter _stream_final()
@@ -485,7 +491,18 @@ def _emit_tool_round_think(agent, think_step: list, reasoning: Optional[str]) ->
     rather than partially firing and crashing on the missing one -- the
     same getattr-guarded fail-inert posture as every other optional-
     capability check in this file (see _accepts_tool_choice_mode()'s own
-    docstring for the precedent)."""
+    docstring for the precedent).
+
+    AGENT-FLIGHT-RECORDER-01A1 -- ALSO records this same reasoning text as
+    a turn.think model-expression event, via record_model_expression()
+    (never record_machine_event() -- provenance is structural, not a
+    choice made here). Recorded regardless of whether the Qt callbacks
+    fire (a headless/CLI/subagent turn has no on_think_* callbacks at all
+    but should still get a Flight Recorder trace) -- the UI-callback guard
+    above and the recorder call below are two independent consumers of
+    the same already-collected reasoning, not one gating the other."""
+    _fr_model(agent, "turn.think", reasoning, turn_id=turn_id,
+              fields={"think_step": think_step[0] + 1} if reasoning else None)
     if not reasoning:
         return
     on_think_start = getattr(agent, "on_think_start", None)
@@ -497,6 +514,149 @@ def _emit_tool_round_think(agent, think_step: list, reasoning: Optional[str]) ->
     on_think_start(think_step[0])
     on_think_token(reasoning)
     on_think_end()
+
+
+# ---------------------------------------------------------------------
+# AGENT-FLIGHT-RECORDER-01A1 -- recorder-access helpers.
+#
+# Every call site below reaches the recorder through agent.flight_recorder
+# (an instance attribute LuminaAgent.__init__ sets, never the bare module-
+# level flight_recorder.get_recorder() singleton) precisely so the dozens
+# of existing tests/test_agent_*.py fake agents (types.SimpleNamespace,
+# predating this patch, never given a .flight_recorder attribute) get
+# getattr(..., None) -> skip -- zero recorder writes, zero real-disk
+# touches, zero behavior change for any test that doesn't opt in by
+# setting fake.flight_recorder itself. This is the same getattr-guarded
+# optional-capability pattern every other cross-cutting hook in this file
+# already uses (on_think_start, extract_termination, ...).
+# ---------------------------------------------------------------------
+
+def _fr(agent):
+    return getattr(agent, "flight_recorder", None)
+
+
+def _fr_machine(agent, event_type: str, *, turn_id=None, chat_id=None,
+                 severity: str = "info", fields: dict = None, **kwargs) -> None:
+    """Fail-safe machine-event recording. Computing `fields` at the call
+    site (self.llm.configured_model(), registry.schema_token_estimate(),
+    ...) can itself raise against a minimal test fake missing an optional
+    method -- callers should still wrap that gathering defensively, but
+    this wrapper is the last line of defense so a recorder call can never
+    surface as a crash in a real turn either way. ValueError (calling this
+    for a model-expression event_type -- provenance-API misuse) is a real
+    programming-bug signal and stays loud; every other exception is
+    swallowed, mirroring FlightRecorder._write()'s own operational-failure
+    posture one layer up."""
+    fr = _fr(agent)
+    if fr is None:
+        return
+    try:
+        fr.record_machine_event(event_type, turn_id=turn_id, chat_id=chat_id,
+                                 severity=severity, fields=fields, **kwargs)
+    except ValueError:
+        raise
+    except Exception:
+        pass
+
+
+def _fr_model(agent, event_type: str, text: Optional[str], *, turn_id=None,
+               chat_id=None, severity: str = "info", fields: dict = None, **kwargs) -> None:
+    """Fail-safe model-expression recording -- same posture as _fr_machine()
+    above. A None/empty `text` is a legitimate "nothing to record" no-op,
+    not an error (a round with no reasoning/commentary this cycle)."""
+    if not text:
+        return
+    fr = _fr(agent)
+    if fr is None:
+        return
+    try:
+        fr.record_model_expression(event_type, text=text, turn_id=turn_id,
+                                    chat_id=chat_id, severity=severity, fields=fields, **kwargs)
+    except ValueError:
+        raise
+    except Exception:
+        pass
+
+
+def _tool_call_fields(batch_ordinal: int, call_ordinal: int, name: str, args) -> dict:
+    """AGENT-FLIGHT-RECORDER-01A1 -- the fields one tool.call event carries:
+    where it sits in its batch, the tool's tier (TOOL_TIERS, same table
+    core/agent.py's own non-owner PIN gate already reads -- default
+    "execute" for an unclassified tool, same fail-closed default that gate
+    uses), a bounded/redacted args representation for human debugging, and
+    a stable args hash (flight_recorder.hash_args()) for duplicate-call
+    detection across a turn's whole tool-burst -- mission section 6/12."""
+    return {
+        "batch_ordinal": batch_ordinal,
+        "call_ordinal": call_ordinal,
+        "tool_name": name,
+        "tool_tier": TOOL_TIERS.get(name, "execute"),
+        "args": flight_recorder.bounded_repr(args),
+        "args_hash": flight_recorder.hash_args(args),
+        "start_ts": time.time(),
+    }
+
+
+def _effective_tool_budgets(agent) -> dict:
+    """Best-effort snapshot of the LIVE effective values actually driving
+    this turn's tool loop -- not the raw config constants alone, since
+    several of these are resolved per-backend/per-profile at runtime (see
+    core/context.py's ContextManager.max_tokens, itself seeded from
+    config.MAX_CONTEXT_TOKENS which is per-backend-resolved in config.py;
+    core/tool_profiles.py's per-persona enabled-tool set). Source-vetted
+    against the live for-loop this feeds (see _chat_impl()'s own
+    `for iteration in range(config.MAX_TOOL_ITERATIONS)`): MAX_TOOL_
+    ITERATIONS bounds tool-decision ROUNDS (each a single non-streaming
+    provider call, itself possibly carrying a multi-call tool BATCH) --
+    it is NOT a raw tool-call-count ceiling, and is reported here under
+    that exact name (tool_iteration_limit) rather than a "tool call
+    limit" label the source does not support. Never raises -- any single
+    field unreadable from a minimal test fake just comes back absent from
+    the dict rather than aborting the whole snapshot.
+
+    Field naming note: every quantity below is denominated in tokens (the
+    LLM-context sense, not a credential), but deliberately does NOT spell
+    "token" into the field name itself -- flight_recorder's own structural
+    redaction treats any field whose key contains "token" as a likely
+    credential and replaces its value with "[REDACTED]" outright (mission
+    section 7's explicit requirement). "tool_schema_budget"/"tool_schema_
+    footprint"/"context_limit"/"context_used" read fine as token counts in
+    context (this function's own docstring says so) without colliding
+    with that marker -- renaming the field beats weakening the redaction."""
+    out = {}
+    try:
+        out["tool_iteration_limit"] = config.MAX_TOOL_ITERATIONS
+    except Exception:
+        pass
+    try:
+        out["tool_schema_budget"] = config.TOOL_BUDGET_TOKENS
+    except Exception:
+        pass
+    registry = getattr(agent, "registry", None)
+    schema_footprint = None
+    if registry is not None:
+        try:
+            schema_footprint = registry.schema_token_estimate()
+            out["tool_schema_footprint"] = schema_footprint
+        except Exception:
+            pass
+        try:
+            out["enabled_tool_count"] = len(registry.list_enabled())
+        except Exception:
+            pass
+    ctx = getattr(agent, "ctx", None)
+    if ctx is not None:
+        try:
+            out["context_limit"] = ctx.max_tokens
+        except Exception:
+            pass
+        try:
+            usage = ctx.context_usage_snapshot(tool_budget=schema_footprint or 0)
+            out["context_used"] = usage.get("used_tokens")
+            out["context_used_percent"] = usage.get("percent")
+        except Exception:
+            pass
+    return out
 
 
 # Sentinel prefixes chat()'s tool-loop except-block and _stream_final()'s
@@ -550,6 +710,9 @@ class LuminaAgent:
                  project_context: Optional[ProjectContext] = None,
                  _review_target_grant: Optional[
                      checkpoint_store.TargetIdentity
+                 ] = None,
+                 flight_recorder_instance: Optional[
+                     flight_recorder.FlightRecorder
                  ] = None):
         """
         Streaming callbacks:
@@ -602,6 +765,19 @@ class LuminaAgent:
             never authority (see tools/review.py's module docstring), and
             this value is never re-read from a mutable ProjectContextState
             that a later-granted activate_project() call could repoint.
+        flight_recorder_instance (AGENT-FLIGHT-RECORDER-01A1): optional
+            explicit FlightRecorder to use instead of the process-wide
+            default singleton (core.flight_recorder.get_recorder()).
+            None (default, every real caller) resolves to that singleton
+            lazily on first use. Tests that want an isolated, throwaway
+            recorder (never touching the real on-disk telemetry db) pass
+            their own FlightRecorder(db_path=tmp_path/...) here. See
+            _fr()/_fr_machine()/_fr_model() module-level helpers above --
+            every recorder call in this file reads self.flight_recorder,
+            never the bare module-level singleton directly, so a
+            types.SimpleNamespace test fake that never sets this attribute
+            at all gets recorder calls skipped entirely (getattr(...,
+            None)), not a crash and not a real write.
         """
         self.llm = get_llm_backend(name=backend)
         self.owner = owner
@@ -621,6 +797,17 @@ class LuminaAgent:
         # project_context above. Set at the top of a turn, cleared when it
         # ends -- see chat() below.
         self.turn_cancellation = TurnCancellation()
+        # AGENT-FLIGHT-RECORDER-01A1 -- every real (non-test-fake)
+        # LuminaAgent gets a working recorder reference: the process-wide
+        # default singleton unless a caller explicitly overrides it (tests
+        # only -- see the docstring above). FlightRecorder's own __init__
+        # never raises (init failure degrades to enabled=False, not an
+        # exception), so this can't fail agent construction either.
+        self.flight_recorder = (
+            flight_recorder_instance
+            if flight_recorder_instance is not None
+            else flight_recorder.get_recorder()
+        )
 
         if owner:
             # FE-09: one-time, idempotent — moves any cloud API keys still
@@ -820,6 +1007,21 @@ class LuminaAgent:
         EmergencyStopError is caught here — never a bare Exception — so an
         unrelated programmer error out of execution_scope() still surfaces
         as itself.
+
+        AGENT-FLIGHT-RECORDER-01A1: mints this turn's turn_id HERE (once
+        per foreground turn, per the mission's correlation model — see
+        flight_recorder.new_turn_id()), threads it down into _chat_impl()
+        (and from there into every Think/Commentary/tool/final event this
+        turn produces), and records exactly one terminal machine event —
+        turn.completed, turn.cancelled, or turn.failed — no matter which of
+        _chat_impl()'s three exit shapes actually happened: a normal
+        return (classified via is_error_response() -- an error-sentinel
+        STRING return is turn.failed even though nothing was raised), a
+        raised TurnCancelled/EmergencyStopError (turn.cancelled), or any
+        other raised exception (turn.failed). This wrapping observes the
+        outcome after the fact; it changes no control flow and swallows
+        nothing new — every branch below still returns or raises exactly
+        as it did before this instrumentation existed.
         """
         # CODING-06A2: getattr-guarded, same reason as every other fake-self
         # compatibility check in this method — lightweight test stand-ins
@@ -829,6 +1031,14 @@ class LuminaAgent:
         turn_cancellation = getattr(self, "turn_cancellation", None)
         if turn_cancellation is not None:
             turn_cancellation._set(cancel_event)
+        turn_id = flight_recorder.new_turn_id()
+        turn_started_at = time.time()
+        # Set by the EmergencyStopError handler below BEFORE it raises
+        # TurnCancelled -- so the outer `except TurnCancelled:` (which also
+        # catches every OTHER TurnCancelled raised directly from deep
+        # inside _chat_impl()'s own cooperative-cancel checks) never
+        # double-records the same cancellation under two different reasons.
+        cancel_already_recorded = False
         try:
             try:
                 with emergency_stop.execution_scope(
@@ -840,21 +1050,51 @@ class LuminaAgent:
                         "chat_id": chat_id,
                     },
                 ):
-                    return LuminaAgent._chat_impl(
+                    result = LuminaAgent._chat_impl(
                         self, user_input, source=source, chat_id=chat_id,
                         cancel_event=cancel_event, reasoning_effort=reasoning_effort,
+                        turn_id=turn_id,
                     )
+                    duration_s = time.time() - turn_started_at
+                    if is_error_response(result):
+                        _fr_machine(self, "turn.failed", turn_id=turn_id, chat_id=chat_id,
+                                    severity="error",
+                                    fields={"reason": "error_sentinel", "duration_s": duration_s,
+                                            "response_preview": result})
+                    else:
+                        _fr_machine(self, "turn.completed", turn_id=turn_id, chat_id=chat_id,
+                                    fields={"duration_s": duration_s,
+                                            "response_chars": len(result or "")})
+                    return result
             except emergency_stop.EmergencyStopError:
                 self.ctx.add_user(user_input, source=source)
+                _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
+                            severity="warning",
+                            fields={"reason": "emergency_stop", "duration_s": time.time() - turn_started_at})
+                cancel_already_recorded = True
                 raise TurnCancelled()
+        except TurnCancelled:
+            if not cancel_already_recorded:
+                _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
+                            severity="warning",
+                            fields={"reason": "cooperative_stop", "duration_s": time.time() - turn_started_at})
+            raise
+        except Exception as e:
+            _fr_machine(self, "turn.failed", turn_id=turn_id, chat_id=chat_id,
+                        severity="error",
+                        fields={"reason": "exception", "error_type": type(e).__name__,
+                                "duration_s": time.time() - turn_started_at})
+            raise
         finally:
             if turn_cancellation is not None:
                 turn_cancellation._set(None)
 
     def _chat_impl(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
-                    cancel_event=None, reasoning_effort: Optional[str] = None) -> str:
+                    cancel_event=None, reasoning_effort: Optional[str] = None,
+                    turn_id: Optional[str] = None) -> str:
         tools_used_this_turn = set()
         think_step = [0]
+        tool_batch_ordinal = 0  # AGENT-FLIGHT-RECORDER-01A1 -- per-turn, incremented once per tool-bearing WORK round
         # AGENT-CONTINUATION-01A — per-turn bound on the corrective retry
         # below, not per-occurrence: this whole foreground turn gets at
         # most one automatic "you didn't call a tool or confirm completion"
@@ -1000,6 +1240,38 @@ class LuminaAgent:
                   f"{config.TOOL_BUDGET_TOKENS} configured ceiling "
                   f"({len(self.registry.list_enabled())} enabled tools)", flush=True)
 
+        # AGENT-FLIGHT-RECORDER-01A1 -- turn.started, with the LIVE
+        # effective budgets actually governing this turn's tool loop (see
+        # _effective_tool_budgets()'s own docstring for why these are
+        # resolved values, not raw config constants). backend/model come
+        # from self.llm.name (a plain class attribute) and configured_
+        # model() (BaseLLMBackend's network-free "what's configured"
+        # read -- deliberately NOT get_model(), which some backends
+        # resolve via a live HTTP call when no model is set yet; logging a
+        # turn start must never risk a surprise network request).
+        #
+        # The whole block is wrapped here, not just the eventual record()
+        # call -- _fr_machine()'s own try/except only guards the actual
+        # write; gathering these fields (an attribute that exists but
+        # raises when called, on some future/unusual test double) happens
+        # at this call site, before _fr_machine() is even entered. Recorder
+        # instrumentation must never be the reason a real turn breaks.
+        try:
+            _llm = getattr(self, "llm", None)
+            _fr_machine(
+                self, "turn.started", turn_id=turn_id, chat_id=chat_id,
+                backend=getattr(_llm, "name", None),
+                model=getattr(_llm, "configured_model", lambda: None)(),
+                fields={
+                    "source": source,
+                    "channel_id": getattr(self, "channel_id", None),
+                    "owner": getattr(self, "owner", None),
+                    **_effective_tool_budgets(self),
+                },
+            )
+        except Exception:
+            pass
+
         # AGENT-CONTINUATION-CONTROL-GATE-01A -- explicit state for which
         # request this iteration sends: "work" (full enabled product
         # profile, AUTO) or "gate" (the two internal continuation-control
@@ -1023,7 +1295,7 @@ class LuminaAgent:
                 next_action = "work"
                 outcome, gate_error = _run_tool_work_control_gate(
                     self, tools_used_this_turn, cancel_event, reasoning_effort, chat_id,
-                    think_step,
+                    think_step, turn_id,
                 )
                 if outcome == "cancelled":
                     raise TurnCancelled()
@@ -1037,7 +1309,7 @@ class LuminaAgent:
                     # final stream.
                     clean_messages = self.ctx.build_messages(chat_id=chat_id)
                     return self._stream_final(clean_messages, think_step, cancel_event=cancel_event,
-                                               reasoning_effort=reasoning_effort)
+                                               reasoning_effort=reasoning_effort, turn_id=turn_id)
 
                 if outcome == "continue":
                     consecutive_gate_continues += 1
@@ -1134,7 +1406,7 @@ class LuminaAgent:
                     # still needs no tool and no gate).
                     if termination != TerminationStatus.INCOMPLETE:
                         return self._stream_final(messages, think_step, cancel_event=cancel_event,
-                                                   reasoning_effort=reasoning_effort)
+                                                   reasoning_effort=reasoning_effort, turn_id=turn_id)
 
                     if _cancel_requested(cancel_event):
                         raise TurnCancelled()
@@ -1209,7 +1481,7 @@ class LuminaAgent:
             # check already covers the Commentary-to-Tool-dispatch
             # boundary -- see that loop below).
             reasoning = _collect_tool_round_reasoning(self.llm, response, message)
-            _emit_tool_round_think(self, think_step, reasoning)
+            _emit_tool_round_think(self, think_step, reasoning, turn_id=turn_id)
 
             if message.get("content"):
                 message["content"] = strip_think_blocks(message["content"])
@@ -1246,8 +1518,29 @@ class LuminaAgent:
                 on_commentary = getattr(self, "on_commentary", None)
                 if callable(on_commentary):
                     on_commentary(commentary)
+                _fr_model(self, "turn.commentary", commentary, turn_id=turn_id)
 
             self.ctx.add_tool_call(message)
+
+            # AGENT-FLIGHT-RECORDER-01A1 -- one batch = one provider
+            # response's tool_calls list, exactly the unit already
+            # established by _collect_tool_round_reasoning()/commentary
+            # above (both read the SAME `message`/`tool_calls` this batch
+            # event describes). tool_batch_ordinal is turn-scoped (declared
+            # once at the top of _chat_impl(), incremented once per
+            # tool-bearing WORK round -- a GATE round never reaches this
+            # branch at all, so gate rounds never contribute a batch).
+            #
+            # "concurrent" is always False and explicitly recorded as such
+            # (never omitted, never phrased as "parallel") -- the loop
+            # dispatching this batch below is a plain sequential `for`,
+            # confirmed by reading it, not assumed. If concurrent tool
+            # dispatch is ever added, THIS is the one field that must
+            # change to stay honest.
+            tool_batch_ordinal += 1
+            _fr_machine(self, "tool.batch", turn_id=turn_id, chat_id=chat_id,
+                        fields={"batch_ordinal": tool_batch_ordinal,
+                                "batch_size": len(tool_calls), "concurrent": False})
 
             for index, tc in enumerate(tool_calls):
                 if _cancel_requested(cancel_event):
@@ -1263,20 +1556,38 @@ class LuminaAgent:
                 if "web_search" in tools_used_this_turn and name in CHAIN_BLOCKED_AFTER_SEARCH:
                     result = "[Skipped: summarize from search results already provided.]"
                     self.ctx.add_tool_result(tool_id, name, result)
+                    _fr_machine(self, "tool.call", turn_id=turn_id, chat_id=chat_id,
+                                fields=_tool_call_fields(tool_batch_ordinal, index, name, args))
+                    _fr_machine(self, "tool.result", turn_id=turn_id, chat_id=chat_id,
+                                fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,
+                                        "tool_name": name, "success": True, "skipped": True,
+                                        "duration_s": 0.0,
+                                        "result_summary": flight_recorder.bounded_repr(result)})
                     if _cancel_requested(cancel_event):
                         _close_cancelled_tool_calls(self, tool_calls[index + 1:])
                         raise TurnCancelled()
                     continue
 
                 self.on_tool_call(name, args)
+                _fr_machine(self, "tool.call", turn_id=turn_id, chat_id=chat_id,
+                            fields=_tool_call_fields(tool_batch_ordinal, index, name, args))
                 if _cancel_requested(cancel_event):
                     _close_cancelled_tool_calls(self, tool_calls[index:])
                     raise TurnCancelled()
+                _tool_start = time.time()
                 try:
                     result = self.registry.call(name, args)
                 except Exception as e:
                     result = f"[Tool error: {name} failed — {e}]"
                     print(f"[TOOL ERROR] {name}: {e}", flush=True)
+                _tool_duration = time.time() - _tool_start
+                _tool_success = not (isinstance(result, str) and result.startswith("[Tool error:"))
+                _fr_machine(self, "tool.result", turn_id=turn_id, chat_id=chat_id,
+                            severity="info" if _tool_success else "warning",
+                            fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,
+                                    "tool_name": name, "success": _tool_success, "skipped": False,
+                                    "duration_s": _tool_duration,
+                                    "result_summary": flight_recorder.bounded_repr(result)})
                 self.on_tool_result(name, result)
                 tools_used_this_turn.add(name)
                 self.ctx.add_tool_result(tool_id, name, result)
@@ -1306,17 +1617,30 @@ class LuminaAgent:
         # Max iterations — force final streamed answer
         if _cancel_requested(cancel_event):
             raise TurnCancelled()
+        # AGENT-FLIGHT-RECORDER-01A1 -- the configured tool-iteration
+        # ceiling (config.MAX_TOOL_ITERATIONS -- a WORK/GATE ROUND count,
+        # not a raw tool-call count, see _effective_tool_budgets()'s own
+        # docstring) was genuinely reached: the for-loop above ran out of
+        # iterations without the model ever confirming completion through
+        # the gate. Recorded here, not guessed after the fact from
+        # tool.batch counts alone -- this is the one place in the whole
+        # method that KNOWS the ceiling was actually hit.
+        _fr_machine(self, "turn.tool_ceiling_reached", turn_id=turn_id, chat_id=chat_id,
+                    severity="warning",
+                    fields={"tool_iteration_limit": config.MAX_TOOL_ITERATIONS})
         messages = self.ctx.build_messages(chat_id=chat_id)
         messages.append({"role": "user", "content": "Give your final answer now based on what you have."})
         return self._stream_final(messages, think_step, cancel_event=cancel_event,
-                                   reasoning_effort=reasoning_effort)
+                                   reasoning_effort=reasoning_effort, turn_id=turn_id)
 
     def _stream_final(self, messages: list, think_step: list, cancel_event=None,
-                       reasoning_effort: Optional[str] = None) -> str:
+                       reasoning_effort: Optional[str] = None,
+                       turn_id: Optional[str] = None) -> str:
         """Stream the final response, firing callbacks for UI updates."""
         full_response = []
         in_think = False
         stream = None
+        _think_buffer = []  # AGENT-FLIGHT-RECORDER-01A1 -- see __THINK_END__ handling below
 
         def _raise_cancelled():
             if in_think:
@@ -1355,8 +1679,19 @@ class LuminaAgent:
                 elif chunk == "__THINK_END__":
                     in_think = False
                     self.on_think_end()
+                    # AGENT-FLIGHT-RECORDER-01A1 -- the final stream's OWN
+                    # inline think content (a local model emitting <think>
+                    # around its final answer) is provider-exposed
+                    # reasoning exactly like a tool-round's -- recorded as
+                    # turn.think the same way, bulk (one event per block,
+                    # not per streamed token), never conflated with
+                    # full_response/turn.final below.
+                    _fr_model(self, "turn.think", "".join(_think_buffer), turn_id=turn_id,
+                              fields={"think_step": think_step[0]})
+                    _think_buffer = []
                 elif in_think:
                     self.on_think_token(chunk)
+                    _think_buffer.append(chunk)
                 else:
                     self.on_response_token(chunk)
                     full_response.append(chunk)
@@ -1377,6 +1712,14 @@ class LuminaAgent:
 
         content = "".join(full_response).strip()
         self.ctx.add_assistant(content)
+        # AGENT-FLIGHT-RECORDER-01A1 -- the model's own final-answer text
+        # is model expression (record_model_expression(), never machine),
+        # same as Think/Commentary -- see MODEL_EVENT_TYPES. The stream-
+        # error early-return above deliberately does NOT reach here: that
+        # `err` string is Lumina's OWN diagnostic text, not something the
+        # model said, so it must never be recorded as model provenance.
+        _fr_model(self, "turn.final", content, turn_id=turn_id,
+                  fields={"char_count": len(content)})
         if self.tts and content and not getattr(self, "_persona_speech_suppressed", False):
             self.tts.speak(content)
         return content

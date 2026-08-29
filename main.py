@@ -8,6 +8,7 @@ CLI tool override (per-run only, doesn't touch any file):
 """
 
 import argparse
+import platform
 import sys
 import os
 
@@ -21,6 +22,68 @@ import os
 os.environ.setdefault("LUMINA_DATA_DIR", os.path.join(os.path.expanduser("~"), ".local", "share", "lumina-release"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# AGENT-FLIGHT-RECORDER-01A1 -- the two literal version strings below
+# (CLI banner, GUI app.setApplicationVersion) already existed independently
+# before this patch and are left untouched (fixing that duplication is out
+# of scope here) -- this constant is a THIRD, new use specifically for the
+# recorder's runtime.startup identity fields, deliberately matching their
+# current value rather than introducing a fourth drifting copy silently.
+LUMINA_VERSION = "0.2.7-beta.2"
+
+
+def _record_runtime_startup(entry_point: str, channel_id=None):
+    """AGENT-FLIGHT-RECORDER-01A1 -- runtime.startup, the first event of
+    every session: bounded, non-secret identity sufficient to diagnose a
+    build/data-state mismatch after the fact (the historical "blank fresh
+    Lumina" class of incident) -- executing build version, DATA_DIR (which
+    install/profile this process is bound to), platform, interpreter, pid,
+    entry point, configured backend. No credentials, no backend_url (which
+    could embed a token for a self-hosted endpoint) beyond the backend
+    NAME. model is intentionally absent here -- it's resolved lazily
+    inside LuminaAgent/backend init, not at process boot; the first real
+    turn.started event carries it instead of forcing an eager resolution
+    (and possible network call) just to populate this one field. Never
+    raises -- import failures or an unwritable telemetry dir must not
+    block startup; see flight_recorder's own fail-safe posture."""
+    try:
+        from core import flight_recorder
+        import config
+        flight_recorder.record_machine_event(
+            "runtime.startup",
+            backend=getattr(config, "LLM_BACKEND", None),
+            fields={
+                "version": LUMINA_VERSION,
+                "data_dir": config.DATA_DIR,
+                "platform": platform.platform(),
+                "python_version": platform.python_version(),
+                "pid": os.getpid(),
+                "entry_point": entry_point,
+                "channel_id": channel_id,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _record_runtime_shutdown(entry_point: str, reason: str):
+    """AGENT-FLIGHT-RECORDER-01A1 -- reason is "clean" or "crash", decided
+    by the caller's own try/except structure (a real except branch vs. the
+    normal finally fallthrough) -- never guessed here. Also checkpoints the
+    recorder's WAL at this deliberate lifecycle boundary (mission section
+    9: checkpoint at lifecycle boundaries, not on every routine prune).
+    Never raises -- a failing shutdown-time recorder write must not mask
+    or interfere with the real shutdown already in progress."""
+    try:
+        from core import flight_recorder
+        flight_recorder.record_machine_event(
+            "runtime.shutdown",
+            severity="info" if reason == "clean" else "warning",
+            fields={"reason": reason, "entry_point": entry_point},
+        )
+        flight_recorder.checkpoint()
+    except Exception:
+        pass
 
 
 def apply_cli_persona_and_tools(agent, persona_name: str = None, tools_override: str = None) -> list[str]:
@@ -96,6 +159,7 @@ def run_cli(persona_name: str = None, tools_override: str = None):
     print(f"  Backend: {config.LLM_BACKEND} ({config.LLM_BACKEND_URL})")
     print(f"{'='*52}\n")
 
+    _record_runtime_startup("cli", channel_id="cli-local")
     try:
         # MB-22: CLI is a trusted local session, same footing as the desktop app --
         # owner=True is already LuminaAgent's default, unchanged here. channel_id
@@ -144,6 +208,17 @@ def run_cli(persona_name: str = None, tools_override: str = None):
             reasoning_effort = resolve_reasoning_effort(agent.llm)
             response = agent.chat(user_input, reasoning_effort=reasoning_effort)
             print(response + "\n")
+    except SystemExit:
+        # The one intentional early-exit path above (failed connection
+        # test) -- an expected exit, not a crash, so it gets its own
+        # distinct reason rather than being folded into "crash" below.
+        _record_runtime_shutdown("cli", reason="exit")
+        raise
+    except BaseException:
+        _record_runtime_shutdown("cli", reason="crash")
+        raise
+    else:
+        _record_runtime_shutdown("cli", reason="clean")
     finally:
         # Ordinary CLI exit (quit, EOF, Ctrl-C, connection failure, or an
         # unexpected loop exception) owns normal managed-process shutdown.
@@ -162,6 +237,7 @@ def run_gui():
     app = QApplication(sys.argv)
     app.setApplicationName("Lumina")
     app.setApplicationVersion("0.2.7-beta.2")
+    _record_runtime_startup("gui")
 
     # Set default font — prefer monospace
     for font_name in ["JetBrains Mono", "Fira Code", "Cascadia Code", "Monospace"]:
@@ -191,6 +267,11 @@ def run_gui():
     window.show()
     try:
         exit_code = app.exec()
+    except BaseException:
+        _record_runtime_shutdown("gui", reason="crash")
+        raise
+    else:
+        _record_runtime_shutdown("gui", reason="clean")
     finally:
         # Canonical GUI lifecycle boundary: runs on normal event-loop return
         # and on adjacent GUI cleanup/event-loop exceptions alike.
