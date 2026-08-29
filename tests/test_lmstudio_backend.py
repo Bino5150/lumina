@@ -13,6 +13,7 @@ import pytest
 import requests
 from core.backends.lmstudio import (
     _iter_lines_safe,
+    _first_reasoning_field,
     validate_base_url,
     join_endpoint,
     classify_provider_error,
@@ -489,3 +490,148 @@ def test_lmstudio_backend_default_no_reasoning_is_none_not_empty_string():
     backend = _make_backend()
     resp = _oai_response({"role": "assistant", "content": "", "tool_calls": []})
     assert backend.extract_reasoning(resp) is None
+
+
+# ── streaming reasoning-alias parity -- AGENT-GLM-THINK-TOOL-TRANSITION-01 ──
+#
+# chat_stream()'s own delta parsing used to only check
+# reasoning_content/thinking, silently dropping OpenRouter/GLM's "reasoning"
+# delta field entirely -- not shown as Think, not shown as content, gone.
+# Live-proven 2026-08-29 against a real openrouter / z-ai/glm-5.3-flash
+# final-answer stream: delta frames carried non-empty delta["reasoning"]
+# alongside an empty delta["content"] in the SAME frame (up to 147 of 449
+# frames in one real turn). Fixed by routing chat_stream() through the same
+# _first_reasoning_field() alias-priority helper extract_openai_compatible_
+# reasoning() already used, so the two call sites can't drift out of sync
+# again the way they did before this fix.
+
+def test_stream_reasoning_field_alone_reaches_think(monkeypatch):
+    """The exact live-proven gap: OpenRouter/GLM's unified "reasoning" delta
+    field, with no "reasoning_content" present at all, must still open a
+    Think block -- this was silently dropped entirely before this fix (not
+    shown as Think, not shown as content)."""
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"role": "assistant", "reasoning": "checking the code",
+                                 "reasoning_details": [{"type": "reasoning.text"}]},
+                      "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "Done."}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert out[0] == "__THINK_START__"
+    assert out[1] == "checking the code"
+    assert out[2] == "__THINK_END__"
+    assert "".join(out[3:]) == "Done."
+
+
+def test_stream_reasoning_field_with_empty_content_sibling_does_not_leak_as_content(monkeypatch):
+    """Exact live wire shape: a single delta frame carries BOTH keys --
+    {"content": "", "reasoning": "All"} -- content present but empty,
+    reasoning carrying the real text. The empty content must never yield a
+    stray content chunk, and the reasoning text must still surface as
+    Think."""
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"role": "assistant", "content": "", "reasoning": "All"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "", "reasoning": " three"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "done"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert out[0] == "__THINK_START__"
+    assert out[1] == "All"
+    assert out[2] == " three"
+    assert out[3] == "__THINK_END__"
+    assert "".join(out[4:]) == "done"
+
+
+def test_stream_thinking_field_alone_reaches_think(monkeypatch):
+    """Streaming-side symmetry check for the third alias -- "thinking" was
+    already checked pre-fix, this locks it in through the shared helper."""
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"thinking": "qwen-style"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "answer"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert out[0] == "__THINK_START__"
+    assert out[1] == "qwen-style"
+    assert out[2] == "__THINK_END__"
+    assert "".join(out[3:]) == "answer"
+
+
+def test_stream_reasoning_content_still_wins_priority_over_reasoning(monkeypatch):
+    """Priority order (reasoning_content, then reasoning, then thinking)
+    must hold identically in the streaming per-frame lookup as it already
+    does in the non-streaming whole-blob lookup -- one shared alias list,
+    not two independently-ordered ones."""
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"reasoning_content": "local-style", "reasoning": "should not be reached"},
+                      "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "x"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert out[1] == "local-style"
+
+
+def test_stream_reasoning_whitespace_only_token_is_preserved_not_stripped():
+    """chat_stream() reads _first_reasoning_field(delta, strip=False) --
+    a legitimate individual reasoning TOKEN can be pure whitespace (the
+    single space between two words in the model's reasoning text,
+    live-observed 2026-08-29 against z-ai/glm-5.3-flash). Stripping a
+    per-token fragment the way the non-streaming whole-blob extractor does
+    would silently eat that whitespace out of the reconstructed Think
+    text. Exercises _first_reasoning_field() directly -- the exact unit
+    both call sites share."""
+    assert _first_reasoning_field({"reasoning": " "}, strip=False) == " "
+    assert _first_reasoning_field({"reasoning": "  x  "}, strip=False) == "  x  "
+    # The non-streaming (default strip=True) shape still strips a whole blob.
+    assert _first_reasoning_field({"reasoning": "  x  "}) == "x"
+
+
+def test_first_reasoning_field_is_the_one_shared_seam(monkeypatch):
+    """Both extract_openai_compatible_reasoning() (non-streaming) and
+    chat_stream() (streaming) must go through the SAME
+    _first_reasoning_field() helper -- one alias list, not two
+    independently-maintained ones that can silently drift back out of
+    sync the way they did before this fix. Proven here by monkeypatching
+    the shared helper itself and observing both call sites are affected."""
+    import core.backends.lmstudio as lmstudio_mod
+    calls = []
+
+    def _fake(source, *, strip=True):
+        calls.append((dict(source) if isinstance(source, dict) else source, strip))
+        return "SENTINEL" if isinstance(source, dict) and source else None
+
+    monkeypatch.setattr(lmstudio_mod, "_first_reasoning_field", _fake)
+
+    # Non-streaming call site.
+    resp = _oai_response({"role": "assistant", "content": "", "reasoning": "anything"})
+    assert lmstudio_mod.extract_openai_compatible_reasoning(resp) == "SENTINEL"
+    assert any(strip is True for _, strip in calls)
+
+    # Streaming call site.
+    calls.clear()
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"reasoning": "anything"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "x"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert out[0] == "__THINK_START__"
+    assert out[1] == "SENTINEL"
+    assert any(strip is False for _, strip in calls)

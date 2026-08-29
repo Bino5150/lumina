@@ -154,6 +154,72 @@ def format_provider_error(provider: str, status_code, raw_body: str, fallback: s
     return f"{provider} error ({info['kind']}, HTTP {status_code}): {detail}"
 
 
+# AGENT-GLM-THINK-TOOL-TRANSITION-01 -- one shared alias-priority list for
+# every OpenAI-compatible reasoning field name Lumina has live-verified
+# across providers, in priority order, first non-empty string wins:
+#   "reasoning_content" -- Qwen3/DeepSeek-R1-style local/self-hosted servers.
+#   "reasoning" -- OpenRouter's own unified field. LIVE-VERIFIED 2026-08-28
+#     (non-streaming) and again 2026-08-29 (STREAMING deltas, this ticket)
+#     against the actual configured production route (openrouter /
+#     z-ai/glm-5.3-flash): a real tool_calls-bearing response returns
+#     message == {"role", "content": null, "refusal": null,
+#     "reasoning": "<plain text>", "tool_calls": [...],
+#     "reasoning_details": [...]} -- "reasoning" is a plain string sibling
+#     of "tool_calls"/"content" in the SAME message object (non-streaming)
+#     or the SAME delta object (streaming, alongside an empty "content").
+#     "reasoning_details" (OpenRouter's structured/newer sibling field) is
+#     deliberately NOT parsed here -- out of scope for this slice's
+#     "surface only what's already a plain string" law.
+#     Also confirmed live: reasoning is genuinely ABSENT (null) on some
+#     otherwise-valid tool-calls-bearing turns from the same route (the
+#     control-gate-shaped probe) -- callers must treat that as an
+#     ordinary, expected "no reasoning this round" case, not an error.
+#   "thinking" -- alternate name kept for the same symmetry.
+_REASONING_FIELD_PRIORITY = ("reasoning_content", "reasoning", "thinking")
+
+
+def _first_reasoning_field(source: dict, *, strip: bool = True) -> Optional[str]:
+    """AGENT-GLM-THINK-TOOL-TRANSITION-01 -- shared alias-priority lookup
+    used by both extract_openai_compatible_reasoning() below (a full
+    non-streaming message dict, whole-text, stripped) and chat_stream()'s
+    own per-frame delta lookup (a single streaming delta dict, one
+    incremental token, never stripped).
+
+    strip=False exists because a legitimate individual reasoning TOKEN can
+    be pure whitespace (e.g. the single space between two words in the
+    model's reasoning text, live-observed 2026-08-29) -- stripping a
+    per-token fragment would silently eat that whitespace from the
+    reconstructed Think text. Only the non-streaming whole-blob case wants
+    a strip. This is the ONE difference from a bare shared constant: same
+    alias set, same priority order, same isinstance/non-empty gate,
+    different collapse-boundary semantics for the two call shapes.
+
+    Every candidate is type-checked (isinstance str) before being trusted
+    -- a non-string value (malformed/unexpected shape) is skipped, never
+    coerced via str()/repr(). Returns the first candidate's text (stripped
+    or not, per `strip`), or None if `source` isn't a dict or no candidate
+    field is a non-empty string."""
+    if not isinstance(source, dict):
+        return None
+    for key in _REASONING_FIELD_PRIORITY:
+        value = source.get(key)
+        if not isinstance(value, str):
+            continue
+        if strip:
+            # Whole-blob shape: a whitespace-only value must be treated as
+            # absent (fall through to the next alias), matching the
+            # original non-streaming behavior exactly.
+            stripped = value.strip()
+            if stripped:
+                return stripped
+        elif value:
+            # Per-token shape: only a truly empty string ("") is absent --
+            # a whitespace-only token (e.g. a single " " between two words)
+            # is real content and must be returned as-is, never stripped.
+            return value
+    return None
+
+
 def extract_openai_compatible_reasoning(response: dict) -> Optional[str]:
     """AGENT-TOOL-THINK-TELEMETRY-01A1 -- passive reasoning extraction for
     every OpenAI-compatible-shaped non-streaming response: LMStudioBackend
@@ -162,53 +228,18 @@ def extract_openai_compatible_reasoning(response: dict) -> Optional[str]:
     OllamaBackend, which shares this exact response shape but does not
     subclass LMStudioBackend (see ollama.py's own extract_reasoning()).
 
-    Field priority, in order, first non-empty string wins:
-      "reasoning_content" -- Qwen3/DeepSeek-R1-style local/self-hosted
-        servers. Already the field chat_stream() reads off streaming
-        deltas two lines below and complete_utility() reads as its own
-        content fallback (see base.py) -- reusing the same name here,
-        not inventing a new one.
-      "reasoning" -- OpenRouter's own unified field. LIVE-VERIFIED
-        2026-08-28 against the actual configured production route
-        (openrouter / z-ai/glm-5.3-flash): a real non-streaming
-        tool_calls-bearing response returned
-        message == {"role", "content": null, "refusal": null,
-        "reasoning": "<plain text>", "tool_calls": [...],
-        "reasoning_details": [...]} -- "reasoning" is a plain string
-        sibling of "tool_calls" in the SAME message object, exactly the
-        "arrives alongside, not before/separate from" shape the A0
-        source-vet needed confirmed before this field name was trusted.
-        "reasoning_details" (OpenRouter's structured/newer sibling field)
-        is deliberately NOT parsed here -- out of scope for this slice's
-        "surface only what's already a plain string" law; "reasoning"
-        alone was sufficient on the live probe.
-        Also confirmed live: reasoning is genuinely ABSENT (null) on some
-        otherwise-valid tool-calls-bearing turns from the same route (the
-        control-gate-shaped probe) -- callers must treat that as an
-        ordinary, expected "no reasoning this round" case, not an error.
-      "thinking" -- alternate name already checked by chat_stream()'s own
-        delta parsing below; kept here for the same non-streaming/
-        streaming symmetry the "reasoning_content" entry has.
-
-    Every candidate is type-checked (isinstance str) before being trusted
-    -- a non-string value (malformed/unexpected shape) is skipped, never
-    coerced via str()/repr(), matching this slice's explicit "malformed
-    reasoning must fail inertly" contract. Returns the first candidate's
-    stripped text, or None if the response doesn't even parse to a
-    choices[0].message shape, or no candidate field is a non-empty
-    string -- both collapse to the same "nothing to surface" result.
+    See _first_reasoning_field()'s own docstring for the field priority
+    and live-verification history; this wrapper just locates the message
+    dict and requests the stripped (whole-blob) variant. Returns None if
+    the response doesn't even parse to a choices[0].message shape, or no
+    candidate field is a non-empty string -- both collapse to the same
+    "nothing to surface" result.
     """
     try:
         message = response["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
         return None
-    for key in ("reasoning_content", "reasoning", "thinking"):
-        value = message.get(key)
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped:
-                return stripped
-    return None
+    return _first_reasoning_field(message)
 
 
 def _iter_lines_safe(resp):
@@ -454,8 +485,21 @@ class LMStudioBackend(BaseLLMBackend):
                             yield "__THINK_END__"
                         break
 
-                    # reasoning_content field (Qwen3, DeepSeek-R1 style)
-                    reasoning = delta.get("reasoning_content", "") or delta.get("thinking", "")
+                    # AGENT-GLM-THINK-TOOL-TRANSITION-01 -- same
+                    # reasoning_content/reasoning/thinking alias priority
+                    # as extract_openai_compatible_reasoning()'s
+                    # non-streaming lookup, via the shared
+                    # _first_reasoning_field() helper. Previously this
+                    # only checked reasoning_content/thinking here,
+                    # silently dropping OpenRouter/GLM's "reasoning" delta
+                    # field entirely (never shown as Think, never falls
+                    # through to content either) -- live-proven 2026-08-29
+                    # against z-ai/glm-5.3-flash: 74-147 of ~90-449 frames
+                    # per final-answer stream carried non-empty
+                    # delta["reasoning"] alongside an empty delta["content"]
+                    # in the same frame. strip=False preserves the
+                    # original never-strip per-token semantics exactly.
+                    reasoning = _first_reasoning_field(delta, strip=False) or ""
                     if reasoning:
                         if not in_think:
                             in_think = True
