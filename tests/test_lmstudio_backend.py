@@ -17,6 +17,7 @@ from core.backends.lmstudio import (
     join_endpoint,
     classify_provider_error,
     format_provider_error,
+    extract_openai_compatible_reasoning,
     LMStudioBackend,
 )
 from core.backends.loader import CustomBackend
@@ -402,3 +403,89 @@ def test_empty_base_url_raises_before_stream_request_is_attempted(monkeypatch):
     with pytest.raises(ValueError, match="no endpoint URL configured"):
         list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
     assert called["post"] is False
+
+
+# ── extract_openai_compatible_reasoning() -- AGENT-TOOL-THINK-TELEMETRY-01A1 ─
+#
+# Field priority (reasoning_content, then reasoning, then thinking) and the
+# "reasoning" field name specifically are anchored to the live OpenRouter/
+# z-ai/glm-5.3-flash probe run for this ticket's Phase 0 gate -- a real
+# non-streaming tool_calls-bearing response returned:
+#   {"role": "assistant", "content": null, "refusal": null,
+#    "reasoning": "<plain text>", "tool_calls": [...], "reasoning_details": [...]}
+# and a second (control-primitive-shaped) probe on the same route returned
+# "reasoning": null on an otherwise valid tool_calls-bearing turn -- absence
+# on some valid turns is expected provider behavior, not a bug.
+
+def _oai_response(message: dict, finish_reason: str = "tool_calls") -> dict:
+    return {"choices": [{"message": message, "finish_reason": finish_reason}]}
+
+
+def test_reasoning_extraction_prefers_reasoning_content_field():
+    resp = _oai_response({"role": "assistant", "content": None,
+                           "reasoning_content": "local-server style reasoning",
+                           "reasoning": "should not be reached",
+                           "tool_calls": []})
+    assert extract_openai_compatible_reasoning(resp) == "local-server style reasoning"
+
+
+def test_reasoning_extraction_falls_back_to_openrouter_reasoning_field():
+    """Exact shape observed live against openrouter / z-ai/glm-5.3-flash --
+    see this module's own comment above and the LMStudioBackend.
+    extract_reasoning() docstring for the citation."""
+    resp = _oai_response({
+        "role": "assistant", "content": None, "refusal": None,
+        "reasoning": "The user wants to know the weather in Tokyo. "
+                      "I have a get_weather tool available.",
+        "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": "{}"}}],
+        "reasoning_details": [{"type": "reasoning.text", "text": "..."}],
+    })
+    assert extract_openai_compatible_reasoning(resp) == (
+        "The user wants to know the weather in Tokyo. "
+        "I have a get_weather tool available."
+    )
+
+
+def test_reasoning_extraction_falls_back_to_thinking_field():
+    resp = _oai_response({"role": "assistant", "content": "", "thinking": "qwen-style thinking"})
+    assert extract_openai_compatible_reasoning(resp) == "qwen-style thinking"
+
+
+def test_reasoning_extraction_absent_on_valid_tool_call_turn_returns_none():
+    """LIVE-VERIFIED shape: a genuine tool_calls-bearing response with no
+    reasoning field present at all (openrouter / z-ai/glm-5.3-flash,
+    control-gate-shaped probe, 2026-08-28)."""
+    resp = _oai_response({
+        "role": "assistant", "content": None, "refusal": None, "reasoning": None,
+        "tool_calls": [{"type": "function", "function": {"name": "finish_tool_work", "arguments": "{}"}}],
+    })
+    assert extract_openai_compatible_reasoning(resp) is None
+
+
+def test_reasoning_extraction_malformed_type_is_skipped_not_coerced():
+    resp = _oai_response({"role": "assistant", "content": "",
+                           "reasoning_content": {"nested": "object, not a string"}})
+    assert extract_openai_compatible_reasoning(resp) is None
+
+
+def test_reasoning_extraction_empty_string_treated_as_absent():
+    resp = _oai_response({"role": "assistant", "content": "", "reasoning": "   "})
+    assert extract_openai_compatible_reasoning(resp) is None
+
+
+def test_reasoning_extraction_malformed_response_shape_returns_none_not_raise():
+    assert extract_openai_compatible_reasoning({}) is None
+    assert extract_openai_compatible_reasoning({"choices": []}) is None
+    assert extract_openai_compatible_reasoning(None) is None
+
+
+def test_lmstudio_backend_extract_reasoning_delegates_to_shared_helper():
+    backend = _make_backend()
+    resp = _oai_response({"role": "assistant", "content": "", "reasoning": "delegated"})
+    assert backend.extract_reasoning(resp) == "delegated"
+
+
+def test_lmstudio_backend_default_no_reasoning_is_none_not_empty_string():
+    backend = _make_backend()
+    resp = _oai_response({"role": "assistant", "content": "", "tool_calls": []})
+    assert backend.extract_reasoning(resp) is None

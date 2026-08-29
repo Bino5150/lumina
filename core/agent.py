@@ -283,7 +283,7 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
 
 
 def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
-                                 reasoning_effort, chat_id):
+                                 reasoning_effort, chat_id, think_step: list):
     """AGENT-CONTINUATION-CONTROL-GATE-01A -- ask ONLY the two internal
     continuation-control primitives (_CONTROL_GATE_SCHEMAS — never a
     product tool) whether real tool work for this turn is complete. Only
@@ -302,6 +302,13 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
       ("cancelled", None)   -- caller must raise TurnCancelled
       ("error", text)       -- provider exception; text is ready to
                                 return directly from chat()
+
+    think_step (AGENT-TOOL-THINK-TELEMETRY-01A1): the SAME shared, mutable
+    [int] counter list _chat_impl() seeds and _stream_final() also
+    advances -- passed through (never a fresh local counter here) so a
+    Think event fired during this gate's own request numbers into the
+    same monotonic per-turn sequence as WORK-round and final-stream Think
+    events. See _emit_tool_round_think()'s docstring.
 
     Uses the existing one-turn ephemeral system-prompt injection
     (ctx.push_ephemeral/build_messages) for the gate's own instruction --
@@ -371,6 +378,20 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
         outcome = "malformed"
 
     if outcome in ("finish", "continue"):
+        # AGENT-TOOL-THINK-TELEMETRY-01A1 -- Think, then a cancellation
+        # check, then Commentary: same required ordering/boundary as the
+        # WORK round below (_chat_impl()'s own tool-bearing branch),
+        # applied here without touching this gate's existing
+        # non-persistence contract -- nothing below reads or writes
+        # agent.ctx. Gated on the same (finish, continue) outcomes
+        # commentary itself is already scoped to, not every outcome --
+        # a malformed/incomplete gate response gets retried, never
+        # surfaced as if it were a real tool-decision round.
+        reasoning = _collect_tool_round_reasoning(agent.llm, response, message)
+        _emit_tool_round_think(agent, think_step, reasoning)
+        if _cancel_requested(cancel_event):
+            return "cancelled", None
+
         commentary = _extract_commentary(message)
         if commentary:
             on_commentary = getattr(agent, "on_commentary", None)
@@ -384,6 +405,98 @@ def strip_think_blocks(text: str) -> str:
     if not text:
         return text
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+
+# AGENT-TOOL-THINK-TELEMETRY-01A1 -- same span definition strip_think_blocks()
+# uses above (non-greedy, DOTALL), with a capture group added so the exact
+# text about to be destroyed can be recovered first. Kept as a genuinely
+# separate regex object (not a refactor of strip_think_blocks() to reuse
+# one pattern) so a future edit to either can't silently desync the other
+# without a visible diff in both places.
+_INLINE_THINK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
+
+
+def _extract_inline_think(text) -> Optional[str]:
+    """AGENT-TOOL-THINK-TELEMETRY-01A1 -- return the concatenated text of
+    every <think>...</think> span in `text`, or None if there are none (or
+    `text` isn't a non-empty string). Must be called BEFORE
+    strip_think_blocks() runs on the same text -- that function's whole
+    job is to erase exactly what this one recovers; call order is what
+    keeps this observability addition from starting to fight the existing
+    anti-bleed contract instead of sitting in front of it."""
+    if not isinstance(text, str) or not text:
+        return None
+    matches = _INLINE_THINK_RE.findall(text)
+    if not matches:
+        return None
+    joined = "\n\n".join(m.strip() for m in matches if m.strip())
+    return joined or None
+
+
+def _collect_tool_round_reasoning(llm, response, message: dict) -> Optional[str]:
+    """AGENT-TOOL-THINK-TELEMETRY-01A1 -- one-shot, best-effort collection
+    of whatever legitimate provider reasoning already exists for a single
+    tool-decision round: a backend-declared field (llm.extract_reasoning())
+    and/or inline <think> tags embedded in the raw (not-yet-stripped)
+    message content. Neither source is fabricated or requested -- this
+    only reads what already arrived on `response`/`message`. Never raises:
+    a backend without extract_reasoning() at all, or one whose
+    extract_reasoning() itself raises, degrades to "no field-based
+    reasoning" rather than breaking the tool loop over an observability
+    add-on. Returns None (never an empty string) when nothing was found in
+    either source, so callers can treat "None" as the single, unambiguous
+    "no Think event this round" signal."""
+    parts = []
+
+    extract_reasoning = getattr(llm, "extract_reasoning", None)
+    if callable(extract_reasoning):
+        try:
+            field_reasoning = extract_reasoning(response)
+        except Exception:
+            field_reasoning = None
+        if isinstance(field_reasoning, str):
+            stripped = field_reasoning.strip()
+            if stripped:
+                parts.append(stripped)
+
+    inline = _extract_inline_think(message.get("content"))
+    if inline:
+        parts.append(inline)
+
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def _emit_tool_round_think(agent, think_step: list, reasoning: Optional[str]) -> None:
+    """AGENT-TOOL-THINK-TELEMETRY-01A1 -- fire one bulk Think event
+    (start/one token/end) for a tool-decision round's already-collected
+    reasoning, using the SAME shared `think_step` counter _stream_final()
+    advances -- so WORK/GATE/final Think numbering is one monotonic
+    per-turn sequence, never separate per-phase counters (see this
+    method's own call sites for why think_step is threaded through as a
+    shared mutable [int] rather than a local variable per phase).
+
+    No-ops entirely (no start, no end, no counter advance) when
+    `reasoning` is None/empty -- there must never be an empty Think
+    widget for a round that had nothing to show. Requires all three
+    callbacks to be callable before firing any of them; a fake/legacy
+    agent missing one degrades to silently skipping Think for this round
+    rather than partially firing and crashing on the missing one -- the
+    same getattr-guarded fail-inert posture as every other optional-
+    capability check in this file (see _accepts_tool_choice_mode()'s own
+    docstring for the precedent)."""
+    if not reasoning:
+        return
+    on_think_start = getattr(agent, "on_think_start", None)
+    on_think_token = getattr(agent, "on_think_token", None)
+    on_think_end = getattr(agent, "on_think_end", None)
+    if not (callable(on_think_start) and callable(on_think_token) and callable(on_think_end)):
+        return
+    think_step[0] += 1
+    on_think_start(think_step[0])
+    on_think_token(reasoning)
+    on_think_end()
 
 
 # Sentinel prefixes chat()'s tool-loop except-block and _stream_final()'s
@@ -910,6 +1023,7 @@ class LuminaAgent:
                 next_action = "work"
                 outcome, gate_error = _run_tool_work_control_gate(
                     self, tools_used_this_turn, cancel_event, reasoning_effort, chat_id,
+                    think_step,
                 )
                 if outcome == "cancelled":
                     raise TurnCancelled()
@@ -1084,8 +1198,42 @@ class LuminaAgent:
 
             # Has one or more real tool calls.
             consecutive_gate_continues = 0  # real work happened -- ping-pong bound resets
+
+            # AGENT-TOOL-THINK-TELEMETRY-01A1 -- collect + emit Think
+            # BEFORE strip_think_blocks() below destroys any inline
+            # <think> span in message["content"]; this is the one call
+            # site that needs the raw, not-yet-stripped content to still
+            # be there to read. Required ordering: Think, then a
+            # cancellation check, then Commentary, then Tool dispatch (the
+            # existing tool-call loop's own first-iteration cancellation
+            # check already covers the Commentary-to-Tool-dispatch
+            # boundary -- see that loop below).
+            reasoning = _collect_tool_round_reasoning(self.llm, response, message)
+            _emit_tool_round_think(self, think_step, reasoning)
+
             if message.get("content"):
                 message["content"] = strip_think_blocks(message["content"])
+
+            if _cancel_requested(cancel_event):
+                # Cancelled between Think and Commentary: the message
+                # (with its tool_calls) still gets persisted and every one
+                # of those ids still gets a paired cancelled tool result --
+                # identical bookkeeping to the tool-dispatch loop's own
+                # first-iteration cancellation check just below, only
+                # reached one step earlier so Commentary describing a
+                # call that's about to be thrown away never fires. This
+                # preserves the EXISTING cancellation contract (see
+                # tests/test_operator_stop.py's
+                # test_cancel_after_tool_message_before_execution_closes_every_id)
+                # rather than weakening it to buy Think/Commentary
+                # ordering -- an already-emitted Think event stays
+                # emitted (same "truthfully already happened" precedent
+                # AGENT-COMMENTARY-01A's own cancellation case establishes
+                # for Commentary), it just never gets followed by
+                # Commentary for work that never actually happened.
+                self.ctx.add_tool_call(message)
+                _close_cancelled_tool_calls(self, tool_calls)
+                raise TurnCancelled()
 
             # AGENT-COMMENTARY-01A — read from the already-stripped content
             # that's about to be persisted via add_tool_call() below; this

@@ -154,6 +154,63 @@ def format_provider_error(provider: str, status_code, raw_body: str, fallback: s
     return f"{provider} error ({info['kind']}, HTTP {status_code}): {detail}"
 
 
+def extract_openai_compatible_reasoning(response: dict) -> Optional[str]:
+    """AGENT-TOOL-THINK-TELEMETRY-01A1 -- passive reasoning extraction for
+    every OpenAI-compatible-shaped non-streaming response: LMStudioBackend
+    and every one of its descendants (LM Studio, DeepSeek, Groq, Kimi,
+    llama.cpp, OmniRoute, OpenAI, OpenRouter, Qwen, vLLM, Custom) plus
+    OllamaBackend, which shares this exact response shape but does not
+    subclass LMStudioBackend (see ollama.py's own extract_reasoning()).
+
+    Field priority, in order, first non-empty string wins:
+      "reasoning_content" -- Qwen3/DeepSeek-R1-style local/self-hosted
+        servers. Already the field chat_stream() reads off streaming
+        deltas two lines below and complete_utility() reads as its own
+        content fallback (see base.py) -- reusing the same name here,
+        not inventing a new one.
+      "reasoning" -- OpenRouter's own unified field. LIVE-VERIFIED
+        2026-08-28 against the actual configured production route
+        (openrouter / z-ai/glm-5.3-flash): a real non-streaming
+        tool_calls-bearing response returned
+        message == {"role", "content": null, "refusal": null,
+        "reasoning": "<plain text>", "tool_calls": [...],
+        "reasoning_details": [...]} -- "reasoning" is a plain string
+        sibling of "tool_calls" in the SAME message object, exactly the
+        "arrives alongside, not before/separate from" shape the A0
+        source-vet needed confirmed before this field name was trusted.
+        "reasoning_details" (OpenRouter's structured/newer sibling field)
+        is deliberately NOT parsed here -- out of scope for this slice's
+        "surface only what's already a plain string" law; "reasoning"
+        alone was sufficient on the live probe.
+        Also confirmed live: reasoning is genuinely ABSENT (null) on some
+        otherwise-valid tool-calls-bearing turns from the same route (the
+        control-gate-shaped probe) -- callers must treat that as an
+        ordinary, expected "no reasoning this round" case, not an error.
+      "thinking" -- alternate name already checked by chat_stream()'s own
+        delta parsing below; kept here for the same non-streaming/
+        streaming symmetry the "reasoning_content" entry has.
+
+    Every candidate is type-checked (isinstance str) before being trusted
+    -- a non-string value (malformed/unexpected shape) is skipped, never
+    coerced via str()/repr(), matching this slice's explicit "malformed
+    reasoning must fail inertly" contract. Returns the first candidate's
+    stripped text, or None if the response doesn't even parse to a
+    choices[0].message shape, or no candidate field is a non-empty
+    string -- both collapse to the same "nothing to surface" result.
+    """
+    try:
+        message = response["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = message.get(key)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+    return None
+
+
 def _iter_lines_safe(resp):
     """FE-15: requests.exceptions.RequestException (e.g. ChunkedEncodingError
     from a mid-stream disconnect) raises from *inside* iter_lines(), outside
@@ -322,6 +379,16 @@ class LMStudioBackend(BaseLLMBackend):
                 raise RuntimeError(format_provider_error(self.display_name, None, "", str(e)))
             print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
             raise RuntimeError(format_provider_error(self.display_name, resp.status_code, resp.text, str(e)))
+
+    def extract_reasoning(self, response: dict) -> Optional[str]:
+        """AGENT-TOOL-THINK-TELEMETRY-01A1 -- shared across every
+        LMStudioBackend descendant for free (DeepSeek/Groq/Kimi/
+        llama.cpp/OmniRoute/OpenAI/OpenRouter/Qwen/vLLM/Custom all inherit
+        this unmodified, same pattern as extract_message()/
+        extract_termination() above). See
+        extract_openai_compatible_reasoning()'s own docstring for the
+        live-verified field priority and shape."""
+        return extract_openai_compatible_reasoning(response)
 
     def chat_stream(self, messages: list, max_tokens: int = 4096,
                     temperature: float = 0.7,

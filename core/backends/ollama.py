@@ -10,7 +10,7 @@ import json
 import requests
 from typing import Optional, Generator
 from .base import BaseLLMBackend, ModelDiscoveryResult, ToolChoiceMode
-from .lmstudio import discover_openai_compatible_models
+from .lmstudio import discover_openai_compatible_models, extract_openai_compatible_reasoning
 import config
 
 
@@ -120,6 +120,17 @@ class OllamaBackend(BaseLLMBackend):
             if resp is not None:
                 print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
             raise RuntimeError(f"Ollama HTTP error: {e}")
+
+    def extract_reasoning(self, response: dict) -> Optional[str]:
+        """AGENT-TOOL-THINK-TELEMETRY-01A1 -- Ollama's /v1/ endpoint is the
+        same OpenAI-compatible response shape LMStudioBackend's own
+        override reads (module docstring: "nearly identical to LM Studio
+        with different defaults"), but this class doesn't subclass
+        LMStudioBackend, so it needs its own one-line delegation to the
+        shared parser rather than inheriting it -- exactly the same
+        relationship this file already has with discover_openai_
+        compatible_models() above."""
+        return extract_openai_compatible_reasoning(response)
 
     def chat_stream(self, messages: list, max_tokens: int = 1024,
                     temperature: float = 0.7,

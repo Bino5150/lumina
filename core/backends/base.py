@@ -477,6 +477,37 @@ class BaseLLMBackend(ABC):
             return TerminationStatus.INCOMPLETE
         return TerminationStatus.UNKNOWN
 
+    def extract_reasoning(self, response: dict) -> Optional[str]:
+        """
+        AGENT-TOOL-THINK-TELEMETRY-01A1 -- passive extraction of whatever
+        legitimate, provider-exposed reasoning already accompanies a
+        non-streaming chat() response (tool-bearing or not). Purely a
+        read of `response`; never performs I/O, never mutates `response`,
+        never requests reasoning that wasn't already coming back on its
+        own -- no backend's chat()/_build_payload() is changed by this
+        method existing.
+
+        Fail-safe default: this base implementation always returns None
+        (same "unknown backend / no positive capability -> no override"
+        posture as reasoning_capabilities()'s NO_REASONING_CONTROL
+        default above). A subclass only overrides this when it has live-
+        verified evidence its own non-streaming response shape actually
+        carries a reasoning field -- see LMStudioBackend/OllamaBackend for
+        the one shared implementation every OpenAI-compatible-shaped
+        backend gets for free. AnthropicBackend and GeminiBackend
+        deliberately do NOT override this: A0's source-vet + this slice's
+        live OpenRouter/GLM probe confirmed neither backend's chat()
+        payload currently requests extended thinking / includeThoughts,
+        so there is nothing on their wire to extract, and asking either
+        provider to start reasoning is explicitly out of scope for this
+        slice (a provider-behavior change, not observability).
+
+        Callers must treat a non-string or empty-after-strip return
+        identically to None -- absence, not a signal to fabricate
+        anything.
+        """
+        return None
+
     def complete_utility(self, prompt: str, prefill: str = "",
                           max_tokens: int = 500, temperature: float = 0.3) -> Optional[str]:
         """
