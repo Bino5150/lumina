@@ -110,6 +110,28 @@ TOOL_TIERS = {
     "browser_extract": "read_only", "browser_screenshot": "read_only",
     "diff_texts": "read_only", "diff_files": "read_only", "submit_pin": "read_only",
     "get_active_project": "read_only",
+    # TOOL-TIER-CLASSIFICATION-01: explicit read_only classification for
+    # previously unclassified, non-owner-relevant tools whose complete
+    # production call path is proven observational (source-vetted this
+    # slice; per-tool evidence contract in
+    # tests/test_tool_tier_classification_01.py). git_status/git_diff/
+    # git_log/git_branches run only read-only git subcommands
+    # (rev-parse/rev-list/status/diff/log/branch -- no fetch, no refs
+    # mutated) against allowlist-resolved repos; view_image stats a path
+    # (exists/isfile/getsize, contents never read); get_weather is a pure
+    # function with zero I/O; load_project/load_codebase/get_project_chats
+    # read tracked/data files. Deliberately NOT classified here:
+    # update_project, refresh_codebase_index, link_chat (tracked-file
+    # writers), spawn_subagent + run/schedule_background_subagent
+    # (dispatch/launch semantics), check_background_task (get_task_result
+    # lazy-GC deletes TTL-expired queue entries -- a hidden mutating edge
+    # inside a nominal read). See the classification test's
+    # STILL_UNCLASSIFIED accounting for the full per-tool rationale.
+    "git_status": "read_only", "git_diff": "read_only",
+    "git_log": "read_only", "git_branches": "read_only",
+    "view_image": "read_only", "get_weather": "read_only",
+    "load_project": "read_only", "load_codebase": "read_only",
+    "get_project_chats": "read_only",
 
     "edit_prompt": "write_local", "reset_chat": "write_local",
     # CODING-02B-A: project-context tools. activate_project/clear_active_project

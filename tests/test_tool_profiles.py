@@ -142,12 +142,25 @@ def test_old_project_tools_tier_behavior_unchanged():
     sessions, same as any other tool nobody has ever explicitly
     classified). CODING-02B-A1 changes exactly one bit of that: create_project
     is now in OWNER_ONLY_TOOLS (see test_create_project_is_owner_only below)
-    -- it stays deliberately absent from TOOL_TIERS itself. The other six
-    tools are untouched by this corrective."""
-    for name in ("create_project", "load_project", "update_project",
-                 "refresh_codebase_index", "load_codebase",
-                 "link_chat", "get_project_chats"):
+    -- it stays deliberately absent from TOOL_TIERS itself.
+
+    TOOL-TIER-CLASSIFICATION-01 changes exactly three more bits: the three
+    pure readers of this family (load_project, load_codebase,
+    get_project_chats) now carry an explicit read_only tier -- their
+    complete production call path is proven observational (per-tool
+    evidence contract in tests/test_tool_tier_classification_01.py). The
+    three writers (update_project, refresh_codebase_index, link_chat)
+    remain deliberately unclassified, keeping their fail-closed execute
+    PIN gate for non-owner sessions."""
+    # Deliberately still unclassified: owner-only binding authority
+    # (create_project) + tracked-file writers (fail-closed execute
+    # default retained for non-owner sessions).
+    for name in ("create_project", "update_project",
+                 "refresh_codebase_index", "link_chat"):
         assert name not in TOOL_TIERS
+    # Explicitly classified read_only by TOOL-TIER-CLASSIFICATION-01.
+    for name in ("load_project", "load_codebase", "get_project_chats"):
+        assert TOOL_TIERS[name] == "read_only"
     for name in ("load_project", "update_project",
                  "refresh_codebase_index", "load_codebase",
                  "link_chat", "get_project_chats"):
