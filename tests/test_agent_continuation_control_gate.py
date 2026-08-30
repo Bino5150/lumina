@@ -169,6 +169,7 @@ def _fake_agent(llm, tool_result="ok"):
         _skill_nudge_sent=False,
     )
     ns._stream_final = types.MethodType(LuminaAgent._stream_final, ns)
+    ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
     return ns, calls
 
 

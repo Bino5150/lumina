@@ -149,6 +149,7 @@ def _fake_agent(llm, tool_result="ok"):
         _skill_nudge_sent=False,
     )
     ns._stream_final = types.MethodType(LuminaAgent._stream_final, ns)
+    ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
     return ns, calls
 
 
@@ -299,6 +300,13 @@ def test_G2_finish_tool_work_commentary_also_strips_embedded_think_block():
 # ── H. Ambiguous post-tool prose is NOT commentary ───────────────────────
 
 def test_H_ambiguous_post_tool_prose_is_not_commentary():
+    """AGENT-WORK-COMPLETE-DISCARD-01 -- "let me think about that" is a
+    preserved completion candidate (COMPLETE, zero tool_calls, in tool work
+    phase), promoted directly once the gate confirms finish_tool_work --
+    NOT regenerated via chat_stream() (which would have produced the fake's
+    fixed "final streamed response" sentinel instead). Still never
+    Commentary, which is this test's actual point: a candidate answer is
+    not outward tool-decision narration merely for having arrived mid-WORK."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
         {"content": "let me think about that", "termination": TerminationStatus.COMPLETE},
@@ -308,7 +316,7 @@ def test_H_ambiguous_post_tool_prose_is_not_commentary():
 
     result = LuminaAgent.chat(fake, "find it")
 
-    assert result == "final streamed response"
+    assert result == "let me think about that"
     # The corrective-retry contract (AGENT-CONTINUATION-01A) still fired --
     # proves this path was reached, not skipped.
     assert len(calls["ephemeral"]) == 1

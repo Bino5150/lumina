@@ -1103,6 +1103,23 @@ class LuminaAgent:
         # to the visible non-success path instead of ping-ponging retries.
         corrective_retry_used = False
 
+        # AGENT-WORK-COMPLETE-DISCARD-01 -- a preserved WORK-round answer
+        # that arrived with finish_reason=stop (TerminationStatus.COMPLETE
+        # or UNKNOWN) and genuinely zero tool_calls, while tool work is
+        # already in progress. Such a response is not automatically FINAL
+        # (Design Law unchanged: only the completion gate decides that) but
+        # it is a real, complete assistant answer that must not be thrown
+        # away just because the gate still has to run -- see
+        # _run_tool_work_control_gate()'s "finish"/"continue" handling
+        # below and _finalize_completion_candidate(). Plain local state,
+        # never stored on self -- a fresh `_chat_impl()` call (i.e. a new
+        # turn) always starts this at None, so a candidate can never leak
+        # across turns. Set at the one creation call site below; cleared on
+        # "continue" (stale -- more tool work is coming) and whenever a
+        # real tool call executes (superseded by new work); consumed
+        # exactly once, on "finish".
+        completion_candidate = None
+
         # Preserve the user's submitted turn even in the tiny race where /stop
         # lands before this worker gets past chat()'s prologue. Do not run any
         # background-notification bookkeeping or provider work in that case.
@@ -1303,6 +1320,21 @@ class LuminaAgent:
                     return gate_error
 
                 if outcome == "finish":
+                    # AGENT-WORK-COMPLETE-DISCARD-01 -- a preserved
+                    # candidate IS the final answer once the gate confirms
+                    # tool work is done; promote it directly rather than
+                    # asking the provider to regenerate an answer it
+                    # already gave. No candidate (the ordinary case for
+                    # every pre-existing caller -- an empty-content trigger
+                    # response, or finish_tool_work reached with no prior
+                    # no-tool-call WORK round at all) falls through to the
+                    # unchanged pre-existing behavior.
+                    if completion_candidate is not None:
+                        if _cancel_requested(cancel_event):
+                            raise TurnCancelled()
+                        _fr_machine(self, "completion_candidate.accepted", turn_id=turn_id, chat_id=chat_id,
+                                    fields={"source_round": completion_candidate["source_round"]})
+                        return self._finalize_completion_candidate(completion_candidate, turn_id=turn_id)
                     # The gate's own ephemeral instruction was already
                     # consumed by its build_messages() call -- build fresh,
                     # clean messages here so it can never leak into the
@@ -1312,6 +1344,17 @@ class LuminaAgent:
                                                reasoning_effort=reasoning_effort, turn_id=turn_id)
 
                 if outcome == "continue":
+                    # AGENT-WORK-COMPLETE-DISCARD-01 -- "continue" means
+                    # the gate itself judged tool work is NOT done, so
+                    # whatever candidate triggered this gate call is stale
+                    # by the gate's own verdict -- discard it. The next
+                    # WORK round starts fresh; only a LATER no-tool-call
+                    # response (if any) can set a new candidate.
+                    if completion_candidate is not None:
+                        _fr_machine(self, "completion_candidate.discarded", turn_id=turn_id, chat_id=chat_id,
+                                    fields={"reason": "continue_tool_work",
+                                            "source_round": completion_candidate["source_round"]})
+                        completion_candidate = None
                     consecutive_gate_continues += 1
                     if consecutive_gate_continues > 1:
                         print(f"[AGENT] tool-work completion gate contradicted its own "
@@ -1460,16 +1503,76 @@ class LuminaAgent:
                 # COMPLETE/UNKNOWN, in tool work phase, no real tool call:
                 # this is NOT completion and NOT ordinary commentary (see
                 # this method's module docstring) -- it is an unresolved
-                # work-phase response. Whatever content it carries is
-                # discarded here; only the completion gate decides whether
-                # work is actually done.
+                # work-phase response. It is also NOT automatically
+                # discarded (AGENT-WORK-COMPLETE-DISCARD-01): whatever
+                # complete, well-formed content it carries is preserved as
+                # a completion candidate below -- only the completion gate
+                # decides whether work is actually done, and only
+                # "finish_tool_work" ever promotes this candidate to a
+                # real final answer (see _run_tool_work_control_gate()'s
+                # "finish"/"continue" handling below).
+                #
+                # Same Think-then-cancel-then-(never Commentary) ordering
+                # the tool-bearing branch below uses: reasoning is
+                # collected from the RAW, not-yet-stripped content before
+                # strip_think_blocks() destroys it, then a cancellation
+                # check, then the stripped text becomes the candidate. This
+                # response is deliberately never routed through
+                # on_commentary()/turn.commentary -- Commentary is outward
+                # narration accompanying a structural tool/control
+                # decision; a no-tool-call answer earns no such narration
+                # merely for having arrived during WORK.
+                reasoning = _collect_tool_round_reasoning(self.llm, response, message)
+                _emit_tool_round_think(self, think_step, reasoning, turn_id=turn_id)
+                if message.get("content"):
+                    message["content"] = strip_think_blocks(message["content"])
+                candidate_content = (message.get("content") or "").strip()
+
                 if _cancel_requested(cancel_event):
                     raise TurnCancelled()
+
+                # An empty/blank remainder is not a candidate -- a response
+                # that was pure <think> (or genuinely empty) carries no
+                # answer to preserve, matching Design Law ("silence is not
+                # completion"). This also keeps EVERY pre-existing test
+                # that scripts an empty-content trigger response (the
+                # overwhelming majority of the existing continuation-gate
+                # suite) exercising the unchanged pre-existing code path.
+                if candidate_content:
+                    completion_candidate = {
+                        "content": candidate_content,
+                        # Provider-neutral by construction: core/agent.py
+                        # never string-matches a raw finish_reason (that
+                        # abstraction boundary is extract_termination()'s
+                        # job) -- termination.value ("complete"/"unknown")
+                        # is the correct, already-established vocabulary
+                        # to record here, not a reach into raw response
+                        # internals.
+                        "finish_reason": termination.value,
+                        "source_round": iteration,
+                    }
+                    _fr_machine(self, "completion_candidate.created", turn_id=turn_id, chat_id=chat_id,
+                                fields={"content_chars": len(candidate_content),
+                                        "source_round": iteration,
+                                        "finish_reason": termination.value})
+                else:
+                    completion_candidate = None
+
                 next_action = "gate"
                 continue
 
             # Has one or more real tool calls.
             consecutive_gate_continues = 0  # real work happened -- ping-pong bound resets
+            # AGENT-WORK-COMPLETE-DISCARD-01 -- a real tool call always
+            # supersedes any earlier completion candidate. Structurally
+            # this is already unreachable with a live candidate (the only
+            # ways back to a WORK round after a candidate is set are the
+            # gate's "continue" outcome, which clears it explicitly below,
+            # or a bounded gate-retry, which never re-enters WORK) -- kept
+            # anyway as the literal, defense-in-depth statement of the
+            # design law itself: real tool work always invalidates a
+            # pending candidate.
+            completion_candidate = None
 
             # AGENT-TOOL-THINK-TELEMETRY-01A1 -- collect + emit Think
             # BEFORE strip_think_blocks() below destroys any inline
@@ -1718,6 +1821,39 @@ class LuminaAgent:
         # error early-return above deliberately does NOT reach here: that
         # `err` string is Lumina's OWN diagnostic text, not something the
         # model said, so it must never be recorded as model provenance.
+        _fr_model(self, "turn.final", content, turn_id=turn_id,
+                  fields={"char_count": len(content)})
+        if self.tts and content and not getattr(self, "_persona_speech_suppressed", False):
+            self.tts.speak(content)
+        return content
+
+    def _finalize_completion_candidate(self, candidate: dict, *,
+                                        turn_id: Optional[str] = None) -> str:
+        """AGENT-WORK-COMPLETE-DISCARD-01 -- promote a preserved WORK-round
+        completion candidate (see _chat_impl()'s candidate-creation site and
+        its "finish" gate-outcome handling) to this turn's final answer,
+        WITHOUT asking the provider to regenerate it. The candidate's
+        content already IS a complete, well-formed assistant answer
+        (finish_reason=stop/complete or unknown, genuinely zero tool_calls)
+        that the completion gate has just confirmed tool work is done for --
+        re-streaming a fresh answer from scratch here would silently throw
+        away a correct answer the model already gave and ask the same
+        question again for no reason (the exact defect this ticket fixes).
+
+        Mirrors the persistence/telemetry contract _stream_final() upholds
+        for an ordinary streamed final -- deliver via on_response_token(),
+        ctx.add_assistant(), record turn.final, speak via TTS if configured
+        -- minus the chat_stream()/token-loop machinery itself, since there
+        is no new provider response to stream: the whole answer is already
+        in hand. Delivered as a single on_response_token() call rather than
+        chunked, since there is no real stream to chunk from -- the exact
+        convention every other whole-string UI delivery in this file already
+        uses (e.g. the visible non-success notices above)."""
+        content = candidate["content"]
+        on_response_token = getattr(self, "on_response_token", None)
+        if callable(on_response_token):
+            on_response_token(content)
+        self.ctx.add_assistant(content)
         _fr_model(self, "turn.final", content, turn_id=turn_id,
                   fields={"char_count": len(content)})
         if self.tts and content and not getattr(self, "_persona_speech_suppressed", False):

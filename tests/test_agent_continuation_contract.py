@@ -144,6 +144,7 @@ def _fake_agent(llm, tool_result="ok"):
         _skill_nudge_sent=False,
     )
     ns._stream_final = types.MethodType(LuminaAgent._stream_final, ns)
+    ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
     return ns, calls
 
 
@@ -240,6 +241,12 @@ def test_E_tool_result_then_another_real_tool_remains_in_tool_work_phase():
 # ── F/G/H/I. Ambiguous continuation + corrective retry ─────────────────
 
 def test_F_no_tool_no_sentinel_triggers_exactly_one_corrective_retry():
+    """AGENT-WORK-COMPLETE-DISCARD-01 -- "let me think about that" is a
+    preserved completion candidate; once the gate confirms finish_tool_work
+    it is promoted directly rather than regenerated via chat_stream() (which
+    would have produced the fake's fixed "final streamed response"
+    sentinel instead). llm.call_count == 3 (unchanged) already proves no
+    extra provider call happened for the final answer."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
         {"content": "let me think about that", "termination": TerminationStatus.COMPLETE},
@@ -249,13 +256,19 @@ def test_F_no_tool_no_sentinel_triggers_exactly_one_corrective_retry():
 
     result = LuminaAgent.chat(fake, "find it")
 
-    assert result == "final streamed response"
+    assert result == "let me think about that"
     assert llm.call_count == 3
     assert len(calls["ephemeral"]) == 1
     assert "finish_tool_work" in calls["ephemeral"][0]
 
 
 def test_G_corrective_retry_then_finish_tool_work_streams_final():
+    """AGENT-WORK-COMPLETE-DISCARD-01 -- "hmm" is a genuine (if terse)
+    complete answer: COMPLETE termination, zero tool_calls, in tool work
+    phase. Once the gate confirms finish_tool_work, that preserved
+    candidate becomes the final answer directly -- it is NOT thrown away
+    in favor of a fresh chat_stream() regeneration (which would have
+    produced the fake's fixed "final streamed response" sentinel instead)."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
         {"content": "hmm", "termination": TerminationStatus.COMPLETE},
@@ -265,7 +278,7 @@ def test_G_corrective_retry_then_finish_tool_work_streams_final():
 
     result = LuminaAgent.chat(fake, "find it")
 
-    assert result == "final streamed response"
+    assert result == "hmm"
 
 
 def test_H_gate_continue_then_real_tool_executes_and_continues():

@@ -133,6 +133,7 @@ def _fake_agent(llm, tmp_path, tool_result="ok", flight_recorder=True):
         _skill_nudge_sent=False,
     )
     ns._stream_final = types.MethodType(LuminaAgent._stream_final, ns)
+    ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
     if flight_recorder:
         ns.flight_recorder = FlightRecorder(db_path=str(tmp_path / "fr.db"))
     return ns
