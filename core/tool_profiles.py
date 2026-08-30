@@ -251,6 +251,17 @@ def apply_tool_profile(registry, profile_name: str = None, tools_enabled: list =
 
     Default-deny: owner=False with nothing resolvable disables EVERYTHING,
     not everything. A missing/typo'd/broken profile fails closed.
+
+    TOOL-PROFILE-REFRESH-01: explicit user-disabled tools (prefs
+    "disabled_tools") survive profile application. A profile is a
+    capability-selection convenience, never permission authority and never a
+    silent resurrection of tools the user explicitly disabled — the union
+    below can only ever shrink the enabled set, for owner and non-owner
+    alike. Mirrors the construction-time overlay in LuminaAgent.__init__,
+    which applies the same persisted list after registration; without this,
+    any post-construction profile switch (persona apply_persona(), Settings
+    profile combo, headless force_tools_profile) would re-enable a
+    user-disabled tool merely because the selected profile lists it.
     """
     all_tools = registry.all_tool_names()
     enabled = resolve_enabled_set(profile_name, tools_enabled, owner=owner, all_tools=all_tools)
@@ -260,5 +271,11 @@ def apply_tool_profile(registry, profile_name: str = None, tools_enabled: list =
             return
         enabled = set()
 
-    disabled = [t for t in all_tools if t not in enabled]
+    from core.persistence import load as _load_persisted_prefs
+    user_disabled = set(_load_persisted_prefs().get("disabled_tools", []) or [])
+
+    # Union of the profile complement with the persisted user-disabled list
+    # (clamped to the live universe — a stale prefs entry for a tool that no
+    # longer exists must not linger in the disabled set forever).
+    disabled = sorted((set(all_tools) - enabled) | (user_disabled & set(all_tools)))
     registry.set_disabled(disabled)

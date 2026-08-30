@@ -51,30 +51,47 @@ def test_coding_profile_includes_edit_file():
 
 
 def test_coding_profile_did_not_gain_unrelated_tools():
-    """CODING-01B-B added edit_file; CODING-02B-A added exactly
-    activate_project/get_active_project/clear_active_project (NOT
-    set_project_root -- see test_set_project_root_not_in_coding_profile
-    below); CODING-03A1 added exactly search_code (search_files stays,
-    additive not replaced); CODING-04A2-B4 added exactly the five managed-
-    process tools; CODING-06A2 added exactly run_tests; CODING-07A3 added
-    exactly create_worktree/list_worktrees/remove_worktree; CODING-08A3 added
-    exactly review_changes/review_file_diff -- this is a regression guard
-    against accidentally sweeping in other tools (e.g. the still-out-of-scope
-    diff_texts/diff_files/git_* tools) while editing the same JSON file."""
+    """Each Coding-profile slice added exactly its own tools, and this guard
+    keeps it that way. Slice history: CODING-01B-B added edit_file;
+    CODING-02B-A added exactly activate_project/get_active_project/
+    clear_active_project (NOT set_project_root -- see
+    test_set_project_root_not_in_coding_profile below); CODING-03A1 added
+    exactly search_code (search_files stays, additive not replaced);
+    CODING-04A2-B4 added exactly the five managed-process tools; CODING-06A2
+    added exactly run_tests; CODING-07A3 added exactly
+    create_worktree/list_worktrees/remove_worktree; CODING-08A3 added exactly
+    review_changes/review_file_diff.
+
+    TOOL-PROFILE-REFRESH-01 (2026-08-29) modernized the set against the live
+    registry by operator direction: added exactly apply_patch/diff_texts/
+    diff_files (diff+patch workflow), git_status/git_diff/git_log/
+    git_branches (read-only Git observation), load_project/load_codebase/
+    refresh_codebase_index/update_project (Project context), and view_image
+    (UI acceptance screenshots). Deliberately NOT added: spawn_subagent and
+    the three background-task tools (flag-gated registration -- dead profile
+    references whenever SUBAGENTS_ENABLED/BACKGROUND_TASKS_ENABLED are off),
+    set_project_root/create_project (owner-only binding authority),
+    edit_prompt (MB-29 scoping), browser automation, web tools. Tier map
+    untouched: the new git/project/view_image members stay deliberately
+    unclassified (fail-closed execute tier for non-owner PIN gating)."""
     coding = next(p for p in list_profiles() if p.get("name") == "Coding")
     enabled = set(coding.get("enabled", []))
     expected = {
         "get_time", "list_tools", "view_prompt", "reset_chat",
         "save_memory", "search_memory", "get_recent_memories",
-        "read_file", "write_file", "edit_file", "list_dir", "search_files", "search_code",
+        "read_file", "write_file", "edit_file", "apply_patch", "diff_texts", "diff_files",
+        "list_dir", "search_files", "search_code",
+        "git_status", "git_diff", "git_log", "git_branches",
         "run_python", "run_command",
         "start_process", "read_process", "send_process_input", "stop_process", "list_processes",
         "read_coding_checkpoint", "save_coding_checkpoint", "run_tests",
         "create_worktree", "list_worktrees", "remove_worktree",
         "review_changes", "review_file_diff",
         "activate_project", "get_active_project", "clear_active_project",
+        "load_project", "load_codebase", "refresh_codebase_index", "update_project",
         "create_tool", "list_custom_tools", "delete_tool",
         "palace_remember", "palace_hall", "palace_recall", "palace_status",
+        "view_image",
     }
     assert enabled == expected
 
