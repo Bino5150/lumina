@@ -6,6 +6,8 @@ import pytest
 pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import config
+import tools.memory as memory
 import ui.main_window as main_window
 from ui.main_window import LuminaWindow
 
@@ -55,18 +57,24 @@ class _Ctx:
         self.history.append({"role": "assistant", "content": content})
 
 
-def test_load_chat_renders_full_transcript_but_restores_only_checkpoint_tail(monkeypatch):
-    messages = [
-        {"role": "user", "content": "u1", "metadata": None},
-        {"role": "assistant", "content": "a1", "metadata": None},
-        {"role": "user", "content": "u2", "metadata": None},
-        {"role": "assistant", "content": "a2", "metadata": None},
-        {"role": "user", "content": "u3", "metadata": None},
-        {"role": "assistant", "content": "a3", "metadata": None},
-    ]
+def test_load_chat_renders_full_transcript_but_restores_only_checkpoint_tail(tmp_path, monkeypatch):
+    """CONTEXT-LIFECYCLE-A2 integration proof (required test #15/#16): this
+    exercises the REAL core/context_reconstruction.py kernel end to end via
+    an isolated on-disk chat DB -- not a mocked reconstruction result --
+    so a regression in _load_chat()'s delegation to the kernel, or in the
+    kernel itself, shows up here exactly as it would in the live app."""
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "chat.db"))
+    memory.init_chat_db()
+    chat_id = memory.create_chat("test chat")
+    for role, content in [
+        ("user", "u1"), ("assistant", "a1"),
+        ("user", "u2"), ("assistant", "a2"),
+        ("user", "u3"), ("assistant", "a3"),
+    ]:
+        memory.save_chat_message(chat_id, role, content)
+
     monkeypatch.setattr(main_window.persistence, "save", lambda prefs: None)
-    monkeypatch.setattr(main_window, "load_chat_messages", lambda chat_id: messages)
-    monkeypatch.setattr(main_window, "latest_manual_compaction_skip", lambda chat_id: 2)
+    monkeypatch.setattr("core.manual_compaction.latest_manual_compaction_skip", lambda cid: 2)
 
     fake = types.SimpleNamespace(
         _current_chat_id=None,
@@ -75,7 +83,7 @@ def test_load_chat_renders_full_transcript_but_restores_only_checkpoint_tail(mon
         chat_widget=_ChatWidget(),
         _refresh_chat_list=lambda: None,
     )
-    LuminaWindow._load_chat(fake, 77)
+    LuminaWindow._load_chat(fake, chat_id)
 
     assert fake.chat_widget.rendered == [
         ("user", "u1"), ("assistant", "a1"),

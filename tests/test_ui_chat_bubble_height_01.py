@@ -38,6 +38,7 @@ from ui.chat_widget import ChatWidget, LiveResponseBubble, ResponseBrowser
 
 try:
     from ui import main_window as mw
+    from core.context_reconstruction import ReconstructionResult
     _HAVE_MW = True
 except ModuleNotFoundError:
     _HAVE_MW = False
@@ -281,6 +282,25 @@ def _fake_window(chat):
     )
 
 
+def _fake_reconstruct(store):
+    """CONTEXT-LIFECYCLE-A2: see tests/test_ui_chat_scroll_01.py's
+    identical helper docstring -- these geometry tests need an arbitrary
+    in-memory row set, not real persistence/compaction semantics, so the
+    kernel entrypoint itself is faked rather than routed through a DB."""
+    def _reconstruct(chat_id, context_skip=0):
+        msgs = store[chat_id]
+        rows = [{"id": i, "role": m["role"], "content": m["content"], "metadata": ""}
+                for i, m in enumerate(msgs, start=1)]
+        messages = [{"role": m["role"], "content": m["content"]} for m in msgs]
+        return ReconstructionResult(
+            chat_id=chat_id, context_skip=context_skip, rows=rows,
+            eligible_rows=rows, messages=messages,
+            restored_row_count=len(messages), skipped_row_count=0,
+            durable_spine_fingerprint="test-fixture",
+        )
+    return _reconstruct
+
+
 @pytest.mark.skipif(not _HAVE_MW, reason="ui.main_window unavailable")
 def test_history_restore_produces_sane_geometry_like_live_finalize(qapp, monkeypatch):
     chat = _make_chat(qapp, w=500)
@@ -289,8 +309,8 @@ def test_history_restore_produces_sane_geometry_like_live_finalize(qapp, monkeyp
         {"role": "user", "content": "what's going on with the bus?"},
         {"role": "assistant", "content": LONG_RESPONSE},
     ]}
-    monkeypatch.setattr(mw, "load_chat_messages", lambda cid: store[cid])
-    monkeypatch.setattr(mw, "latest_manual_compaction_skip", lambda cid: 0)
+    monkeypatch.setattr(mw, "resolve_context_skip", lambda cid: 0)
+    monkeypatch.setattr(mw, "reconstruct_chat_context", _fake_reconstruct(store))
     monkeypatch.setattr(mw.persistence, "update", lambda *a, **kw: None)
 
     mw.LuminaWindow._load_chat(fake, 42)
@@ -312,8 +332,8 @@ def test_history_restore_at_different_width_sizes_for_new_width(qapp, monkeypatc
         {"role": "user", "content": "what's going on with the bus?"},
         {"role": "assistant", "content": LONG_RESPONSE},
     ]}
-    monkeypatch.setattr(mw, "load_chat_messages", lambda cid: store[cid])
-    monkeypatch.setattr(mw, "latest_manual_compaction_skip", lambda cid: 0)
+    monkeypatch.setattr(mw, "resolve_context_skip", lambda cid: 0)
+    monkeypatch.setattr(mw, "reconstruct_chat_context", _fake_reconstruct(store))
     monkeypatch.setattr(mw.persistence, "update", lambda *a, **kw: None)
 
     mw.LuminaWindow._load_chat(fake, 42)

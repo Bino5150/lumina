@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from core.agent import TurnCancelled, is_error_response
 from core import emergency_stop
-from core.manual_compaction import latest_manual_compaction_skip, run_manual_compaction
+from core.context_reconstruction import reconstruct_chat_context, resolve_context_skip
+from core.manual_compaction import run_manual_compaction
 from core.operator_commands import (
     command_help, compaction_cut_index, format_duration, format_tokens,
     parse_operator_command, unwrap_background_result,
@@ -891,23 +892,24 @@ class LuminaWindow(QMainWindow):
         self._current_chat_id = chat_id
         self._prefs["last_chat_id"] = chat_id  # read-cache only
         persistence.update({"last_chat_id": chat_id})
-        self.agent.ctx.clear()
-        self.chat_widget.clear_messages()
-        msgs = load_chat_messages(chat_id)
-        try:
-            context_skip = latest_manual_compaction_skip(chat_id)
-        except Exception as e:
-            print(f"[COMPACTION] checkpoint read failed for chat {chat_id}: {e}", flush=True)
-            context_skip = 0
-        conversation_index = 0
-        for m in msgs:
-            role = m.get("role")
-            is_conversation = role in ("user", "assistant")
-            restore_to_context = (not is_conversation or conversation_index >= context_skip)
-            if is_conversation:
-                conversation_index += 1
 
-            content = m.get("content") or ""
+        # CONTEXT-LIFECYCLE-A2: which durable rows re-enter active context
+        # is decided entirely by the neutral kernel (core/context_
+        # reconstruction.py), not by a loop here -- this method now only
+        # owns chat selection, visible-transcript rendering, and other
+        # genuinely UI-specific state. context_skip is still resolved here
+        # (not inside the kernel's default path) so a checkpoint read
+        # failure degrades to "restore everything" instead of crashing
+        # chat load -- the exact pre-A2 behavior.
+        result = reconstruct_chat_context(chat_id, context_skip=resolve_context_skip(chat_id))
+
+        self.agent.ctx.clear()
+        self.agent.ctx.history = list(result.messages)
+
+        self.chat_widget.clear_messages()
+        for row in result.rows:
+            role = row["role"]
+            content = row["content"] or ""
             if not content:
                 continue
             if role == "user":
@@ -915,14 +917,10 @@ class LuminaWindow(QMainWindow):
                 # explicit layout-settled positioning after the loop owns
                 # the final viewport.
                 self.chat_widget.add_user_message(content, mode="none")
-                if restore_to_context:
-                    self.agent.ctx.add_user(content)
             elif role == "assistant":
                 bubble = self.chat_widget.create_live_bubble()
                 bubble._response_text = content
                 bubble.finalize()
-                if restore_to_context:
-                    self.agent.ctx.add_assistant(content)
         # UI-CHAT-SCROLL-01: one intentional layout-settled positioning for
         # the whole restore -- history reopens at the latest turn without
         # dozens of per-message scroll timers racing each other.

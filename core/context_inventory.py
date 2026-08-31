@@ -16,11 +16,20 @@ guessed). Think and Commentary are never ContextManager entries at all
 UI bubble widget, never self.agent.ctx -- see A0's finding #3/#4) --
 inventory_active_history() reports that truthfully as "not resident"
 rather than inventing a fake zero-token history row for them.
-"""
-import hashlib
 
+CONTEXT-LIFECYCLE-A2: durable-row eligibility (`eligible_durable_rows`)
+and the durable-spine fingerprint now live in core/context_reconstruction
+.py, the neutral reconstruction kernel ui/main_window.py::_load_chat()
+consumes directly. This module re-exports eligible_durable_rows() for
+import-path compatibility and delegates durable_spine_fingerprint() to
+the kernel so there is exactly one eligibility implementation and one
+fingerprint implementation -- this module never re-derives either.
+"""
 from core.context import estimate_message_tokens
-from core.db import connect
+from core.context_reconstruction import (
+    eligible_durable_rows,  # noqa: F401 -- re-exported for import-path compatibility
+    reconstruct_chat_context,
+)
 
 MESSAGE_CLASSES = ("user", "assistant_final", "assistant_tool_call", "tool_result", "other")
 
@@ -91,67 +100,6 @@ def inventory_active_history(history: list) -> dict:
     }
 
 
-def _load_durable_conversation_rows(chat_id: int) -> list:
-    """Read-only query against chat_messages, ordered exactly like
-    tools/memory.py::load_chat_messages() (ORDER BY created_at, no
-    secondary tiebreak -- matched deliberately for reconstruction-order
-    parity, not "improved" with an id tiebreak that function doesn't use).
-
-    Selects `id` in addition to that function's own columns -- needed as
-    this module's fingerprint row-identity anchor. A local query rather
-    than adding `id` to load_chat_messages()'s shared return shape: that
-    would be a safe additive change, but A1's mission is the smallest
-    possible read-only footprint, and this observation has no need to
-    touch a function three other subsystems already depend on.
-    """
-    conn = connect()
-    try:
-        rows = conn.execute(
-            "SELECT id, role, content, metadata FROM chat_messages "
-            "WHERE chat_id=? ORDER BY created_at",
-            (chat_id,),
-        ).fetchall()
-    finally:
-        conn.close()
-    return [
-        {"id": r["id"], "role": r["role"], "content": r["content"],
-         "metadata": r["metadata"] or ""}
-        for r in rows
-    ]
-
-
-def eligible_durable_rows(rows: list, context_skip: int) -> list:
-    """Reproduce ui/main_window.py::_load_chat()'s exact eligibility logic
-    for which durable rows actually re-enter ctx.history:
-
-    - only role in ("user", "assistant") is ever restored (no elif branch
-      exists for any other role, so any other role -- none occur in
-      practice today -- is silently never restored regardless of skip);
-    - `conversation_index` counts every conversation-class row in order,
-      checked against context_skip BEFORE incrementing for the current
-      row (a 0-indexed "skip the first N conversational rows" cut);
-    - an empty-content row still consumes a conversation_index slot even
-      though it is never itself restored -- CONTEXT-LIFECYCLE-A0 confirmed
-      this exact ordering in the live source, so it is reproduced here
-      rather than "corrected."
-
-    Any divergence from _load_chat()'s real behavior here is a parity
-    bug in this function, not a design choice -- see required proof #7.
-    """
-    eligible = []
-    conversation_index = 0
-    for row in rows:
-        if row["role"] not in ("user", "assistant"):
-            continue
-        restore = conversation_index >= context_skip
-        conversation_index += 1
-        if not row["content"]:
-            continue
-        if restore:
-            eligible.append(row)
-    return eligible
-
-
 def durable_spine_fingerprint(chat_id: int, context_skip: int = None) -> dict:
     """Deterministic SHA-256 over the exact durable user/assistant rows
     _load_chat() would restore into ctx.history right now for this chat,
@@ -165,32 +113,19 @@ def durable_spine_fingerprint(chat_id: int, context_skip: int = None) -> dict:
 
     `context_skip` defaults to the chat's live latest_manual_compaction_
     skip() value; pass an explicit value to compare against a different
-    skip state without a live DB round-trip.
+    skip state without a live DB round-trip. Delegates entirely to
+    core/context_reconstruction.py::reconstruct_chat_context() (the A2
+    kernel) for row loading, eligibility, and the fingerprint hash itself
+    -- this function only reshapes that result into A1's pre-existing
+    dict contract so callers/tests written against it are unaffected.
     """
-    if context_skip is None:
-        from core.manual_compaction import latest_manual_compaction_skip
-        context_skip = latest_manual_compaction_skip(chat_id)
-
-    rows = _load_durable_conversation_rows(chat_id)
-    eligible = eligible_durable_rows(rows, context_skip)
-
-    h = hashlib.sha256()
-    for row in eligible:
-        h.update(str(row["id"]).encode("utf-8"))
-        h.update(b"\x00")
-        h.update(row["role"].encode("utf-8"))
-        h.update(b"\x00")
-        h.update(row["content"].encode("utf-8"))
-        h.update(b"\x00")
-        h.update(row["metadata"].encode("utf-8"))
-        h.update(b"\x1e")
-
+    result = reconstruct_chat_context(chat_id, context_skip=context_skip)
     return {
-        "chat_id": chat_id,
-        "context_skip": context_skip,
-        "durable_row_count": len(rows),
-        "eligible_row_count": len(eligible),
-        "fingerprint_sha256": h.hexdigest(),
+        "chat_id": result.chat_id,
+        "context_skip": result.context_skip,
+        "durable_row_count": len(result.rows),
+        "eligible_row_count": len(result.eligible_rows),
+        "fingerprint_sha256": result.durable_spine_fingerprint,
     }
 
 

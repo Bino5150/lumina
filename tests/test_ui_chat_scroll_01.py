@@ -27,6 +27,7 @@ from ui.chat_widget import ChatWidget
 
 try:
     from ui import main_window as mw
+    from core.context_reconstruction import ReconstructionResult
     _HAVE_MW = True
 except ModuleNotFoundError:
     _HAVE_MW = False
@@ -308,14 +309,38 @@ def _restore_msgs(turns):
     return msgs
 
 
+def _fake_reconstruct(store):
+    """CONTEXT-LIFECYCLE-A2: _load_chat() now gets its candidate history
+    from core.context_reconstruction.reconstruct_chat_context() instead
+    of independently calling load_chat_messages()/latest_manual_
+    compaction_skip(). These scroll/geometry tests don't care about real
+    persistence or compaction semantics (test_context_reconstruction.py
+    and test_manual_compaction_ui.py already cover those) -- they just
+    need an arbitrary in-memory row set, so the kernel entrypoint itself
+    is faked here rather than routing an in-memory store through a real
+    on-disk DB."""
+    def _reconstruct(chat_id, context_skip=0):
+        msgs = store[chat_id]
+        rows = [{"id": i, "role": m["role"], "content": m["content"], "metadata": ""}
+                for i, m in enumerate(msgs, start=1)]
+        messages = [{"role": m["role"], "content": m["content"]} for m in msgs]
+        return ReconstructionResult(
+            chat_id=chat_id, context_skip=context_skip, rows=rows,
+            eligible_rows=rows, messages=messages,
+            restored_row_count=len(messages), skipped_row_count=0,
+            durable_spine_fingerprint="test-fixture",
+        )
+    return _reconstruct
+
+
 @pytest.mark.skipif(not _HAVE_MW, reason="ui.main_window unavailable")
 def test_history_restore_ends_at_latest_turn_with_one_positioning(qapp, monkeypatch):
     chat = _make_chat(qapp)
     fake = _fake_window(chat)
 
     store = {42: _restore_msgs(30)}
-    monkeypatch.setattr(mw, "load_chat_messages", lambda cid: store[cid])
-    monkeypatch.setattr(mw, "latest_manual_compaction_skip", lambda cid: 0)
+    monkeypatch.setattr(mw, "resolve_context_skip", lambda cid: 0)
+    monkeypatch.setattr(mw, "reconstruct_chat_context", _fake_reconstruct(store))
     monkeypatch.setattr(mw.persistence, "update", lambda *a, **kw: None)
 
     calls = []
@@ -338,8 +363,8 @@ def test_chat_switch_positions_deterministically(qapp, monkeypatch):
     fake = _fake_window(chat)
 
     store = {42: _restore_msgs(30), 43: _restore_msgs(3)}
-    monkeypatch.setattr(mw, "load_chat_messages", lambda cid: store[cid])
-    monkeypatch.setattr(mw, "latest_manual_compaction_skip", lambda cid: 0)
+    monkeypatch.setattr(mw, "resolve_context_skip", lambda cid: 0)
+    monkeypatch.setattr(mw, "reconstruct_chat_context", _fake_reconstruct(store))
     monkeypatch.setattr(mw.persistence, "update", lambda *a, **kw: None)
 
     mw.LuminaWindow._load_chat(fake, 42)
