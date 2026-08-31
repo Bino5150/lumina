@@ -80,6 +80,14 @@ class CheckpointNotReady(ReconstructionError):
     just returned by get_latest_usable_checkpoint())."""
 
 
+class CheckpointChatMismatch(ReconstructionError):
+    """CONTEXT-LIFECYCLE-A6P1: an explicitly requested checkpoint_id exists
+    but belongs to a different chat than the one this transaction was
+    invoked for. Only reachable via deliberate_reconstruct_checkpoint() --
+    get_latest_usable_checkpoint() (legacy selection) already scopes its
+    query to the requested chat_id, so this can never fire there."""
+
+
 class CheckpointStale(ReconstructionError):
     """The durable spine fingerprint no longer matches the checkpoint's
     frozen binding, observed either during off-side preparation or at the
@@ -330,15 +338,78 @@ def _active_turn_exists(chat_id) -> bool:
     return False
 
 
-def deliberate_reconstruct(chat_id: int, generation_owner, *, recorder=None) -> ReconstructResult:
-    """Run the full A5I transaction for `chat_id` against `generation_owner`
-    (see this module's docstring for the required protocol). Returns a
-    ReconstructResult on success. Raises a ReconstructionError subclass (or
-    propagates core.context_checkpoints.CheckpointNotFound) on any failure
-    -- in every failure case, `generation_owner.live_ctx().history` is
-    guaranteed untouched: the exact same list object it was before this
-    call, since the only rebind (step 5) is unconditionally the last
-    mutation performed, after every check above it has already passed.
+def _select_latest_checkpoint(chat_id: int):
+    """Off-side selection for deliberate_reconstruct()'s legacy/current
+    callers -- exactly the lookup A5I has always used, unchanged by
+    CONTEXT-LIFECYCLE-A6P1."""
+    checkpoint = get_latest_usable_checkpoint(chat_id)
+    if checkpoint is None:
+        raise NoUsableCheckpoint(f"no usable READY checkpoint for chat {chat_id}")
+    if checkpoint.state != STATE_READY:
+        raise CheckpointNotReady(f"checkpoint {checkpoint.id} is {checkpoint.state}, not READY")
+    return checkpoint
+
+
+def _select_exact_checkpoint(chat_id: int, checkpoint_id: int):
+    """Off-side selection for CONTEXT-LIFECYCLE-A6P1's exact-ID entry point
+    (deliberate_reconstruct_checkpoint()). Never calls
+    get_latest_usable_checkpoint() -- fetches exactly the row the caller
+    asked for (get_checkpoint() raises CheckpointNotFound if it doesn't
+    exist) and verifies chat ownership, READY state, and payload validity
+    before it may become the transaction's candidate. Durable-spine
+    fingerprint and context_skip agreement against this exact record are
+    verified by the caller immediately after this returns -- see
+    _deliberate_reconstruct()'s strict_context_skip_offside branch and its
+    shared off-side fingerprint check, both compared against this same
+    `checkpoint`, never a substitute."""
+    checkpoint = get_checkpoint(checkpoint_id)
+    if checkpoint.chat_id != chat_id:
+        raise CheckpointChatMismatch(
+            f"checkpoint {checkpoint_id} belongs to chat {checkpoint.chat_id}, not {chat_id}"
+        )
+    if checkpoint.state != STATE_READY:
+        raise CheckpointNotReady(f"checkpoint {checkpoint.id} is {checkpoint.state}, not READY")
+    if checkpoint.payload is None:
+        raise InvalidContinuityPayload(
+            f"checkpoint {checkpoint.id} payload failed validation during selection"
+        )
+    return checkpoint
+
+
+def _deliberate_reconstruct(
+    chat_id: int,
+    generation_owner,
+    *,
+    recorder,
+    select_checkpoint,
+    checkpoint_id_hint,
+    strict_context_skip_offside,
+) -> ReconstructResult:
+    """Shared A5 transaction body for both public entry points below --
+    deliberate_reconstruct() (A5I, latest-usable selection) and
+    deliberate_reconstruct_checkpoint() (CONTEXT-LIFECYCLE-A6P1, exact-ID
+    selection). They differ only in `select_checkpoint` (how the off-side
+    candidate is chosen -- see _select_latest_checkpoint()/
+    _select_exact_checkpoint() above), `checkpoint_id_hint` (the ID to
+    report in rejection telemetry when selection itself fails before a
+    CheckpointRecord exists, e.g. a missing or wrong-chat explicit ID --
+    None for legacy callers, since "latest usable" has no such ID to
+    report), and `strict_context_skip_offside` (an extra off-side
+    context_skip agreement check, exact-ID mode only -- see
+    deliberate_reconstruct_checkpoint()'s docstring for why legacy mode
+    deliberately does not gain this extra check). Every other line below --
+    capture, the off-side fingerprint check, candidate rendering, the swap
+    critical section and everything it revalidates, telemetry -- is
+    unchanged from A5I and runs identically regardless of which selector
+    supplied `checkpoint`.
+
+    Returns a ReconstructResult on success. Raises a ReconstructionError
+    subclass (or propagates core.context_checkpoints.CheckpointNotFound) on
+    any failure -- in every failure case, `generation_owner.live_ctx().
+    history` is guaranteed untouched: the exact same list object it was
+    before this call, since the only rebind (the atomic-install step) is
+    unconditionally the last mutation performed, after every check above it
+    has already passed.
 
     A programming-bug exception raised by rendering (e.g. a malformed
     payload past InvalidContinuityPayload's own defensive check) is
@@ -350,24 +421,26 @@ def deliberate_reconstruct(chat_id: int, generation_owner, *, recorder=None) -> 
 
     captured_chat_id = generation_owner.current_chat_id()
     if captured_chat_id != chat_id:
-        _emit_rejected(recorder, chat_id, None, "ActiveChatChanged", "warning")
+        _emit_rejected(recorder, chat_id, checkpoint_id_hint, "ActiveChatChanged", "warning")
         raise ActiveChatChanged(f"generation owner's active chat is {captured_chat_id}, not {chat_id}")
     captured_generation = generation_owner.current_generation()
     captured_epoch = emergency_stop.current_epoch()
 
-    checkpoint_id_for_telemetry = None
+    checkpoint_id_for_telemetry = checkpoint_id_hint
     try:
         # ---- build off-side: no lock held, no ctx mutation ----
-        checkpoint = get_latest_usable_checkpoint(chat_id)
-        if checkpoint is None:
-            raise NoUsableCheckpoint(f"no usable READY checkpoint for chat {chat_id}")
+        checkpoint = select_checkpoint()
         checkpoint_id_for_telemetry = checkpoint.id
-        if checkpoint.state != STATE_READY:
-            raise CheckpointNotReady(f"checkpoint {checkpoint.id} is {checkpoint.state}, not READY")
 
         reconstruction = reconstruct_chat_context(chat_id)
         if reconstruction.durable_spine_fingerprint != checkpoint.durable_spine_fingerprint:
             raise CheckpointStale(f"checkpoint {checkpoint.id} spine fingerprint stale during preparation")
+        if strict_context_skip_offside and reconstruction.context_skip != checkpoint.context_skip:
+            raise CheckpointStale(
+                f"checkpoint {checkpoint.id} context_skip ({checkpoint.context_skip}) disagrees "
+                f"with the current resolved context_skip ({reconstruction.context_skip}) during "
+                "off-side preparation"
+            )
 
         continuity_text = render_continuity_message(checkpoint.payload)
         candidate_history = list(reconstruction.messages) + [
@@ -451,4 +524,72 @@ def deliberate_reconstruct(chat_id: int, generation_owner, *, recorder=None) -> 
         old_entry_count=len(old_history),
         new_entry_count=len(candidate_history),
         durable_row_count=reconstruction.restored_row_count,
+    )
+
+
+def deliberate_reconstruct(chat_id: int, generation_owner, *, recorder=None) -> ReconstructResult:
+    """Run the full A5I transaction for `chat_id` against `generation_owner`
+    (see this module's docstring for the required protocol), selecting
+    whichever checkpoint get_latest_usable_checkpoint(chat_id) currently
+    considers usable. Unchanged behavior from A5I -- see
+    _deliberate_reconstruct() for the shared mechanics this now delegates
+    to, and deliberate_reconstruct_checkpoint() below for the exact-ID
+    alternative CONTEXT-LIFECYCLE-A6P1 adds alongside this."""
+    return _deliberate_reconstruct(
+        chat_id, generation_owner,
+        recorder=recorder,
+        select_checkpoint=lambda: _select_latest_checkpoint(chat_id),
+        checkpoint_id_hint=None,
+        strict_context_skip_offside=False,
+    )
+
+
+def deliberate_reconstruct_checkpoint(
+    chat_id: int, checkpoint_id: int, generation_owner, *, recorder=None
+) -> ReconstructResult:
+    """CONTEXT-LIFECYCLE-A6P1: consume exactly `checkpoint_id`, or fail --
+    never any other checkpoint. Closes A6D Blocker B2: unlike
+    deliberate_reconstruct(), which independently re-derives "latest usable"
+    and may therefore select a different same-spine checkpoint than the one
+    a caller (e.g. A6's coordinator, immediately after a fresh A4 compile)
+    just prepared, this entry point takes the checkpoint identity as a hard
+    input. get_latest_usable_checkpoint() is never called anywhere in this
+    path (see _select_exact_checkpoint()) -- if `checkpoint_id` is missing,
+    wrong-chat, not READY (FAILED/SUPERSEDED/BUILDING), has an invalid
+    payload, or its durable-spine binding (fingerprint or context_skip) no
+    longer matches the current live state at ANY point before the swap
+    (off-side preparation or the in-lock final re-check), the whole
+    transaction fails and `generation_owner.live_ctx().history` is left
+    untouched -- even if another, newer, perfectly valid READY checkpoint
+    for the same chat/spine exists. The caller decides what happens next;
+    this function never silently substitutes one checkpoint for another.
+
+    Gains one extra off-side check relative to deliberate_reconstruct():
+    strict_context_skip_offside compares the freshly resolved context_skip
+    against `checkpoint.context_skip` before candidate rendering begins,
+    per A6D section 3's exact-ID selection contract. deliberate_reconstruct()
+    deliberately does NOT gain this same check -- adding it there would
+    reorder an existing, already-tested A5I protection (its off-side pass
+    currently checks only the fingerprint; the corrupted-context_skip case
+    is caught by the in-lock recheck, which both entry points still run
+    unconditionally) for a caller that never asked for stricter off-side
+    behavior. Preserving deliberate_reconstruct()'s exact existing check
+    order is CONTEXT-LIFECYCLE-A6P1's explicit mandate, not an oversight.
+
+    Every other A5I protection -- off-side candidate construction,
+    active-chat/generation/foreground-turn/emergency-epoch revalidation at
+    the swap boundary, a fresh in-lock re-fetch of this SAME checkpoint_id
+    (never "latest"), fresh strict fingerprint/context_skip/payload
+    re-validation against that fresh re-fetch, one atomic history rebind,
+    usage-cache and pending-compaction reset, generation advancement,
+    bounded telemetry, and whole-transaction failure atomicity -- applies
+    identically to this entry point, via the same shared
+    _deliberate_reconstruct() body deliberate_reconstruct() itself uses.
+    """
+    return _deliberate_reconstruct(
+        chat_id, generation_owner,
+        recorder=recorder,
+        select_checkpoint=lambda: _select_exact_checkpoint(chat_id, checkpoint_id),
+        checkpoint_id_hint=checkpoint_id,
+        strict_context_skip_offside=True,
     )

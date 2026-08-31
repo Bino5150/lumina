@@ -783,3 +783,458 @@ def test_rejected_telemetry_carries_failure_class(tmp_path):
     rejected = [e for e in events if e["event_type"] == "context.reconstruction.rejected"][0]
     fields = _json.loads(rejected["fields_json"])
     assert fields["failure_class"] == "NoUsableCheckpoint"
+
+
+# ── CONTEXT-LIFECYCLE-A6P1: deliberate_reconstruct_checkpoint() ───────────
+#
+# Exact-checkpoint-identity consumption: given checkpoint_id=N, this entry
+# point must consume exactly N or fail -- never silently reselect "latest
+# usable" the way deliberate_reconstruct() does. The next block proves that
+# contract directly (never calling get_latest_usable_checkpoint()), the
+# same-spine race (B2's core regression: a newer READY checkpoint for the
+# identical spine must never be substituted for the requested one), the
+# failure race (a stale/superseded/missing requested ID must never fall
+# back to a valid newer checkpoint), every off-side/in-lock A5I protection
+# already proven for deliberate_reconstruct() above, and that rejection
+# telemetry always names the checkpoint that was actually requested.
+
+def test_explicit_checkpoint_succeeds_with_requested_id(tmp_path):
+    chat_id = _seed_chat([("user", "u1"), ("assistant", "a1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    recorder = _fr(tmp_path)
+
+    result = ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    assert result.checkpoint_id == checkpoint.id
+    expected_reconstruction = reconstruct_chat_context(chat_id)
+    assert owner.ctx.history == list(expected_reconstruction.messages) + [
+        {"role": "assistant", "content": ct.render_continuity_message(checkpoint.payload)}
+    ]
+    assert owner.current_generation() == 1
+    events = _events(recorder)
+    assert [e["event_type"] for e in events] == [
+        "context.reconstruction.requested", "context.reconstruction.swapped"
+    ]
+
+
+def test_explicit_checkpoint_never_calls_get_latest_usable_checkpoint(tmp_path, monkeypatch):
+    """Kills M1 directly: proves selection never goes through
+    get_latest_usable_checkpoint() at all in explicit-ID mode."""
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    recorder = _fr(tmp_path)
+
+    def _boom(*a, **k):
+        raise AssertionError("get_latest_usable_checkpoint must never be called in explicit-ID mode")
+
+    monkeypatch.setattr(ct, "get_latest_usable_checkpoint", _boom)
+
+    result = ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+    assert result.checkpoint_id == checkpoint.id
+
+
+def test_explicit_checkpoint_consumes_exact_id_not_newer_same_spine_checkpoint(tmp_path):
+    """The load-bearing B2 regression test (A6P1 section 5): checkpoint A
+    and checkpoint B are both READY, both bound to the identical durable
+    spine, B newer than A. Requesting A must install A's content and report
+    A's id -- even though get_latest_usable_checkpoint() would return B --
+    and B must remain completely untouched. Kills M1/M4/M5 together: a
+    reselect-at-any-point mutation or a report/render mismatch would make
+    this test observe B's content, B's id, or a still-READY-but-consumed A."""
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint_a = _ready_checkpoint(chat_id, payload=_valid_payload(statement="checkpoint A statement"))
+    checkpoint_b = _ready_checkpoint(chat_id, payload=_valid_payload(statement="checkpoint B statement"))
+    assert checkpoint_b.id > checkpoint_a.id
+    assert checkpoint_b.durable_spine_fingerprint == checkpoint_a.durable_spine_fingerprint
+    # Sanity: the legacy "latest usable" lookup really would pick B, not A --
+    # proving this is a genuine race, not a scenario where both selections
+    # happen to agree.
+    assert cc.get_latest_usable_checkpoint(chat_id).id == checkpoint_b.id
+
+    owner = _FakeGenerationOwner(chat_id)
+    recorder = _fr(tmp_path)
+
+    result = ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint_a.id, owner, recorder=recorder)
+
+    assert result.checkpoint_id == checkpoint_a.id
+    assert "checkpoint A statement" in owner.ctx.history[-1]["content"]
+    assert "checkpoint B statement" not in owner.ctx.history[-1]["content"]
+    assert cc.get_checkpoint(checkpoint_b.id).state == cc.STATE_READY  # B untouched
+
+    import json as _json
+    events = _events(recorder)
+    swapped = [e for e in events if e["event_type"] == "context.reconstruction.swapped"][0]
+    fields = _json.loads(swapped["fields_json"])
+    assert fields["checkpoint_id"] == checkpoint_a.id
+
+
+def test_explicit_checkpoint_stale_requested_id_fails_despite_valid_newer_checkpoint(tmp_path):
+    """The failure-race counterpart (A6P1 section 6): the requested
+    checkpoint A is SUPERSEDED before the call; a fully valid newer
+    checkpoint B exists for the same chat. The call must fail and B must
+    never be consumed."""
+    chat_id = _seed_chat([("user", "u1"), ("assistant", "a1"), ("user", "u2")])
+    checkpoint_a = _ready_checkpoint(chat_id, context_skip=0)
+    cc.supersede_checkpoint(checkpoint_a.id, chat_id)
+    checkpoint_b = _ready_checkpoint(chat_id, context_skip=0, payload=_valid_payload(statement="checkpoint B"))
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    with pytest.raises(ct.CheckpointNotReady):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint_a.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+    assert cc.get_checkpoint(checkpoint_b.id).state == cc.STATE_READY  # B never consumed
+
+    import json as _json
+    events = _events(recorder)
+    rejected = [e for e in events if e["event_type"] == "context.reconstruction.rejected"][0]
+    fields = _json.loads(rejected["fields_json"])
+    assert fields["checkpoint_id"] == checkpoint_a.id  # never B
+
+
+def test_explicit_checkpoint_failed_state_fails(tmp_path):
+    chat_id = _seed_chat([("user", "u1")])
+    fp = _spine(chat_id)
+    building = cc.begin_checkpoint(chat_id, fp, 0)
+    cc.fail_checkpoint(building.id, chat_id, reason="test failure")
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    with pytest.raises(ct.CheckpointNotReady):
+        ct.deliberate_reconstruct_checkpoint(chat_id, building.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_missing_id_fails_despite_valid_newer_checkpoint(tmp_path):
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint_b = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+    missing_id = checkpoint_b.id + 999999
+
+    with pytest.raises(cc.CheckpointNotFound):
+        ct.deliberate_reconstruct_checkpoint(chat_id, missing_id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+    assert cc.get_checkpoint(checkpoint_b.id).state == cc.STATE_READY  # B never consumed
+
+    import json as _json
+    events = _events(recorder)
+    rejected = [e for e in events if e["event_type"] == "context.reconstruction.rejected"][0]
+    fields = _json.loads(rejected["fields_json"])
+    assert fields["checkpoint_id"] == missing_id  # requested ID reported even though it never resolved
+
+
+def test_explicit_checkpoint_wrong_chat_id_fails(tmp_path):
+    chat_id = _seed_chat([("user", "u1")])
+    other_chat_id = _seed_chat([("user", "other")])
+    checkpoint = _ready_checkpoint(other_chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    with pytest.raises(ct.CheckpointChatMismatch):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_corrupted_payload_fails_off_side(tmp_path):
+    """A READY row whose payload_json/hash was corrupted directly (bypassing
+    finalize_checkpoint()'s own hash-write contract) reads back with
+    payload=None despite state==READY -- must be rejected during selection,
+    before any candidate is built."""
+    import sqlite3
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.execute("UPDATE context_checkpoints SET payload_json='not json' WHERE id=?", (checkpoint.id,))
+    conn.commit()
+    conn.close()
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    with pytest.raises(ct.InvalidContinuityPayload):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_context_skip_mismatch_rejected_off_side(tmp_path):
+    """A6P1 section 3's extra strict off-side check: a checkpoint row whose
+    context_skip column was corrupted (fingerprint column left genuinely
+    valid) must be rejected before candidate rendering, not only at the
+    swap boundary."""
+    chat_id = _seed_chat([("user", "u1"), ("assistant", "a1"), ("user", "u2")])
+    fp0 = _spine(chat_id, context_skip=0)
+    fp1 = _spine(chat_id, context_skip=1)
+    assert fp0 != fp1  # sanity: skip genuinely matters for this fixture
+
+    checkpoint = _ready_checkpoint(chat_id, context_skip=0)
+    assert checkpoint.durable_spine_fingerprint == fp0
+    _corrupt_checkpoint_context_skip(checkpoint.id, wrong_skip=1)
+
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    with pytest.raises(ct.CheckpointStale, match="context_skip"):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_durable_fingerprint_moves_during_preparation_raises_stale(tmp_path, monkeypatch):
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    real_reconstruct = ct.reconstruct_chat_context
+    call_count = {"n": 0}
+
+    def _reconstruct_then_mutate(cid, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            memory.save_chat_message(chat_id, "user", "a late concurrent message")
+        return real_reconstruct(cid, **kwargs)
+
+    monkeypatch.setattr(ct, "reconstruct_chat_context", _reconstruct_then_mutate)
+
+    with pytest.raises(ct.CheckpointStale):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_stale_spine_never_silently_falls_back_to_fresh_checkpoint(tmp_path, monkeypatch):
+    """M15-equivalent for explicit-ID mode: while checkpoint A prepares, the
+    durable spine moves AND a brand-new, perfectly valid checkpoint B is
+    built for the NEW spine. An internal auto-retry would "succeed" by
+    silently switching to B -- forbidden. The call must fail, and B (though
+    genuinely usable) must never be touched."""
+    chat_id = _seed_chat([("user", "u1"), ("assistant", "a1"), ("user", "u2")])
+    checkpoint_a = _ready_checkpoint(chat_id, context_skip=0)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    real_reconstruct = ct.reconstruct_chat_context
+    checkpoint_b_id = {"id": None}
+
+    def _reconstruct_then_build_fresh_checkpoint(cid, **kwargs):
+        _write_compaction_skip(chat_id, 1)
+        checkpoint_b = _ready_checkpoint(chat_id, context_skip=1)
+        checkpoint_b_id["id"] = checkpoint_b.id
+        monkeypatch.setattr(ct, "reconstruct_chat_context", real_reconstruct)
+        return real_reconstruct(cid, **kwargs)
+
+    monkeypatch.setattr(ct, "reconstruct_chat_context", _reconstruct_then_build_fresh_checkpoint)
+
+    with pytest.raises(ct.CheckpointStale):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint_a.id, owner, recorder=recorder)
+
+    assert checkpoint_b_id["id"] is not None
+    assert cc.get_latest_usable_checkpoint(chat_id).id == checkpoint_b_id["id"]
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_generation_changed_during_preparation_raises(tmp_path, monkeypatch):
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    real_reconstruct = ct.reconstruct_chat_context
+
+    def _reconstruct_then_bump(cid, **kwargs):
+        owner.bump()  # simulates a chat switch/new turn during off-side prep
+        monkeypatch.setattr(ct, "reconstruct_chat_context", real_reconstruct)
+        return real_reconstruct(cid, **kwargs)
+
+    monkeypatch.setattr(ct, "reconstruct_chat_context", _reconstruct_then_bump)
+
+    with pytest.raises(ct.ContextGenerationChanged):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_active_chat_changed_during_preparation_raises(tmp_path, monkeypatch):
+    chat_id = _seed_chat([("user", "u1")])
+    other_chat_id = _seed_chat([("user", "u2")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    real_reconstruct = ct.reconstruct_chat_context
+
+    def _reconstruct_then_switch(cid, **kwargs):
+        owner.chat_id = other_chat_id  # simulates a mid-prep chat switch
+        monkeypatch.setattr(ct, "reconstruct_chat_context", real_reconstruct)
+        return real_reconstruct(cid, **kwargs)
+
+    monkeypatch.setattr(ct, "reconstruct_chat_context", _reconstruct_then_switch)
+
+    with pytest.raises(ct.ActiveChatChanged):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_active_chat_already_changed_before_call_raises_immediately(tmp_path):
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    owner.chat_id = 999999  # never call reconstruct_chat_context in this shape
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    with pytest.raises(ct.ActiveChatChanged):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_active_turn_conflict_raises(tmp_path):
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    with emergency_stop.execution_scope(kind="foreground_turn", metadata={"chat_id": chat_id}):
+        with pytest.raises(ct.ActiveTurnConflict):
+            ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_active_turn_starts_during_preparation_raises_conflict_at_swap(tmp_path, monkeypatch):
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    real_reconstruct = ct.reconstruct_chat_context
+    lease_cm = {"cm": None}
+
+    def _reconstruct_then_start_turn(cid, **kwargs):
+        cm = emergency_stop.execution_scope(kind="foreground_turn", metadata={"chat_id": chat_id})
+        cm.__enter__()
+        lease_cm["cm"] = cm
+        monkeypatch.setattr(ct, "reconstruct_chat_context", real_reconstruct)
+        return real_reconstruct(cid, **kwargs)
+
+    monkeypatch.setattr(ct, "reconstruct_chat_context", _reconstruct_then_start_turn)
+
+    try:
+        with pytest.raises(ct.ActiveTurnConflict):
+            ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+    finally:
+        if lease_cm["cm"] is not None:
+            lease_cm["cm"].__exit__(None, None, None)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_emergency_stop_fires_during_preparation_raises_cancelled(tmp_path, monkeypatch):
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    real_reconstruct = ct.reconstruct_chat_context
+
+    def _reconstruct_then_latch(cid, **kwargs):
+        emergency_stop.latch(reason="test")
+        monkeypatch.setattr(ct, "reconstruct_chat_context", real_reconstruct)
+        return real_reconstruct(cid, **kwargs)
+
+    monkeypatch.setattr(ct, "reconstruct_chat_context", _reconstruct_then_latch)
+
+    with pytest.raises(ct.ReconstructionCancelled):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_superseded_between_preparation_and_swap_raises_stale(tmp_path, monkeypatch):
+    """M8: proves the in-lock final exact-ID re-fetch is real for explicit
+    mode too, not merely inherited-by-assumption from the legacy path.
+    Explicit-ID selection itself also calls get_checkpoint() (unlike
+    legacy selection, which calls get_latest_usable_checkpoint() instead),
+    so the mock must let the first (off-side, selection) call through
+    untouched and only supersede ahead of the second (in-lock, swap-time
+    re-fetch) call."""
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    old_history = owner.ctx.history
+    recorder = _fr(tmp_path)
+
+    real_get_checkpoint = ct.get_checkpoint
+    call_count = {"n": 0}
+
+    def _get_checkpoint_then_supersede_on_second_call(cpid, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            cc.supersede_checkpoint(checkpoint.id, chat_id)
+        return real_get_checkpoint(cpid, **kwargs)
+
+    monkeypatch.setattr(ct, "get_checkpoint", _get_checkpoint_then_supersede_on_second_call)
+
+    with pytest.raises(ct.CheckpointStale):
+        ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    assert call_count["n"] == 2
+    _assert_untouched(owner, old_history, recorder)
+
+
+def test_explicit_checkpoint_reusing_the_same_id_twice_revalidates_independently(tmp_path):
+    chat_id = _seed_chat([("user", "u1")])
+    checkpoint = _ready_checkpoint(chat_id)
+    owner = _FakeGenerationOwner(chat_id)
+    recorder = _fr(tmp_path)
+
+    first = ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+    second = ct.deliberate_reconstruct_checkpoint(chat_id, checkpoint.id, owner, recorder=recorder)
+
+    assert second.checkpoint_id == first.checkpoint_id == checkpoint.id
+    assert second.generation_after == first.generation_after + 1
+    continuity_msgs = [m for m in owner.ctx.history if m["role"] == "assistant"
+                        and "continuity summary" in m["content"]]
+    assert len(continuity_msgs) == 1
+
+
+def test_legacy_latest_usable_still_works_when_a_higher_id_exists_from_a_different_chat(tmp_path):
+    """Sanity that the two entry points coexist correctly: an explicit-ID
+    call for chat 1 creates a checkpoint with a numerically higher id than
+    chat 2's own checkpoint; deliberate_reconstruct() for chat 2 must still
+    resolve its own latest-usable checkpoint correctly, unaffected by A6P1's
+    new selector existing in the same module."""
+    chat_1 = _seed_chat([("user", "u1")])
+    chat_2 = _seed_chat([("user", "u2")])
+    checkpoint_1 = _ready_checkpoint(chat_1)
+    checkpoint_2 = _ready_checkpoint(chat_2)
+    assert checkpoint_2.id > checkpoint_1.id
+
+    owner_1 = _FakeGenerationOwner(chat_1)
+    ct.deliberate_reconstruct_checkpoint(chat_1, checkpoint_1.id, owner_1, recorder=_fr(tmp_path, "fr1.db"))
+
+    owner_2 = _FakeGenerationOwner(chat_2)
+    result_2 = ct.deliberate_reconstruct(chat_2, owner_2, recorder=_fr(tmp_path, "fr2.db"))
+    assert result_2.checkpoint_id == checkpoint_2.id
