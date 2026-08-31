@@ -47,7 +47,6 @@ other database in this codebase.
 import hashlib
 import json
 import os
-import re
 import threading
 import time
 import uuid
@@ -115,36 +114,20 @@ _INDEX_SQL = (
 # Redaction / bounding -- payload policy (mission section 7)
 # ---------------------------------------------------------------------
 
-# Structural key-name redaction: ANY field whose key contains one of these
-# (case-insensitive substring match, deliberately broad) has its value
-# replaced outright, regardless of type -- catches api_key/apikey/API_KEY/
-# access_token/authorization/Authorization/password/client_secret/etc.
-# without depending on the value itself looking like a known secret shape.
-_SECRET_KEY_MARKERS = (
-    "api_key", "apikey", "access_key", "access_token", "secret_key",
-    "secret", "token", "auth", "password", "passwd", "credential",
-    "private_key",
-)
-
-# Regex layer for known secret VALUE shapes that could appear under an
-# innocuous key name (e.g. a tool arg literally named "query" containing a
-# pasted API key). Deliberately narrow, known-prefix patterns -- same
-# posture as gemini_backend.py's own _redact_thought_signatures(): look for
-# recognizable shapes, redact, never assume absence of a marker means safe.
-_SECRET_VALUE_RE = re.compile(
-    r"sk-[A-Za-z0-9_-]{16,}"
-    r"|Bearer\s+[A-Za-z0-9._-]{16,}"
-    r"|AKIA[0-9A-Z]{16}"
-    r"|ghp_[A-Za-z0-9]{20,}"
-    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
-)
+# CONTEXT-LIFECYCLE-A4I: the actual key-marker tuple, value-shape regex, and
+# redaction function now live in core/redaction.py -- a neutral, public
+# module so the continuity compiler can share the exact same primitives
+# without reaching into this module's private names. Aliased under the
+# original private names so every call site below (_sanitize/_sanitize_
+# fields/bounded_repr) is unchanged; behavior is byte-for-byte identical to
+# the pre-A4I inline definitions -- this is a pure extraction, not a
+# behavior change.
+from core.redaction import SECRET_KEY_MARKERS as _SECRET_KEY_MARKERS
+from core.redaction import SECRET_VALUE_RE as _SECRET_VALUE_RE
+from core.redaction import redact_secret_shapes as _redact_value_shapes
 
 _IMAGE_CONTENT_TYPES = frozenset({"image", "image_url", "input_image", "inline_data"})
 _CHAT_ROLES = frozenset({"user", "assistant", "system", "tool"})
-
-
-def _redact_value_shapes(text: str) -> str:
-    return _SECRET_VALUE_RE.sub("[REDACTED]", text)
 
 
 def _looks_like_conversation(value: list) -> bool:

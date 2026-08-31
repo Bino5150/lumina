@@ -508,6 +508,52 @@ class BaseLLMBackend(ABC):
         """
         return None
 
+    def _complete_utility_request(self, prompt: str, prefill: str,
+                                   max_tokens: int, temperature: float) -> dict:
+        """
+        CONTEXT-LIFECYCLE-A4I. Shared, unguarded transport for both
+        complete_utility() and complete_utility_content_only() below: build
+        the request, route through THIS backend's own chat() +
+        extract_message() — same model resolution, same auth headers, same
+        timeout config as every real turn this backend handles (see
+        complete_utility()'s own docstring below for why that matters —
+        this is a pure extraction of that method's pre-A4I request-building
+        code, not a behavior change).
+
+        May raise — deliberately unguarded. Each public method below wraps
+        this in its own try/except so complete_utility()'s existing
+        "[UTILITY] complete_utility failed: ..." log line is preserved
+        byte-for-byte, rather than both methods sharing one generic
+        message.
+        """
+        messages = [{"role": "user", "content": prompt}]
+        if prefill:
+            messages.append({"role": "assistant", "content": prefill})
+        response = self.chat(messages=messages, tools=None,
+                              temperature=temperature, max_tokens=max_tokens,
+                              disable_thinking=True)
+        return self.extract_message(response)
+
+    @staticmethod
+    def _strip_utility_think_leakage(content: str, prefill: str) -> str:
+        """
+        CONTEXT-LIFECYCLE-A4I. Shared <think>-block + prefill-echo stripping
+        for both complete_utility() and complete_utility_content_only() —
+        pure extraction of complete_utility()'s pre-A4I cleanup code,
+        identical behavior. Inlined rather than importing
+        core.agent.strip_think_blocks — that function is trivial, but
+        importing core.agent at all pulls in its full transitive chain
+        (every tool registration module) just to reach a one-line regex.
+        Not worth the weight or the fragility for a backend-layer utility
+        method that should stay lightweight.
+        """
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        content = re.sub(r'<think>.*', '', content, flags=re.DOTALL)  # unclosed — truncated mid-think
+        content = content.strip()
+        if prefill:
+            content = re.sub(rf'^{re.escape(prefill)}\s*', '', content, flags=re.IGNORECASE)
+        return content.strip()
+
     def complete_utility(self, prompt: str, prefill: str = "",
                           max_tokens: int = 500, temperature: float = 0.3) -> Optional[str]:
         """
@@ -540,16 +586,17 @@ class BaseLLMBackend(ABC):
         Never raises — callers should treat None as "skip this utility
         call," matching the pre-existing contract both call sites already
         expected.
-        """
-        messages = [{"role": "user", "content": prompt}]
-        if prefill:
-            messages.append({"role": "assistant", "content": prefill})
 
+        CONTEXT-LIFECYCLE-A4I: falls back to `reasoning_content` when
+        `content` is empty (S41/F-62's original fix for thinking-model
+        bleed into that field) — unchanged from every pre-A4I release.
+        A caller that must never accept reasoning-lane text as its result
+        (the continuity compiler) uses complete_utility_content_only()
+        below instead, which has no code path capable of reading
+        reasoning_content at all.
+        """
         try:
-            response = self.chat(messages=messages, tools=None,
-                                  temperature=temperature, max_tokens=max_tokens,
-                                  disable_thinking=True)
-            message = self.extract_message(response)
+            message = self._complete_utility_request(prompt, prefill, max_tokens, temperature)
             content = (message.get("content") or "").strip()
             if not content:
                 content = (message.get("reasoning_content") or "").strip()
@@ -557,15 +604,39 @@ class BaseLLMBackend(ABC):
             print(f"[UTILITY] complete_utility failed: {e}", flush=True)
             return None
 
-        # Inlined rather than importing core.agent.strip_think_blocks — that
-        # function is trivial, but importing core.agent at all pulls in its
-        # full transitive chain (every tool registration module) just to
-        # reach a one-line regex. Not worth the weight or the fragility for
-        # a backend-layer utility method that should stay lightweight.
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-        content = re.sub(r'<think>.*', '', content, flags=re.DOTALL)  # unclosed — truncated mid-think
-        content = content.strip()
-        if prefill:
-            content = re.sub(rf'^{re.escape(prefill)}\s*', '', content, flags=re.IGNORECASE)
-        content = content.strip()
+        content = self._strip_utility_think_leakage(content, prefill)
+        return content or None
+
+    def complete_utility_content_only(self, prompt: str, prefill: str = "",
+                                       max_tokens: int = 500, temperature: float = 0.3) -> Optional[str]:
+        """
+        CONTEXT-LIFECYCLE-A4I. The smallest content-only utility completion
+        path: identical to complete_utility() in every respect (same
+        transport, same auth/timeout config, same disable_thinking=True
+        intent, same <think>-block/prefill-echo stripping) EXCEPT this
+        method never reads `message.get("reasoning_content")` — there is no
+        code path here capable of returning reasoning-lane text under any
+        circumstance, structurally rather than by convention.
+
+        Exists for callers where a stray reasoning-derived string silently
+        standing in for "the actual answer" would be worse than no answer
+        at all — today, the continuity compiler (core/continuity_compiler.py),
+        which must never let raw chain-of-thought/reasoning text pass as its
+        JSON candidate. Ordinary utility callers (dream-sweep summarization,
+        chat auto-naming, human-profile curation) are unaffected and
+        continue to use complete_utility() unchanged — this method changes
+        no existing caller's behavior; it is purely additive.
+
+        Empty `content` after stripping → None (matching complete_utility()'s
+        "never raises, None means skip" contract), even if the backend
+        happened to put real text in `reasoning_content` for this response.
+        """
+        try:
+            message = self._complete_utility_request(prompt, prefill, max_tokens, temperature)
+            content = (message.get("content") or "").strip()
+        except Exception as e:
+            print(f"[UTILITY] complete_utility_content_only failed: {e}", flush=True)
+            return None
+
+        content = self._strip_utility_think_leakage(content, prefill)
         return content or None

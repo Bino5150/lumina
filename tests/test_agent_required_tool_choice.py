@@ -360,12 +360,24 @@ def test_L_complete_utility_never_touches_tool_choice():
     """complete_utility() (core/backends/base.py) always calls
     self.chat(tools=None, ...) -- no tools means no tool_choice field on
     any real backend's wire payload regardless of what this patch adds,
-    and it never passes tool_choice_mode at all."""
+    and it never passes tool_choice_mode at all.
+
+    CONTEXT-LIFECYCLE-A4I: complete_utility() now delegates its actual
+    request-building to a shared private helper, _complete_utility_request()
+    -- also used by the new complete_utility_content_only() -- so the
+    "tools=None" wire-shape assertion belongs on that helper, the real call
+    site, rather than on complete_utility()'s own (now thin) source. The
+    "no tool_choice_mode anywhere in complete_utility()'s own call chain"
+    half of the invariant is checked on both methods directly."""
     import inspect
     from core.backends.base import BaseLLMBackend
-    src = inspect.getsource(BaseLLMBackend.complete_utility)
-    assert "tool_choice_mode" not in src
-    assert "tools=None" in src
+    complete_utility_src = inspect.getsource(BaseLLMBackend.complete_utility)
+    content_only_src = inspect.getsource(BaseLLMBackend.complete_utility_content_only)
+    request_src = inspect.getsource(BaseLLMBackend._complete_utility_request)
+    assert "tool_choice_mode" not in complete_utility_src
+    assert "tool_choice_mode" not in content_only_src
+    assert "tool_choice_mode" not in request_src
+    assert "tools=None" in request_src
 
 
 def test_M_reasoning_settings_unaffected(monkeypatch):
