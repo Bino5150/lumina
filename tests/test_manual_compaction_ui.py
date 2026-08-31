@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import config
 import tools.memory as memory
 import ui.main_window as main_window
+from core.context_transaction import ContextGeneration
 from ui.main_window import LuminaWindow
 
 
@@ -82,6 +83,9 @@ def test_load_chat_renders_full_transcript_but_restores_only_checkpoint_tail(tmp
         agent=types.SimpleNamespace(ctx=_Ctx()),
         chat_widget=_ChatWidget(),
         _refresh_chat_list=lambda: None,
+        worker=None,
+        _context_generation=ContextGeneration(),
+        _chat_switch_admitted=lambda: True,
     )
     LuminaWindow._load_chat(fake, chat_id)
 
@@ -114,6 +118,7 @@ def _completion_fake(history, chat_id=7):
         _manual_compaction_thread=object(),
         _manual_compaction_cancel=object(),
         _manual_compaction_started_at=123.0,
+        _context_generation=ContextGeneration(),
         _refresh_operator_telemetry=lambda refresh_context=False: None,
     )
 

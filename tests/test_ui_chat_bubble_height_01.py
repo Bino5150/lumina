@@ -34,6 +34,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication
 
+from core.context_transaction import ContextGeneration
 from ui.chat_widget import ChatWidget, LiveResponseBubble, ResponseBrowser
 
 try:
@@ -279,6 +280,9 @@ def _fake_window(chat):
         agent=SimpleNamespace(ctx=_FakeCtx()),
         chat_widget=chat,
         _refresh_chat_list=lambda: None,
+        worker=None,
+        _context_generation=ContextGeneration(),
+        _chat_switch_admitted=lambda: True,
     )
 
 

@@ -26,6 +26,7 @@ import config
 from core.agent import TurnCancelled, is_error_response
 from core import emergency_stop
 from core.context_reconstruction import reconstruct_chat_context, resolve_context_skip
+from core.context_transaction import ContextGeneration
 from core.manual_compaction import run_manual_compaction
 from core.operator_commands import (
     command_help, compaction_cut_index, format_duration, format_tokens,
@@ -478,6 +479,15 @@ class LuminaWindow(QMainWindow):
         self._pending_image = None   # (path, b64_data, media_type) when image is queued
         self._pending_audio = None
         self._current_chat_id = None
+        # CONTEXT-LIFECYCLE-A5I: chat-scoped generation counter, exactly
+        # parallel to ui/review_controller.py's ReviewController._generation
+        # -- owned here (not by ContextManager, not process-wide), bumped at
+        # every point that invalidates an in-flight deliberate_reconstruct()
+        # preparation. See _chat_switch_admitted()/current_chat_id()/
+        # current_generation()/bump()/live_ctx() below for the generation-
+        # owner protocol core.context_transaction.deliberate_reconstruct()
+        # consumes.
+        self._context_generation = ContextGeneration()
         self._prefs = persistence.load()
         self._last_activity = time.time()
         # DREAM-LIFECYCLE-01: two orthogonal lifecycle states replace the old
@@ -536,6 +546,9 @@ class LuminaWindow(QMainWindow):
         # in-flight capture/retrieval worker's eventual result becomes
         # unpublishable -- never killed unsafely, just discarded.
         self.review_panel.shutdown()
+        # CONTEXT-LIFECYCLE-A5I: mirrors the same discard-in-flight-work
+        # pattern for any in-flight deliberate_reconstruct() preparation.
+        self._context_generation.bump()
         super().closeEvent(event)
 
     def _restore_session(self):
@@ -870,7 +883,49 @@ class LuminaWindow(QMainWindow):
                 break
         self.chat_combo.blockSignals(False)
 
+    def _chat_switch_admitted(self) -> bool:
+        """CONTEXT-LIFECYCLE-A5I / D4: fail-closed admission check for
+        _new_chat()/_clear_chat()/_load_chat(). Before this method existed,
+        all three called ctx.clear()/reassigned ctx.history with zero check
+        of whether the AgentWorker thread was mid-turn -- the exact race
+        CONTEXT-LIFECYCLE-A5D's source-vet documents (D4): a worker's next
+        self.history.append() (a fresh attribute lookup every call) would
+        silently land in whichever chat's list .history now points to, once
+        one of these methods reassigned it out from under the running turn.
+        _on_user_message()/_command_compact() already guard the opposite
+        direction (a new turn/compaction while one of these is conceptually
+        "in progress"); this closes the direction that was actually open.
+        Must fail closed for a programmatic caller too, not merely disable
+        a Qt widget -- checked here, inside the method itself, every time."""
+        if self.worker is not None and self.worker.isRunning():
+            self.chat_widget.add_operator_message(
+                "Cannot switch, start, or clear a chat while the main turn is "
+                "still running. Use /status or /stop, then try again."
+            )
+            return False
+        return True
+
+    # ── CONTEXT-LIFECYCLE-A5I: generation-owner protocol consumed by
+    # core.context_transaction.deliberate_reconstruct(). See that module's
+    # docstring for the exact contract -- LuminaWindow implements it
+    # directly so a caller can pass `self` as generation_owner with no
+    # separate adapter object. ──
+    def current_chat_id(self) -> int:
+        return self._current_chat_id
+
+    def current_generation(self) -> int:
+        return self._context_generation.current()
+
+    def bump(self) -> int:
+        return self._context_generation.bump()
+
+    def live_ctx(self):
+        return self.agent.ctx
+
     def _new_chat(self):
+        if not self._chat_switch_admitted():
+            return
+        self._context_generation.bump()
         self._current_chat_id = create_chat()
         self._prefs["last_chat_id"] = self._current_chat_id  # read-cache only
         persistence.update({"last_chat_id": self._current_chat_id})
@@ -884,11 +939,17 @@ class LuminaWindow(QMainWindow):
         self._refresh_chat_list()
 
     def _clear_chat(self):
+        if not self._chat_switch_admitted():
+            return
+        self._context_generation.bump()
         self.agent.ctx.clear()
         self.chat_widget.clear_messages()
         self.chat_widget.add_system_message("Chat cleared.")
 
     def _load_chat(self, chat_id: int):
+        if not self._chat_switch_admitted():
+            return
+        self._context_generation.bump()
         self._current_chat_id = chat_id
         self._prefs["last_chat_id"] = chat_id  # read-cache only
         persistence.update({"last_chat_id": chat_id})
@@ -1569,6 +1630,10 @@ class LuminaWindow(QMainWindow):
         if self._current_chat_id == result.get("chat_id") and self.agent.ctx.history == snapshot:
             self.agent.ctx.history = list(result.get("retained_history") or [])
             self.agent.ctx._last_usage_snapshot = None
+            # CONTEXT-LIFECYCLE-A5I: a live-applied compaction result moves
+            # the durable spine's context_skip, exactly like a chat switch --
+            # invalidates any in-flight deliberate_reconstruct() preparation.
+            self._context_generation.bump()
             applied_live = True
 
         self._refresh_operator_telemetry(refresh_context=True)
@@ -1818,6 +1883,9 @@ class LuminaWindow(QMainWindow):
         if self._current_chat_id:
             save_chat_message(self._current_chat_id, "user", display_text)
         self._live_bubble = self.chat_widget.create_live_bubble()
+        # CONTEXT-LIFECYCLE-A5I: a new foreground turn invalidates any
+        # in-flight deliberate_reconstruct() preparation for this chat.
+        self._context_generation.bump()
         self.worker = AgentWorker(self.agent, content, self.signals, chat_id=self._current_chat_id)
         self.worker.start()
         
