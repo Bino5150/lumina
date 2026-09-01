@@ -48,9 +48,20 @@ class _RecordingLLM:
     def get_model(self):
         return "test-model"
 
-    def chat(self, messages, tools=None, max_tokens=None, reasoning_effort=None):
+    def chat(self, messages, tools=None, max_tokens=None, reasoning_effort=None,
+              tool_choice_mode=None):
         self.chat_calls.append(reasoning_effort)
         self._chat_count += 1
+        # AGENT-PRETOOL-ACTION-INTEGRITY-01: a non-empty `tools` list only
+        # ever happens for the internal completion-control gate call --
+        # this fake's own registry.get_schemas() always reports zero
+        # schemas for ordinary WORK rounds. Tagging on `tools` truthiness
+        # (rather than only the pre-existing round-count logic below)
+        # means a first-round zero-tool turn's own new gate call is
+        # recognized identically to the tool-turn case's already-existing
+        # gate round.
+        if tools:
+            return {"_gate": True}
         if self._chat_count <= self.tool_call_rounds:
             return {"_round": self._chat_count}
         if self.tool_call_rounds > 0 and self._chat_count == self.tool_call_rounds + 1:
@@ -58,6 +69,12 @@ class _RecordingLLM:
         return {"_final": True}
 
     def extract_message(self, response):
+        if response.get("_gate"):
+            return {
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": "finish", "type": "function",
+                                 "function": {"name": "finish_tool_work", "arguments": "{}"}}],
+            }
         if "_round" in response:
             n = response["_round"]
             return {
@@ -143,20 +160,28 @@ def _fake_agent(llm, tool_result="tool ran fine"):
     # a bare SimpleNamespace has no such attribute, so bind the real
     # unbound implementation onto this fake instance.
     ns._stream_final = types.MethodType(LuminaAgent._stream_final, ns)
+    ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
     return ns
 
 
 # ── A. No-tool turn ──────────────────────────────────────────────────────
 
 def test_no_tool_turn_forwards_reasoning_effort_to_final_stream():
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: a first-round zero-tool response
+    # now goes through the internal completion-control gate (its own
+    # chat() call, carrying the same reasoning_effort) before finalizing,
+    # and finalizes via the held completion_candidate -- no chat_stream()
+    # call happens at all, since there is nothing left to regenerate. See
+    # tests/test_agent_continuation_contract.py::test_A for the same
+    # reasoning behind this shape.
     llm = _RecordingLLM(tool_call_rounds=0)
     fake_self = _fake_agent(llm)
 
     result = LuminaAgent.chat(fake_self, "hello", reasoning_effort="high")
 
-    assert llm.chat_calls == ["high"]
-    assert llm.stream_calls == ["high"]
-    assert result == "final streamed response"
+    assert llm.chat_calls == ["high", "high"]
+    assert llm.stream_calls == []
+    assert result == "no tools needed"
 
 
 # ── B. Tool turn ─────────────────────────────────────────────────────────
@@ -196,8 +221,12 @@ def test_omitting_reasoning_effort_entirely_defaults_to_none():
 
     LuminaAgent.chat(fake_self, "hello")
 
-    assert llm.chat_calls == [None]
-    assert llm.stream_calls == [None]
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: see test_no_tool_turn_forwards_
+    # reasoning_effort_to_final_stream above -- the gate's own chat() call
+    # carries the same (here: None) value, and finalization happens via
+    # the held candidate, never chat_stream().
+    assert llm.chat_calls == [None, None]
+    assert llm.stream_calls == []
 
 
 # ── D. Max-iteration finalization ────────────────────────────────────────
@@ -229,20 +258,26 @@ def test_no_cross_turn_reasoning_state_leakage():
     must show None, never a leftover 'high' from turn 1. Proves
     reasoning_effort is genuinely per-call state, not cached anywhere on
     the agent or the backend."""
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: each turn's own first-round
+    # zero-tool response now makes two chat() calls (WORK + the internal
+    # completion-control gate) and finalizes via the held candidate, never
+    # chat_stream() -- see test_no_tool_turn_forwards_reasoning_effort_
+    # to_final_stream above. Both calls within one turn must carry that
+    # turn's own value; nothing must leak into the other turn's pair.
     llm = _RecordingLLM(tool_call_rounds=0)
     fake_self = _fake_agent(llm)
 
     LuminaAgent.chat(fake_self, "turn one", reasoning_effort="high")
-    assert llm.chat_calls == ["high"]
-    assert llm.stream_calls == ["high"]
+    assert llm.chat_calls == ["high", "high"]
+    assert llm.stream_calls == []
 
     LuminaAgent.chat(fake_self, "turn two", reasoning_effort=None)
 
     # Only turn 2's own calls should be None -- turn 1's recorded "high"
-    # entries stay at index 0 (call history accumulates), turn 2's new
-    # entries at index 1 must not have inherited turn 1's value.
-    assert llm.chat_calls == ["high", None]
-    assert llm.stream_calls == ["high", None]
+    # entries stay at indices 0-1 (call history accumulates), turn 2's new
+    # entries at indices 2-3 must not have inherited turn 1's value.
+    assert llm.chat_calls == ["high", "high", None, None]
+    assert llm.stream_calls == []
 
 
 def test_reversed_order_no_cross_turn_leakage_in_either_direction():
@@ -250,11 +285,14 @@ def test_reversed_order_no_cross_turn_leakage_in_either_direction():
     explicit effort -- so the guarantee isn't accidentally direction-
     specific (e.g. only proven for 'explicit value doesn't leak forward',
     not 'None doesn't get contaminated backward')."""
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: see test_no_cross_turn_reasoning_
+    # state_leakage above -- each turn now makes two chat() calls (WORK +
+    # gate) and never reaches chat_stream().
     llm = _RecordingLLM(tool_call_rounds=0)
     fake_self = _fake_agent(llm)
 
     LuminaAgent.chat(fake_self, "turn one", reasoning_effort=None)
     LuminaAgent.chat(fake_self, "turn two", reasoning_effort="low")
 
-    assert llm.chat_calls == [None, "low"]
-    assert llm.stream_calls == [None, "low"]
+    assert llm.chat_calls == [None, None, "low", "low"]
+    assert llm.stream_calls == []

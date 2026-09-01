@@ -168,18 +168,27 @@ def _fake_agent(llm, tool_result="ok"):
         _skill_nudge_sent=False,
     )
     ns._stream_final = types.MethodType(LuminaAgent._stream_final, ns)
+    ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
     return ns, calls
 
 
 # ── A/B. Initial round ──────────────────────────────────────────────────
 
 def test_A_initial_round_requests_auto():
-    llm = _ScriptedLLM([{"content": "hi", "termination": TerminationStatus.COMPLETE}])
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: a first-round zero-tool COMPLETE
+    # response now becomes a completion_candidate and goes through the
+    # control gate (REQUIRED) rather than auto-finalizing -- see
+    # tests/test_agent_continuation_contract.py::test_A for the same
+    # reasoning. The WORK round itself still requests AUTO.
+    llm = _ScriptedLLM([
+        {"content": "hi", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
     fake, calls = _fake_agent(llm)
 
     LuminaAgent.chat(fake, "hello")
 
-    assert llm.tool_choice_modes_seen == [ToolChoiceMode.AUTO]
+    assert llm.tool_choice_modes_seen == [ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED]
 
 
 def test_B_initial_round_does_not_expose_finish_tool_work():
@@ -327,14 +336,19 @@ def test_J_required_mode_is_per_round_not_sticky():
         {"content": "", "termination": TerminationStatus.COMPLETE},
         {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
         {"content": "second turn, no tool needed", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
 
     LuminaAgent.chat(fake, "find it")
     LuminaAgent.chat(fake, "unrelated new question")
 
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: the second turn's own first-round
+    # zero-tool response now also goes through its own control gate (a
+    # fresh REQUIRED call) rather than auto-finalizing.
     assert llm.tool_choice_modes_seen == [
-        ToolChoiceMode.AUTO, ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED, ToolChoiceMode.AUTO,
+        ToolChoiceMode.AUTO, ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED,
+        ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED,
     ]
 
 
@@ -344,14 +358,22 @@ def test_K_new_turn_starts_auto_again():
     # to matrix item K.
     llm = _ScriptedLLM([
         {"content": "first", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
         {"content": "second", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
 
     LuminaAgent.chat(fake, "turn one")
     LuminaAgent.chat(fake, "turn two")
 
-    assert llm.tool_choice_modes_seen == [ToolChoiceMode.AUTO, ToolChoiceMode.AUTO]
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: each turn's own first-round
+    # zero-tool response goes through its own control gate (REQUIRED)
+    # before finalizing.
+    assert llm.tool_choice_modes_seen == [
+        ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED,
+        ToolChoiceMode.AUTO, ToolChoiceMode.REQUIRED,
+    ]
 
 
 # ── L/M/N. Unaffected surfaces ───────────────────────────────────────────

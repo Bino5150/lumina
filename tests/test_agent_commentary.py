@@ -156,12 +156,21 @@ def _fake_agent(llm, tool_result="ok"):
 # ── A. Ordinary no-tool answer ──────────────────────────────────────────
 
 def test_A_ordinary_no_tool_answer_emits_zero_commentary():
-    llm = _ScriptedLLM([{"content": "hi there", "termination": TerminationStatus.COMPLETE}])
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: a first-round zero-tool COMPLETE
+    # response is no longer auto-finalized -- it becomes a
+    # completion_candidate and goes through the control gate exactly like
+    # an in-tool-work-phase zero-tool response already did. An ordinary
+    # conversational answer still ends in a zero-tool Final (the candidate
+    # promoted verbatim, no regeneration) once the gate confirms finish.
+    llm = _ScriptedLLM([
+        {"content": "hi there", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
     fake, calls = _fake_agent(llm)
 
     result = LuminaAgent.chat(fake, "hello")
 
-    assert result == "final streamed response"
+    assert result == "hi there"
     assert calls["commentary"] == []
 
 
@@ -328,16 +337,24 @@ def test_H_ambiguous_post_tool_prose_is_not_commentary():
 # ── I. INCOMPLETE no-tool initial response is NOT commentary ────────────
 
 def test_I_incomplete_initial_response_is_not_commentary():
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: the corrective retry for a
+    # genuinely INCOMPLETE first response is unchanged; the retry's own
+    # COMPLETE, zero-tool response now goes through the control gate
+    # rather than auto-finalizing -- same reasoning as test A above.
     llm = _ScriptedLLM([
         {"content": "cut off mid-", "termination": TerminationStatus.INCOMPLETE},
         {"content": "complete now", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
 
     result = LuminaAgent.chat(fake, "hello")
 
-    assert result == "final streamed response"
-    assert len(calls["ephemeral"]) == 1
+    assert result == "complete now"
+    # One push for the corrective retry itself, one more for the control
+    # gate's own instruction (AGENT-PRETOOL-ACTION-INTEGRITY-01) -- both
+    # are non-durable one-turn ephemeral injections, not commentary.
+    assert len(calls["ephemeral"]) == 2
     assert calls["commentary"] == []
 
 

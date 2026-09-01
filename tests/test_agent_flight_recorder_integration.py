@@ -193,7 +193,14 @@ def test_turn_started_carries_effective_budgets_and_identity(tmp_path):
 
 
 def test_turn_completed_recorded_on_success(tmp_path):
-    llm = _ScriptedLLM([{"content": "hi", "termination": TerminationStatus.COMPLETE}])
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: a first-round zero-tool COMPLETE
+    # response now goes through the control gate before finalizing -- see
+    # tests/test_agent_continuation_contract.py::test_A for the same
+    # reasoning. turn.completed still fires exactly once regardless.
+    llm = _ScriptedLLM([
+        {"content": "hi", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
     fake = _fake_agent(llm, tmp_path)
 
     LuminaAgent.chat(fake, "hello")
@@ -321,13 +328,16 @@ def test_recorder_failure_does_not_break_the_turn(tmp_path):
 # ── recorder disabled/absent stays operationally safe (part of test 23) ──
 
 def test_agent_with_no_flight_recorder_attribute_stays_safe(tmp_path):
-    llm = _ScriptedLLM([{"content": "hi", "termination": TerminationStatus.COMPLETE}])
+    llm = _ScriptedLLM([
+        {"content": "hi", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
     fake = _fake_agent(llm, tmp_path, flight_recorder=False)
     assert not hasattr(fake, "flight_recorder")
 
     result = LuminaAgent.chat(fake, "hello")
 
-    assert result == "final streamed response"
+    assert result == "hi"
 
 
 def test_real_luminaagent_construction_gets_a_working_recorder(tmp_path, monkeypatch):

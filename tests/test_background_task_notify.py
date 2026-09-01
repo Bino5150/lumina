@@ -23,18 +23,42 @@ from core.agent import LuminaAgent, BACKGROUND_TASK_NOTIFY_RETRIES
 
 
 class _FakeLLM:
-    """No tool calls -- every turn goes straight through to _stream_final()."""
+    """No tool calls during WORK rounds -- every turn's WORK round carries
+    the turn's actual answer as plain content.
+
+    AGENT-PRETOOL-ACTION-INTEGRITY-01: a first-round zero-tool response now
+    becomes a completion_candidate and goes through the internal completion-
+    control gate before finalizing (see core/agent.py's module docstring).
+    This fake's own registry always reports zero schemas for ordinary WORK
+    rounds, so a non-empty `tools` list only ever happens for that internal
+    gate call -- confirm finish_tool_work immediately so these tests (which
+    are about background-task notification injection, not gate behavior
+    itself) still finalize via the held candidate exactly once per turn."""
     def __init__(self, response_text="ok"):
         self.response_text = response_text
 
-    def chat(self, messages, tools=None, max_tokens=None, reasoning_effort=None):
+    def chat(self, messages, tools=None, max_tokens=None, reasoning_effort=None,
+              tool_choice_mode=None):
+        if tools:
+            return {"_gate": True}
         return {"content": self.response_text}
 
     def extract_message(self, response):
+        if response.get("_gate"):
+            from core.agent import FINISH_TOOL_WORK_NAME
+            return {"role": "assistant", "content": "",
+                    "tool_calls": [{"id": "finish", "type": "function",
+                                     "function": {"name": FINISH_TOOL_WORK_NAME, "arguments": "{}"}}]}
         return {"role": "assistant", "content": response["content"]}
 
     def is_tool_call(self, message):
-        return False
+        return bool(message.get("tool_calls"))
+
+    def get_tool_calls(self, message):
+        return message.get("tool_calls", [])
+
+    def parse_tool_call(self, tc):
+        return tc["function"]["name"], {}
 
     def chat_stream(self, messages, max_tokens, reasoning_effort=None):
         yield self.response_text
@@ -82,6 +106,7 @@ def _fake_agent(response_text="unrelated answer", background_task_ids=None):
     # SimpleNamespace has no such attribute, so bind the real unbound
     # implementation onto this fake instance.
     ns._stream_final = types.MethodType(LuminaAgent._stream_final, ns)
+    ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
     return ns
 
 

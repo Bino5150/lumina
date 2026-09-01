@@ -349,14 +349,21 @@ def test_7_inline_think_extracted_before_strip():
 # ── 8. reasoning absent -> no empty Think widget/event (explicit) ──────
 
 def test_8_reasoning_absent_no_empty_think_widget():
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: a first-round zero-tool COMPLETE
+    # response now becomes a completion_candidate and goes through the
+    # control gate rather than auto-finalizing -- see
+    # tests/test_agent_continuation_contract.py::test_A for the same
+    # reasoning. This response's own reasoning is still absent, so still
+    # no Think widget fires for it.
     llm = _ScriptedLLM([
         {"content": "Just answering directly.", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls, order = _order_tracking_agent(llm)
 
     result = LuminaAgent.chat(fake, "hello")
 
-    assert result == "final streamed response"
+    assert result == "Just answering directly."
     assert calls["think_start"] == []
     assert calls["think_end"] == 0
 

@@ -151,31 +151,47 @@ def _fake_agent(llm, tool_result="ok"):
 # ── A/B. Initial round ──────────────────────────────────────────────────
 
 def test_A_initial_no_tool_complete_streams_final_normally():
-    llm = _ScriptedLLM([{"content": "hi there", "termination": TerminationStatus.COMPLETE}])
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: a first-round zero-tool COMPLETE
+    # response is no longer auto-finalized via a no-tools regeneration --
+    # it becomes a completion_candidate and goes through the control gate,
+    # same as an in-tool-work-phase zero-tool response already did. An
+    # ordinary conversational answer still ends in a zero-tool Final (the
+    # candidate promoted verbatim, no regeneration), just reached via one
+    # small two-choice gate call instead of an unconditional shortcut.
+    llm = _ScriptedLLM([
+        {"content": "hi there", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
     fake, calls = _fake_agent(llm)
 
     result = LuminaAgent.chat(fake, "hello")
 
-    assert result == "final streamed response"
-    assert llm.call_count == 1
-    # Sentinel never offered before any tool has run.
-    assert llm.tools_seen == [[]]
+    assert result == "hi there"
+    assert llm.call_count == 2
+    # WORK round offered the (empty, in this fake) registry tool set; the
+    # gate call that follows offers only the two internal control
+    # primitives, never the registry's own tools or a raw finish_reason
+    # string match.
+    assert llm.tools_seen == [[], [CONTINUE_TOOL_WORK_NAME, FINISH_TOOL_WORK_NAME]]
 
 
 def test_B_initial_no_tool_incomplete_does_not_silently_finalize():
     llm = _ScriptedLLM([
         {"content": "cut off mid-", "termination": TerminationStatus.INCOMPLETE},
         {"content": "complete now", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
     ])
     fake, calls = _fake_agent(llm)
 
     result = LuminaAgent.chat(fake, "hello")
 
-    # One corrective retry, then a genuine final stream -- never finalized
-    # on the truncated first response.
-    assert llm.call_count == 2
-    assert len(calls["ephemeral"]) == 1
-    assert result == "final streamed response"
+    # One corrective retry, then AGENT-PRETOOL-ACTION-INTEGRITY-01's
+    # control gate (not a no-tools regeneration) -- never finalized on the
+    # truncated first response, and never auto-finalized on the retry's
+    # own zero-tool response either.
+    assert llm.call_count == 3
+    assert len(calls["ephemeral"]) == 2
+    assert result == "complete now"
 
 
 # ── C/D/E. Tool-work completion ─────────────────────────────────────────

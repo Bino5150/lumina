@@ -245,7 +245,13 @@ def test_candidate_promotion_delivers_via_on_response_token():
 
     LuminaAgent.chat(fake, "find it")
 
-    assert calls["response_tokens"] == ["Complete candidate text."]
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: delivered through the same
+    # chunked on_response_token() channel a real stream uses (see
+    # _deliver_held_text()), not one single call -- reconstructing the
+    # chunks must reproduce the exact candidate text byte-for-byte, and
+    # this candidate is long enough to span more than one chunk.
+    assert "".join(calls["response_tokens"]) == "Complete candidate text."
+    assert len(calls["response_tokens"]) > 1
 
 
 # ── 2. "continue" discards the candidate -- it never leaks ──────────────
@@ -347,7 +353,10 @@ def test_final_output_is_never_both_candidate_and_regenerated():
 
     assert result == "Only this text should ever appear."
     assert "REGENERATED-FROM-CHAT-STREAM" not in result
-    assert len(calls["response_tokens"]) == 1
+    # AGENT-PRETOOL-ACTION-INTEGRITY-01: delivered chunked (see
+    # _deliver_held_text()), not as one call -- the reconstructed text must
+    # still be exactly (and only) the candidate, never anything regenerated.
+    assert "".join(calls["response_tokens"]) == "Only this text should ever appear."
 
 
 # ── 5. Empty/blank content is never promoted as a candidate ─────────────
