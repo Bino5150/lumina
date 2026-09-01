@@ -197,6 +197,7 @@ def _fake_agent(llm, tool_result="ok", flight_recorder_path=None):
     )
     ns._stream_final = types.MethodType(LuminaAgent._stream_final, ns)
     ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
+    ns._finalize_with_reconciliation = types.MethodType(LuminaAgent._finalize_with_reconciliation, ns)
     if flight_recorder_path is not None:
         ns.flight_recorder = FlightRecorder(db_path=str(flight_recorder_path))
     return ns, calls
@@ -549,3 +550,160 @@ def test_no_candidate_events_when_no_candidate_ever_exists(tmp_path):
 
     events = _events(fake)
     assert not any(e["event_type"].startswith("completion_candidate.") for e in events)
+
+
+# ── AGENT-FINAL-INTEGRITY-01 -- reconciliation when the real conclusion
+# already went out as Commentary alongside a real tool call, and only a
+# later, trivial zero-tool round becomes the completion_candidate. ────────
+
+def test_reconciliation_triggers_when_prior_commentary_precedes_trivial_candidate():
+    """The live-observed defect this repairs, reproduced exactly: a real
+    tool-bearing round delivers the actual substantive conclusion as
+    Commentary right before a housekeeping tool call (save_memory-shaped),
+    and only a later, trivial no-tool round ("Committed to memory.")
+    becomes the completion_candidate. The candidate must NOT be blindly
+    promoted verbatim -- a reconciliation pass must run, and the turn's
+    real output must come from that pass, not from the trivial candidate."""
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("read_file")],
+         "content": "Here is the complete diagnostic report the user asked for: "
+                    "root cause found in module X, line Y. Saving this to memory now."},
+        {"tool_calls": [_tc("search_memory")]},  # stands in for save_memory(...)
+        {"content": "Committed to memory. \U0001F499", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "diagnose it")
+
+    # The durable Final is the reconciliation pass's own output, not the
+    # trivial candidate text and not a bare string concatenation of the two.
+    assert result == "REGENERATED-FROM-CHAT-STREAM"
+    assert result != "Committed to memory. \U0001F499"
+    # Exactly ONE additional provider call -- a single explicit
+    # finalization pass, not an open-ended/repeated regeneration loop.
+    assert llm.chat_stream_calls == 1
+    # Persisted to history exactly like an ordinary streamed final would be
+    # -- one new assistant entry, not the trivial candidate text re-appended.
+    assert fake.ctx.history[-1] == {"role": "assistant", "content": "REGENERATED-FROM-CHAT-STREAM"}
+    # The trivial candidate's own text is never separately persisted as a
+    # plain assistant entry -- it only ever reached history-adjacent state
+    # via the ephemeral instruction (asserted in the next test), never a
+    # bare add_assistant()/add_tool_call() row of its own.
+    assert not any(
+        entry.get("role") == "assistant" and entry.get("content") == "Committed to memory. \U0001F499"
+        and "tool_calls" not in entry
+        for entry in fake.ctx.history
+    )
+
+
+def test_reconciliation_ephemeral_surfaces_both_prior_commentary_and_candidate_text():
+    """AGENT-FINAL-INTEGRITY-01's whole point: the reconciliation pass must
+    not be asked to reconstruct the answer from tool history while its own
+    already-produced text (both the earlier substantive Commentary and the
+    trivial candidate remark) is withheld from it. Both must appear in the
+    one-turn ephemeral instruction, and that instruction must never leak
+    into ctx.history (push_ephemeral()'s existing non-durable contract)."""
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("read_file")], "content": "SUBSTANTIVE-DIAGNOSTIC-REPORT-TEXT"},
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": "TRIVIAL-SIGNOFF-TEXT", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    LuminaAgent.chat(fake, "diagnose it")
+
+    ephemeral_pushes = calls["ephemeral"]
+    reconciliation_push = ephemeral_pushes[-1]
+    assert "SUBSTANTIVE-DIAGNOSTIC-REPORT-TEXT" in reconciliation_push
+    assert "TRIVIAL-SIGNOFF-TEXT" in reconciliation_push
+    # Never durable: ContextManager.push_ephemeral()/build_messages() owns
+    # clearing it in the real class -- this fake only records the push,
+    # so assert it was never separately appended to ctx.history itself.
+    assert not any(
+        "SUBSTANTIVE-DIAGNOSTIC-REPORT-TEXT" in str(entry.get("content", ""))
+        and entry.get("role") == "assistant" and "tool_calls" not in entry
+        for entry in fake.ctx.history
+    )
+
+
+def test_reconciliation_never_fires_on_commentary_a_second_time():
+    """The ephemeral instruction text itself must never be routed through
+    on_commentary()/turn.commentary -- it is Lumina's own internal
+    finalization instruction, never model expression."""
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("read_file")], "content": "Real substantive finding."},
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": "Saved.", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    LuminaAgent.chat(fake, "diagnose it")
+
+    # Exactly one on_commentary() call -- the real substantive-finding
+    # round -- never a second one for the ephemeral finalization prompt.
+    assert calls["commentary"] == ["Real substantive finding."]
+
+
+def test_original_no_regeneration_fast_path_is_unaffected_by_this_repair():
+    """AGENT-WORK-COMPLETE-DISCARD-01's original promise -- a candidate
+    with NO prior tool-bearing Commentary this turn is promoted verbatim,
+    zero extra provider calls -- must survive this repair exactly. Same
+    scenario as test_candidate_survives_gate_acceptance_with_no_regeneration_call
+    above, restated here under AGENT-FINAL-INTEGRITY-01's own name so the
+    two repairs' regression coverage sits side by side."""
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("search_memory")]},   # no content -- no Commentary emitted
+        {"content": "Here is the complete answer you asked for.",
+         "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "find it")
+
+    assert result == "Here is the complete answer you asked for."
+    assert llm.chat_stream_calls == 0
+    assert calls["commentary"] == []
+
+
+def test_commentary_reset_on_continue_does_not_force_unnecessary_reconciliation():
+    """Early, now-superseded Commentary from a narrative arc the model
+    itself abandoned (a "continue_tool_work" gate outcome) must not force
+    reconciliation on a later, independent, genuinely-first candidate --
+    see turn_relevant_commentary's reset-on-continue docstring in
+    core/agent.py. Ordinary early progress narration must not cause
+    unnecessary final regeneration."""
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("read_file")], "content": "Early narration about a lead that gets abandoned."},
+        {"content": "", "termination": TerminationStatus.COMPLETE},  # -> gate
+        {"tool_calls": [_tc(CONTINUE_TOOL_WORK_NAME)]},              # continue -- resets the log
+        {"tool_calls": [_tc("read_file")]},                          # fresh real work, no commentary
+        {"content": "Here is the actual complete final answer.",
+         "termination": TerminationStatus.COMPLETE},                 # genuinely first candidate now
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "find it")
+
+    assert result == "Here is the actual complete final answer."
+    assert llm.chat_stream_calls == 0
+
+
+def test_flight_recorder_records_reconciled_not_accepted(tmp_path):
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("read_file")], "content": "Substantive finding before housekeeping."},
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": "Done.", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm, flight_recorder_path=tmp_path / "fr.db")
+
+    LuminaAgent.chat(fake, "diagnose it")
+
+    events = _events(fake)
+    assert any(e["event_type"] == "completion_candidate.reconciled" for e in events)
+    assert not any(e["event_type"] == "completion_candidate.accepted" for e in events)

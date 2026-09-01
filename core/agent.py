@@ -1120,6 +1120,28 @@ class LuminaAgent:
         # exactly once, on "finish".
         completion_candidate = None
 
+        # AGENT-FINAL-INTEGRITY-01 -- Commentary emitted by a REAL
+        # tool-bearing WORK round (see the "has tool calls" branch below)
+        # during the CURRENT, still-unfinalized attempt at an answer.
+        # Exists because a completion_candidate can only ever be created
+        # from a zero-tool-call round (see that branch below), so if the
+        # model's actual substantive conclusion went out as Commentary
+        # alongside a real tool call (e.g. "Here's what I found: ... "
+        # + save_memory(...)), and a LATER, merely-trivial zero-tool round
+        # ("Committed to memory. 💙") becomes the candidate instead, that
+        # candidate must not be blindly promoted as this turn's durable
+        # Final -- see _finalize_with_reconciliation()'s docstring for the
+        # repair this drives. Deliberately scoped narrower than "any
+        # Commentary anywhere this turn": reset to empty whenever a
+        # "continue_tool_work" gate outcome fires (below) -- that outcome
+        # means the model itself judged this narrative arc unfinished and
+        # is moving on to fresh work, exactly the same "stale" judgment
+        # that already clears completion_candidate on continue. Ordinary
+        # early progress narration that gets superseded by a continue
+        # cycle must never cause a later, genuinely-first, genuinely-
+        # complete candidate to trigger unnecessary reconciliation.
+        turn_relevant_commentary = []
+
         # Preserve the user's submitted turn even in the tiny race where /stop
         # lands before this worker gets past chat()'s prologue. Do not run any
         # background-notification bookkeeping or provider work in that case.
@@ -1332,6 +1354,22 @@ class LuminaAgent:
                     if completion_candidate is not None:
                         if _cancel_requested(cancel_event):
                             raise TurnCancelled()
+                        if turn_relevant_commentary:
+                            # AGENT-FINAL-INTEGRITY-01 -- this candidate is
+                            # not trustworthy as-is: real Commentary from
+                            # this same unfinalized attempt may already
+                            # carry the substantive conclusion. Reconcile
+                            # via one explicit provider call instead of
+                            # blindly promoting the (possibly trivial)
+                            # candidate -- see that method's docstring.
+                            _fr_machine(self, "completion_candidate.reconciled", turn_id=turn_id, chat_id=chat_id,
+                                        fields={"source_round": completion_candidate["source_round"],
+                                                "commentary_rounds": len(turn_relevant_commentary)})
+                            return self._finalize_with_reconciliation(
+                                completion_candidate, turn_relevant_commentary, think_step,
+                                cancel_event=cancel_event, reasoning_effort=reasoning_effort,
+                                chat_id=chat_id, turn_id=turn_id,
+                            )
                         _fr_machine(self, "completion_candidate.accepted", turn_id=turn_id, chat_id=chat_id,
                                     fields={"source_round": completion_candidate["source_round"]})
                         return self._finalize_completion_candidate(completion_candidate, turn_id=turn_id)
@@ -1355,6 +1393,12 @@ class LuminaAgent:
                                     fields={"reason": "continue_tool_work",
                                             "source_round": completion_candidate["source_round"]})
                         completion_candidate = None
+                    # AGENT-FINAL-INTEGRITY-01 -- the gate itself just
+                    # judged this narrative arc unfinished; whatever
+                    # Commentary led up to it is superseded by the fresh
+                    # WORK round about to run, same "stale" judgment that
+                    # discards completion_candidate just above.
+                    turn_relevant_commentary = []
                     consecutive_gate_continues += 1
                     if consecutive_gate_continues > 1:
                         print(f"[AGENT] tool-work completion gate contradicted its own "
@@ -1622,6 +1666,13 @@ class LuminaAgent:
                 if callable(on_commentary):
                     on_commentary(commentary)
                 _fr_model(self, "turn.commentary", commentary, turn_id=turn_id)
+                # AGENT-FINAL-INTEGRITY-01 -- this round's Commentary
+                # accompanies a REAL tool call; if it's the model's actual
+                # conclusion rather than mere narration, it must not be
+                # allowed to silently vanish from the durable Final. See
+                # turn_relevant_commentary's own docstring above and
+                # _finalize_with_reconciliation() below.
+                turn_relevant_commentary.append(commentary)
 
             self.ctx.add_tool_call(message)
 
@@ -1859,6 +1910,64 @@ class LuminaAgent:
         if self.tts and content and not getattr(self, "_persona_speech_suppressed", False):
             self.tts.speak(content)
         return content
+
+    def _finalize_with_reconciliation(self, candidate: dict, relevant_commentary: list, think_step: list,
+                                        cancel_event=None, reasoning_effort: Optional[str] = None,
+                                        chat_id: int = None, turn_id: Optional[str] = None) -> str:
+        """AGENT-FINAL-INTEGRITY-01 -- reconcile a preserved completion_
+        candidate against Commentary already emitted earlier this same
+        unfinalized attempt, via exactly one additional provider call,
+        rather than either horn of the bug this exists to fix: blindly
+        promoting a possibly-trivial candidate as the durable Final
+        (silently losing a real conclusion the model already delivered as
+        Commentary alongside a real tool call -- e.g. a full diagnostic
+        write-up right before save_memory(...), followed only by a later
+        "Committed to memory." zero-tool round), or discarding the
+        candidate and asking the provider to regenerate with no memory
+        either text ever existed (AGENT-WORK-COMPLETE-DISCARD-01's own
+        original bug -- two independent ~2000+ character verdicts thrown
+        away in one turn).
+
+        Only ever called when `relevant_commentary` is non-empty -- an
+        empty list takes the pre-existing, zero-extra-provider-call fast
+        path (_finalize_completion_candidate()) instead; see that call
+        site in _chat_impl(). This is what keeps AGENT-WORK-COMPLETE-
+        DISCARD-01's original no-regeneration promise intact for every
+        turn this repair doesn't apply to.
+
+        Surfaces both texts via the existing one-turn ephemeral system-
+        prompt injection (same mechanism _run_tool_work_control_gate()
+        uses for its own instruction) rather than folding them into
+        ctx.history: this is exactly what keeps this repair from becoming
+        "persist Commentary" or "blindly copy Commentary into Final" --
+        the ephemeral block is gone the moment build_messages() below
+        consumes it (ContextManager.push_ephemeral()'s existing contract),
+        never durable, and the model still authors its own Final; nothing
+        here concatenates strings into the answer directly. The resulting
+        Final is delivered and persisted through the exact same
+        _stream_final() path (streaming, on_response_token,
+        ctx.add_assistant(), turn.final telemetry, TTS) every ordinary
+        final answer already uses -- this method's only job is building
+        the one-shot instruction that call sees."""
+        prior = "\n\n---\n\n".join(relevant_commentary)
+        ephemeral = (
+            "## Finalizing this turn\n"
+            "During tool work this turn you already wrote the following "
+            "before taking further action:\n\n"
+            f"{prior}\n\n"
+            "Your most recent remark, right before this finalization step, "
+            "was:\n\n"
+            f"{candidate['content']}\n\n"
+            "Tool work for this turn is now confirmed complete. Write your "
+            "real, complete final answer for the user now. Use what you "
+            "already found above as needed -- you do not need to "
+            "reinvestigate or re-derive it -- but write an actual final "
+            "answer, not another short acknowledgment."
+        )
+        self.ctx.push_ephemeral(ephemeral)
+        messages = self.ctx.build_messages(chat_id=chat_id)
+        return self._stream_final(messages, think_step, cancel_event=cancel_event,
+                                   reasoning_effort=reasoning_effort, turn_id=turn_id)
 
     def clear_persona_speech_suppression(self):
         """Restore ordinary speech when no persona is active."""
