@@ -83,6 +83,21 @@ COMPILER_MAX_OUTPUT_TOKENS = 6000   # generation-length cap; comfortably above 1
 COMPILER_TEMPERATURE = 0.2
 PAYLOAD_VERSION = 1
 
+# CONTEXT-LIFECYCLE-A6P2: normal cooperative-cancellation reason vocabulary.
+# Deliberately distinct strings from the pre-existing emergency-epoch reasons
+# ("cancelled_before_utility_call" / "cancelled_after_utility_call", checked
+# elsewhere in this module and left byte-for-byte unchanged) -- two
+# independent cancellation signals must remain machine-distinguishable from
+# each other, not just from ordinary validation failures.
+REASON_CANCELLED_BEFORE_UTILITY_CALL = "cooperative_cancel_before_utility_call"
+REASON_CANCELLED_AFTER_UTILITY_CALL = "cooperative_cancel_after_utility_call"
+REASON_CANCELLED_BEFORE_RETRY = "cooperative_cancel_before_retry"
+REASON_CANCELLED_BEFORE_FINALIZE = "cooperative_cancel_before_finalize"
+# No FAILED-row reason for this one -- the checkpoint legitimately reached
+# READY; see CompilationCancelled's own docstring for why it is never
+# written to the store as a failure.
+REASON_CANCELLED_AFTER_FINALIZE_READY = "cooperative_cancel_observed_after_finalize_ready"
+
 # A4-PIN-01: what the compiler MAY represent. "authorization_boundary" from
 # the A4D-R draft is deliberately gone -- replaced by scope_constraint,
 # framed only as a non-authoritative scope/STOP note, never a grant.
@@ -131,6 +146,35 @@ class CompilerValidationFailure(CompilerError):
     validation, or exceeded the hard output ceiling. A4-PIN-02: this
     invalidates the WHOLE candidate -- callers retry the whole attempt,
     never salvage individual items."""
+
+
+class CompilationCancelled(CompilerError):
+    """CONTEXT-LIFECYCLE-A6P2: raised when a caller-supplied `cancel_event`
+    was observed set at one of compile_continuity_checkpoint()'s defined
+    cooperative-cancellation checkpoints. This is deliberately a distinct,
+    typed outcome -- never returned as a plain CheckpointRecord -- so a
+    caller cannot mistake a cancelled run for an ordinary FAILED or READY
+    result by inspecting `.state` alone (see M7 in the mission's mutation
+    matrix: reporting cancellation while still handing back a consumable
+    READY result is exactly the bug this type exists to make impossible).
+
+    Fully independent of emergency-epoch cancellation, which is unchanged
+    and continues to return a FAILED CheckpointRecord via fail_checkpoint()
+    -- neither mechanism substitutes for the other.
+
+    `reason`: one of this module's REASON_CANCELLED_* constants.
+    `checkpoint`: the CheckpointRecord as of the moment cancellation was
+    observed. FAILED for every checkpoint except the post-finalize race
+    (REASON_CANCELLED_AFTER_FINALIZE_READY), where it is the legitimately-
+    READY record itself -- never deleted or demoted merely to make the
+    cancellation narration prettier. Callers must treat ANY
+    CompilationCancelled as "do not consume this outcome," regardless of
+    the attached record's own state."""
+
+    def __init__(self, reason: str, checkpoint: CheckpointRecord):
+        super().__init__(reason)
+        self.reason = reason
+        self.checkpoint = checkpoint
 
 
 # ---------------------------------------------------------------------
@@ -601,8 +645,33 @@ def _final_payload_size_bytes(payload: dict) -> int:
 # Pipeline orchestration
 # ---------------------------------------------------------------------
 
+def _cooperative_cancel_requested(cancel_event) -> bool:
+    """True iff a caller-supplied cancel_event is present and set. Mirrors
+    threading.Event's is_set() protocol -- any object exposing a zero-arg
+    is_set() -> bool works. None means "no cooperative cancellation in
+    play," matching this module's existing expected_epoch=None "skip
+    checking entirely" convention -- legacy callers that never pass
+    cancel_event see no behavior change whatsoever."""
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _raise_if_cooperative_cancel(checkpoint: CheckpointRecord, chat_id: int,
+                                  cancel_event, reason: str) -> None:
+    """Shared guard for every "before retry" / "before first call" style
+    checkpoint: if cancel_event is set, fail the still-BUILDING checkpoint
+    with `reason` and raise CompilationCancelled -- never silently continue
+    the pipeline. A no-op when cancel_event is None/unset. Never called
+    once the checkpoint has already left BUILDING (see the dedicated
+    post-finalize race handling in compile_continuity_checkpoint(), which
+    does not call fail_checkpoint() at all)."""
+    if _cooperative_cancel_requested(cancel_event):
+        record = fail_checkpoint(checkpoint.id, chat_id, reason=reason)
+        raise CompilationCancelled(reason, record)
+
+
 def compile_continuity_checkpoint(chat_id: int, backend, ephemeral_history: list,
-                                   project_context=None, expected_epoch: int = None) -> CheckpointRecord:
+                                   project_context=None, expected_epoch: int = None,
+                                   cancel_event=None) -> CheckpointRecord:
     """Run the full A4 pipeline end to end and return the resulting
     CheckpointRecord (READY or FAILED -- never BUILDING on return, except
     when a caller-level exception, e.g. UnknownChat from begin_checkpoint(),
@@ -623,6 +692,38 @@ def compile_continuity_checkpoint(chat_id: int, backend, ephemeral_history: list
     caller's emergency-stop epoch, captured before this call, or None to
     skip cancellation checking entirely (matches every other None-epoch
     caller's "no epoch tracking" convention in this codebase).
+
+    `cancel_event` (CONTEXT-LIFECYCLE-A6P2): an optional threading.Event-like
+    object (anything exposing `is_set() -> bool`) for NORMAL cooperative
+    cancellation -- e.g. an owner-triggered `/stop` on an in-progress
+    compile that is not an emergency. None (the default) disables this
+    entirely; every existing caller that omits it keeps its exact current
+    behavior. This is fully independent of `expected_epoch` -- emergency-
+    epoch checks are unchanged, and neither signal substitutes for the
+    other; both may be set at once and both are honored.
+
+    Checked at four safe boundaries: before every utility-model call,
+    immediately after every utility-model call returns, before retrying
+    after any invalid/rejected attempt, and immediately before the final
+    checkpoint promotion. A blocked/in-flight `backend.complete_utility_
+    content_only(...)` call is never interrupted -- this function always
+    waits for it to return (or time out, on the backend's own terms) and
+    only then observes cancellation and discards the output; no thread is
+    ever killed and no transport interruption is ever claimed.
+
+    When cooperative cancellation is observed, this function raises
+    CompilationCancelled instead of returning -- a distinct, typed outcome
+    that cannot be confused with an ordinary CheckpointRecord return (see
+    that exception's own docstring). The still-BUILDING checkpoint row is
+    failed with a REASON_CANCELLED_* reason before raising, EXCEPT for the
+    one true race case: if finalize_checkpoint() already atomically
+    promoted the row to READY before cancellation was observed (it cannot
+    be interrupted mid-flight any more than the utility call can), that
+    READY row is left exactly as-is -- truthful durable history, never
+    deleted or demoted -- but CompilationCancelled is still raised, so no
+    caller of this function walks away treating the run as an ordinary,
+    consumable success. No auto-retry, no A5 live-context swap, and no
+    live ContextManager access ever happens once cancellation has won.
 
     EPHEMERAL-SNAPSHOT LIMITATION (CONTEXT-LIFECYCLE-A4I section 16, stated
     here verbatim as the load-bearing caveat for any consumer of this
@@ -659,6 +760,7 @@ def compile_continuity_checkpoint(chat_id: int, backend, ephemeral_history: list
     for _attempt in range(1, CONTINUITY_COMPILER_MAX_ATTEMPTS + 1):
         if expected_epoch is not None and not emergency_stop.execution_permitted(expected_epoch):
             return fail_checkpoint(checkpoint.id, chat_id, reason="cancelled_before_utility_call")
+        _raise_if_cooperative_cancel(checkpoint, chat_id, cancel_event, REASON_CANCELLED_BEFORE_UTILITY_CALL)
 
         raw = backend.complete_utility_content_only(
             prompt=bundle.rendered_prompt, prefill="",
@@ -667,24 +769,30 @@ def compile_continuity_checkpoint(chat_id: int, backend, ephemeral_history: list
 
         if expected_epoch is not None and not emergency_stop.execution_permitted(expected_epoch):
             return fail_checkpoint(checkpoint.id, chat_id, reason="cancelled_after_utility_call")
+        _raise_if_cooperative_cancel(checkpoint, chat_id, cancel_event, REASON_CANCELLED_AFTER_UTILITY_CALL)
 
         if raw is None:
             last_failure_reason = "utility_call_returned_none"
+            _raise_if_cooperative_cancel(checkpoint, chat_id, cancel_event, REASON_CANCELLED_BEFORE_RETRY)
             continue
 
         try:
             validated = parse_and_validate(raw, bundle, chat_id)
         except CompilerValidationFailure as e:
             last_failure_reason = f"validation_failed: {e}"
+            _raise_if_cooperative_cancel(checkpoint, chat_id, cancel_event, REASON_CANCELLED_BEFORE_RETRY)
             continue
 
         final_payload = assemble_final_payload(validated, machine_facts)
         if _final_payload_size_bytes(final_payload) > CONTINUITY_COMPILER_HARD_OUTPUT_CEILING_BYTES:
             last_failure_reason = "final_payload_exceeds_hard_ceiling"
+            _raise_if_cooperative_cancel(checkpoint, chat_id, cancel_event, REASON_CANCELLED_BEFORE_RETRY)
             continue
 
+        _raise_if_cooperative_cancel(checkpoint, chat_id, cancel_event, REASON_CANCELLED_BEFORE_FINALIZE)
+
         try:
-            return finalize_checkpoint(
+            result = finalize_checkpoint(
                 checkpoint.id, chat_id, reconstruction.durable_spine_fingerprint,
                 payload_version=PAYLOAD_VERSION, payload=final_payload,
             )
@@ -692,6 +800,18 @@ def compile_continuity_checkpoint(chat_id: int, backend, ephemeral_history: list
             raise  # terminal: A3 already marked this checkpoint FAILED; no retry of the same build
         except PayloadValidationError as e:
             last_failure_reason = f"a3_payload_validation_failed: {e}"
+            _raise_if_cooperative_cancel(checkpoint, chat_id, cancel_event, REASON_CANCELLED_BEFORE_RETRY)
             continue
+
+        # Race to READY: finalize_checkpoint() cannot be interrupted
+        # mid-flight any more than the utility call can. If cancellation
+        # only becomes observable now, the row already atomically reached
+        # READY -- it stays exactly as-is (truthful durable history, never
+        # demoted), but this function still raises rather than handing back
+        # a normal, consumable success (see CompilationCancelled's own
+        # docstring and mutation M7).
+        if _cooperative_cancel_requested(cancel_event):
+            raise CompilationCancelled(REASON_CANCELLED_AFTER_FINALIZE_READY, result)
+        return result
 
     return fail_checkpoint(checkpoint.id, chat_id, reason=last_failure_reason)

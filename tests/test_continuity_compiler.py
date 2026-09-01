@@ -16,6 +16,7 @@ reported in the CONTEXT-LIFECYCLE-A4I report rather than encoded as
 permanent test functions here.
 """
 import json
+import threading
 
 import pytest
 
@@ -498,6 +499,283 @@ def test_failure_stale_spine_no_retry_of_same_build():
     checkpoints = list_checkpoints(chat_id)
     assert checkpoints[-1].state == STATE_FAILED
     assert checkpoints[-1].failure_reason == "stale_spine"
+
+
+# ── Cooperative cancellation (CONTEXT-LIFECYCLE-A6P2) ────────────────────
+# Normal `cancel_event` cancellation, fully independent of the emergency-
+# epoch mechanism exercised above by test_failure_cancellation_before_call_
+# no_ready / test_failure_cancellation_after_call_discards_output_no_ready
+# (both left untouched -- their continued pass is itself the "epoch
+# cancellation still works unchanged" proof).
+
+def test_cancel_before_first_call_backend_never_invoked():
+    chat_id = _seed_chat([("user", "hi")])
+    backend = _ScriptedBackend([_valid_candidate()])
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(cc.CompilationCancelled) as exc_info:
+        cc.compile_continuity_checkpoint(
+            chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+        )
+
+    assert exc_info.value.reason == cc.REASON_CANCELLED_BEFORE_UTILITY_CALL
+    assert exc_info.value.checkpoint.state == STATE_FAILED
+    assert exc_info.value.checkpoint.failure_reason == cc.REASON_CANCELLED_BEFORE_UTILITY_CALL
+    assert backend.calls == []  # never even attempted
+
+
+def test_cancel_during_blocked_call_output_never_finalized():
+    """Cancellation "arrives" while complete_utility_content_only() is
+    still running (simulated here by flipping the event from inside the
+    call itself, mirroring how test_failure_cancellation_after_call_
+    discards_output_no_ready fakes the equivalent epoch race). The call is
+    allowed to run to completion and return a fully VALID candidate -- but
+    it must never be parsed, validated, or finalized once cancellation is
+    observed immediately afterward."""
+    chat_id = _seed_chat([("user", "hi")])
+    cancel_event = threading.Event()
+
+    def _answer_then_cancel():
+        cancel_event.set()
+        return _valid_candidate()
+
+    backend = _ScriptedBackend([_answer_then_cancel])
+
+    with pytest.raises(cc.CompilationCancelled) as exc_info:
+        cc.compile_continuity_checkpoint(
+            chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+        )
+
+    assert exc_info.value.reason == cc.REASON_CANCELLED_AFTER_UTILITY_CALL
+    assert len(backend.calls) == 1  # the call ran to completion, uninterrupted
+    checkpoints = list_checkpoints(chat_id)
+    assert checkpoints[-1].state == STATE_FAILED
+    assert checkpoints[-1].payload is None  # the valid output was discarded, never consumed
+
+
+def test_cancel_after_invalid_attempt_no_retry(monkeypatch):
+    chat_id = _seed_chat([("user", "hi")])
+    cancel_event = threading.Event()
+    # 2nd script entry must never be reached if the no-retry contract holds
+    backend = _ScriptedBackend(["not json at all", _valid_candidate()])
+
+    orig_parse = cc.parse_and_validate
+
+    def _fake_parse(raw, bundle, chat_id_arg):
+        cancel_event.set()  # cancellation lands exactly while this attempt is judged invalid
+        return orig_parse(raw, bundle, chat_id_arg)
+
+    monkeypatch.setattr(cc, "parse_and_validate", _fake_parse)
+
+    with pytest.raises(cc.CompilationCancelled) as exc_info:
+        cc.compile_continuity_checkpoint(
+            chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+        )
+
+    assert exc_info.value.reason == cc.REASON_CANCELLED_BEFORE_RETRY
+    assert len(backend.calls) == 1  # no retry attempted
+
+
+def test_cancel_before_finalize_no_ready_promotion(monkeypatch):
+    chat_id = _seed_chat([("user", "hi")])
+    cancel_event = threading.Event()
+    backend = _ScriptedBackend([_valid_candidate()])
+
+    orig_size = cc._final_payload_size_bytes
+
+    def _fake_size(payload):
+        cancel_event.set()  # cancellation lands exactly between validation and finalize
+        return orig_size(payload)
+
+    monkeypatch.setattr(cc, "_final_payload_size_bytes", _fake_size)
+
+    with pytest.raises(cc.CompilationCancelled) as exc_info:
+        cc.compile_continuity_checkpoint(
+            chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+        )
+
+    assert exc_info.value.reason == cc.REASON_CANCELLED_BEFORE_FINALIZE
+    assert exc_info.value.checkpoint.state == STATE_FAILED
+    checkpoints = list_checkpoints(chat_id)
+    assert all(cp.state != STATE_READY for cp in checkpoints)  # finalize_checkpoint() never called
+
+
+def test_cancel_after_finalize_ready_race_checkpoint_stays_ready_but_raises(monkeypatch):
+    """Race to READY: finalize_checkpoint() cannot be interrupted mid-flight.
+    If cancellation only becomes observable once it has already atomically
+    promoted the row to READY, that row is truthful durable history -- left
+    exactly as-is, never deleted or demoted -- but the caller must still
+    receive a CompilationCancelled, never a plain consumable READY return
+    (mutation M7)."""
+    chat_id = _seed_chat([("user", "hi")])
+    cancel_event = threading.Event()
+    backend = _ScriptedBackend([_valid_candidate()])
+
+    orig_finalize = cc.finalize_checkpoint
+
+    def _fake_finalize(*args, **kwargs):
+        result = orig_finalize(*args, **kwargs)
+        cancel_event.set()  # cancellation lands exactly after the atomic READY promotion
+        return result
+
+    monkeypatch.setattr(cc, "finalize_checkpoint", _fake_finalize)
+
+    with pytest.raises(cc.CompilationCancelled) as exc_info:
+        cc.compile_continuity_checkpoint(
+            chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+        )
+
+    assert exc_info.value.reason == cc.REASON_CANCELLED_AFTER_FINALIZE_READY
+    assert exc_info.value.checkpoint.state == STATE_READY  # attached, not hidden
+    reread = get_checkpoint(exc_info.value.checkpoint.id)
+    assert reread.state == STATE_READY  # never deleted or demoted
+    assert reread.payload is not None
+
+
+def test_cancel_event_present_but_never_set_normal_success_unaffected():
+    chat_id = _seed_chat([("user", "hi")])
+    backend = _ScriptedBackend([_valid_candidate()])
+    cancel_event = threading.Event()  # constructed but never .set()
+    record = cc.compile_continuity_checkpoint(
+        chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+    )
+    assert record.state == STATE_READY
+
+
+def test_cancel_event_none_is_the_default_legacy_callers_unaffected():
+    chat_id = _seed_chat([("user", "hi")])
+    backend = _ScriptedBackend([_valid_candidate()])
+    record = cc.compile_continuity_checkpoint(chat_id, backend, ephemeral_history=[])
+    assert record.state == STATE_READY
+
+
+def test_cooperative_cancel_never_touches_emergency_epoch():
+    chat_id = _seed_chat([("user", "hi")])
+    backend = _ScriptedBackend([_valid_candidate()])
+    cancel_event = threading.Event()
+    cancel_event.set()
+    epoch_before = emergency_stop.current_epoch()
+
+    with pytest.raises(cc.CompilationCancelled):
+        cc.compile_continuity_checkpoint(
+            chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+        )
+
+    assert emergency_stop.current_epoch() == epoch_before
+    assert emergency_stop.execution_permitted() is True  # process-wide authority untouched
+
+
+def test_epoch_cancellation_still_returns_unchanged_when_cooperative_cancel_also_set():
+    """Both signals active at once: the pre-existing epoch check runs first
+    at each boundary and is completely unchanged -- its own established
+    return-based (not raise-based) contract still governs when it is the
+    one that fires first."""
+    chat_id = _seed_chat([("user", "hi")])
+    backend = _ScriptedBackend([_valid_candidate()])
+    real_epoch = emergency_stop.current_epoch()
+    stale_epoch = real_epoch - 1
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    record = cc.compile_continuity_checkpoint(
+        chat_id, backend, ephemeral_history=[],
+        expected_epoch=stale_epoch, cancel_event=cancel_event,
+    )
+
+    assert record.state == STATE_FAILED
+    assert record.failure_reason == "cancelled_before_utility_call"  # exact pre-existing epoch reason, unchanged
+    assert backend.calls == []
+
+
+def test_cooperative_cancel_fires_independently_under_a_live_epoch():
+    """A live (non-stale) epoch does not suppress cooperative cancellation --
+    the two mechanisms are independently effective, neither substitutes for
+    the other."""
+    chat_id = _seed_chat([("user", "hi")])
+    backend = _ScriptedBackend([_valid_candidate()])
+    real_epoch = emergency_stop.current_epoch()
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(cc.CompilationCancelled) as exc_info:
+        cc.compile_continuity_checkpoint(
+            chat_id, backend, ephemeral_history=[],
+            expected_epoch=real_epoch, cancel_event=cancel_event,
+        )
+
+    assert exc_info.value.reason == cc.REASON_CANCELLED_BEFORE_UTILITY_CALL
+    assert backend.calls == []
+
+
+def test_cooperative_cancel_reason_vocabulary_distinct_from_epoch_reasons():
+    """Machine-distinguishability: no cooperative-cancel reason string
+    collides with the pre-existing, unchanged epoch-cancellation reasons."""
+    epoch_reasons = {"cancelled_before_utility_call", "cancelled_after_utility_call"}
+    cooperative_reasons = {
+        cc.REASON_CANCELLED_BEFORE_UTILITY_CALL,
+        cc.REASON_CANCELLED_AFTER_UTILITY_CALL,
+        cc.REASON_CANCELLED_BEFORE_RETRY,
+        cc.REASON_CANCELLED_BEFORE_FINALIZE,
+        cc.REASON_CANCELLED_AFTER_FINALIZE_READY,
+    }
+    assert epoch_reasons.isdisjoint(cooperative_reasons)
+    assert len(cooperative_reasons) == 5  # every constant is a distinct string
+
+
+def test_cooperative_cancel_stale_spine_behavior_unchanged():
+    """StaleSpine's existing terminal-raise contract is untouched by this
+    module's cancellation additions -- a cancel_event that is never set has
+    no effect on it whatsoever."""
+    chat_id = _seed_chat([("user", "hi")])
+    cancel_event = threading.Event()
+
+    def _mutate_spine_then_answer():
+        memory.save_chat_message(chat_id, "user", "a concurrent message landed mid-compile")
+        return _valid_candidate()
+
+    backend = _ScriptedBackend([_mutate_spine_then_answer])
+
+    from core.context_checkpoints import StaleSpine
+    with pytest.raises(StaleSpine):
+        cc.compile_continuity_checkpoint(
+            chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+        )
+
+    assert len(backend.calls) == 1
+    checkpoints = list_checkpoints(chat_id)
+    assert checkpoints[-1].state == STATE_FAILED
+    assert checkpoints[-1].failure_reason == "stale_spine"
+
+
+def test_no_thread_or_interruption_primitives_around_utility_call():
+    """M8: this module must never attempt to kill or interrupt an in-flight
+    backend.complete_utility_content_only() call -- compile_continuity_
+    checkpoint() always waits for it to return synchronously and only then
+    observes cancellation. Structural guard rather than an applied mutation:
+    there is no single line to flip that "adds" unsafe termination without
+    introducing wholly new threading/signal machinery, so this instead
+    locks in the absence of any such machinery as a standing invariant."""
+    import inspect
+    source = inspect.getsource(cc)
+    for forbidden in ("threading.Thread", "concurrent.futures", "signal.alarm",
+                       "signal.SIGALRM", "ctypes.pythonapi", ".terminate(", ".kill("):
+        assert forbidden not in source, f"unexpected interruption primitive: {forbidden}"
+
+
+def test_cooperative_cancel_payload_validation_failure_behavior_unchanged():
+    """A3's own PayloadValidationError retry-with-same-build path is
+    untouched by a present-but-unset cancel_event."""
+    chat_id = _seed_chat([("user", "hi")])
+    cancel_event = threading.Event()
+    backend = _ScriptedBackend([
+        json.dumps({"reported": [], "inferred": [], "authority": True}),
+    ] * cc.CONTINUITY_COMPILER_MAX_ATTEMPTS)
+
+    record = cc.compile_continuity_checkpoint(
+        chat_id, backend, ephemeral_history=[], cancel_event=cancel_event,
+    )
+    assert record.state == STATE_FAILED
 
 
 # ── Trust ─────────────────────────────────────────────────────────────

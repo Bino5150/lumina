@@ -37,3 +37,7 @@ eval/results/
 eval/_scratch_data/
 eval_scratch.txt
 skills/rubber-duck-debugging.md
+
+# Ad hoc design/handoff docs dropped at repo root — read-only reports,
+# never meant to be committed source
+LUMINA_CONTEXT_OWNER_CONTROL_DESIGN_2026-08-31.md
