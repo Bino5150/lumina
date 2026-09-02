@@ -584,9 +584,24 @@ class LuminaWindow(QMainWindow):
         chats = list_chats()
         if chats:
             self._refresh_chat_list()
-            # Try to restore last chat
+            # Try to restore last chat -- CHAT-STARTUP-RESTORE-01: a
+            # persisted last_chat_id can go stale (e.g. another Lumina
+            # process sharing this same DATA_DIR/database wrote a
+            # different chat's id after this one, or the chat was since
+            # deleted) without ever being validated here. An unvalidated
+            # stale id used to reach _load_chat() unchanged: it would
+            # reconstruct zero rows for a chat_id that plain doesn't
+            # exist, leaving the message pane blank while the chat_combo
+            # -- finding no item matching that id -- fell back to Qt's own
+            # default (index 0, chats[0], the same "most recent" row this
+            # fallback already intends), a visibly mismatched restore.
+            # Validating against the same `chats` list already fetched
+            # above keeps the intended recency semantics (chats[0], not
+            # lowest-id/oldest) as the ONE fallback path, whether
+            # last_chat_id is missing or merely stale.
             last_id = self._prefs.get("last_chat_id")
-            target_id = last_id if last_id else chats[0]["id"]
+            valid_ids = {c["id"] for c in chats}
+            target_id = last_id if last_id in valid_ids else chats[0]["id"]
             self._load_chat(target_id)
         else:
             self._new_chat()
