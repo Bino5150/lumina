@@ -67,7 +67,7 @@ class _ChatWidget:
     def scroll_to_bottom_now(self):
         pass
 
-    def create_live_bubble(self):
+    def create_live_bubble(self, restored: bool = False):
         class _Bubble:
             def __init__(self, rendered):
                 self._response_text = ""

@@ -154,6 +154,18 @@ class MetricsBar(QFrame):
         layout.setSpacing(8)
         self.lbl = QLabel("")
         self.lbl.setStyleSheet(f"color:{colors['text_dim']};font-size:10px;font-family:monospace;background:transparent;border:none;")
+        # TOKS-STREAM-TIMING-01 (Bino-approved expansion) -- the metrics
+        # line grew two more segments (Final TTFT/first-answer); at Lumina's
+        # minimum supported width (setMinimumSize(960, 660) in
+        # ui/main_window.py, ~800px of actual chat-column width after the
+        # fixed 160px sidebar) an unwrapped single-line label can no
+        # longer fit every segment. Word-wrap + an Expanding/Preferred
+        # size policy lets Qt's own layout shrink the label to its
+        # container's real width and grow height instead -- wraps onto a
+        # second line, never clips or silently drops a trailing segment
+        # off the visible edge.
+        self.lbl.setWordWrap(True)
+        self.lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout.addWidget(self.lbl)
         layout.addStretch()
         self.replay_btn = QPushButton("🔊")
@@ -191,13 +203,55 @@ class MetricsBar(QFrame):
         if self._response_text:
             QApplication.clipboard().setText(self._response_text)
 
-    def set_metrics(self, elapsed: float, tok_in: int, tok_out: int, tool_calls: int, think_time: float):
-        tok_s = tok_out / elapsed if elapsed > 0 else 0
-        parts = [
-            f"{elapsed:.1f}s",
-            f"{tok_s:.1f} tok/s",
-            f"{tok_in}in / {tok_out}out / {tok_in+tok_out}total",
-        ]
+    def set_metrics(self, turn_elapsed, stream_elapsed, stream_tokens,
+                     tok_in: int, tok_out: int, tool_calls: int, think_time: float,
+                     ttfa=None, final_ttft=None):
+        """TOKS-STREAM-TIMING-01. Independent values, never conflated:
+        turn_elapsed (this bubble's whole dispatch-to-finalize wall time --
+        None only for a restored/historical bubble that never actually
+        streamed, see LiveResponseBubble.finalize()); the stream_elapsed/
+        stream_tokens pair (the provider's OWN measured Final-content
+        generation interval and estimate_tokens() count -- core/agent.py's
+        on_final_stream_timing callback, NEVER Qt-side chunk-arrival timing
+        or a held-candidate's local replay speed); ttfa (Bino-approved
+        expansion -- time-to-first-answer: turn dispatch to the first
+        real answer text the user actually saw, deliberately INCLUDING
+        Think/Commentary/tool/gate/WORK/reconciliation time before it --
+        core/agent.py's on_time_to_first_answer callback); and final_ttft
+        (Bino-approved expansion, Bino-corrected naming -- Final TTFT /
+        final-request TTFT: the final-PRODUCING provider request's own
+        dispatch-to-first-nonempty-output-delta latency, Think or Final
+        either counts for that one request -- core/agent.py's
+        on_final_ttft callback. Deliberately never implies it measures an
+        earlier WORK/tool round on a multi-round turn -- it is scoped to
+        the SAME request final-stream duration below is scoped to.
+        Never fired at all for a held-candidate promotion, which has no
+        streaming request to observe -- see core/agent.py's
+        _finalize_completion_candidate() docstring: that path shows
+        "Final TTFT n/a · stream n/a" while turn/first-answer stay
+        honest). tok_s is computed ONLY from the stream_elapsed/
+        stream_tokens pair; tok_in/tok_out below remain the pre-existing
+        approximate usage counters (chunk-count based, not a real token
+        count) -- left in place for their existing display role, never
+        relabeled as the authoritative stream token count."""
+        parts = ([f"{turn_elapsed:.1f}s turn"] if turn_elapsed is not None
+                 else ["turn n/a"])
+        parts.append(f"{ttfa:.1f}s first answer" if ttfa is not None and ttfa > 0
+                      else "first answer n/a")
+        # Final TTFT immediately precedes stream/tok-s -- both describe
+        # the SAME final-producing request, in the chronological order
+        # they actually happen (first token arrives, then the rest of
+        # generation follows) -- and matches the paired "Final TTFT n/a
+        # · stream n/a" shape a held-candidate turn shows together.
+        parts.append(f"{final_ttft:.1f}s Final TTFT" if final_ttft is not None and final_ttft > 0
+                      else "Final TTFT n/a")
+        if stream_elapsed is not None and stream_elapsed > 0 and stream_tokens:
+            tok_s = stream_tokens / stream_elapsed
+            parts.append(f"{stream_elapsed:.1f}s stream")
+            parts.append(f"{tok_s:.1f} tok/s")
+        else:
+            parts.append("stream n/a")
+        parts.append(f"{tok_in}in / {tok_out}out / {tok_in+tok_out}total")
         if tool_calls:
             parts.append(f"{tool_calls} tool calls")
         if think_time > 0:
@@ -257,7 +311,15 @@ class ResponseBrowser(QTextBrowser):
 
 class LiveResponseBubble(QFrame):
     def __init__(self, colors: dict, avatar_path: str = None, agent_name: str = None,
-                 tts=None, tts_speech_allowed=None, parent=None):
+                 tts=None, tts_speech_allowed=None, parent=None, restored: bool = False):
+        """TOKS-STREAM-TIMING-01 -- `restored` marks a bubble rebuilt from
+        persisted history (ui/main_window.py::_load_chat()), never a live
+        turn. It never sets _turn_start_time from "now" -- a restored
+        bubble's real turn wall-clock time isn't known (nothing persists
+        it -- see finalize()'s own docstring), so faking one from restore
+        time would show a fabricated ~0.0s for a message that may be days
+        old. finalize() shows turn/stream as unavailable for exactly this
+        case rather than compute anything."""
         self.avatar_path = avatar_path
         self._agent_name = agent_name or config.AGENT_NAME
         self._tts = tts
@@ -266,7 +328,32 @@ class LiveResponseBubble(QFrame):
         self.colors = colors
         self._think_block = None
         self._response_text = ""
-        self._start_time = time.time()
+        self._restored = restored
+        # TOKS-STREAM-TIMING-01 -- monotonic, set exactly once at creation
+        # (never reset at first token -- that reset used to conflate "turn
+        # wall time" with an ad-hoc, UI-side approximation of "final-
+        # stream time"; the two are now separate values from separate
+        # sources, see finalize()/set_stream_timing()). create_live_bubble()
+        # for a live turn happens immediately before AgentWorker.start()
+        # (ui/main_window.py), so this is a faithful turn-dispatch anchor.
+        self._turn_start_time = None if restored else time.monotonic()
+        # TOKS-STREAM-TIMING-01 -- populated ONLY by set_stream_timing(),
+        # itself fired ONLY from core/agent.py's on_final_stream_timing
+        # callback (via ui/main_window.py's final_stream_timing signal).
+        # Never computed locally from chunk-arrival timestamps -- that is
+        # exactly what let a held-candidate's instant local replay
+        # (core/agent.py _deliver_held_text()) masquerade as real-time
+        # generation before this fix.
+        self._stream_elapsed_s = None
+        self._stream_tokens = None
+        # TOKS-STREAM-TIMING-01 (Bino-approved expansion, Bino-corrected
+        # naming) -- populated ONLY by set_final_ttft()/
+        # set_time_to_first_answer(), themselves fired ONLY from
+        # core/agent.py's on_final_ttft/on_time_to_first_answer
+        # callbacks. Same "never computed locally" posture as
+        # _stream_elapsed_s/_stream_tokens above.
+        self._final_ttft_s = None
+        self._ttfa_s = None
         self._think_start_time = 0.0
         self._think_time = 0.0
         self._tok_out = 0
@@ -345,7 +432,7 @@ class LiveResponseBubble(QFrame):
     def open_think_block(self, step: int):
         if not shiboken6.isValid(self.bubble_layout):
             return
-        self._think_start_time = time.time()
+        self._think_start_time = time.monotonic()
         self._think_block = ThinkBlock(step, self.colors)
         idx = self.bubble_layout.indexOf(self.stream_lbl)
         self.bubble_layout.insertWidget(idx, self._think_block)
@@ -358,7 +445,7 @@ class LiveResponseBubble(QFrame):
 
     def close_think_block(self):
         if self._think_start_time:
-            self._think_time += time.time() - self._think_start_time
+            self._think_time += time.monotonic() - self._think_start_time
             self._think_start_time = 0.0
         if self._think_block:
             self._think_block.finalize_content()
@@ -389,19 +476,66 @@ class LiveResponseBubble(QFrame):
     def append_response_token(self, token: str):
         if not shiboken6.isValid(self.stream_lbl):
             return
-        if not self._response_text:
-            self._start_time = time.time()  # reset clock at first response token
         self._cursor_timer.stop()
         self._response_text += token
         self._tok_out += 1
         self.stream_lbl.setText(self._response_text + "▋")
-        
+
+    def set_stream_timing(self, duration_s, token_count):
+        """TOKS-STREAM-TIMING-01 -- called by ui/main_window.py's
+        final_stream_timing signal handler, itself fed only by core/
+        agent.py's on_final_stream_timing callback: the provider's own
+        measured generation interval + estimate_tokens() count for this
+        turn's Final text. Fires at most once per live turn, strictly
+        before finalize() (both derive from the same agent.chat() call,
+        and this signal is always emitted -- and therefore always
+        processed by Qt's queued-connection ordering -- before finished/
+        cancelled/error). A turn that never calls this (a synthetic
+        notice/error final, an empty/tool-only final, a cancelled stream)
+        leaves _stream_elapsed_s/_stream_tokens at their None default,
+        which set_metrics() below renders as "stream n/a" rather than
+        inventing a number."""
+        if duration_s and duration_s > 0 and token_count:
+            self._stream_elapsed_s = duration_s
+            self._stream_tokens = token_count
+
+    def set_final_ttft(self, final_ttft_s):
+        """TOKS-STREAM-TIMING-01 (Bino-approved expansion, Bino-corrected
+        naming) -- Final TTFT / final-request TTFT. Same firing/ordering/
+        degrade contract as set_stream_timing() above, fed by
+        core/agent.py's on_final_ttft via ui/main_window.py's final_ttft
+        signal: the final-PRODUCING request's own dispatch-to-first-
+        nonempty-delta latency, scoped to that one request -- never an
+        earlier WORK/tool round's dispatch on a multi-round turn. Never
+        fired for a held-candidate promotion (no streaming request to
+        observe) -- leaves _final_ttft_s at None, which set_metrics()
+        renders as "Final TTFT n/a", alongside "stream n/a" for the same
+        structural reason (see core/agent.py's
+        _finalize_completion_candidate() docstring)."""
+        if final_ttft_s and final_ttft_s > 0:
+            self._final_ttft_s = final_ttft_s
+
+    def set_time_to_first_answer(self, ttfa_s):
+        """TOKS-STREAM-TIMING-01 (Bino-approved expansion). Same firing/
+        ordering/degrade contract as set_stream_timing() above, fed by
+        core/agent.py's on_time_to_first_answer via ui/main_window.py's
+        time_to_first_answer signal -- fires for BOTH a direct/
+        reconciliation stream and a promoted held candidate (see that
+        callback's own docstring), unlike set_stream_timing() which only
+        ever fires for the former."""
+        if ttfa_s and ttfa_s > 0:
+            self._ttfa_s = ttfa_s
 
     def finalize(self):
         if not shiboken6.isValid(self.bubble_layout):
             return
         self._cursor_timer.stop()
-        elapsed = time.time() - self._start_time
+        # TOKS-STREAM-TIMING-01 -- None for a restored/historical bubble
+        # (see __init__'s own docstring): _turn_start_time was never set
+        # from a real turn dispatch, so there is nothing honest to compute
+        # here. set_metrics() renders None as "turn n/a".
+        turn_elapsed = (time.monotonic() - self._turn_start_time
+                        if self._turn_start_time is not None else None)
 
         if self._response_text.strip():
             # Swap streaming label for a rendered ResponseBrowser -- content-
@@ -428,7 +562,9 @@ class LiveResponseBubble(QFrame):
             self.stream_lbl.setText("")
 
         # Show metrics — estimate tok_in from context (~183 shown in screenshot)
-        self.metrics.set_metrics(elapsed, 0, self._tok_out, self._tool_calls, self._think_time)
+        self.metrics.set_metrics(turn_elapsed, self._stream_elapsed_s, self._stream_tokens,
+                                  0, self._tok_out, self._tool_calls, self._think_time,
+                                  ttfa=self._ttfa_s, final_ttft=self._final_ttft_s)
         self.metrics.setVisible(True)
         self.metrics._response_text = self._response_text
 
@@ -772,11 +908,12 @@ class ChatWidget(QWidget):
         layout.addWidget(lbl)
         self._insert(frame)
 
-    def create_live_bubble(self) -> LiveResponseBubble:
+    def create_live_bubble(self, restored: bool = False) -> LiveResponseBubble:
         bubble = LiveResponseBubble(self.colors, avatar_path=self.avatar_path,
                                     agent_name=getattr(self, '_persona_name', config.AGENT_NAME),
                                     tts=self._tts,
-                                    tts_speech_allowed=self._tts_speech_allowed)
+                                    tts_speech_allowed=self._tts_speech_allowed,
+                                    restored=restored)
         # "none": bubble creation never repositions the viewport. During a
         # foreground send the just-anchored user card owns the position;
         # during history restore the explicit end-positioning owns it.

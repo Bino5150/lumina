@@ -145,6 +145,26 @@ class StreamSignals(QObject):
     think_end      = Signal()
     response_chunk = Signal(str)   # batched response text
     commentary     = Signal(str)   # AGENT-COMMENTARY-01A: whole event per provider decision, never batched
+    # TOKS-STREAM-TIMING-01 -- mirrors core/agent.py's on_final_stream_timing:
+    # (duration_s, token_count) for whichever provider generation produced
+    # this turn's visible Final text. Fires at most once per turn, always
+    # before `finished`/`cancelled` (same emitting thread, same call --
+    # see AgentWorker.run() below), never for a synthetic/empty/cancelled
+    # final. Absence (never emitted this turn) is the UI's "unavailable"
+    # signal -- there is no separate sentinel value for it.
+    final_stream_timing = Signal(float, int)
+    # TOKS-STREAM-TIMING-01 (Bino-approved expansion, Bino-corrected
+    # naming) -- mirrors core/agent.py's on_final_ttft/
+    # on_time_to_first_answer. Both fire at most once per turn,
+    # independently of final_stream_timing and of each other -- see
+    # core/agent.py's _stream_final() docstring for why these are three
+    # separate clocks with three separate anchors, never allowed to
+    # overwrite one another. Absence is each one's own "unavailable"
+    # signal, same convention as above. final_ttft is scoped to THIS
+    # request only -- never an earlier WORK/tool round's dispatch on a
+    # multi-round turn (see core/agent.py's _fire_final_ttft() docstring).
+    final_ttft            = Signal(float)
+    time_to_first_answer  = Signal(float)
     finished       = Signal(str)
     error          = Signal(str)
     # SEPT-AC-R1-C01 -- presentation text and persistence authority are
@@ -255,6 +275,17 @@ class AgentWorker(QThread):
             self._flush_resp()
             self.signals.commentary.emit(text)
 
+        def on_final_stream_timing(duration_s, token_count):
+            # TOKS-STREAM-TIMING-01 -- no buffering: fires once, already
+            # holds the two final numbers, nothing to batch.
+            self.signals.final_stream_timing.emit(duration_s, token_count)
+
+        def on_final_ttft(final_ttft_s):
+            self.signals.final_ttft.emit(final_ttft_s)
+
+        def on_time_to_first_answer(ttfa_s):
+            self.signals.time_to_first_answer.emit(ttfa_s)
+
         self.agent.on_tool_call      = on_tool_call
         self.agent.on_tool_result    = on_tool_result
         self.agent.on_think_start    = on_think_start
@@ -262,6 +293,9 @@ class AgentWorker(QThread):
         self.agent.on_think_end      = on_think_end
         self.agent.on_response_token = on_response_token
         self.agent.on_commentary     = on_commentary
+        self.agent.on_final_stream_timing = on_final_stream_timing
+        self.agent.on_final_ttft = on_final_ttft
+        self.agent.on_time_to_first_answer = on_time_to_first_answer
 
         try:
             kwargs = {"chat_id": self.chat_id}
@@ -884,6 +918,9 @@ class LuminaWindow(QMainWindow):
         self.signals.think_end.connect(self._on_think_end)
         self.signals.response_chunk.connect(self._on_response_chunk)
         self.signals.commentary.connect(self._on_commentary)
+        self.signals.final_stream_timing.connect(self._on_final_stream_timing)
+        self.signals.final_ttft.connect(self._on_final_ttft)
+        self.signals.time_to_first_answer.connect(self._on_time_to_first_answer)
         self.signals.finished.connect(self._on_finished)
         self.signals.error.connect(self._on_error)
         self.signals.cancelled.connect(self._on_cancelled)
@@ -1000,7 +1037,15 @@ class LuminaWindow(QMainWindow):
                 # the final viewport.
                 self.chat_widget.add_user_message(content, mode="none")
             elif role == "assistant":
-                bubble = self.chat_widget.create_live_bubble()
+                # TOKS-STREAM-TIMING-01 -- restored=True: this bubble never
+                # ran a live turn, so it must never fabricate a turn/stream
+                # elapsed reading from "now" (see LiveResponseBubble.
+                # __init__'s own docstring). No per-message turn/stream
+                # telemetry is persisted today, so every restored bubble
+                # honestly shows both as unavailable -- not a regression,
+                # the same "never measured" state these rows have always
+                # been in, just no longer misreported as ~0.0s / 0.0 tok/s.
+                bubble = self.chat_widget.create_live_bubble(restored=True)
                 bubble._response_text = content
                 bubble.finalize()
         # UI-CHAT-SCROLL-01: one intentional layout-settled positioning for
@@ -2063,6 +2108,32 @@ class LuminaWindow(QMainWindow):
         self._mark_operator_progress("commentary")
         if self._live_bubble:
             self._live_bubble.add_commentary(text)
+
+    def _on_final_stream_timing(self, duration_s: float, token_count: int):
+        """TOKS-STREAM-TIMING-01. Always arrives before finished/cancelled/
+        error for the same turn (see StreamSignals.final_stream_timing's
+        own docstring) -- stash straight onto the still-live bubble so
+        _on_finished()/_on_cancelled()/_on_error()'s later finalize() call
+        already has it. No pending/window-level state needed: a turn that
+        never emits this leaves the bubble's stream fields at their None
+        default, which reads as "unavailable", not stale data from a
+        previous turn (each bubble is fresh per turn)."""
+        if self._live_bubble:
+            self._live_bubble.set_stream_timing(duration_s, token_count)
+
+    def _on_final_ttft(self, final_ttft_s: float):
+        """TOKS-STREAM-TIMING-01 (Bino-approved expansion, Bino-corrected
+        naming). Same stash-onto-the-live-bubble pattern as
+        _on_final_stream_timing() above -- Final TTFT, scoped to the
+        final-producing request only."""
+        if self._live_bubble:
+            self._live_bubble.set_final_ttft(final_ttft_s)
+
+    def _on_time_to_first_answer(self, ttfa_s: float):
+        """TOKS-STREAM-TIMING-01 (Bino-approved expansion). Same stash-
+        onto-the-live-bubble pattern as _on_final_stream_timing() above."""
+        if self._live_bubble:
+            self._live_bubble.set_time_to_first_answer(ttfa_s)
 
     def _on_finished(self, response: str):
         

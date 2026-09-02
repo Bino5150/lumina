@@ -36,7 +36,7 @@ class _ChatWidget:
     def scroll_to_bottom_now(self):
         pass
 
-    def create_live_bubble(self):
+    def create_live_bubble(self, restored: bool = False):
         return _Bubble(self.rendered)
 
     def add_operator_message(self, text):
