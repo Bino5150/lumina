@@ -42,17 +42,21 @@ writing this file).
 """
 import json
 import sqlite3
+import threading
 import types
 
 import pytest
 
+import config
 from core.agent import (
     LuminaAgent,
     TurnCancelled,
     FINISH_TOOL_WORK_NAME,
     CONTINUE_TOOL_WORK_NAME,
+    is_error_response,
 )
 from core.backends.base import TerminationStatus
+from core.context import RECONCILIATION_CONTINUATION_CUE
 from core.flight_recorder import FlightRecorder
 
 
@@ -126,7 +130,7 @@ class _ScriptedLLM:
 def _fake_agent(llm, tool_result="ok", flight_recorder_path=None, fail_tool=None):
     history = []
     calls = {
-        "ephemeral": [], "registry_calls": [], "on_tool_call": [],
+        "ephemeral": [], "ephemeral_messages": [], "registry_calls": [], "on_tool_call": [],
         "on_tool_result": [], "response_tokens": [], "commentary": [],
         "build_messages_calls": 0,
     }
@@ -155,6 +159,10 @@ def _fake_agent(llm, tool_result="ok", flight_recorder_path=None, fail_tool=None
             {"role": "tool", "tool_call_id": tool_call_id, "name": name,
              "content": "[Cancelled by operator before execution.]"}),
         push_ephemeral=lambda block: calls["ephemeral"].append(block),
+        push_ephemeral_assistant=lambda content: calls["ephemeral_messages"].append(
+            {"role": "assistant", "content": content}),
+        push_ephemeral_reconciliation_request=lambda: calls["ephemeral_messages"].append(
+            {"role": "user", "content": RECONCILIATION_CONTINUATION_CUE}),
         build_messages=build_messages,
         context_usage_snapshot=lambda tool_budget=0, chat_id=None, refresh=False: (
             {"used_tokens": 1, "max_tokens": 8000, "percent": 0.0, "chat_id": chat_id}
@@ -546,5 +554,294 @@ def test_held_candidate_delivers_chunked_through_the_same_channel_a_stream_uses(
     # through), not one single call -- but reconstructs byte-for-byte.
     assert len(calls["response_tokens"]) > 1
     assert "".join(calls["response_tokens"]) == result
+    assert [row for row in fake.ctx.history if row.get("role") == "assistant"] == [
+        {"role": "assistant", "content": result}
+    ]
     # No regeneration call was made to produce this text.
     assert llm.chat_stream_calls == 0
+
+
+def _held_candidate_agent(candidate, *, flight_recorder_path=None):
+    llm = _ScriptedLLM([
+        {"content": candidate, "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    return _fake_agent(llm, flight_recorder_path=flight_recorder_path)
+
+
+def _assistant_rows(fake):
+    return [row for row in fake.ctx.history if row.get("role") == "assistant"]
+
+
+def test_cancel_on_first_held_chunk_stops_delivery_and_records_only_cancellation(tmp_path):
+    candidate = "0123456789ABCDEF"
+    fake, calls = _held_candidate_agent(
+        candidate, flight_recorder_path=tmp_path / "fr.db",
+    )
+    cancel_event = threading.Event()
+    record_token = fake.on_response_token
+
+    def cancel_on_first_chunk(chunk):
+        record_token(chunk)
+        cancel_event.set()
+
+    fake.on_response_token = cancel_on_first_chunk
+
+    with pytest.raises(TurnCancelled):
+        LuminaAgent.chat(fake, "hello", cancel_event=cancel_event)
+
+    assert calls["response_tokens"] == [candidate[:4]]
+    assert _assistant_rows(fake) == []
+    event_types = [event["event_type"] for event in _events(fake)]
+    assert event_types.count("turn.cancelled") == 1
+    assert "turn.final" not in event_types
+    assert "turn.completed" not in event_types
+
+
+def test_cancel_on_middle_held_chunk_emits_nothing_after_cancellation():
+    candidate = "0123456789ABCDEF"
+    fake, calls = _held_candidate_agent(candidate)
+    cancel_event = threading.Event()
+    record_token = fake.on_response_token
+
+    def cancel_on_second_chunk(chunk):
+        record_token(chunk)
+        if len(calls["response_tokens"]) == 2:
+            cancel_event.set()
+
+    fake.on_response_token = cancel_on_second_chunk
+
+    with pytest.raises(TurnCancelled):
+        LuminaAgent.chat(fake, "hello", cancel_event=cancel_event)
+
+    assert calls["response_tokens"] == [candidate[:4], candidate[4:8]]
+    assert _assistant_rows(fake) == []
+
+
+def test_cancel_on_final_held_chunk_is_caught_before_final_persistence():
+    candidate = "0123456789AB"
+    fake, calls = _held_candidate_agent(candidate)
+    cancel_event = threading.Event()
+    record_token = fake.on_response_token
+
+    def cancel_on_final_chunk(chunk):
+        record_token(chunk)
+        if len(calls["response_tokens"]) == 3:
+            cancel_event.set()
+
+    fake.on_response_token = cancel_on_final_chunk
+
+    with pytest.raises(TurnCancelled):
+        LuminaAgent.chat(fake, "hello", cancel_event=cancel_event)
+
+    assert "".join(calls["response_tokens"]) == candidate
+    assert _assistant_rows(fake) == []
+
+
+def test_cancellation_set_before_held_delivery_emits_no_chunks_or_final():
+    candidate = "0123456789ABCDEF"
+    fake, calls = _held_candidate_agent(candidate)
+    cancel_event = threading.Event()
+    original_is_tool_call = fake.llm.is_tool_call
+
+    def cancel_when_finish_gate_is_observed(message):
+        result = original_is_tool_call(message)
+        if fake.llm.call_count == 2:
+            cancel_event.set()
+        return result
+
+    fake.llm.is_tool_call = cancel_when_finish_gate_is_observed
+
+    with pytest.raises(TurnCancelled):
+        LuminaAgent.chat(fake, "hello", cancel_event=cancel_event)
+
+    assert calls["response_tokens"] == []
+    assert _assistant_rows(fake) == []
+
+
+# ── SEPT-AC-R1-B01 -- a pending completion-control transition is not a
+# WORK round and cannot disappear at the configured WORK-round boundary. ──
+
+def _last_work_round_candidate_script(limit, gate_name=FINISH_TOOL_WORK_NAME):
+    candidate = f"candidate created on final WORK round {limit}"
+    turns = [
+        {"tool_calls": [_tc("read_file", f"work-{round_number}")]}
+        for round_number in range(1, limit)
+    ]
+    turns.extend([
+        {"content": candidate, "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(gate_name, "control-gate")]},
+    ])
+    return candidate, turns
+
+
+def test_b01_limit_one_first_round_candidate_reaches_gate_before_final(
+        tmp_path, monkeypatch):
+    """Rookie's exact release-blocking reproduction.
+
+    MAX_TOOL_ITERATIONS=1 is a supported Settings value. The first WORK
+    response consumes that one WORK slot, but its pending control gate must
+    still execute and confirm finish before the held candidate can become
+    the one canonical Final.
+    """
+    monkeypatch.setattr(config, "MAX_TOOL_ITERATIONS", 1)
+    candidate, turns = _last_work_round_candidate_script(1)
+    llm = _ScriptedLLM(turns)
+    fake, calls = _fake_agent(
+        llm, flight_recorder_path=tmp_path / "b01-limit-one.db",
+    )
+
+    result = LuminaAgent.chat(fake, "Save this to memory")
+
+    assert result == candidate
+    assert llm.call_count == 2
+    assert set(llm.tools_seen[1]) == {
+        CONTINUE_TOOL_WORK_NAME, FINISH_TOOL_WORK_NAME,
+    }
+    assert calls["registry_calls"] == []
+    assert llm.chat_stream_calls == 0
+    assert _assistant_rows(fake) == [
+        {"role": "assistant", "content": candidate},
+    ]
+
+    event_types = [event["event_type"] for event in _events(fake)]
+    assert event_types.index("completion_candidate.created") < event_types.index(
+        "completion_candidate.accepted")
+    assert event_types.index("completion_candidate.accepted") < event_types.index(
+        "turn.final")
+    assert event_types.index("turn.final") < event_types.index("turn.completed")
+    assert "turn.tool_ceiling_reached" not in event_types
+
+
+def test_b01_limit_two_second_work_round_candidate_still_reaches_gate(
+        monkeypatch):
+    monkeypatch.setattr(config, "MAX_TOOL_ITERATIONS", 2)
+    candidate, turns = _last_work_round_candidate_script(2)
+    llm = _ScriptedLLM(turns)
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "read once, then answer")
+
+    assert result == candidate
+    assert llm.call_count == 3  # two WORK rounds + the independent gate
+    assert calls["registry_calls"] == ["read_file"]
+    assert set(llm.tools_seen[-1]) == {
+        CONTINUE_TOOL_WORK_NAME, FINISH_TOOL_WORK_NAME,
+    }
+    assert llm.chat_stream_calls == 0
+
+
+@pytest.mark.parametrize("limit", [1, 2, 5])
+def test_b01_candidate_on_any_final_permitted_work_round_always_reaches_gate(
+        limit, monkeypatch):
+    monkeypatch.setattr(config, "MAX_TOOL_ITERATIONS", limit)
+    candidate, turns = _last_work_round_candidate_script(limit)
+    llm = _ScriptedLLM(turns)
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, f"use exactly {limit} work rounds")
+
+    assert result == candidate
+    assert llm.call_count == limit + 1
+    assert len(calls["registry_calls"]) == limit - 1
+    assert set(llm.tools_seen[-1]) == {
+        CONTINUE_TOOL_WORK_NAME, FINISH_TOOL_WORK_NAME,
+    }
+    assert llm.chat_stream_calls == 0
+
+
+def test_b01_gate_continue_with_work_budget_remaining_restores_product_tools(
+        monkeypatch):
+    monkeypatch.setattr(config, "MAX_TOOL_ITERATIONS", 2)
+    llm = _ScriptedLLM([
+        {"content": "premature", "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(CONTINUE_TOOL_WORK_NAME, "continue")]},
+        {"tool_calls": [_tc("read_file", "real-tool")]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "continue with one remaining WORK round")
+
+    assert result == "REGENERATED-FROM-CHAT-STREAM"
+    assert llm.call_count == 3
+    assert calls["registry_calls"] == ["read_file"]
+    assert set(llm.tools_seen[1]) == {
+        CONTINUE_TOOL_WORK_NAME, FINISH_TOOL_WORK_NAME,
+    }
+    assert "read_file" in llm.tools_seen[2]
+    assert CONTINUE_TOOL_WORK_NAME not in llm.tools_seen[2]
+    assert FINISH_TOOL_WORK_NAME not in llm.tools_seen[2]
+
+
+def test_b01_gate_continue_with_no_work_budget_fails_closed(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "MAX_TOOL_ITERATIONS", 1)
+    candidate, turns = _last_work_round_candidate_script(
+        1, gate_name=CONTINUE_TOOL_WORK_NAME,
+    )
+    # Script one forbidden extra WORK response so a mutation that grants a
+    # product round beyond the configured ceiling fails on dispatch evidence,
+    # not merely by exhausting the fake provider's response list.
+    turns.append({"tool_calls": [_tc("read_file", "forbidden-extra-work")]})
+    llm = _ScriptedLLM(turns)
+    fake, calls = _fake_agent(
+        llm, flight_recorder_path=tmp_path / "b01-continue-exhausted.db",
+    )
+
+    result = LuminaAgent.chat(fake, "this still needs a real tool")
+
+    assert is_error_response(result)
+    assert result == (
+        "[Lumina error: tool-work iteration limit reached before completion "
+        "was confirmed.]"
+    )
+    assert llm.call_count == 2
+    assert llm.chat_stream_calls == 0
+    assert calls["registry_calls"] == []
+    assert _assistant_rows(fake) == []
+    assert "".join(calls["response_tokens"]) == result
+
+    events = _events(fake)
+    event_types = [event["event_type"] for event in events]
+    assert event_types.count("completion_candidate.created") == 1
+    assert event_types.count("completion_candidate.discarded") == 1
+    assert event_types.count("turn.tool_ceiling_reached") == 1
+    assert event_types.count("turn.failed") == 1
+    assert "completion_candidate.accepted" not in event_types
+    assert "turn.final" not in event_types
+    assert "turn.completed" not in event_types
+    assert "tool.call" not in event_types
+    ceiling = next(
+        event for event in events
+        if event["event_type"] == "turn.tool_ceiling_reached"
+    )
+    ceiling_fields = json.loads(ceiling["fields_json"])
+    assert ceiling_fields == {
+        "tool_iteration_limit": 1,
+        "work_rounds_used": 1,
+        "reason": "control_gate_requested_more_work",
+        "candidate_source_round": 0,
+    }
+
+
+def test_b01_ordinary_tool_work_ceiling_without_candidate_is_unchanged(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "MAX_TOOL_ITERATIONS", 1)
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("read_file", "only-work-round")]},
+    ])
+    fake, calls = _fake_agent(
+        llm, flight_recorder_path=tmp_path / "b01-ordinary-ceiling.db",
+    )
+
+    result = LuminaAgent.chat(fake, "use the ordinary ceiling")
+
+    assert result == "REGENERATED-FROM-CHAT-STREAM"
+    assert llm.call_count == 1
+    assert llm.chat_stream_calls == 1
+    assert calls["registry_calls"] == ["read_file"]
+    event_types = [event["event_type"] for event in _events(fake)]
+    assert "completion_candidate.created" not in event_types
+    assert event_types.count("turn.tool_ceiling_reached") == 1
+    assert event_types.count("turn.final") == 1
+    assert event_types.count("turn.completed") == 1

@@ -8,6 +8,18 @@ import json
 import config
 
 
+# SEPT-AC-R1-F05 -- the fixed, machine-authored USER-role continuation cue
+# ContextManager.push_ephemeral_reconciliation_request() queues. A module-
+# level constant (not inlined in that method) so deterministic tests can
+# assert on it directly instead of duplicating the literal string -- see
+# that method's own docstring for why its content must stay fixed and
+# never caller-supplied.
+RECONCILIATION_CONTINUATION_CUE = (
+    "Produce the canonical final response now, following the "
+    "reconciliation instructions above."
+)
+
+
 def estimate_tokens(text: str) -> int:
     """Fast token estimator: ~4 chars per token."""
     return max(1, len(str(text)) // 4)
@@ -43,6 +55,7 @@ class ContextManager:
         self.max_tokens = config.MAX_CONTEXT_TOKENS
         self.reserve = config.RESPONSE_RESERVE_TOKENS
         self._ephemeral = ""   # per-turn injection, cleared after build_messages()
+        self._ephemeral_messages = []  # SEPT-AC-R1-F03/F04 -- see push_ephemeral_assistant()
         self._untrusted_content_seen = False  # sticky once True — stays for the rest of the session
         self.owner = owner  # gates passive context injection below — see _build_system_prompt()
         self._pending_compaction = []   # messages captured off the trim loop, awaiting summarization
@@ -303,6 +316,8 @@ class ContextManager:
         """
         system_prompt = self._build_system_prompt(tool_budget=tool_budget, chat_id=chat_id)
         self._ephemeral = ""   # consumed — clear for next turn
+        ephemeral_messages = self._ephemeral_messages
+        self._ephemeral_messages = []  # consumed — clear for next turn (SEPT-AC-R1-F03)
         history_copy, system_tokens = self._fit_history_to_budget(
             system_prompt, tool_budget=tool_budget, capture_compaction=True
         )
@@ -334,7 +349,12 @@ class ContextManager:
                 msg = dict(msg)
                 msg["content"] = _strip_image_blocks(msg["content"])
             sanitized.append(msg)
-        return [{"role": "system", "content": system_prompt}] + sanitized
+        # SEPT-AC-R1-F03/F04 -- ephemeral ASSISTANT-role messages
+        # (reconciliation source material) land AFTER real history, never
+        # merged into the role="system" entry above -- and never at any
+        # other role, since push_ephemeral_assistant() is the only way
+        # anything reaches this list and it hardcodes role="assistant".
+        return [{"role": "system", "content": system_prompt}] + sanitized + list(ephemeral_messages)
 
     def token_count(self) -> int:
         return estimate_tokens(self.system_prompt) + sum(
@@ -350,8 +370,99 @@ class ContextManager:
         self._last_usage_snapshot = None
 
     def push_ephemeral(self, block: str):
-        """Append a one-turn injection (e.g. skill docs). Cleared after build_messages()."""
+        """Append a one-turn injection (e.g. skill docs). Cleared after build_messages().
+
+        This block is folded into the trusted role="system" prompt by
+        _build_system_prompt() -- reserve it for machine-authored harness
+        instructions (skill docs, gate prompts, the reconciliation
+        instruction itself). Never pass historical model/tool/external
+        CONTENT being reconciled through here -- that content may carry
+        lower trust than the harness instruction wrapping it, and folding
+        it into role="system" promotes its authority regardless of how it's
+        worded or escaped. Use push_ephemeral_assistant() for that instead
+        (SEPT-AC-R1-F03/F04)."""
         self._ephemeral = block
+        self._last_usage_snapshot = None
+
+    def push_ephemeral_assistant(self, content: str):
+        """Append a one-turn, ASSISTANT-role ephemeral message -- SEPT-AC-
+        R1-F03/F04.
+
+        Unlike push_ephemeral() (which is folded into the single trusted
+        role="system" prompt string), this is appended to build_messages()'s
+        returned list as its OWN message, after real history, always at
+        role="assistant". It exists so reconciliation can hand the model
+        lower-trust source material (prior Commentary, a held completion
+        candidate -- both model-authored text that may itself echo
+        TOOL_OUTPUT/EXTERNAL_CHANNEL_INBOUND content quoted back by the
+        model) without that material ever gaining role="system" authority.
+        The accompanying machine-authored instruction explaining what this
+        material is and how to treat it belongs in push_ephemeral() instead
+        -- trusted instruction and lower-trust content stay in separate
+        messages, never merged into one.
+
+        SEPT-AC-R1-F04 -- this method deliberately takes NO role parameter.
+        F03's original push_ephemeral_message(role, content) let any caller
+        undo the whole trust separation just by passing role="system" (or
+        any other provider-privileged role); Rookie demonstrated that
+        exact attack, live, against all four supported backend families.
+        The fix is not a runtime allowlist check on a role argument --
+        "validate then reject" still leaves a caller-choosable parameter
+        for the next caller to get wrong -- it is having no such parameter
+        at all. _finalize_with_reconciliation() (core/agent.py), the only
+        production caller, is the sole reason this seam exists, and it only
+        ever needs ASSISTANT (the material really is the assistant's own
+        earlier output this turn). If a second lower-trust ephemeral role
+        is ever genuinely needed, that is the time to add a new
+        push_ephemeral_<role>() method next to this one -- never to widen
+        this one back into a general role parameter.
+
+        Same lifetime contract as push_ephemeral(): queued here, consumed
+        and cleared by build_messages(), never written to self.history --
+        it does not survive past the next build_messages() call and is
+        never durable."""
+        self._ephemeral_messages.append({"role": "assistant", "content": content})
+        self._last_usage_snapshot = None
+
+    def push_ephemeral_reconciliation_request(self):
+        """Queue the fixed, machine-authored USER-role continuation cue
+        that closes out a reconciliation request -- SEPT-AC-R1-F05.
+
+        F03/F04 left build_messages() free to end on the ephemeral
+        ASSISTANT message push_ephemeral_assistant() queues (reconciliation
+        source material, appended last after real history). That is
+        provenance-correct but not always a legal generation request:
+        Anthropic rejects a trailing assistant message as an invalid
+        prefill for extended-thinking-capable models, and Gemini's
+        generateContent expects a non-empty final user turn -- a request
+        that just stops on ASSISTANT/MODEL is liable to a provider-side
+        400 regardless of what it says. Call this AFTER
+        push_ephemeral_assistant() so it becomes the new terminal message.
+
+        Takes NO argument on purpose -- same reasoning as
+        push_ephemeral_assistant() taking no role argument. The content is
+        a fixed constant (RECONCILIATION_CONTINUATION_CUE below), not
+        caller-supplied, so this seam is structurally incapable of
+        carrying historical Commentary/candidate text, an interpolated
+        user message, or any other payload -- it can only ever be the one
+        fixed control sentence. Do not widen this into
+        push_ephemeral_message(role, content) with role="user" baked in
+        as a default; that reintroduces exactly the caller-selectable-role
+        shape F04 removed, just aimed at "user" instead of "system".
+
+        Same one-shot, non-durable lifetime as push_ephemeral_assistant():
+        queued here, consumed and cleared by the same build_messages()
+        call, never written to self.history. Because build_messages()
+        drains and clears _ephemeral_messages synchronously, before the
+        caller ever makes the actual provider request with the returned
+        list, there is no window in which a provider exception or a
+        cancellation between this call and the next turn could leave this
+        cue (or the assistant source queued alongside it) stale for a
+        later, unrelated build_messages() call."""
+        self._ephemeral_messages.append({
+            "role": "user",
+            "content": RECONCILIATION_CONTINUATION_CUE,
+        })
         self._last_usage_snapshot = None
 
     def pending_compaction_tokens(self) -> int:

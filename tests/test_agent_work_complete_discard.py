@@ -55,6 +55,7 @@ from core.agent import (
     CONTINUE_TOOL_WORK_NAME,
 )
 from core.backends.base import TerminationStatus
+from core.context import ContextManager, RECONCILIATION_CONTINUATION_CUE
 from core.flight_recorder import FlightRecorder
 
 
@@ -136,7 +137,7 @@ class _ScriptedLLM:
 def _fake_agent(llm, tool_result="ok", flight_recorder_path=None):
     history = []
     calls = {
-        "ephemeral": [], "registry_calls": [], "on_tool_call": [],
+        "ephemeral": [], "ephemeral_messages": [], "registry_calls": [], "on_tool_call": [],
         "on_tool_result": [], "response_tokens": [], "commentary": [],
         "build_messages_calls": 0,
     }
@@ -163,6 +164,10 @@ def _fake_agent(llm, tool_result="ok", flight_recorder_path=None):
             {"role": "tool", "tool_call_id": tool_call_id, "name": name,
              "content": "[Cancelled by operator before execution.]"}),
         push_ephemeral=lambda block: calls["ephemeral"].append(block),
+        push_ephemeral_assistant=lambda content: calls["ephemeral_messages"].append(
+            {"role": "assistant", "content": content}),
+        push_ephemeral_reconciliation_request=lambda: calls["ephemeral_messages"].append(
+            {"role": "user", "content": RECONCILIATION_CONTINUATION_CUE}),
         build_messages=build_messages,
         context_usage_snapshot=lambda tool_budget=0, chat_id=None, refresh=False: (
             {"used_tokens": 1, "max_tokens": 8000, "percent": 0.0, "chat_id": chat_id}
@@ -611,8 +616,18 @@ def test_reconciliation_ephemeral_surfaces_both_prior_commentary_and_candidate_t
     not be asked to reconstruct the answer from tool history while its own
     already-produced text (both the earlier substantive Commentary and the
     trivial candidate remark) is withheld from it. Both must appear in the
-    one-turn ephemeral instruction, and that instruction must never leak
-    into ctx.history (push_ephemeral()'s existing non-durable contract)."""
+    ephemeral material.
+
+    SEPT-AC-R1-F03/F04: that material is historical model-authored content,
+    not machine instruction -- it must surface via push_ephemeral_assistant()
+    (a fixed-role ephemeral assistant message; F04 removed the caller-
+    selectable role push_ephemeral_message() briefly had, after Rookie
+    showed a caller could pass role="system" through it) and never via
+    push_ephemeral() (the trusted role="system" injection). Neither channel
+    is durable --
+    ContextManager.build_messages() owns clearing both in the real class;
+    this fake only records the pushes, so assert nothing separately leaked
+    into ctx.history itself."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("read_file")], "content": "SUBSTANTIVE-DIAGNOSTIC-REPORT-TEXT"},
         {"tool_calls": [_tc("search_memory")]},
@@ -623,13 +638,25 @@ def test_reconciliation_ephemeral_surfaces_both_prior_commentary_and_candidate_t
 
     LuminaAgent.chat(fake, "diagnose it")
 
-    ephemeral_pushes = calls["ephemeral"]
-    reconciliation_push = ephemeral_pushes[-1]
-    assert "SUBSTANTIVE-DIAGNOSTIC-REPORT-TEXT" in reconciliation_push
-    assert "TRIVIAL-SIGNOFF-TEXT" in reconciliation_push
-    # Never durable: ContextManager.push_ephemeral()/build_messages() owns
-    # clearing it in the real class -- this fake only records the push,
-    # so assert it was never separately appended to ctx.history itself.
+    # The machine-authored SYSTEM instruction never carries the payload.
+    for push in calls["ephemeral"]:
+        assert "SUBSTANTIVE-DIAGNOSTIC-REPORT-TEXT" not in push
+        assert "TRIVIAL-SIGNOFF-TEXT" not in push
+    # The payload arrives as its own ephemeral assistant-role message --
+    # SEPT-AC-R1-F05: NOT the last ephemeral message anymore, since the
+    # fixed USER continuation cue now follows it so the request ends on a
+    # legal generation turn (see push_ephemeral_reconciliation_request()).
+    reconciliation_message = calls["ephemeral_messages"][-2]
+    assert reconciliation_message["role"] == "assistant"
+    assert "SUBSTANTIVE-DIAGNOSTIC-REPORT-TEXT" in reconciliation_message["content"]
+    assert "TRIVIAL-SIGNOFF-TEXT" in reconciliation_message["content"]
+    assert calls["ephemeral_messages"][-1] == {
+        "role": "user", "content": RECONCILIATION_CONTINUATION_CUE,
+    }
+    # Never durable: ContextManager.push_ephemeral()/push_ephemeral_assistant()/
+    # build_messages() own clearing it in the real class -- this fake only
+    # records the push, so assert it was never separately appended to
+    # ctx.history itself.
     assert not any(
         "SUBSTANTIVE-DIAGNOSTIC-REPORT-TEXT" in str(entry.get("content", ""))
         and entry.get("role") == "assistant" and "tool_calls" not in entry
@@ -716,3 +743,433 @@ def test_flight_recorder_records_reconciled_not_accepted(tmp_path):
     events = _events(fake)
     assert any(e["event_type"] == "completion_candidate.reconciled" for e in events)
     assert not any(e["event_type"] == "completion_candidate.accepted" for e in events)
+
+
+# ── SEPT-AC-R1-F02 -- finish-gate Commentary participates in the SAME
+# reconciliation material as relevant WORK Commentary, without making
+# continue-gate progress narration durable. ─────────────────────────────
+
+def _plain_assistant_rows(fake):
+    return [
+        entry for entry in fake.ctx.history
+        if entry.get("role") == "assistant" and "tool_calls" not in entry
+    ]
+
+
+def test_f02_finish_gate_commentary_reconciles_into_one_canonical_final(tmp_path):
+    gate_conclusion = "SUBSTANTIVE GATE CONCLUSION: the audit found a blocker."
+    canonical_final = "Canonical Final preserving: the audit found a blocker."
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": "Done.", "termination": TerminationStatus.COMPLETE},
+        {"content": gate_conclusion, "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+
+    def reconciliation_stream(messages, max_tokens=None, reasoning_effort=None):
+        llm.chat_stream_calls += 1
+        yield canonical_final
+
+    llm.chat_stream = reconciliation_stream
+    fake, calls = _fake_agent(llm, flight_recorder_path=tmp_path / "fr.db")
+
+    result = LuminaAgent.chat(fake, "save it")
+
+    assert result == canonical_final
+    assert llm.chat_stream_calls == 1
+    assert calls["commentary"] == [gate_conclusion]
+    # SEPT-AC-R1-F03: the payload lands in the ephemeral assistant-role
+    # message, never in the SYSTEM instruction.
+    for push in calls["ephemeral"]:
+        assert gate_conclusion not in push
+        assert "Done." not in push
+    # SEPT-AC-R1-F05: the assistant source is second-to-last now -- the
+    # fixed USER continuation cue follows it as the true terminal message.
+    reconciliation_message = calls["ephemeral_messages"][-2]
+    assert reconciliation_message["role"] == "assistant"
+    reconciliation = reconciliation_message["content"]
+    assert gate_conclusion in reconciliation
+    assert "Done." in reconciliation
+    assert calls["ephemeral_messages"][-1] == {
+        "role": "user", "content": RECONCILIATION_CONTINUATION_CUE,
+    }
+    assert _plain_assistant_rows(fake) == [
+        {"role": "assistant", "content": canonical_final}
+    ]
+
+    event_types = [event["event_type"] for event in _events(fake)]
+    assert event_types.count("turn.commentary") == 1
+    assert event_types.count("completion_candidate.reconciled") == 1
+    assert "completion_candidate.accepted" not in event_types
+    assert event_types.count("turn.final") == 1
+    assert event_types.count("turn.completed") == 1
+
+
+def test_f02_work_and_finish_gate_commentary_keep_chronological_order():
+    work_a = "WORK-COMMENTARY-A"
+    work_b = "WORK-COMMENTARY-B"
+    gate_c = "FINISH-GATE-COMMENTARY-C"
+    candidate_d = "CANDIDATE-D"
+    llm = _ScriptedLLM([
+        {"content": work_a, "tool_calls": [_tc("read_file")]},
+        {"content": work_b, "tool_calls": [_tc("search_memory")]},
+        {"content": candidate_d, "termination": TerminationStatus.COMPLETE},
+        {"content": gate_c, "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "diagnose it")
+
+    assert result == "REGENERATED-FROM-CHAT-STREAM"
+    assert calls["commentary"] == [work_a, work_b, gate_c]
+    # SEPT-AC-R1-F03: none of this model-authored material reaches the
+    # machine-authored SYSTEM instruction.
+    for push in calls["ephemeral"]:
+        for text in (work_a, work_b, gate_c, candidate_d):
+            assert text not in push
+    # SEPT-AC-R1-F05: the assistant source is second-to-last now -- the
+    # fixed USER continuation cue follows it as the true terminal message.
+    reconciliation_message = calls["ephemeral_messages"][-2]
+    assert reconciliation_message["role"] == "assistant"
+    reconciliation = reconciliation_message["content"]
+    assert reconciliation.index(work_a) < reconciliation.index(work_b)
+    assert reconciliation.index(work_b) < reconciliation.index(gate_c)
+    assert reconciliation.index(gate_c) < reconciliation.index(candidate_d)
+    assert calls["ephemeral_messages"][-1] == {
+        "role": "user", "content": RECONCILIATION_CONTINUATION_CUE,
+    }
+    assert _plain_assistant_rows(fake) == [
+        {"role": "assistant", "content": "REGENERATED-FROM-CHAT-STREAM"}
+    ]
+
+
+def test_f02_finish_gate_without_commentary_keeps_verbatim_fast_path():
+    candidate = "Exact candidate; no regeneration needed."
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": candidate, "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "find it")
+
+    assert result == candidate
+    assert llm.chat_stream_calls == 0
+    assert calls["commentary"] == []
+    assert _plain_assistant_rows(fake) == [
+        {"role": "assistant", "content": candidate}
+    ]
+
+
+def test_f02_continue_gate_commentary_never_contaminates_later_final():
+    stale_progress = "STALE CONTINUE-GATE PROGRESS"
+    final_candidate = "Fresh final answer after successful work."
+    llm = _ScriptedLLM([
+        {"content": "premature candidate", "termination": TerminationStatus.COMPLETE},
+        {"content": stale_progress, "tool_calls": [_tc(CONTINUE_TOOL_WORK_NAME)]},
+        {"tool_calls": [_tc("read_file")]},
+        {"content": final_candidate, "termination": TerminationStatus.COMPLETE},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "read then answer")
+
+    assert calls["commentary"] == [stale_progress]
+    assert calls["registry_calls"] == ["read_file"]
+    assert result == final_candidate
+    assert llm.chat_stream_calls == 0
+    assert stale_progress not in result
+    assert not any("## Finalizing this turn" in block for block in calls["ephemeral"])
+    assert _plain_assistant_rows(fake) == [
+        {"role": "assistant", "content": final_candidate}
+    ]
+
+
+def test_f02_cancellation_during_reconciliation_persists_no_final(tmp_path):
+    event = threading.Event()
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": "Done.", "termination": TerminationStatus.COMPLETE},
+        {"content": "Substantive finish-gate conclusion.",
+         "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+
+    def cancelling_stream(messages, max_tokens=None, reasoning_effort=None):
+        llm.chat_stream_calls += 1
+        event.set()
+        yield "must not become Final"
+
+    llm.chat_stream = cancelling_stream
+    fake, calls = _fake_agent(llm, flight_recorder_path=tmp_path / "fr.db")
+
+    with pytest.raises(TurnCancelled):
+        LuminaAgent.chat(fake, "save it", cancel_event=event)
+
+    assert _plain_assistant_rows(fake) == []
+    event_types = [entry["event_type"] for entry in _events(fake)]
+    assert event_types.count("turn.cancelled") == 1
+    assert "turn.final" not in event_types
+    assert "turn.completed" not in event_types
+
+
+# ── SEPT-AC-R1-C01 -- cancelled reconciliation is presentation-only ────
+
+def _c01_reconciliation_agent(tmp_path, stream):
+    """Real ContextManager + real chat/reconciliation methods.
+
+    The scripted provider supplies only wire responses; live history,
+    ephemeral consumption, cancellation, Flight Recorder, and Final
+    persistence all run through production code.
+    """
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": "Done.", "termination": TerminationStatus.COMPLETE},
+        {"content": "SUBSTANTIVE FINISH-GATE CONCLUSION",
+         "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    llm.chat_stream = stream.__get__(llm, _ScriptedLLM)
+    fake, calls = _fake_agent(
+        llm, flight_recorder_path=tmp_path / "c01-flight.db",
+    )
+    fake.ctx = ContextManager(owner=False)
+    fake.ctx.max_tokens = 32000
+    fake.ctx.reserve = 0
+    return fake, llm, calls
+
+
+def _plain_final_rows(ctx):
+    return [
+        row for row in ctx.history
+        if row.get("role") == "assistant" and "tool_calls" not in row
+    ]
+
+
+@pytest.mark.parametrize(
+    "cancel_after",
+    [1, 2, 3],
+    ids=["first-chunk", "middle-chunk", "final-chunk"],
+)
+def test_c01_cancelled_reconciliation_partial_never_becomes_context(
+        tmp_path, cancel_after):
+    chunks = ["PARTIAL-", "CANONICAL-", "FINAL"]
+    event = threading.Event()
+
+    def stream(llm, messages, max_tokens=None, reasoning_effort=None):
+        llm.chat_stream_calls += 1
+        yield from chunks
+
+    fake, llm, calls = _c01_reconciliation_agent(tmp_path, stream)
+    record_token = fake.on_response_token
+
+    def cancel_from_response_callback(chunk):
+        record_token(chunk)
+        if len(calls["response_tokens"]) == cancel_after:
+            event.set()
+
+    fake.on_response_token = cancel_from_response_callback
+
+    with pytest.raises(TurnCancelled) as exc:
+        LuminaAgent.chat(fake, "perform the work", cancel_event=event)
+
+    visible_partial = "".join(chunks[:cancel_after])
+    assert exc.value.partial_response == visible_partial
+    assert calls["response_tokens"] == chunks[:cancel_after]
+    assert _plain_final_rows(fake.ctx) == []
+    assert exc.value.persist_partial_response is False
+
+    event_types = [row["event_type"] for row in _events(fake)]
+    assert event_types.count("turn.cancelled") == 1
+    assert "turn.final" not in event_types
+    assert "turn.completed" not in event_types
+
+    later_messages = fake.ctx.build_messages()
+    assert visible_partial not in str(later_messages)
+    assert "SUBSTANTIVE FINISH-GATE CONCLUSION" not in str(later_messages)
+    assert "Done." not in str(later_messages)
+    assert RECONCILIATION_CONTINUATION_CUE not in str(later_messages)
+    assert fake.ctx._ephemeral_messages == []
+
+
+def test_c01_cancelled_before_reconciliation_stream_emits_and_persists_nothing(
+        tmp_path):
+    event = threading.Event()
+
+    def stream(llm, messages, max_tokens=None, reasoning_effort=None):
+        llm.chat_stream_calls += 1
+        yield "MUST-NOT-ARRIVE"
+
+    fake, llm, calls = _c01_reconciliation_agent(tmp_path, stream)
+    real_build_messages = fake.ctx.build_messages
+
+    def cancel_when_reconciliation_request_is_built(*args, **kwargs):
+        messages = real_build_messages(*args, **kwargs)
+        if messages[-1] == {
+            "role": "user", "content": RECONCILIATION_CONTINUATION_CUE,
+        }:
+            event.set()
+        return messages
+
+    fake.ctx.build_messages = cancel_when_reconciliation_request_is_built
+
+    with pytest.raises(TurnCancelled) as exc:
+        LuminaAgent.chat(fake, "perform the work", cancel_event=event)
+
+    assert exc.value.partial_response == ""
+    assert exc.value.persist_partial_response is False
+    assert llm.chat_stream_calls == 0
+    assert calls["response_tokens"] == []
+    assert _plain_final_rows(fake.ctx) == []
+    assert fake.ctx._ephemeral_messages == []
+
+
+def test_c01_reconciliation_stream_exception_does_not_canonize_partial(
+        tmp_path):
+    partial = "UNFINISHED-CANONICAL-DRAFT"
+
+    def stream(llm, messages, max_tokens=None, reasoning_effort=None):
+        llm.chat_stream_calls += 1
+        yield partial
+        raise RuntimeError("provider stream broke")
+
+    fake, llm, calls = _c01_reconciliation_agent(tmp_path, stream)
+
+    result = LuminaAgent.chat(fake, "perform the work")
+
+    assert result == "[Stream error: provider stream broke]"
+    assert partial in calls["response_tokens"]
+    assert _plain_final_rows(fake.ctx) == []
+    assert partial not in str(fake.ctx.build_messages())
+    event_types = [row["event_type"] for row in _events(fake)]
+    assert event_types.count("turn.failed") == 1
+    assert "turn.final" not in event_types
+    assert "turn.completed" not in event_types
+
+
+def test_c01_successful_reconciliation_still_persists_one_canonical_final(
+        tmp_path):
+    canonical = "COMPLETE CANONICAL FINAL"
+
+    def stream(llm, messages, max_tokens=None, reasoning_effort=None):
+        llm.chat_stream_calls += 1
+        yield "COMPLETE "
+        yield "CANONICAL FINAL"
+
+    fake, llm, calls = _c01_reconciliation_agent(tmp_path, stream)
+
+    result = LuminaAgent.chat(fake, "perform the work")
+
+    assert result == canonical
+    assert _plain_final_rows(fake.ctx) == [
+        {"role": "assistant", "content": canonical},
+    ]
+    event_types = [row["event_type"] for row in _events(fake)]
+    assert event_types.count("turn.final") == 1
+    assert event_types.count("turn.completed") == 1
+    assert "turn.cancelled" not in event_types
+    assert canonical in str(fake.ctx.build_messages())
+
+
+# ── SEPT-AC-R1-F04 -- reconciliation with NO tool call ever run this turn ──
+#
+# Rookie's source-vet falsified "the terminal ctx.history role before
+# reconciliation is always tool": a first-round zero-tool response (see
+# AGENT-PRETOOL-ACTION-INTEGRITY-01) that goes straight through the
+# completion gate to a "finish" outcome carrying Commentary reconciles via
+# _finalize_with_reconciliation() having never run a single real tool call
+# this turn -- ctx.history's only row is the turn's own initial add_user(),
+# i.e. the terminal role is "user", not "tool". This test proves that path
+# is legal end-to-end through the full chat() loop (not just a hand-built
+# ContextManager state) and reconciles correctly.
+
+def test_f04_first_round_candidate_with_finish_gate_commentary_and_zero_tool_calls():
+    gate_conclusion = "SUBSTANTIVE GATE CONCLUSION: no tool work was needed."
+    canonical_final = "Canonical Final preserving: no tool work was needed."
+    llm = _ScriptedLLM([
+        {"content": "Immediate answer.", "termination": TerminationStatus.COMPLETE},
+        {"content": gate_conclusion, "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+
+    def reconciliation_stream(messages, max_tokens=None, reasoning_effort=None):
+        llm.chat_stream_calls += 1
+        yield canonical_final
+
+    llm.chat_stream = reconciliation_stream
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "quick question")
+
+    assert result == canonical_final
+    assert llm.chat_stream_calls == 1
+    assert calls["registry_calls"] == []  # zero tool calls this turn, ever
+    # No tool row was ever added -- ctx.history holds only the turn's own
+    # user message before the reconciled Final lands.
+    assert [row for row in fake.ctx.history if row.get("role") == "tool"] == []
+    # SEPT-AC-R1-F05: the assistant source is second-to-last -- the fixed
+    # USER continuation cue follows it as the true terminal message, so
+    # the request ends on a legal generation turn even with zero durable
+    # tool history this turn.
+    reconciliation_message = calls["ephemeral_messages"][-2]
+    assert reconciliation_message["role"] == "assistant"
+    assert gate_conclusion in reconciliation_message["content"]
+    assert "Immediate answer." in reconciliation_message["content"]
+    assert calls["ephemeral_messages"][-1] == {
+        "role": "user", "content": RECONCILIATION_CONTINUATION_CUE,
+    }
+    assert _plain_assistant_rows(fake) == [
+        {"role": "assistant", "content": canonical_final}
+    ]
+
+
+# ── SEPT-AC-R1-F05 -- parallel tools + a tool failure + WORK/finish-gate
+# Commentary composition, all landing in the same reconciled turn. Closes
+# out the sequencing-matrix scenarios F05's own docstring lists that
+# weren't already exercised by the tests above (single sequential tool
+# call, first-round zero-tool candidate): parallel tool calls in one
+# batch, a failing tool result, and multi-source Commentary composition,
+# all still producing the correct [assistant source, user cue] ephemeral
+# tail. ───────────────────────────────────────────────────────────────
+
+def test_f05_parallel_tools_with_a_failure_still_terminate_correctly():
+    work_commentary = "Running both lookups in parallel."
+    gate_conclusion_2 = "SUBSTANTIVE GATE CONCLUSION: one lookup failed."
+    canonical_final_2 = "Canonical Final acknowledging the partial failure."
+    llm = _ScriptedLLM([
+        {"content": work_commentary,
+         "tool_calls": [_tc("search_memory", "call_1"), _tc("read_file", "call_2")]},
+        {"content": "Done.", "termination": TerminationStatus.COMPLETE},
+        {"content": gate_conclusion_2, "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+
+    def reconciliation_stream(messages, max_tokens=None, reasoning_effort=None):
+        llm.chat_stream_calls += 1
+        yield canonical_final_2
+
+    llm.chat_stream = reconciliation_stream
+    # Every tool call in this fake shares one registry -- "[Tool error:"
+    # is the exact prefix core/agent.py checks to classify a result as a
+    # failure (see _tool_success in _chat_impl()'s tool-dispatch loop),
+    # so this simulates one of the two parallel calls having failed.
+    fake, calls = _fake_agent(llm, tool_result="[Tool error: read_file failed]")
+
+    result = LuminaAgent.chat(fake, "look two things up")
+
+    assert result == canonical_final_2
+    # Both parallel tool calls got their own tool-role result row, in the
+    # same batch -- the terminal durable role is still "tool" either way.
+    tool_rows = [row for row in fake.ctx.history if row.get("role") == "tool"]
+    assert len(tool_rows) == 2
+    # -2, not -1: the durable canonical Final (appended by _stream_final()
+    # via add_assistant()) is the actual last row now.
+    assert fake.ctx.history[-2]["role"] == "tool"
+    assert calls["commentary"] == [work_commentary, gate_conclusion_2]
+    reconciliation_message = calls["ephemeral_messages"][-2]
+    assert reconciliation_message["role"] == "assistant"
+    assert work_commentary in reconciliation_message["content"]
+    assert gate_conclusion_2 in reconciliation_message["content"]
+    assert calls["ephemeral_messages"][-1] == {
+        "role": "user", "content": RECONCILIATION_CONTINUATION_CUE,
+    }
+    assert _plain_assistant_rows(fake) == [
+        {"role": "assistant", "content": canonical_final_2}
+    ]

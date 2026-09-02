@@ -8,7 +8,10 @@ pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import ui.main_window as main_window
+import config
+import tools.memory as memory
 from core.agent import TurnCancelled
+from core.context_reconstruction import reconstruct_chat_context
 from ui.main_window import AgentWorker, LuminaWindow, StreamSignals
 
 
@@ -188,6 +191,49 @@ def test_cancelled_before_response_removes_empty_live_bubble_and_writes_nothing(
     assert "no assistant response was committed" in fake.chat_widget.notices[-1]
 
 
+def test_cancelled_reconciliation_partial_stays_visible_but_is_not_persisted(
+        monkeypatch):
+    writes = []
+    monkeypatch.setattr(
+        main_window, "save_chat_message",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+    fake, bubble = _cancel_completion_fake()
+
+    LuminaWindow._on_cancelled(
+        fake, "partial canonical draft", persist_partial_response=False,
+    )
+
+    assert bubble.finalized is True
+    assert writes == []
+    assert "shown but not committed" in fake.chat_widget.notices[-1]
+
+
+def test_cancelled_reconciliation_partial_cannot_reenter_reconstructed_context(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "c01-restart.db"))
+    memory.init_chat_db()
+    chat_id = memory.create_chat("C01 restart proof")
+    memory.save_chat_message(chat_id, "user", "perform the work")
+
+    fake, bubble = _cancel_completion_fake()
+    fake._current_chat_id = chat_id
+
+    LuminaWindow._on_cancelled(
+        fake, "PARTIAL-CANONICAL-FINAL", persist_partial_response=False,
+    )
+    reconstructed = reconstruct_chat_context(chat_id, context_skip=0)
+
+    assert bubble.finalized is True
+    assert len(reconstructed.rows) == 1
+    assert reconstructed.rows[0]["role"] == "user"
+    assert reconstructed.rows[0]["content"] == "perform the work"
+    assert reconstructed.messages == [
+        {"role": "user", "content": "perform the work"},
+    ]
+    assert "PARTIAL-CANONICAL-FINAL" not in str(reconstructed.messages)
+
+
 def test_agent_worker_routes_turn_cancelled_to_cancelled_signal_not_error():
     class _Agent:
         def chat(self, user_input, chat_id=None, cancel_event=None):
@@ -196,14 +242,36 @@ def test_agent_worker_routes_turn_cancelled_to_cancelled_signal_not_error():
     signals = StreamSignals()
     cancelled = []
     errors = []
-    signals.cancelled.connect(cancelled.append)
+    signals.cancelled.connect(
+        lambda text, persist: cancelled.append((text, persist)),
+    )
     signals.error.connect(errors.append)
     worker = AgentWorker(_Agent(), "question", signals, chat_id=4)
 
     worker.run()
 
-    assert cancelled == ["partial"]
+    assert cancelled == [("partial", True)]
     assert errors == []
+
+
+def test_agent_worker_forwards_reconciliation_non_persistence_authority():
+    class _Agent:
+        def chat(self, user_input, chat_id=None, cancel_event=None):
+            raise TurnCancelled(
+                "partial canonical draft",
+                persist_partial_response=False,
+            )
+
+    signals = StreamSignals()
+    cancelled = []
+    signals.cancelled.connect(
+        lambda text, persist: cancelled.append((text, persist)),
+    )
+    worker = AgentWorker(_Agent(), "question", signals, chat_id=4)
+
+    worker.run()
+
+    assert cancelled == [("partial canonical draft", False)]
 
 
 def test_agent_worker_keeps_legacy_test_stub_compatibility_without_cancel_kwarg():

@@ -147,7 +147,10 @@ class StreamSignals(QObject):
     commentary     = Signal(str)   # AGENT-COMMENTARY-01A: whole event per provider decision, never batched
     finished       = Signal(str)
     error          = Signal(str)
-    cancelled      = Signal(str)
+    # SEPT-AC-R1-C01 -- presentation text and persistence authority are
+    # separate. Reconciliation can have already displayed partial text while
+    # explicitly forbidding it from becoming canonical assistant history.
+    cancelled      = Signal(str, bool)
     manual_compaction_finished = Signal(object)
     
 class STTSignals(QObject):
@@ -281,7 +284,10 @@ class AgentWorker(QThread):
         except TurnCancelled as e:
             self._flush_think()
             self._flush_resp()
-            self.signals.cancelled.emit(e.partial_response)
+            self.signals.cancelled.emit(
+                e.partial_response,
+                e.persist_partial_response,
+            )
         except Exception as e:
             self.signals.error.emit(str(e))
 
@@ -2079,7 +2085,16 @@ class LuminaWindow(QMainWindow):
             self._maybe_compact(self._current_chat_id)
 
 
-    def _on_cancelled(self, partial_response: str):
+    def _on_cancelled(self, partial_response: str,
+                      persist_partial_response: bool = True):
+        """Finish cancelled-turn presentation without overclaiming durability.
+
+        The default preserves the established ordinary-stream behavior for
+        direct callers and older tests. Reconciliation cancellation arrives
+        with ``persist_partial_response=False``: already-streamed text remains
+        visible in the live bubble, but no assistant row is written for later
+        reconstruction.
+        """
         partial_response = (partial_response or "").strip()
         if self._live_bubble:
             if partial_response:
@@ -2095,13 +2110,16 @@ class LuminaWindow(QMainWindow):
         self._operator_current_tool = None
         self.status_lbl.setText("")
 
-        if self._current_chat_id and partial_response:
+        if (self._current_chat_id and partial_response
+                and persist_partial_response):
             save_chat_message(
                 self._current_chat_id, "assistant", partial_response,
                 metadata={"cancelled": True},
             )
             self._refresh_chat_list()
             detail = "partial response kept in the transcript"
+        elif partial_response:
+            detail = "partial response shown but not committed"
         else:
             detail = "no assistant response was committed"
 
