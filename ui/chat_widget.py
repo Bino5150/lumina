@@ -667,6 +667,8 @@ class ChatWidget(QWidget):
     message_submitted = Signal(str)
     files_dropped = Signal(list)
     audio_preview_cancelled = Signal()
+    image_preview_removed = Signal(int)
+    attach_files_requested = Signal()
     mic_pressed = Signal()
 
     def __init__(self, colors: dict, avatar_path: str = None, user_avatar_path: str = None,
@@ -678,7 +680,9 @@ class ChatWidget(QWidget):
         self.user_avatar_path = user_avatar_path
         self._tts = tts
         self._tts_speech_allowed = tts_speech_allowed
-        self._preview_frame = None
+        self._image_preview_container = None
+        self._image_preview_layout = None
+        self._image_preview_rows = {}
         self._build()
 
     def set_persona(self, name: str, avatar_path: str):
@@ -740,7 +744,19 @@ class ChatWidget(QWidget):
         """)
         self.mic_btn.clicked.connect(self.mic_pressed.emit)
 
+        self.attach_btn = QPushButton("📎")
+        self.attach_btn.setFixedSize(40, 40)
+        self.attach_btn.setCursor(Qt.PointingHandCursor)
+        self.attach_btn.setStyleSheet(f"""
+            QPushButton{{background:{self.colors['bg_card']};color:{self.colors['text_primary']};border:1px solid {self.colors['border']};border-radius:10px;font-size:16px;}}
+            QPushButton:hover{{background:{self.colors['bg_panel']};border-color:{self.colors['accent']};}}
+            QPushButton:disabled{{background:{self.colors['text_dim']};color:{self.colors['bg_panel']};}}
+        """)
+        self.attach_btn.setToolTip("Attach images")
+        self.attach_btn.clicked.connect(self.attach_files_requested.emit)
+
         bl.addWidget(self.input, 1)
+        bl.addWidget(self.attach_btn)
         bl.addWidget(self.mic_btn)
         bl.addWidget(self.send_btn)
         layout.addWidget(bar)
@@ -924,6 +940,7 @@ class ChatWidget(QWidget):
         self.input.setEnabled(enabled)
         self.send_btn.setEnabled(enabled)
         self.mic_btn.setEnabled(enabled)
+        self.attach_btn.setEnabled(enabled)
         if enabled:
             self.input.setFocus()
 
@@ -932,6 +949,7 @@ class ChatWidget(QWidget):
         self.input.setEnabled(True)
         self.send_btn.setEnabled(True)
         self.mic_btn.setEnabled(not running)
+        self.attach_btn.setEnabled(not running)
         if running:
             self.input.setPlaceholderText("Main task running — /status · /btw <question> · /stop")
         else:
@@ -944,26 +962,41 @@ class ChatWidget(QWidget):
             if item.widget():
                 item.widget().deleteLater()
                 
-    def show_image_preview(self, pixmap: QPixmap, filename: str):
-        """Show a thumbnail preview of the pending image above the input bar."""
-        self.clear_image_preview()
-        frame = QFrame()
-        frame.setStyleSheet(f"""
-            QFrame{{background:{self.colors['bg_card']};
-            border-top:1px solid {self.colors['border_accent']};
-            border-bottom:none;padding:4px 16px;}}
-        """)
-        row = QHBoxLayout(frame)
-        row.setContentsMargins(0, 4, 0, 4)
-        row.setSpacing(10)
+    def add_image_preview(self, pixmap: QPixmap, filename: str, image_id: int):
+        """Add one thumbnail row to the pending-image preview strip above the
+        input bar. Multiple images pending at once each get their own row,
+        individually removable — the strip is a single container frame
+        (created lazily on the first image) holding one row per pending
+        image, keyed by image_id so removal doesn't depend on filename
+        uniqueness or row position."""
+        if self._image_preview_container is None:
+            container = QFrame()
+            container.setStyleSheet(f"""
+                QFrame{{background:{self.colors['bg_card']};
+                border-top:1px solid {self.colors['border_accent']};
+                border-bottom:none;}}
+            """)
+            self._image_preview_layout = QVBoxLayout(container)
+            self._image_preview_layout.setContentsMargins(0, 4, 0, 4)
+            self._image_preview_layout.setSpacing(2)
+            # Insert above input bar (second-to-last item in main layout)
+            insert_pos = self._main_layout.count() - 1
+            self._main_layout.insertWidget(insert_pos, container)
+            self._image_preview_container = container
+            self._image_preview_rows = {}
+
+        row = QFrame()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(16, 2, 16, 2)
+        row_layout.setSpacing(10)
 
         img_lbl = QLabel()
         img_lbl.setPixmap(pixmap)
-        row.addWidget(img_lbl)
+        row_layout.addWidget(img_lbl)
 
         name_lbl = QLabel(f"🖼  {filename}")
         name_lbl.setStyleSheet(f"color:{self.colors['text_muted']};font-size:11px;background:transparent;")
-        row.addWidget(name_lbl, 1)
+        row_layout.addWidget(name_lbl, 1)
 
         clear_btn = QPushButton("✕")
         clear_btn.setFixedSize(20, 20)
@@ -973,21 +1006,41 @@ class ChatWidget(QWidget):
             color:{self.colors['text_dim']};font-size:12px;}}
             QPushButton:hover{{color:{self.colors['danger']};}}
         """)
-        clear_btn.clicked.connect(self._on_preview_cleared)
-        row.addWidget(clear_btn)
+        clear_btn.clicked.connect(lambda checked=False, iid=image_id: self._on_image_preview_row_cleared(iid))
+        row_layout.addWidget(clear_btn)
 
-        # Insert above input bar (second-to-last item in main layout)
-        insert_pos = self._main_layout.count() - 1
-        self._main_layout.insertWidget(insert_pos, frame)
-        self._preview_frame = frame
+        self._image_preview_layout.addWidget(row)
+        self._image_preview_rows[image_id] = row
 
-    def clear_image_preview(self):
-        """Remove the image preview frame if present."""
-        if self._preview_frame is not None:
-            self._preview_frame.setParent(None)
-            self._preview_frame.deleteLater()
-            self._preview_frame = None
-            
+    def _on_image_preview_row_cleared(self, image_id: int):
+        """User clicked ✕ on one thumbnail — drop just that row and tell the
+        parent window which pending image to forget."""
+        self.remove_image_preview(image_id)
+        self.image_preview_removed.emit(image_id)
+
+    def remove_image_preview(self, image_id: int):
+        """Remove a single pending-image row by id. Collapses the whole
+        preview strip once the last row is gone."""
+        row = self._image_preview_rows.pop(image_id, None)
+        if row is not None:
+            row.setParent(None)
+            row.deleteLater()
+        if not self._image_preview_rows and self._image_preview_container is not None:
+            self._image_preview_container.setParent(None)
+            self._image_preview_container.deleteLater()
+            self._image_preview_container = None
+            self._image_preview_layout = None
+
+    def clear_image_previews(self):
+        """Remove the entire pending-image preview strip, if present."""
+        if self._image_preview_container is not None:
+            self._image_preview_container.setParent(None)
+            self._image_preview_container.deleteLater()
+            self._image_preview_container = None
+            self._image_preview_layout = None
+        self._image_preview_rows = {}
+
+
     def show_audio_preview(self, fname: str):
         """Show an audio file preview above the input bar."""
         self.clear_audio_preview()
@@ -1028,18 +1081,5 @@ class ChatWidget(QWidget):
         self.clear_audio_preview()
         # Signal main window to clear _pending_audio
         self.audio_preview_cancelled.emit()
-
-    def _on_preview_cleared(self):
-        """User clicked ✕ — clear preview and notify parent window."""
-        self.clear_image_preview()
-        parent = self.parent()
-        while parent is not None:
-            if hasattr(parent, '_pending_image'):
-                parent._pending_image = None
-                text = self.input.toPlainText()
-                text = re.sub(r'\[image: [^\]]+\]\n?', '', text).strip()
-                self.input.setPlainText(text)
-                break
-            parent = parent.parent()
 
             

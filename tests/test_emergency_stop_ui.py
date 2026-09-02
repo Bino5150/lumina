@@ -392,7 +392,9 @@ def test_command_compact_blocked_while_latched():
 def test_on_user_message_blocked_while_latched_preserves_pending_image():
     emergency_stop.latch(source="test", reason="on-user-message-blocked")
     fake = _window_fake()
-    fake._pending_image = ("path.png", "b64data", "image/png")
+    fake._pending_images = [
+        {"id": 1, "path": "path.png", "filename": "path.png", "b64": "b64data", "media_type": "image/png"},
+    ]
     fake._pending_audio = None
     # CODING-08R.1C: the real blocked-turn path restores text via
     # QTimer.singleShot(0, lambda: self.chat_widget.input.setPlainText(...))
@@ -404,7 +406,9 @@ def test_on_user_message_blocked_while_latched_preserves_pending_image():
     LuminaWindow._on_user_message(fake, "hello while stopped")
 
     assert "blocked" in fake.chat_widget.notices[-1].lower()
-    assert fake._pending_image == ("path.png", "b64data", "image/png")  # untouched
+    assert fake._pending_images == [
+        {"id": 1, "path": "path.png", "filename": "path.png", "b64": "b64data", "media_type": "image/png"},
+    ]  # untouched
     emergency_stop.rearm_local()
 
 

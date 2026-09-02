@@ -516,7 +516,16 @@ class LuminaWindow(QMainWindow):
         self.worker = None
         self.signals = StreamSignals()
         self._live_bubble = None
-        self._pending_image = None   # (path, b64_data, media_type) when image is queued
+        # VISION-MULTI-IMAGE-01: ordered list of pending image attachments,
+        # each {"id", "path", "filename", "b64", "media_type"} — attachment
+        # order is preserved end to end by appending here and iterating in
+        # order when the turn is built (see _on_user_message()). "id" is a
+        # monotonic counter (_next_image_id below), not filename or list
+        # index, so an individual thumbnail can be removed (duplicate
+        # filenames from different directories stay distinguishable, and
+        # removing one doesn't renumber the rest).
+        self._pending_images = []
+        self._next_image_id = 1
         self._pending_audio = None
         self._current_chat_id = None
         # CONTEXT-LIFECYCLE-A5I: chat-scoped generation counter, exactly
@@ -730,6 +739,8 @@ class LuminaWindow(QMainWindow):
         self.chat_widget.message_submitted.connect(self._on_user_message)
         self.chat_widget.files_dropped.connect(self._on_files_dropped)
         self.chat_widget.audio_preview_cancelled.connect(lambda: setattr(self, '_pending_audio', None))
+        self.chat_widget.image_preview_removed.connect(self._on_image_preview_removed)
+        self.chat_widget.attach_files_requested.connect(self._on_attach_files_requested)
         self.chat_widget.set_persona(
             config.AGENT_NAME,
             self._prefs.get("avatar_path")
@@ -1916,14 +1927,24 @@ class LuminaWindow(QMainWindow):
         display_text = text
         clean_text = re.sub(r'\[(image|audio): [^\]]+\]\n?', '', text).strip()
 
-        if self._pending_image:
-            path, b64, media_type = self._pending_image
-            fname = os.path.basename(path)
-            content = [{"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}}]
-            content.append({"type": "text", "text": clean_text if clean_text else "What do you see in this image?"})
-            self._pending_image = None
-            self.chat_widget.clear_image_preview()
-            display_text = f"[🖼 {fname}]" + (f"  {clean_text}" if clean_text else "")
+        if self._pending_images:
+            # Image blocks first, in attachment order, then exactly one
+            # trailing text block — same shape core/context.py's add_user()
+            # and every backend translation path (LMStudioBackend/
+            # OpenRouterBackend passthrough, GeminiBackend._parts_from_
+            # content()) already handle generically per-block, so N images
+            # here needed no changes below the UI layer.
+            content = [
+                {"type": "image_url", "image_url": {"url": f"data:{img['media_type']};base64,{img['b64']}"}}
+                for img in self._pending_images
+            ]
+            default_caption = ("What do you see in this image?" if len(self._pending_images) == 1
+                                else "What do you see in these images?")
+            content.append({"type": "text", "text": clean_text if clean_text else default_caption})
+            fnames = [img["filename"] for img in self._pending_images]
+            self._pending_images = []
+            self.chat_widget.clear_image_previews()
+            display_text = " ".join(f"[🖼 {fn}]" for fn in fnames) + (f"  {clean_text}" if clean_text else "")
 
         elif self._pending_audio:
             path, b64, media_type = self._pending_audio
@@ -1967,60 +1988,20 @@ class LuminaWindow(QMainWindow):
                       '.yaml', '.yml', '.toml', '.ini', '.sh', '.html',
                       '.css', '.xml', '.log'}
 
+        # Images are admitted as one atomic batch ahead of the per-file loop
+        # below (VISION-MULTI-IMAGE-01) -- see _admit_images(): either every
+        # image in this drop/pick makes it into _pending_images in order, or
+        # none does. Non-image files keep the original per-file loop, which
+        # was already independent per file.
+        image_paths = [p for p in paths if os.path.splitext(p)[1].lower() in image_exts]
+        if image_paths:
+            parts.extend(self._admit_images(image_paths))
+
         for p in paths:
             ext = os.path.splitext(p)[1].lower()
 
             if ext in image_exts:
-                fname = os.path.basename(p)
-                try:
-                    # 2026-08-15 fix: this used to load via bare QPixmap(p) with
-                    # no check that it actually worked. QPixmap(p) returns a
-                    # null (not raised!) pixmap on an unsupported/corrupt file
-                    # -- e.g. .webp support depends on an optional Qt image
-                    # plugin that isn't guaranteed present on every install --
-                    # and .save() on a null pixmap can "succeed" while writing
-                    # a tiny near-empty PNG. Net effect: no error anywhere, but
-                    # Gemini/the model gets fed garbage and the description
-                    # comes back nonsensical -- exactly the "gives me shit with
-                    # pictures" symptom, with nothing in the UI to explain why.
-                    # QImageReader + setAutoTransform also fixes a second, real
-                    # issue: bare QPixmap(p) does not reliably honor a JPEG's
-                    # EXIF orientation tag, so photos taken on a phone can be
-                    # sent sideways/upside-down with no visual indication.
-                    from PySide6.QtGui import QImageReader
-                    reader = QImageReader(p)
-                    reader.setAutoTransform(True)
-                    image = reader.read()
-                    if image.isNull():
-                        raise ValueError(reader.errorString() or "unreadable/unsupported image file")
-
-                    # Resize before encoding — cap longest side at 512px
-                    if image.width() > 512 or image.height() > 512:
-                        image = image.scaled(512, 512, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    pix_orig = QPixmap.fromImage(image)
-
-                    from PySide6.QtCore import QBuffer, QIODevice
-                    buf = QBuffer()
-                    buf.open(QIODevice.WriteOnly)
-                    if not pix_orig.save(buf, "PNG"):
-                        raise ValueError("PNG re-encode failed")
-                    raw = bytes(buf.data())
-                    if len(raw) < 100:
-                        # A well-formed PNG header alone is ~60+ bytes; anything
-                        # this small is not a real image even though save()
-                        # reported success -- same silent-garbage failure mode
-                        # as the isNull() case above, caught defensively.
-                        raise ValueError(f"encoded PNG suspiciously small ({len(raw)} bytes)")
-                    b64 = base64.b64encode(raw).decode('utf-8')
-                    media_type = 'image/png'
-                    self._pending_image = (p, b64, media_type)
-                    pix = pix_orig.scaledToHeight(72, Qt.SmoothTransformation)
-                    self.chat_widget.show_image_preview(pix, fname)
-                    parts.append(f"[image: {fname}]")
-                    print(f"[DROP] image encoded: {fname} ({len(b64)} b64 chars)", flush=True)
-                except Exception as e:
-                    parts.append(f"[image:{fname}] (failed to load: {e})")
-                    print(f"[DROP] image load FAILED: {fname}: {e}", flush=True)
+                continue  # handled atomically above
 
             elif ext in audio_exts:
                 try:
@@ -2061,6 +2042,119 @@ class LuminaWindow(QMainWindow):
 
         self.chat_widget.input.setPlainText("\n\n".join(parts).strip())
 
+    def _admit_images(self, paths: list) -> list:
+        """Validate every image in one attach/drop batch, then admit them to
+        _pending_images atomically (VISION-MULTI-IMAGE-01): if any file in
+        the batch fails validation, none of the batch is added -- never a
+        silent partial subset. Pending images already accepted from an
+        earlier, separate drop/pick are untouched either way (repeated
+        selection appends, it never replaces).
+
+        Returns the text placeholder lines to fold into the input box,
+        whichever way the batch resolved -- same shape/wording the old
+        single-image path already used, so a one-image drop is byte-
+        identical to before.
+        """
+        accepted = []  # [{"path","filename","b64","media_type","pixmap"}], in order
+        failures = []  # [(filename, error)], in order
+
+        for p in paths:
+            fname = os.path.basename(p)
+            try:
+                # 2026-08-15 fix: this used to load via bare QPixmap(p) with
+                # no check that it actually worked. QPixmap(p) returns a
+                # null (not raised!) pixmap on an unsupported/corrupt file
+                # -- e.g. .webp support depends on an optional Qt image
+                # plugin that isn't guaranteed present on every install --
+                # and .save() on a null pixmap can "succeed" while writing
+                # a tiny near-empty PNG. Net effect: no error anywhere, but
+                # Gemini/the model gets fed garbage and the description
+                # comes back nonsensical -- exactly the "gives me shit with
+                # pictures" symptom, with nothing in the UI to explain why.
+                # QImageReader + setAutoTransform also fixes a second, real
+                # issue: bare QPixmap(p) does not reliably honor a JPEG's
+                # EXIF orientation tag, so photos taken on a phone can be
+                # sent sideways/upside-down with no visual indication.
+                from PySide6.QtGui import QImageReader
+                reader = QImageReader(p)
+                reader.setAutoTransform(True)
+                image = reader.read()
+                if image.isNull():
+                    raise ValueError(reader.errorString() or "unreadable/unsupported image file")
+
+                # Resize before encoding — cap longest side at 512px
+                if image.width() > 512 or image.height() > 512:
+                    image = image.scaled(512, 512, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pix_orig = QPixmap.fromImage(image)
+
+                from PySide6.QtCore import QBuffer, QIODevice
+                buf = QBuffer()
+                buf.open(QIODevice.WriteOnly)
+                if not pix_orig.save(buf, "PNG"):
+                    raise ValueError("PNG re-encode failed")
+                raw = bytes(buf.data())
+                if len(raw) < 100:
+                    # A well-formed PNG header alone is ~60+ bytes; anything
+                    # this small is not a real image even though save()
+                    # reported success -- same silent-garbage failure mode
+                    # as the isNull() case above, caught defensively.
+                    raise ValueError(f"encoded PNG suspiciously small ({len(raw)} bytes)")
+                b64 = base64.b64encode(raw).decode('utf-8')
+                accepted.append({
+                    "path": p, "filename": fname, "b64": b64,
+                    "media_type": "image/png",
+                    "pixmap": pix_orig.scaledToHeight(72, Qt.SmoothTransformation),
+                })
+                print(f"[DROP] image validated: {fname} ({len(b64)} b64 chars)", flush=True)
+            except Exception as e:
+                failures.append((fname, e))
+                print(f"[DROP] image load FAILED: {fname}: {e}", flush=True)
+
+        if failures:
+            parts = [f"[image:{fname}] (failed to load: {e})" for fname, e in failures]
+            if accepted:
+                parts += [f"[image:{a['filename']}] (not attached — rejected with the rest of this batch)"
+                          for a in accepted]
+            return parts
+
+        parts = []
+        for a in accepted:
+            image_id = self._next_image_id
+            self._next_image_id += 1
+            self._pending_images.append({
+                "id": image_id, "path": a["path"], "filename": a["filename"],
+                "b64": a["b64"], "media_type": a["media_type"],
+            })
+            self.chat_widget.add_image_preview(a["pixmap"], a["filename"], image_id)
+            parts.append(f"[image: {a['filename']}]")
+        return parts
+
+    def _on_image_preview_removed(self, image_id: int):
+        """One thumbnail's ✕ was clicked (ChatWidget.image_preview_removed)
+        -- drop just that pending image and its placeholder text, leaving
+        every other pending image untouched."""
+        removed = None
+        kept = []
+        for img in self._pending_images:
+            if removed is None and img["id"] == image_id:
+                removed = img
+            else:
+                kept.append(img)
+        self._pending_images = kept
+        if removed is not None:
+            text = self.chat_widget.input.toPlainText()
+            text = re.sub(r'\[image: ' + re.escape(removed["filename"]) + r'\]\n?', '', text).strip()
+            self.chat_widget.input.setPlainText(text)
+
+    def _on_attach_files_requested(self):
+        """📎 button: a native multi-select file dialog feeding the same
+        atomic admission path as drag-and-drop (_admit_images), so both
+        entry points share one validation/ordering contract."""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Attach Images", "", "Images (*.png *.jpg *.jpeg *.webp *.gif)"
+        )
+        if paths:
+            self._on_files_dropped(paths)
 
     # ── Streaming signal handlers ──────────────────────────────────────────────
 

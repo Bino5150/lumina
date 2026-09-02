@@ -295,6 +295,82 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
         return None, err
 
 
+def _gate_safe_content(content):
+    """Collapse OpenAI-shaped multipart content into a single gate-safe
+    string: every text block's text is preserved verbatim and in order,
+    and every non-text block (image_url, input_audio, or anything else)
+    is replaced by a short, deterministic placeholder naming its position
+    and declared type -- never the block's actual payload (no base64, no
+    data: URL, no raw bytes). Plain string content is returned completely
+    unchanged, same object. Always returns a value safe to hand to a new
+    dict; never mutates `content` or any block inside it.
+
+    AGENT-GLM-COMPLETION-GATE-01: exists solely so the completion gate's
+    own request never trips core/backends/lmstudio.py's has_vision guard
+    (`any(isinstance(m.get("content"), list) for m in messages)`), which
+    silently drops `tools`/`tool_choice` from ANY request -- a product
+    WORK round or the gate's own two-schema REQUIRED call alike -- the
+    moment a single multipart message exists anywhere in the conversation
+    being sent. Confirmed live and via a network-free local reproduction:
+    once an image is anywhere in a chat's history, has_vision stays True
+    for every later request in that chat, so the gate's REQUIRED
+    continue_tool_work/finish_tool_work schemas never reached the wire at
+    all -- GLM was never non-compliant, it was simply never offered a
+    tool to call. The gate's own instruction is a pure structural yes/no
+    decision that never needed to see the actual image; a deterministic
+    placeholder carries exactly as much information to the gate as the
+    real pixel data would have.
+
+    Placeholder wording deliberately reuses core/operator_commands.py's
+    existing "[image attachment]" convention (with a position suffix for
+    multi-image determinism) rather than inventing new phrasing. A first
+    live trial used wording like "omitted from completion-gate check" --
+    mechanically correct (has_vision did flip to False, tools did reach
+    the wire) but live-observed to backfire: Lumina's own persona reads
+    "omitted"/"check" as a notable redaction worth flagging, and spent the
+    gate's response narrating an honest "I can't actually see these"
+    refusal instead of making the structural continue/finish call -- a
+    new, adjacent failure with the same visible symptom (malformed, no
+    control call). A neutral, already-familiar label reads as ordinary
+    bookkeeping instead of a claim that something is wrong or missing."""
+    if not isinstance(content, list):
+        return content
+    parts = []
+    for i, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text", "")
+            if text:
+                parts.append(text)
+        else:
+            btype = block.get("type") or "attachment"
+            label = {"image_url": "image", "image": "image",
+                      "input_audio": "audio", "audio": "audio"}.get(btype, btype)
+            parts.append(f"[{label} attachment {i + 1}]")
+    return "\n".join(parts)
+
+
+def _sanitize_messages_for_gate(messages: list) -> list:
+    """Request-local copy of `messages` for _run_tool_work_control_gate()'s
+    own provider call ONLY -- never used for a WORK round, never written
+    back to ctx.history, never touches core/backends/lmstudio.py at all.
+    Every message keeps its role, other fields, and position; only a
+    multipart `content` is collapsed via _gate_safe_content() above.
+
+    Builds an entirely NEW list of NEW dicts. This is not optional
+    caution: ContextManager.build_messages() (core/context.py) returns
+    the SAME dict/list objects that live in ContextManager.history for
+    every role except "tool" (only tool-role messages get their own
+    dict()+content copy there, to strip image blocks before replay) --
+    so mutating a returned message or its content list in place here
+    would silently corrupt durable, live context. This function only
+    reads what it's given and returns new objects; the original
+    `messages` list, its dicts, and their content lists are never
+    modified in any way."""
+    return [dict(m, content=_gate_safe_content(m.get("content"))) for m in messages]
+
+
 def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
                                  reasoning_effort, chat_id, think_step: list,
                                  turn_id: Optional[str] = None,
@@ -352,8 +428,13 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
     if _cancel_requested(cancel_event):
         return "cancelled", None
 
+    # AGENT-GLM-COMPLETION-GATE-01 -- request-local only: never assigned
+    # back to `messages`, never writes through to the ContextManager this
+    # request came from. See _sanitize_messages_for_gate()'s docstring for
+    # why this exists and why it must build new objects rather than
+    # mutate what build_messages() returned.
     chat_kwargs = dict(
-        messages=messages,
+        messages=_sanitize_messages_for_gate(messages),
         tools=_CONTROL_GATE_SCHEMAS,
         max_tokens=config.RESPONSE_RESERVE_TOKENS,
         reasoning_effort=reasoning_effort,

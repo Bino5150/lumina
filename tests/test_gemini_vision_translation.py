@@ -109,3 +109,43 @@ def test_unknown_block_type_is_ignored():
     content = [{"type": "audio_url", "audio_url": {"url": "data:audio/mp3;base64,ZZZ"}}]
     parts = GeminiBackend._parts_from_content(content)
     assert parts == [{"text": ""}]
+
+
+# ── VISION-MULTI-IMAGE-01 ────────────────────────────────────────────────────
+# _parts_from_content() already loops over every block in the list -- it was
+# never capped at one image. These lock that in directly, since the UI-layer
+# bug this ticket fixed (a single `_pending_image` slot silently dropping all
+# but the last dropped image) never actually reached this translator: by the
+# time content is multipart here, every image in it must survive translation.
+
+def test_three_images_translate_to_three_inline_data_parts_in_order():
+    content = [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBB"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,CCC"}},
+        {"type": "text", "text": "describe each one"},
+    ]
+    parts = GeminiBackend._parts_from_content(content)
+    assert parts == [
+        {"inline_data": {"mime_type": "image/png", "data": "AAA"}},
+        {"inline_data": {"mime_type": "image/png", "data": "BBB"}},
+        {"inline_data": {"mime_type": "image/png", "data": "CCC"}},
+        {"text": "describe each one"},
+    ]
+
+
+def test_multi_image_order_survives_even_when_shuffled_relative_to_text():
+    """Attachment order is whatever order the blocks arrive in -- the
+    translator must not reorder, dedupe, or otherwise normalize block
+    sequence, text-before-images included."""
+    content = [
+        {"type": "text", "text": "first image is A, second is B"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,IMGA"}},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,IMGB"}},
+    ]
+    parts = GeminiBackend._parts_from_content(content)
+    assert parts == [
+        {"text": "first image is A, second is B"},
+        {"inline_data": {"mime_type": "image/jpeg", "data": "IMGA"}},
+        {"inline_data": {"mime_type": "image/jpeg", "data": "IMGB"}},
+    ]
