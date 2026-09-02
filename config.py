@@ -174,7 +174,7 @@ TOOL_RESULT_MAX_CHARS = _backend_ctx.get("tool_result_max_chars", _ctx_default["
 
 # Not per-backend — tool-call depth and response length are agent-behavior
 # choices, not something that varies by which model is answering.
-TOOL_BUDGET_TOKENS      = _p.get("tool_budget_tokens", 6000)
+TOOL_BUDGET_TOKENS      = _p.get("tool_budget_tokens", 11000)
 RESPONSE_RESERVE_TOKENS = _p.get("response_reserve_tokens", 4096)
 MAX_TOOL_ITERATIONS     = _p.get("max_tool_iterations", 20)
 

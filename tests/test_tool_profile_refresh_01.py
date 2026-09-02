@@ -338,7 +338,7 @@ def test_non_owner_inline_grant_still_strips_owner_only():
 # ── schema footprint hygiene ────────────────────────────────────────────────
 
 def test_profile_cleanup_reduces_schema_footprint():
-    """The 6k TOOL_BUDGET_TOKENS warning is advisory (print + UI readout), and
+    """The 11k TOOL_BUDGET_TOKENS warning is advisory (print + UI readout), and
     the owner's All Tools footprint is inherent to All Tools (live-computed
     since FE-11 — all_tools.json's stale snapshot is never enforced). Profile
     hygiene still pays: selecting the refreshed Coding profile must estimate
