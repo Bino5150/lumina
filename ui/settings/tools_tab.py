@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _btn, _spin, _table, _combo, ButtonFeedback
+from ._widgets import _sec, _lbl, _btn, _spin, _table, _combo, _scroll_wrap, ButtonFeedback
 
 
 # ── Tab: Tools ─────────────────────────────────────────────────────────────────
@@ -33,6 +33,26 @@ class ToolsTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(10)
+
+        # ── Upper configuration/review sections (TOOLS-SETTINGS-LAYOUT-01) ──
+        # Profile bar, Subagents & Background Tasks, Pending Tools, and
+        # Pending Actions all have their own fixed-height inner widgets
+        # (setFixedHeight(110) on the pending list/preview pairs below), so
+        # collectively they used to impose a hard ~800px+ floor on this
+        # tab's whole layout with nothing to shrink -- at the app's declared
+        # minimum window size the tool table (the only flexible widget, via
+        # its stretch=1 below) absorbed the entire deficit and was squeezed
+        # to a ~1-row sliver. Wrapping just this upper block in the same
+        # _scroll_wrap() pattern already used by GeneralTab/TTSTab/
+        # CommunicationsTab/UserProfileTab lets it shrink to a small
+        # QScrollArea minimum (with its own scrollbar) instead of forcing
+        # the whole tab taller than the window -- the tool table below stays
+        # outside this scroll area so it keeps first claim on any height the
+        # window actually has.
+        upper = QWidget()
+        upper_layout = QVBoxLayout(upper)
+        upper_layout.setContentsMargins(0, 0, 0, 0)
+        upper_layout.setSpacing(10)
 
         # ── Profile bar ──
         profile_frame = QFrame()
@@ -69,7 +89,7 @@ class ToolsTab(QWidget):
         self.del_profile_btn.clicked.connect(self._delete_profile)
         profile_layout.addWidget(self.del_profile_btn)
 
-        layout.addWidget(profile_frame)
+        upper_layout.addWidget(profile_frame)
 
         # ── Subagents & Background Tasks (S51 Part B) ────────────────────
         # A human-owner config surface, not a model-controllable one — the
@@ -81,8 +101,8 @@ class ToolsTab(QWidget):
         # everything else in this tab manages tool availability — checked
         # immediately on toggle, same as the per-tool checkboxes in the table
         # below, not batched behind a separate Save button.
-        layout.addWidget(_sec("SUBAGENTS & BACKGROUND TASKS", self.c))
-        layout.addWidget(_lbl(
+        upper_layout.addWidget(_sec("SUBAGENTS & BACKGROUND TASKS", self.c))
+        upper_layout.addWidget(_lbl(
             "Gates the model-facing spawn_subagent tool and the background/"
             "scheduled task queue. Both default off. Independent of each "
             "other — background tasks call spawn_subagent() as a plain "
@@ -107,7 +127,7 @@ class ToolsTab(QWidget):
         self.subagent_depth_spin.editingFinished.connect(self._on_subagent_depth_changed)
         depth_col.addWidget(self.subagent_depth_spin)
         subagent_row.addLayout(depth_col)
-        layout.addLayout(subagent_row)
+        upper_layout.addLayout(subagent_row)
 
         # ── Pending tools review (S41) ──────────────────────────────────
         # The only thing this replaces is scripts/approve_tool.py's ROLE of
@@ -119,7 +139,7 @@ class ToolsTab(QWidget):
         # Settings UI — nothing an agent says over chat, Telegram, or Discord
         # can reach it. create_tool() still only stages; this is still the
         # only place untrusted code actually executes.
-        layout.addWidget(_sec("PENDING TOOLS — AWAITING REVIEW", self.c))
+        upper_layout.addWidget(_sec("PENDING TOOLS — AWAITING REVIEW", self.c))
         pending_row = QHBoxLayout()
         pending_row.setSpacing(10)
 
@@ -153,7 +173,7 @@ class ToolsTab(QWidget):
         """)
         pending_preview_col.addWidget(self.pending_preview)
         pending_row.addLayout(pending_preview_col, 2)
-        layout.addLayout(pending_row)
+        upper_layout.addLayout(pending_row)
 
         pending_btn_row = QHBoxLayout()
         pending_btn_row.addStretch()
@@ -171,10 +191,10 @@ class ToolsTab(QWidget):
         self.pending_approve_btn.setEnabled(False)
         self.pending_approve_btn.clicked.connect(self._approve_pending)
         pending_btn_row.addWidget(self.pending_approve_btn)
-        layout.addLayout(pending_btn_row)
+        upper_layout.addLayout(pending_btn_row)
 
         self.pending_status_lbl = _lbl("", self.c)
-        layout.addWidget(self.pending_status_lbl)
+        upper_layout.addWidget(self.pending_status_lbl)
 
         # ── Pending actions review (MB-33 Tier 2) ───────────────────────
         # edit_prompt/reset_chat/delete_knowledge/delete_memory now only
@@ -185,7 +205,7 @@ class ToolsTab(QWidget):
         # proven pattern as the Pending Tools panel above). Approve stays
         # disabled until a row is selected, which populates the read-only
         # preview showing exactly what's staged.
-        layout.addWidget(_sec("PENDING ACTIONS — AWAITING REVIEW", self.c))
+        upper_layout.addWidget(_sec("PENDING ACTIONS — AWAITING REVIEW", self.c))
         pending_actions_row = QHBoxLayout()
         pending_actions_row.setSpacing(10)
 
@@ -219,7 +239,7 @@ class ToolsTab(QWidget):
         """)
         pending_actions_preview_col.addWidget(self.pending_actions_preview)
         pending_actions_row.addLayout(pending_actions_preview_col, 2)
-        layout.addLayout(pending_actions_row)
+        upper_layout.addLayout(pending_actions_row)
 
         pending_actions_btn_row = QHBoxLayout()
         pending_actions_btn_row.addStretch()
@@ -237,10 +257,24 @@ class ToolsTab(QWidget):
         self.pending_actions_approve_btn.setEnabled(False)
         self.pending_actions_approve_btn.clicked.connect(self._approve_pending_action)
         pending_actions_btn_row.addWidget(self.pending_actions_approve_btn)
-        layout.addLayout(pending_actions_btn_row)
+        upper_layout.addLayout(pending_actions_btn_row)
 
         self.pending_actions_status_lbl = _lbl("", self.c)
-        layout.addWidget(self.pending_actions_status_lbl)
+        upper_layout.addWidget(self.pending_actions_status_lbl)
+
+        upper_scroll = _scroll_wrap(upper, self.c)
+        # Bounded on both ends, not sized to natural content (~800px+ across
+        # 4 sections): a real-Qt measurement (TOOLS-SETTINGS-LAYOUT-01)
+        # showed a stretch=0 widget still loses the shrink negotiation to
+        # a stretch=1 sibling by default -- without a ceiling here, this
+        # region kept claiming any extra window height for itself (growing
+        # toward its full content size) before the table below ever grew
+        # past its own floor. The cap makes growth go to the table instead;
+        # the floor keeps the profile bar and part of Subagents/Background
+        # Tasks visible before this region's own scrollbar takes over.
+        upper_scroll.setMinimumHeight(120)
+        upper_scroll.setMaximumHeight(280)
+        layout.addWidget(upper_scroll)
 
         # ── Tool table header ──
         top = QHBoxLayout()
@@ -268,6 +302,12 @@ class ToolsTab(QWidget):
         self.table.setColumnWidth(1, 460)
         self.table.setColumnWidth(2, 70)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        # Design invariant: several rows plus its header stay visible even
+        # at the app's declared minimum window size (960x660) -- this is
+        # the primary expandable surface of the tab (stretch=1 below), so
+        # it must win the fight for space against upper_scroll above, not
+        # get squeezed toward its own much smaller default minimumSizeHint.
+        self.table.setMinimumHeight(180)
         layout.addWidget(self.table, 1)
 
         note = QLabel("Select a profile to load its tool set. Save to write changes back to the profile file.")
