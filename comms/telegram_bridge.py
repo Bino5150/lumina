@@ -15,6 +15,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 import config
+from comms import telegram_origin_routing as origin_routing
 from core.headless import run_headless_turn
 from core.secrets import get_secret
 from core.persistence import load as load_prefs
@@ -40,11 +41,20 @@ def _owner_chat_id():
     return config.TELEGRAM_OWNER_CHAT_ID
 
 
+def _same_numeric_chat_id(actual, configured) -> bool:
+    if isinstance(actual, bool) or isinstance(configured, bool):
+        return False
+    try:
+        return int(str(actual).strip()) == int(str(configured).strip())
+    except (TypeError, ValueError):
+        return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     owner_id = _owner_chat_id()
 
-    if not owner_id or str(chat_id) != str(owner_id):
+    if not owner_id or not _same_numeric_chat_id(chat_id, owner_id):
         log.warning(f"[TELEGRAM] Rejected message from unauthorized chat_id={chat_id}")
         return  # silent drop — no reply, no acknowledgment
 
@@ -63,15 +73,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    reply_to = getattr(update.message, "reply_to_message", None)
+    reply_to_message_id = getattr(reply_to, "message_id", None)
+    resolution = origin_routing.resolve(
+        destination_chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+    )
+    fallback_note = None
+    if resolution.reason == "ambiguous":
+        fallback_note = "[No unique Telegram origin; telegram-owner fallback.]"
+    elif resolution.reason == "expired":
+        fallback_note = "[Telegram origin route expired; telegram-owner fallback.]"
+    if resolution.route is not None:
+        routed = origin_routing.dispatch(resolution.route, text)
+        if routed is not None:
+            try:
+                reply = await asyncio.wrap_future(routed)
+            except asyncio.CancelledError:
+                # A local emergency stop may win after the initial blast-door
+                # check but before Qt admits the queued turn. Ingress remains
+                # silent and closed in that race too.
+                return
+            except Exception:
+                if emergency_stop.is_latched():
+                    return
+                fallback_note = "[Origin unavailable; telegram-owner fallback.]"
+            else:
+                if emergency_stop.is_latched():
+                    return
+                await update.message.reply_text(reply)
+                return
+        else:
+            if emergency_stop.is_latched():
+                return
+            fallback_note = "[Origin unavailable; telegram-owner fallback.]"
+
     # Offloaded to a thread — run_headless_turn() is a blocking synchronous
     # call (agent.chat() -> requests.post() to llama-server). Without this,
     # a slow generation freezes the entire polling event loop for its full
     # duration, which can cause Telegram to redeliver the update once the
     # loop finally thaws (observed live: a single message producing two
     # separate agent turns). Same fix already applied to Discord in S36b.
+    if emergency_stop.is_latched():
+        return
     result = await asyncio.to_thread(run_headless_turn, task=text, channel_id=CHANNEL_ID, owner=True)
     reply = result["response"] if result["success"] else f"[Lumina error: {result['error']}]"
-    await update.message.reply_text(reply)
+    if fallback_note:
+        reply = f"{fallback_note}\n{reply}"
+    if not emergency_stop.is_latched():
+        await update.message.reply_text(reply)
 
 
 async def _run_until_stopped(stop_event: threading.Event, token: str):

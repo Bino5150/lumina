@@ -17,12 +17,14 @@ from PySide6.QtGui import QFont, QPixmap, QPainter, QBrush, QColor, QPainterPath
 import os
 import sys
 import base64
+from collections import deque
 import re 
 import threading 
 import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+from comms import telegram_origin_routing as origin_routing
 from core.agent import TurnCancelled, is_error_response
 from core import emergency_stop
 from core.context_reconstruction import reconstruct_chat_context, resolve_context_skip
@@ -172,6 +174,7 @@ class StreamSignals(QObject):
     # explicitly forbidding it from becoming canonical assistant history.
     cancelled      = Signal(str, bool)
     manual_compaction_finished = Signal(object)
+    telegram_origin_dispatch = Signal(object)
     
 class STTSignals(QObject):
     transcribed = Signal(str)
@@ -311,7 +314,11 @@ class AgentWorker(QThread):
                 llm = getattr(self.agent, "llm", None)
                 if llm is not None:
                     kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
-            result = self.agent.chat(self.user_input, **kwargs)
+            runtime_token = getattr(
+                self.agent, "_telegram_origin_runtime_token", None,
+            )
+            with origin_routing.origin_scope(runtime_token, self.chat_id):
+                result = self.agent.chat(self.user_input, **kwargs)
             self._flush_think()
             self._flush_resp()
             self.signals.finished.emit(result)
@@ -515,6 +522,9 @@ class LuminaWindow(QMainWindow):
         self._stt_signals.error.connect(self._on_stt_error)
         self.worker = None
         self.signals = StreamSignals()
+        self._telegram_origin_queue = deque()
+        self._telegram_active_dispatch = None
+        self._telegram_route_closed = False
         self._live_bubble = None
         # VISION-MULTI-IMAGE-01: ordered list of pending image attachments,
         # each {"id", "path", "filename", "b64", "media_type"} — attachment
@@ -568,6 +578,10 @@ class LuminaWindow(QMainWindow):
         self._setup_window()
         self._build_ui()
         self._connect_signals()
+        self._telegram_route_token = origin_routing.register_runtime(
+            self._relay_telegram_origin,
+        )
+        self.agent._telegram_origin_runtime_token = self._telegram_route_token
         self._restore_session()
         QTimer.singleShot(600, self._check_connection)
         self._telemetry_timer = QTimer(self)
@@ -598,6 +612,20 @@ class LuminaWindow(QMainWindow):
         # CONTEXT-LIFECYCLE-A5I: mirrors the same discard-in-flight-work
         # pattern for any in-flight deliberate_reconstruct() preparation.
         self._context_generation.bump()
+        self._telegram_route_closed = True
+        origin_routing.unregister_runtime(self._telegram_route_token)
+        if getattr(self.agent, "_telegram_origin_runtime_token", None) == self._telegram_route_token:
+            self.agent._telegram_origin_runtime_token = None
+        pending = list(self._telegram_origin_queue)
+        self._telegram_origin_queue.clear()
+        if self._telegram_active_dispatch is not None:
+            pending.append(self._telegram_active_dispatch)
+            self._telegram_active_dispatch = None
+        for request in pending:
+            if not request.future.done():
+                request.future.set_exception(
+                    origin_routing.OriginUnavailable("origin window closed"),
+                )
         super().closeEvent(event)
 
     def _restore_session(self):
@@ -936,6 +964,7 @@ class LuminaWindow(QMainWindow):
         self.signals.error.connect(self._on_error)
         self.signals.cancelled.connect(self._on_cancelled)
         self.signals.manual_compaction_finished.connect(self._on_manual_compaction_finished)
+        self.signals.telegram_origin_dispatch.connect(self._on_telegram_origin_dispatch)
         self.chat_widget.mic_pressed.connect(self._on_mic_pressed)
         self.status_bar.emergency_btn.clicked.connect(self._on_emergency_button_clicked)
 
@@ -1687,6 +1716,9 @@ class LuminaWindow(QMainWindow):
         self._manual_compaction_thread = None
         self._manual_compaction_cancel = None
         self._manual_compaction_started_at = None
+        drain_telegram = getattr(self, "_drain_telegram_origin_queue", None)
+        if drain_telegram is not None:
+            QTimer.singleShot(0, drain_telegram)
 
         status = result.get("status")
         if status == "cancelled":
@@ -1880,6 +1912,95 @@ class LuminaWindow(QMainWindow):
         threading.Thread(target=_run, daemon=True).start()
 
     # ── Message handling ───────────────────────────────────────────────────────
+
+    def _relay_telegram_origin(self, request) -> bool:
+        """Thread-safe bridge edge: emit only; Qt owns GUI/agent state."""
+        if self._telegram_route_closed or emergency_stop.is_latched():
+            return False
+        self.signals.telegram_origin_dispatch.emit(request)
+        return True
+
+    def _on_telegram_origin_dispatch(self, request):
+        if emergency_stop.is_latched():
+            request.future.cancel()
+            return
+        self._telegram_origin_queue.append(request)
+        self._drain_telegram_origin_queue()
+
+    def _drain_telegram_origin_queue(self):
+        """Admit one Telegram reply through the existing foreground queue."""
+        if self._telegram_active_dispatch is not None:
+            return
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if self._manual_compaction_thread is not None:
+            return
+        if not self._telegram_origin_queue:
+            return
+
+        request = self._telegram_origin_queue.popleft()
+        if emergency_stop.is_latched():
+            request.future.cancel()
+            QTimer.singleShot(0, self._drain_telegram_origin_queue)
+            return
+
+        conversation_id = request.route.conversation_id
+        try:
+            conversation_exists = conversation_id in {
+                chat["id"] for chat in list_chats()
+            }
+        except Exception:
+            conversation_exists = False
+        if not conversation_exists:
+            if not request.future.done():
+                request.future.set_exception(
+                    origin_routing.OriginUnavailable("origin chat unavailable"),
+                )
+            QTimer.singleShot(0, self._drain_telegram_origin_queue)
+            return
+        if conversation_id != self._current_chat_id:
+            try:
+                self._load_chat(conversation_id)
+            except Exception:
+                pass
+            if self._current_chat_id != conversation_id:
+                if not request.future.done():
+                    request.future.set_exception(
+                        origin_routing.OriginUnavailable("origin chat could not be reopened"),
+                    )
+                QTimer.singleShot(0, self._drain_telegram_origin_queue)
+                return
+
+        self._telegram_active_dispatch = request
+        try:
+            self._on_user_message(request.text)
+        except Exception:
+            self._telegram_active_dispatch = None
+            if not request.future.done():
+                request.future.set_exception(
+                    origin_routing.OriginUnavailable("origin turn admission failed"),
+                )
+            QTimer.singleShot(0, self._drain_telegram_origin_queue)
+            return
+        if self.worker is None:
+            self._telegram_active_dispatch = None
+            if not request.future.done():
+                request.future.set_exception(
+                    origin_routing.OriginUnavailable("origin turn was not admitted"),
+                )
+            QTimer.singleShot(0, self._drain_telegram_origin_queue)
+
+    def _complete_telegram_origin(self, response: str):
+        request = self._telegram_active_dispatch
+        if request is None:
+            # A routed reply may be queued behind an ordinary local turn.
+            # That queue becomes admissible at this same completion edge.
+            QTimer.singleShot(0, self._drain_telegram_origin_queue)
+            return
+        self._telegram_active_dispatch = None
+        if not request.future.done():
+            request.future.set_result(response)
+        QTimer.singleShot(0, self._drain_telegram_origin_queue)
 
     def _on_user_message(self, text: str):
         if not text.strip():
@@ -2241,6 +2362,9 @@ class LuminaWindow(QMainWindow):
         self._operator_current_tool = None
         self.status_lbl.setText("")
         self._refresh_operator_telemetry(refresh_context=True)
+        complete_telegram = getattr(self, "_complete_telegram_origin", None)
+        if complete_telegram is not None:
+            complete_telegram(response)
         if self._current_chat_id and response:
             save_chat_message(self._current_chat_id, "assistant", response)
             self._refresh_chat_list()
@@ -2304,6 +2428,10 @@ class LuminaWindow(QMainWindow):
             detail = "no assistant response was committed"
 
         self._refresh_operator_telemetry(refresh_context=True)
+        complete_telegram = getattr(self, "_complete_telegram_origin", None)
+        if complete_telegram is not None:
+            telegram_reply = partial_response or "[Lumina origin turn cancelled.]"
+            complete_telegram(telegram_reply)
         self.chat_widget.add_operator_message(
             f"/stop completed · foreground turn stopped · {detail} · background tasks untouched"
         )
@@ -2318,6 +2446,9 @@ class LuminaWindow(QMainWindow):
         self._operator_phase = "idle"
         self._operator_current_tool = None
         self.status_lbl.setText("")
+        complete_telegram = getattr(self, "_complete_telegram_origin", None)
+        if complete_telegram is not None:
+            complete_telegram(f"[Lumina error: {error}]")
     
     def _on_mic_pressed(self):
         if self.worker and self.worker.isRunning():

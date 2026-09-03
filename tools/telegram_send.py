@@ -3,6 +3,7 @@ import threading
 
 import requests
 import config
+from comms import telegram_origin_routing as origin_routing
 from core.secrets import get_secret
 from core.idempotency import make_request_id, check, record
 from core.persistence import load as load_prefs
@@ -62,6 +63,33 @@ def _with_bridge_warning(result: str, warning: str | None) -> str:
     return f"{result} [Telegram reply bridge unavailable — {warning}]"
 
 
+def _message_id(resp):
+    """Extract the Bot API delivery identity without making send success
+    depend on an optional or malformed response body."""
+    try:
+        payload = resp.json()
+        message_id = payload["result"]["message_id"]
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            return None
+        return message_id
+    except Exception:
+        return None
+
+
+def _record_origin(resp, chat_id) -> None:
+    message_id = _message_id(resp)
+    if message_id is not None:
+        try:
+            origin_routing.record_outbound(
+                destination_chat_id=chat_id,
+                telegram_message_id=message_id,
+            )
+        except Exception:
+            # Routing is an additive return path. It must never rewrite an
+            # already-successful Bot API delivery into a send failure.
+            pass
+
+
 def send_telegram_file(path: str, caption: str = "") -> str:
     request_id = make_request_id("send_telegram_file", path, caption)
     cached = check(request_id)
@@ -81,6 +109,8 @@ def send_telegram_file(path: str, caption: str = "") -> str:
                 files={"document": f}, timeout=30,
             )
         resp.raise_for_status()
+        if bridge_warning is None:
+            _record_origin(resp, chat_id)
         result = f"[Sent '{path}' to Telegram.]"
         record(request_id, result)
         return _with_bridge_warning(result, bridge_warning)
@@ -108,6 +138,8 @@ def send_telegram_message(text: str) -> str:
             data={"chat_id": chat_id, "text": text[:4096]}, timeout=15,
         )
         resp.raise_for_status()
+        if bridge_warning is None:
+            _record_origin(resp, chat_id)
         result = "[Message sent.]"
         record(request_id, result)
         return _with_bridge_warning(result, bridge_warning)
