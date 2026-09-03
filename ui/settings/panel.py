@@ -5,6 +5,7 @@ from .general_tab import GeneralTab
 from .user_profile_tab import UserProfileTab
 from .memory_tab import MemoryTab
 from .knowledge_tab import KnowledgeTab
+from .skills_tab import SkillsTab
 from .tools_tab import ToolsTab
 from .tts_tab import TTSTab
 from .communications_tab import CommunicationsTab
@@ -67,6 +68,7 @@ class SettingsPanel(QWidget):
         tabs.addTab(CommunicationsTab(self.agent, c), "📡  Communications")
         tabs.addTab(MemoryTab(self.agent, c),       "🧠  Memory")
         tabs.addTab(KnowledgeTab(self.agent, c),    "📚  Knowledge")
+        tabs.addTab(SkillsTab(self.agent, c),       "🧩  Skills")
         tabs.addTab(ToolsTab(self.agent, c),        "🔧  Tools")
         tabs.addTab(ScheduledTasksTab(self.agent, c), "🗓  Scheduled Tasks")
         tabs.addTab(self.tts_tab,                   "🔊  TTS")

@@ -3,6 +3,7 @@ from .general_tab import GeneralTab
 from .user_profile_tab import UserProfileTab
 from .memory_tab import MemoryTab
 from .knowledge_tab import KnowledgeTab
+from .skills_tab import SkillsTab
 from .tools_tab import ToolsTab
 from .tts_tab import TTSTab
 from .communications_tab import CommunicationsTab
