@@ -314,7 +314,21 @@ def test_H_gate_continue_then_real_tool_executes_and_continues():
     assert result == "final streamed response"
 
 
-def test_I_second_ambiguous_gate_response_after_retry_is_visible_non_success():
+def test_I_second_ambiguous_gate_response_after_retry_recovers_the_candidate():
+    """AGENT-COMPLETION-SENTINEL-RECOVERY-01 -- supersedes this test's
+    pre-existing "always visible non-success" assumption, written before
+    candidate-recovery existed for this specific branch. Per test_G right
+    above (AGENT-WORK-COMPLETE-DISCARD-01's own established principle),
+    "hmm" is a genuine, if terse, complete answer -- COMPLETE termination,
+    zero tool_calls, in tool work phase -- and becomes a completion
+    candidate exactly as test_G's does. test_G shows that candidate
+    promoted on a clean gate "finish"; this is the SAME candidate, same
+    evidence, but the gate itself never manages to answer continue/finish
+    at all. Live-reproduced 2026-09-03: the pre-fix code discarded an
+    identically-shaped real answer and returned the opaque sentinel here
+    instead -- this is the regression coverage for that fix. See
+    test_I2_... below for the genuinely-empty-candidate case, which still
+    returns the unchanged, truthful sentinel."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
         {"content": "hmm", "termination": TerminationStatus.COMPLETE},        # WORK -> gate
@@ -325,8 +339,33 @@ def test_I_second_ambiguous_gate_response_after_retry_is_visible_non_success():
 
     result = LuminaAgent.chat(fake, "find it")
 
-    assert llm.call_count == 4
+    assert llm.call_count == 4  # bounded: unchanged from before this fix
     assert len(calls["ephemeral"]) == 2  # the gate's own instruction, then its one retry nudge
+    assert result == "hmm"
+    assert "still hmm" not in result  # the gate's OWN malformed prose never leaks
+    assert not result.startswith("[Lumina:")
+    assert "final streamed response" not in result  # no regeneration -- direct promotion
+
+
+def test_I2_second_ambiguous_gate_response_with_no_candidate_is_visible_non_success():
+    """The genuinely-nothing-to-recover sibling of test_I above, preserving
+    the original "visible non-success" coverage under its accurate name:
+    a blank-content WORK round forms no completion candidate at all, so
+    the same malformed-twice gate sequence still falls back to the
+    unchanged, truthful sentinel -- AGENT-COMPLETION-SENTINEL-RECOVERY-01
+    only recovers an answer that already existed, it never invents one."""
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},                 # WORK -> gate, no candidate
+        {"content": "still hmm", "termination": TerminationStatus.COMPLETE},        # GATE -> malformed, 1 retry spent
+        {"content": "still hmm again", "termination": TerminationStatus.COMPLETE},  # GATE retry -> malformed, budget gone
+    ])
+    fake, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake, "find it")
+
+    assert llm.call_count == 4
+    assert len(calls["ephemeral"]) == 2
     assert "confirming completion" in result
     assert result.startswith("[Lumina:")
     # Streamed live, same convention as the provider-continuation-failure
@@ -454,9 +493,17 @@ def test_Q_skill_nudge_not_triggered_by_finish_tool_work_alone(monkeypatch):
 # ── T/U. Distinguishable from provider-exception failures ──────────────
 
 def test_TU_anomaly_notice_is_textually_distinct_from_provider_exception_notice():
+    """AGENT-COMPLETION-SENTINEL-RECOVERY-01 -- this scenario's "hmm" WORK
+    round forms a real completion candidate (see test_I2 above's own
+    no-candidate variant for the case this test used to conflate it
+    with), so the gate's malformed-twice sequence now recovers "hmm"
+    rather than emitting any notice at all -- there is nothing left to
+    distinguish from a provider-exception notice on this exact scripted
+    turn. The textual-distinctness property itself is still real and
+    still covered, on the genuinely-empty-candidate scenario."""
     llm = _ScriptedLLM([
         {"tool_calls": [_tc("search_memory")]},
-        {"content": "hmm", "termination": TerminationStatus.COMPLETE},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
         {"content": "still hmm", "termination": TerminationStatus.COMPLETE},
         {"content": "still hmm again", "termination": TerminationStatus.COMPLETE},
     ])

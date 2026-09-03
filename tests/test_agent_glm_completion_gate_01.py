@@ -420,7 +420,23 @@ def test_continue_tool_work_does_not_prematurely_deliver_the_candidate_with_visi
     assert calls["response_tokens"] == [result]  # "partial thought" never delivered early
 
 
-def test_malformed_gate_with_vision_history_never_auto_promotes():
+def test_malformed_gate_with_vision_history_promotes_the_real_candidate_it_never_saw():
+    """AGENT-COMPLETION-SENTINEL-RECOVERY-01 -- supersedes this test's
+    pre-existing assumption (from before candidate-recovery existed for
+    this branch) that a malformed gate response under vision history must
+    always fall back to the opaque sentinel. The WORK round that produced
+    the "red circle"/"blue square" description saw the REAL image bytes
+    (unsanitized -- VISION-TOOL-INTEROP-01 policy, unchanged) and returned
+    a complete, non-truncated answer with zero tool calls: an independent,
+    trustworthy completion_candidate. The gate's OWN confusion here is
+    caused by _sanitize_messages_for_gate()'s placeholder text (AGENT-GLM-
+    COMPLETION-GATE-02's documented failure mode -- the model doubts it
+    can "see" images it already described), not by anything wrong with
+    the candidate, so promoting that already-correct candidate is now the
+    right outcome instead of discarding it. What must still never happen:
+    the gate's OWN malformed prose ("still deciding") leaking into the
+    result -- see the paired no-candidate variant below for the genuinely-
+    nothing-to-recover case, which this repair leaves untouched."""
     llm = _ScriptedLLM([
         {"content": "**Image 1:** a red circle...\n**Image 2:** a blue square...",
          "termination": TerminationStatus.COMPLETE},
@@ -431,9 +447,31 @@ def test_malformed_gate_with_vision_history_never_auto_promotes():
 
     result = LuminaAgent.chat(fake, _VISION_CONTENT)
 
+    assert result == "**Image 1:** a red circle...\n**Image 2:** a blue square..."
+    assert "still deciding" not in result
+    assert not result.startswith("[Lumina:")
+
+
+def test_malformed_gate_with_vision_history_and_no_candidate_still_returns_sentinel():
+    """The genuinely-nothing-to-recover case, unaffected by AGENT-
+    COMPLETION-SENTINEL-RECOVERY-01: a blank-content WORK round forms no
+    candidate at all (see _chat_impl()'s candidate-creation site -- empty
+    content never becomes a completion_candidate), so a malformed gate
+    under vision history still falls back to the truthful, unchanged
+    sentinel. This repair only recovers an answer that already existed;
+    it never invents one."""
+    llm = _ScriptedLLM([
+        {"tool_calls": [_tc("search_memory")]},
+        {"content": "", "termination": TerminationStatus.COMPLETE},
+        {"content": "still deciding", "termination": TerminationStatus.COMPLETE},
+        {"content": "still deciding again", "termination": TerminationStatus.COMPLETE},
+    ])
+    fake, calls = _fake_agent_with_real_context(llm)
+
+    result = LuminaAgent.chat(fake, _VISION_CONTENT)
+
     assert result.startswith("[Lumina:")
-    assert "red circle" not in result
-    assert "blue square" not in result
+    assert "still deciding" not in result
 
 
 def test_text_only_gate_behavior_is_unaffected():

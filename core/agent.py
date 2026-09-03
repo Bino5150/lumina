@@ -595,6 +595,68 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
     return outcome, None
 
 
+def _promote_completion_candidate(agent, completion_candidate: dict, turn_relevant_commentary: list,
+                                   think_step: list, *, cancel_event=None,
+                                   reasoning_effort: Optional[str] = None, chat_id: int = None,
+                                   turn_id: Optional[str] = None, turn_started_at: Optional[float] = None,
+                                   reason: str) -> str:
+    """AGENT-COMPLETION-SENTINEL-RECOVERY-01 -- shared promotion logic for
+    every way a completion_candidate reaches a confirmed-done state: the
+    gate's own "finish_tool_work" outcome (reason="gate_finish"), and the
+    gate contract-violation fallback in _chat_impl() (reason=
+    "gate_contract_violated") for when the gate itself never manages to
+    answer continue/finish, even after its one bounded corrective retry.
+    Only the "finish" outcome used to reach this logic (duplicated inline
+    in _chat_impl()); the contract-violation branch instead discarded an
+    already-complete, well-formed candidate outright and returned the
+    opaque completion sentinel -- live-reproduced 2026-09-03 (Flight
+    Recorder turn_ids 4af4cbf6.../4cae5158..., dev data dir): a genuinely
+    complete answer sat in `completion_candidate` while a REQUIRED
+    two-choice gate call to z-ai/glm-5.3-flash failed to select either
+    control tool, twice, and the turn ended in "[Lumina: tool-work
+    continuation ended without confirming completion.]" with the real
+    answer never shown, even though nothing about the candidate itself
+    was ever in question -- it was the gate's own separate confirmation
+    request that failed, not the WORK round that produced the answer.
+
+    Module-level and duck-typed against `agent`, same convention as
+    _provider_chat_or_error()/_run_tool_work_control_gate() above -- no
+    method binding needed on the types.SimpleNamespace fakes the existing
+    test suite uses; every one of them already binds
+    _finalize_completion_candidate()/_finalize_with_reconciliation() as
+    real methods (required for the pre-existing "finish" path this
+    function now also serves), so no fixture anywhere needed updating for
+    this ticket's fix.
+
+    Reconciliation vs. direct acceptance follows the identical
+    AGENT-FINAL-INTEGRITY-01 rule regardless of `reason`: non-empty
+    `turn_relevant_commentary` means real Commentary already authored the
+    substantive conclusion during this same unfinalized attempt, so it
+    must be reconciled via one explicit provider call rather than blindly
+    promoting a possibly-trivial candidate; an empty list takes the
+    zero-extra-call fast path (_finalize_completion_candidate()). Neither
+    path ever fabricates content or promotes private Think -- both
+    finalize methods only ever deliver text the model already produced."""
+    if _cancel_requested(cancel_event):
+        raise TurnCancelled()
+    if turn_relevant_commentary:
+        _fr_machine(agent, "completion_candidate.reconciled", turn_id=turn_id, chat_id=chat_id,
+                    fields={"source_round": completion_candidate["source_round"],
+                            "commentary_rounds": len(turn_relevant_commentary),
+                            "reason": reason})
+        return agent._finalize_with_reconciliation(
+            completion_candidate, turn_relevant_commentary, think_step,
+            cancel_event=cancel_event, reasoning_effort=reasoning_effort,
+            chat_id=chat_id, turn_id=turn_id, turn_started_at=turn_started_at,
+        )
+    _fr_machine(agent, "completion_candidate.accepted", turn_id=turn_id, chat_id=chat_id,
+                fields={"source_round": completion_candidate["source_round"], "reason": reason})
+    return agent._finalize_completion_candidate(
+        completion_candidate, cancel_event=cancel_event, turn_id=turn_id,
+        turn_started_at=turn_started_at,
+    )
+
+
 # AGENT-PRETOOL-ACTION-INTEGRITY-01 -- granularity for _deliver_held_text()
 # below. Deliberately smaller than AgentWorker.BATCH_CHARS (ui/main_window.py,
 # 12) so a candidate longer than one batch produces more than one flush
@@ -1762,29 +1824,11 @@ class LuminaAgent:
                     # no-tool-call WORK round at all) falls through to the
                     # unchanged pre-existing behavior.
                     if completion_candidate is not None:
-                        if _cancel_requested(cancel_event):
-                            raise TurnCancelled()
-                        if turn_relevant_commentary:
-                            # AGENT-FINAL-INTEGRITY-01 -- this candidate is
-                            # not trustworthy as-is: real Commentary from
-                            # this same unfinalized attempt may already
-                            # carry the substantive conclusion. Reconcile
-                            # via one explicit provider call instead of
-                            # blindly promoting the (possibly trivial)
-                            # candidate -- see that method's docstring.
-                            _fr_machine(self, "completion_candidate.reconciled", turn_id=turn_id, chat_id=chat_id,
-                                        fields={"source_round": completion_candidate["source_round"],
-                                                "commentary_rounds": len(turn_relevant_commentary)})
-                            return self._finalize_with_reconciliation(
-                                completion_candidate, turn_relevant_commentary, think_step,
-                                cancel_event=cancel_event, reasoning_effort=reasoning_effort,
-                                chat_id=chat_id, turn_id=turn_id, turn_started_at=turn_started_at,
-                            )
-                        _fr_machine(self, "completion_candidate.accepted", turn_id=turn_id, chat_id=chat_id,
-                                    fields={"source_round": completion_candidate["source_round"]})
-                        return self._finalize_completion_candidate(
-                            completion_candidate, cancel_event=cancel_event, turn_id=turn_id,
-                            turn_started_at=turn_started_at,
+                        return _promote_completion_candidate(
+                            self, completion_candidate, turn_relevant_commentary, think_step,
+                            cancel_event=cancel_event, reasoning_effort=reasoning_effort,
+                            chat_id=chat_id, turn_id=turn_id, turn_started_at=turn_started_at,
+                            reason="gate_finish",
                         )
                     # The gate's own ephemeral instruction was already
                     # consumed by its build_messages() call -- build fresh,
@@ -1877,6 +1921,49 @@ class LuminaAgent:
                           f"one bounded corrective retry", flush=True)
                     next_action = "gate"
                     continue
+
+                # AGENT-COMPLETION-SENTINEL-RECOVERY-01 -- the gate itself
+                # never managed to answer continue/finish, even after its
+                # one bounded corrective retry. This used to fall straight
+                # through to the opaque sentinel below with no regard for
+                # `completion_candidate` -- live-reproduced 2026-09-03
+                # (Flight Recorder turn_ids 4af4cbf6.../4cae5158..., dev
+                # data dir): a genuinely complete, already-generated
+                # answer sat in `completion_candidate` (created moments
+                # earlier by a clean, non-truncated zero-tool-call WORK
+                # round -- termination COMPLETE, not INCOMPLETE) while the
+                # gate's own separate two-choice REQUIRED call to
+                # z-ai/glm-5.3-flash failed to select either control tool,
+                # twice in a row. The gate's job is only to answer "is more
+                # tool work needed" -- its own failure to answer that
+                # cleanly is not evidence that the already-independently-
+                # produced candidate is incomplete, and must not erase it.
+                # Reuses the identical promotion path "finish" uses
+                # (_promote_completion_candidate() -- AGENT-FINAL-
+                # INTEGRITY-01 reconciliation still applies if real
+                # Commentary exists this same attempt), so this recovery
+                # carries the same safety guarantees as an ordinary
+                # gate-confirmed finish: it never invents content, never
+                # promotes private Think, and never touches a candidate
+                # that doesn't already exist -- if there is no candidate,
+                # this falls straight through to the unchanged sentinel
+                # below exactly as before.
+                _fr_machine(self, "turn.completion_gate_unresolved", turn_id=turn_id, chat_id=chat_id,
+                            severity="warning",
+                            fields={"outcome": outcome,
+                                    "candidate_recovered": completion_candidate is not None,
+                                    "source_round": (completion_candidate["source_round"]
+                                                      if completion_candidate is not None else None)})
+                if completion_candidate is not None:
+                    print(f"[AGENT] tool-work completion gate contract violated after "
+                          f"corrective retry (outcome={outcome}) — preserving the existing "
+                          f"completion candidate instead of discarding it", flush=True)
+                    return _promote_completion_candidate(
+                        self, completion_candidate, turn_relevant_commentary, think_step,
+                        cancel_event=cancel_event, reasoning_effort=reasoning_effort,
+                        chat_id=chat_id, turn_id=turn_id, turn_started_at=turn_started_at,
+                        reason="gate_contract_violated",
+                    )
                 notice = "[Lumina: tool-work continuation ended without confirming completion.]"
                 print(f"[AGENT] tool-work completion gate contract violated after "
                       f"corrective retry (outcome={outcome})", flush=True)
