@@ -326,11 +326,27 @@ def test_h_no_third_legal_terminal_role_exists():
     can reach a gate/candidate decision (or the turn is cancelled first
     and never reaches reconciliation). This test is a source-level
     assertion, not a runtime one: it greps the traced code paths for the
-    absence of a write this file's docstring claims doesn't exist."""
+    absence of a write this file's docstring claims doesn't exist.
+
+    AGENT-GLM-COMPLETION-GATE-02 update: _run_tool_work_control_gate() now
+    contains one legitimate READ of agent.ctx.history (`any(isinstance(
+    m.get("content"), list) for m in agent.ctx.history)`, deciding whether
+    to add a placeholder-clarifying sentence to the gate's own
+    instruction) -- so a blanket "the substring 'agent.ctx.history' never
+    appears" check is no longer the right proxy for the actual invariant.
+    The property this test protects is "never WRITES to/mutates
+    ctx.history", not "never references ctx.history at all" -- narrowed
+    to check for absence of any mutating call/assignment on it instead."""
     import core.agent as agent_module
     gate_source = inspect.getsource(agent_module._run_tool_work_control_gate)
     assert "agent.ctx.add_" not in gate_source
-    assert "agent.ctx.history" not in gate_source
+    for mutator in (".history.append", ".history.extend", ".history.insert",
+                    ".history.remove", ".history.pop", ".history.clear",
+                    ".history +=", ".history ="):
+        assert mutator not in gate_source, f"found mutating call/assignment: {mutator!r}"
+    # The one legitimate read this ticket added -- confirms the narrowed
+    # check above isn't just vacuously passing because the reference is gone.
+    assert "for m in agent.ctx.history" in gate_source
 
 
 # ── I. F03 hostile-content matrix survives the F04 API narrowing ────────

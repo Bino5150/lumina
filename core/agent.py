@@ -415,14 +415,54 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
     AGENT-FINAL-INTEGRITY-01 / SEPT-AC-R1-F02: when a valid finish outcome
     carries Commentary, append that text to the caller's SAME turn-scoped
     reconciliation list after emitting it normally. A continue outcome is
-    still progress narration and is deliberately never retained here."""
-    agent.ctx.push_ephemeral(
+    still progress narration and is deliberately never retained here.
+
+    AGENT-GLM-COMPLETION-GATE-02 -- when the conversation contains any
+    attachment (vision/audio) history, the gate's instruction gets one
+    extra clarifying sentence about the sanitized placeholders. Root
+    cause (source-vetted via a real live OpenRouter/GLM shakedown, wire
+    payloads captured, no mocking): _sanitize_messages_for_gate() replaces
+    real image/audio blocks with "[image attachment N]"/"[audio attachment
+    N]" text, but the ORIGINAL user instruction referencing those
+    attachments (e.g. "Describe each attached image separately...")
+    survives sanitization verbatim right alongside the placeholder. A
+    capable model reasonably notices the contradiction -- it's being asked
+    to describe images it can plainly see are not actually present in this
+    request -- and, live-observed against z-ai/glm-5.3-flash, sometimes
+    responds by narrating that apparent problem in prose instead of
+    picking a control tool ("I have to be straight with you here... no
+    actual image content came through on my end"), which is exactly the
+    malformed/no-tool-call failure this ticket investigates. This is not a
+    tool-choice wire-translation bug (REQUIRED did reach the wire
+    correctly in every captured trial) -- it's competing conversational
+    context the gate's own instruction never explained. Telling the model
+    up front that the placeholders are expected bookkeeping for this
+    specific structural check, not missing content worth flagging,
+    resolves the contradiction before the model has to guess at it.
+    Gated on real attachment history (not appended to every gate call)
+    so the already-reliable plain-text gate path is untouched -- checked
+    against agent.ctx.history directly (the same has_vision predicate
+    core/backends/lmstudio.py uses) rather than the post-sanitization
+    messages, since sanitization runs after this instruction is pushed."""
+    has_attachment_history = any(
+        isinstance(m.get("content"), list) for m in agent.ctx.history
+    )
+    instruction = (
         "## Tool-work completion gate\n"
         "Decide whether additional real tool work is required. "
         "Call continue_tool_work if more tool work is needed. "
         "Call finish_tool_work if tool work is complete. "
         "Choose exactly one."
     )
+    if has_attachment_history:
+        instruction += (
+            " Note: any \"[image attachment N]\" / \"[audio attachment N]\" "
+            "labels appearing above are a normal, expected part of this "
+            "structural check only -- not an error and not missing content. "
+            "Do not comment on them or apologize for them here; just choose "
+            "continue_tool_work or finish_tool_work."
+        )
+    agent.ctx.push_ephemeral(instruction)
     gate_budget = sum(len(str(s)) // 4 for s in _CONTROL_GATE_SCHEMAS)
     messages = agent.ctx.build_messages(tool_budget=gate_budget, chat_id=chat_id)
     if _cancel_requested(cancel_event):
