@@ -24,12 +24,13 @@ of multipart content blocks and needed zero changes:
     multi-image cases added to test_gemini_vision_translation.py.
 
 core/backends/anthropic_backend.py's AnthropicBackend._translate_messages()
-is the one real exception, but it is a PRE-EXISTING gap unrelated to this
-ticket -- it never translated a single OpenAI-shaped image_url block to
-Anthropic's own image-block shape either, so multi-image support neither
-introduces nor worsens it. See
-test_anthropic_backend_does_not_translate_image_blocks_pre_existing_gap
-below, which documents (not fixes) that finding.
+was the one real exception at the time this ticket landed -- a PRE-EXISTING
+gap unrelated to it (never translated a single OpenAI-shaped image_url
+block to Anthropic's own image-block shape either, so multi-image support
+neither introduced nor worsened it) -- since fixed under
+ANTHROPIC-VISION-CAPABILITY-01; see
+test_anthropic_backend_now_translates_image_blocks_ANTHROPIC_VISION_CAPABILITY_01
+below and tests/test_anthropic_vision_capability_01.py for full coverage.
 
 The fix itself is confined to ui/main_window.py (`_pending_image` ->
 `_pending_images`, a list, plus a new `_admit_images()` atomic-batch
@@ -446,16 +447,16 @@ def test_openrouter_chat_forwards_all_image_blocks_in_order_unmodified(monkeypat
     assert sum(1 for b in sent if b["type"] == "image_url") == 3
 
 
-def test_anthropic_backend_does_not_translate_image_blocks_pre_existing_gap():
-    """Documented finding, NOT a fix. AnthropicBackend._translate_messages()
-    passes a plain user turn's `content` straight through
-    (`{"role": role, "content": m.get("content", "")}`) with no OpenAI
-    image_url -> Anthropic image-block translation at all. This predates
-    VISION-MULTI-IMAGE-01 and is unrelated to it: it was already true for a
-    single image, so multi-image support neither introduces nor worsens it.
-    Locked in here (rather than silently left undiscovered) so a future
-    change to this method is deliberate; see the VISION-MULTI-IMAGE-01
-    handoff report for why fixing it was ruled out of scope."""
+def test_anthropic_backend_now_translates_image_blocks_ANTHROPIC_VISION_CAPABILITY_01():
+    """Formerly a documented-but-not-fixed gap (see git history on this
+    test name): AnthropicBackend._translate_messages() used to pass a
+    plain user turn's multipart `content` straight through with no OpenAI
+    image_url -> Anthropic image-block translation at all -- predated
+    VISION-MULTI-IMAGE-01, deliberately ruled out of that ticket's scope,
+    and explicitly pointed at ANTHROPIC-VISION-CAPABILITY-01 to fix. Full
+    regression coverage for the fix itself lives in
+    tests/test_anthropic_vision_capability_01.py; this is just the
+    direct proof the specific gap this test used to document is closed."""
     content = [
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
         {"type": "text", "text": "what is this?"},
@@ -465,11 +466,12 @@ def test_anthropic_backend_does_not_translate_image_blocks_pre_existing_gap():
     translated = AnthropicBackend._translate_messages(messages)
 
     # Anthropic's real API expects {"type": "image", "source": {...}}, not
-    # {"type": "image_url", ...} -- this passthrough would reach the wire
-    # unconverted and (per live Anthropic API behavior) be rejected as an
-    # unrecognized content block, i.e. it already fails, just not via any
-    # client-side gate this codebase adds.
-    assert translated == [{"role": "user", "content": content}]
+    # {"type": "image_url", ...} -- now correctly translated instead of
+    # passed through unconverted.
+    assert translated == [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}},
+        {"type": "text", "text": "what is this?"},
+    ]}]
 
 
 # ── 10/11. cancellation/error cleanup, no duplicate delivery on resubmit ─────

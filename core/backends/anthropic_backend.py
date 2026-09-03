@@ -278,6 +278,151 @@ class AnthropicBackend(BaseLLMBackend):
         output_config["effort"] = effort
 
     # ------------------------------------------------------------------
+    # ANTHROPIC-VISION-CAPABILITY-01 -- vision capability + image translation
+    # ------------------------------------------------------------------
+
+    # Anthropic shipped vision with the Claude 3 family (2024-03); every
+    # model released since -- 3, 3.5, 3.7, 4, 4.x, and this codebase's
+    # actual configured/known roster (claude-opus-4-7, claude-sonnet-4-6,
+    # claude-sonnet-5, claude-haiku-4-5-20251001; see KNOWN_MODELS /
+    # _REASONING_MODELS above) -- supports it. Only the pre-Claude-3
+    # legacy family (claude-1, claude-2, claude-2.1, claude-instant-1,
+    # claude-instant-1.2) predates vision entirely -- a small, closed,
+    # historically fixed set. Denylisted here rather than allowlisted so
+    # a brand-new Claude model this codebase has never seen defaults to
+    # the historically accurate answer (vision supported) instead of
+    # being incorrectly rejected on day one merely for being
+    # unrecognized -- the opposite failure mode from silently assuming
+    # support for something genuinely too old to have it.
+    _NON_VISION_MODEL_PREFIXES = (
+        "claude-instant-1",
+        "claude-2",
+        "claude-1",
+    )
+
+    def supports_vision(self, model: Optional[str] = None) -> bool:
+        """See BaseLLMBackend.supports_vision()'s docstring for the
+        general contract. `model=None` returns False (no HTTP, no
+        get_model()/default_model fallback -- same posture as every
+        other capability method in this file)."""
+        if not model:
+            return False
+        return not any(model.startswith(p) for p in self._NON_VISION_MODEL_PREFIXES)
+
+    def _reject_if_vision_unsupported(self, messages) -> None:
+        """Fail closed BEFORE any network dispatch or message translation
+        if `messages` (already system-split, non-"system" turns) carries
+        real multipart content but the configured model doesn't support
+        vision at all. Called by both chat() (via _build_payload()) and
+        chat_stream() -- the two independent payload-construction paths
+        that each eventually call _translate_messages() with the same
+        shape of `messages` -- so the logic lives in exactly one place
+        even though there are two call sites.
+
+        Raises ValueError with a specific, user-facing capability
+        explanation. core/agent.py's _provider_chat_or_error() already
+        surfaces any exception chat()/chat_stream() raises as
+        "[Lumina error: <message>]" without further wrapping, so this
+        text alone reaches the user unmangled -- no separate UI plumbing
+        needed. The original conversation/attachment data is untouched
+        either way: ContextManager.add_user() already committed it to
+        ctx.history before this backend was ever called (see core/
+        agent.py's chat() prologue), and this method never mutates
+        `messages` -- it only inspects and raises."""
+        has_vision = any(isinstance(m.get("content"), list) for m in messages)
+        if has_vision and not self.supports_vision(self.default_model):
+            raise ValueError(
+                f"{self.display_name} model '{self.default_model}' does not "
+                "support image input. Switch to a vision-capable Claude "
+                "model (Claude 3 or later) to send images, or remove the "
+                "attached image(s) from this message."
+            )
+
+    # Anthropic's own documented format allowlist (JPEG/PNG/GIF/WebP) --
+    # https://platform.claude.com/docs/en/build-with-claude/vision,
+    # "Supported formats" -- verified against current provider
+    # documentation for this ticket, not assumed from memory. Animations
+    # are unsupported there too (only the first frame is used), but that
+    # is a provider-side behavior, not something to validate here.
+    _SUPPORTED_IMAGE_MEDIA_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
+
+    @classmethod
+    def _translate_content_blocks(cls, content):
+        """Convert OpenAI-shaped content (as ContextManager/the UI build
+        it -- a plain string, or a list of {"type": "text"|"image_url"}
+        blocks) into Anthropic Messages API content: a plain string
+        passes through completely unchanged (same object, not even
+        copied -- matches _translate_messages()'s existing plain-text
+        behavior exactly), a list becomes a NEW list of NEW block dicts,
+        never mutating `content` or any block inside it (same non-
+        mutation contract AGENT-GLM-COMPLETION-GATE-01's
+        _sanitize_messages_for_gate() established for the completion
+        gate -- ContextManager.build_messages() hands back the SAME
+        objects that live in ctx.history for every non-"tool" role).
+
+        Text blocks translate 1:1 ({"type": "text", "text": ...} is
+        already Anthropic's own shape). image_url blocks translate to
+        Anthropic's {"type": "image", "source": {"type": "base64",
+        "media_type", "data"}} -- preserving order exactly as given
+        (Anthropic works best with images before text, per its own
+        docs, but does not require it; this function is not the layer
+        responsible for reordering caller-supplied content, only for
+        translating each block's shape faithfully in place).
+
+        Deliberately validates and RAISES ValueError on a malformed data
+        URL, an unsupported/unparseable media type, or an empty payload
+        -- unlike GeminiBackend._parts_from_content()'s established
+        silent-skip precedent for the same shape. That precedent is
+        right for Gemini (a best-effort translator with no documented
+        hard format contract enforced here); Shot 3 explicitly requires
+        catching a malformed or unsupported image BEFORE network
+        dispatch for Anthropic, with a specific, honest error, rather
+        than either silently dropping the attachment or letting
+        Anthropic's own API reject it deep in provider processing. An
+        unrecognized non-text/non-image block type (e.g. audio) is still
+        silently skipped -- Anthropic's Messages API has no audio-input
+        content block today, so there is nothing to validate a rejection
+        message against; this is unchanged from before this fix (a
+        multipart audio block was never handled here either way)."""
+        if not isinstance(content, list):
+            return content
+        blocks = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text", "")
+                if text:
+                    blocks.append({"type": "text", "text": text})
+            elif btype == "image_url":
+                image_url = block.get("image_url")
+                url = image_url.get("url", "") if isinstance(image_url, dict) else ""
+                if not url.startswith("data:") or "," not in url:
+                    raise ValueError(
+                        "Anthropic: an attached image is not a valid data URL "
+                        "(expected \"data:<media-type>;base64,<data>\")."
+                    )
+                meta, _, data = url.partition(",")
+                media_type = meta[len("data:"):].split(";")[0]
+                if media_type not in cls._SUPPORTED_IMAGE_MEDIA_TYPES:
+                    raise ValueError(
+                        f"Anthropic does not support the image type "
+                        f"'{media_type or '(missing)'}' -- supported types are "
+                        f"{', '.join(cls._SUPPORTED_IMAGE_MEDIA_TYPES)}."
+                    )
+                if not data:
+                    raise ValueError(
+                        "Anthropic: an attached image's data URL has no "
+                        "base64 payload."
+                    )
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data},
+                })
+        return blocks
+
+    # ------------------------------------------------------------------
     # Request translation: OpenAI-shaped tool registry -> Anthropic shape
     # ------------------------------------------------------------------
 
@@ -333,12 +478,23 @@ class AnthropicBackend(BaseLLMBackend):
           - assistant messages with tool_calls -> assistant message with tool_use blocks
           - plain text messages -> pass through with content as a string (Anthropic
             accepts both string and block-array content; string is fine for plain turns)
+          - plain multipart (vision) messages -> _translate_content_blocks() above,
+            same OpenAI-shaped image_url -> Anthropic image/source translation
+            every other block-array content list on this class goes through
 
         Confirmed against context.py's add_tool_result(): tool messages are shaped
         {"role": "tool", "tool_call_id", "name", "content"}, and assistant tool_calls
         follow the OpenAI {"id", "type": "function", "function": {"name", "arguments"}}
         shape (same as what extract_message() below produces) — so the lookups here
         match the actual contract, not a guess.
+
+        ANTHROPIC-VISION-CAPABILITY-01: does NOT itself gate on model
+        vision capability -- that fail-closed check runs earlier, in
+        _reject_if_vision_unsupported(), before this method is ever
+        reached (see both call sites in _build_payload()/chat_stream()).
+        By the time this method runs, either the model is confirmed
+        vision-capable or `messages` genuinely carries no multipart
+        content at all.
         """
         out = []
         for m in messages:
@@ -375,13 +531,17 @@ class AnthropicBackend(BaseLLMBackend):
                 out.append({"role": "assistant", "content": blocks})
                 continue
 
-            # plain user/assistant text turn
-            out.append({"role": role, "content": m.get("content", "")})
+            # plain user/assistant text turn (string) or vision turn
+            # (multipart list) -- _translate_content_blocks() is a no-op
+            # pass-through for the plain-string case, same object as
+            # before this fix.
+            out.append({"role": role, "content": cls._translate_content_blocks(m.get("content", ""))})
 
         return out
 
     def _build_payload(self, messages, tools=None, max_tokens=4096, temperature=0.7, stream=False):
         system_str, convo = self._split_system(messages)
+        self._reject_if_vision_unsupported(convo)
         payload = {
             "model": self.default_model,
             "max_tokens": max_tokens,
@@ -531,6 +691,7 @@ class AnthropicBackend(BaseLLMBackend):
             "stream": True,
         }
         system_str, convo = self._split_system(messages)
+        self._reject_if_vision_unsupported(convo)
         payload["messages"] = self._translate_messages(convo)
         if system_str:
             payload["system"] = system_str

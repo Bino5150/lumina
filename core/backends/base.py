@@ -261,6 +261,32 @@ class BaseLLMBackend(ABC):
         """
         return NO_REASONING_CONTROL
 
+    def supports_vision(self, model: Optional[str] = None) -> bool:
+        """
+        ANTHROPIC-VISION-CAPABILITY-01 -- backend/model capability
+        contract: whether this backend can accept image content for
+        `model` AT ALL (a strictly more fundamental question than
+        supports_vision_with_tools() above, which asks whether vision and
+        tool-calling can be COMBINED -- a backend/model could support
+        vision alone, tools alone, both, or neither).
+
+        Fail-safe default: False for every backend/model without live-
+        verified or authoritatively-documented evidence otherwise. Every
+        OpenAI-compatible (LMStudioBackend-family) backend and
+        GeminiBackend already accept image content structurally (the
+        request shape itself is OpenAI-shaped / already translated) and
+        have never needed this gate -- only AnthropicBackend currently
+        overrides this, using Anthropic's own documented model history
+        (vision shipped with the Claude 3 family; every model released
+        since supports it) rather than a guess. See that override for the
+        full reasoning.
+
+        Same contract as reasoning_capabilities()/supports_vision_with_
+        tools() above: must stay side-effect-free, and `model=None`
+        always returns False.
+        """
+        return False
+
     def supports_vision_with_tools(self, model: Optional[str] = None) -> bool:
         """
         VISION-TOOL-INTEROP-01 -- backend/model capability contract:
