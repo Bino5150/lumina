@@ -412,6 +412,7 @@ def test_openrouter_chat_forwards_all_image_blocks_in_order_unmodified(monkeypat
     backend._model = "z-ai/glm-5.3-flash"
     backend._reasoning_cache = {}
     backend._reasoning_cache_ready = False
+    backend._vision_tool_cache = {}
 
     captured = {}
 

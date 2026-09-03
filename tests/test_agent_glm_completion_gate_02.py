@@ -251,6 +251,7 @@ def test_wire_payload_carries_the_clarification_for_a_vision_gate_call(monkeypat
     backend._model = "z-ai/glm-5.3-flash"
     backend._reasoning_cache = {}
     backend._reasoning_cache_ready = False
+    backend._vision_tool_cache = {}
 
     captured = {}
 
@@ -299,6 +300,7 @@ def test_wire_payload_for_text_only_gate_call_has_no_clarification(monkeypatch):
     backend._model = "z-ai/glm-5.3-flash"
     backend._reasoning_cache = {}
     backend._reasoning_cache_ready = False
+    backend._vision_tool_cache = {}
 
     captured = {}
 

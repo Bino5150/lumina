@@ -371,6 +371,56 @@ def _sanitize_messages_for_gate(messages: list) -> list:
     return [dict(m, content=_gate_safe_content(m.get("content"))) for m in messages]
 
 
+def _maybe_emit_vision_tool_capability_notice(agent, messages: list, tool_schemas: list,
+                                               turn_id: Optional[str] = None,
+                                               chat_id: Optional[int] = None) -> bool:
+    """VISION-TOOL-INTEROP-01 -- return True if a capability notice was
+    just emitted for THIS request's vision-vs-tools shape, else False.
+    This function has no memory across calls; the caller (_chat_impl()'s
+    vision_tool_capability_notice_sent) is responsible for making sure it
+    only actually fires once per turn, not once per WORK round.
+
+    Mirrors LMStudioBackend.chat()'s own has_vision predicate exactly
+    (scans the SAME `messages` about to be sent for this request, not
+    agent.ctx.history directly) -- if tools are non-empty, vision is
+    present in this exact request, and the backend does not advertise
+    supports_vision_with_tools() for the configured model, that backend's
+    own has_vision guard is about to silently drop tools from this
+    request. Surfaces that honestly via on_commentary instead of leaving
+    it invisible, reusing the same "[Lumina: ...]" machine-authored-
+    notice convention this file already uses for the completion gate's
+    own non-success paths (see _run_tool_work_control_gate()'s
+    "continue"/corrective-retry-exhausted notices).
+
+    getattr-guarded throughout -- never raises on a minimal/fake agent or
+    backend missing llm.display_name, llm.name, llm.configured_model, or
+    llm.supports_vision_with_tools, matching every other optional-
+    capability check in this file (see _accepts_tool_choice_mode())."""
+    if not tool_schemas:
+        return False
+    has_vision = any(isinstance(m.get("content"), list) for m in messages)
+    if not has_vision:
+        return False
+    llm = agent.llm
+    configured_model = getattr(llm, "configured_model", lambda: None)()
+    supports_combo = getattr(llm, "supports_vision_with_tools", None)
+    if callable(supports_combo) and supports_combo(configured_model):
+        return False
+
+    display_name = getattr(llm, "display_name", "this backend")
+    notice = (
+        f"[Lumina: {display_name} doesn't support combining tools with "
+        "image input on this model -- tools are unavailable this turn "
+        "while an image is present in the conversation.]"
+    )
+    on_commentary = getattr(agent, "on_commentary", None)
+    if callable(on_commentary):
+        on_commentary(notice)
+    _fr_machine(agent, "turn.vision_tool_capability_notice", turn_id=turn_id, chat_id=chat_id,
+                fields={"backend": getattr(llm, "name", None), "model": configured_model})
+    return True
+
+
 def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
                                  reasoning_effort, chat_id, think_step: list,
                                  turn_id: Optional[str] = None,
@@ -1453,6 +1503,12 @@ class LuminaAgent:
         # to the visible non-success path instead of ping-ponging retries.
         corrective_retry_used = False
 
+        # VISION-TOOL-INTEROP-01 -- per-turn, not per-WORK-round: once the
+        # capability notice has fired for this turn, later WORK rounds
+        # (e.g. after a real tool call, or a gate "continue") never repeat
+        # it even though has_vision stays sticky for the rest of the turn.
+        vision_tool_capability_notice_sent = False
+
         # AGENT-WORK-COMPLETE-DISCARD-01 -- a preserved WORK-round answer
         # that arrived with finish_reason=stop (TerminationStatus.COMPLETE
         # or UNKNOWN) and genuinely zero tool_calls, while tool work is
@@ -1838,6 +1894,11 @@ class LuminaAgent:
             messages = self.ctx.build_messages(tool_budget=tool_token_estimate, chat_id=chat_id)
             if _cancel_requested(cancel_event):
                 raise TurnCancelled()
+
+            if not vision_tool_capability_notice_sent:
+                vision_tool_capability_notice_sent = _maybe_emit_vision_tool_capability_notice(
+                    self, messages, tool_schemas, turn_id=turn_id, chat_id=chat_id,
+                )
 
             chat_kwargs = dict(
                 messages=messages,

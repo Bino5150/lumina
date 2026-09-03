@@ -342,8 +342,29 @@ class LMStudioBackend(BaseLLMBackend):
             "stream": False,
         }
         self._apply_output_token_limit(payload, max_tokens, model=model)
+        # VISION-TOOL-INTEROP-01 -- has_vision has existed unmodified since
+        # the very first commit (6c0b78d, 2026-06-12): a blanket, backend-
+        # wide default that drops tools/tool_choice the moment ANY message
+        # in the request (not just the current turn -- the whole
+        # accumulated history) carries multipart content. That default is
+        # still the right fallback for a backend/model with no confirmed
+        # capability data (never force tools past a transport that might
+        # reject or silently mishandle the combination). But it is no
+        # longer unconditional: supports_vision_with_tools(model) lets a
+        # backend/model that has ACTUALLY been confirmed to handle vision
+        # + tools together (live-verified for OpenRouter/z-ai/glm-5.3-flash
+        # via real HTTP 200s with correct tool_calls decisions across
+        # auto/required tool_choice, both with and without a tool actually
+        # warranted -- see the campaign report) keep offering tools on a
+        # vision turn, including a later text-only turn whose history
+        # merely contains an old image. This never changes WHICH tools are
+        # offered (self.registry's already-enabled set, decided entirely
+        # above this call) -- only whether any are offered when vision is
+        # present. See core/agent.py's WORK-round construction for the
+        # honest capability notice surfaced when this stays False instead
+        # of the old silent drop.
         has_vision = any(isinstance(m.get("content"), list) for m in messages)
-        if tools and not has_vision:
+        if tools and (not has_vision or self.supports_vision_with_tools(model)):
             payload["tools"] = tools
             # AGENT-CONTINUATION-01B -- "required" only ever reaches the
             # wire for a subclass with live-verified support (see

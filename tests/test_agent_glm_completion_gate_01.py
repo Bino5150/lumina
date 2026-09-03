@@ -471,6 +471,7 @@ def test_gate_request_reaches_real_backend_wire_with_tools_and_required_choice(m
     backend._model = "z-ai/glm-5.3-flash"
     backend._reasoning_cache = {}
     backend._reasoning_cache_ready = False
+    backend._vision_tool_cache = {}
 
     captured = {}
 
@@ -529,6 +530,7 @@ def test_work_round_still_loses_product_tools_on_vision_turn_unchanged_policy(mo
     backend._model = "z-ai/glm-5.3-flash"
     backend._reasoning_cache = {}
     backend._reasoning_cache_ready = False
+    backend._vision_tool_cache = {}
 
     captured = {}
 

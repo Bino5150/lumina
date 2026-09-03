@@ -60,6 +60,15 @@ class OpenRouterBackend(LMStudioBackend):
         # collapse to NO_REASONING_CONTROL via reasoning_capabilities()'s
         # dict.get() default, no distinction is made between them here.
         self._reasoning_cache: dict = {}
+        # VISION-TOOL-INTEROP-01 -- sibling per-instance cache, populated by
+        # the SAME discover_models() call as _reasoning_cache above (no
+        # separate HTTP fetch). Sparse like _reasoning_cache: only models
+        # positively confirmed to support vision+tools together get an
+        # entry (value always True); a model absent from this dict falls
+        # through to supports_vision_with_tools()'s False default via
+        # dict.get() -- no distinction between "never discovered" and
+        # "discovered but doesn't support the combination".
+        self._vision_tool_cache: dict = {}
         # Patch 3A.4 Part 4 -- readiness/refresh seam state.
         #
         # _reasoning_cache_ready: True once ANY discover_models() call has ever
@@ -140,6 +149,7 @@ class OpenRouterBackend(LMStudioBackend):
         # from this response's model set will not remain cached after
         # this call returns.
         new_cache = {}
+        new_vision_tool_cache = {}
         for entry in data:
             try:
                 if not isinstance(entry, dict):
@@ -147,12 +157,25 @@ class OpenRouterBackend(LMStudioBackend):
                 model_id = entry.get("id")
                 if not isinstance(model_id, str) or not model_id:
                     continue
-                caps = self._parse_reasoning_metadata(entry)
-                if caps is not None:
-                    new_cache[model_id] = caps
+                # Each field's parse is isolated in its own try/except --
+                # same "one malformed signal can't take down its sibling"
+                # posture _parse_reasoning_metadata() already uses
+                # internally for mandatory/supported_efforts.
+                try:
+                    caps = self._parse_reasoning_metadata(entry)
+                    if caps is not None:
+                        new_cache[model_id] = caps
+                except Exception:
+                    pass
+                try:
+                    if self._parses_vision_tool_capability(entry):
+                        new_vision_tool_cache[model_id] = True
+                except Exception:
+                    pass
             except Exception:
                 continue
         self._reasoning_cache = new_cache
+        self._vision_tool_cache = new_vision_tool_cache
         # Patch 3A.4 Part 4 -- atomic alongside the cache replace above:
         # this call reached a full success, so both flags reflect that.
         self._reasoning_cache_ready = True
@@ -246,6 +269,62 @@ class OpenRouterBackend(LMStudioBackend):
             mandatory=mandatory,
             supports_budget=False,
         )
+
+    @staticmethod
+    def _parses_vision_tool_capability(entry: dict) -> bool:
+        """
+        VISION-TOOL-INTEROP-01 -- True only if THIS model's own OpenRouter
+        /models entry positively advertises BOTH signals needed to send
+        image content and tools in the same request:
+
+          architecture.input_modalities contains "image" -- the model
+          itself accepts image input (not just the OpenRouter route in
+          the abstract).
+
+          supported_parameters contains "tools" -- the model accepts
+          tool-calling at all on this route.
+
+        Both are OpenRouter's own authoritative, per-model capability
+        data -- never inferred from the model id/name/family. A model
+        missing either signal (malformed entry, absent/non-dict
+        architecture, non-list input_modalities or supported_parameters)
+        safely returns False, never True from partial data.
+
+        tool_choice is not checked as a separate third signal: this
+        backend's own configured model (z-ai/glm-5.3-flash) advertises
+        "tool_choice" in supported_parameters whenever "tools" is present,
+        and a real live trial against it (see the campaign report --
+        vision_plus_tools_required) confirmed "required" specifically
+        works correctly with image content in the same request. A model
+        that advertised "tools" without "tool_choice" would still resolve
+        through _resolve_tool_choice_mode()'s own existing AUTO fallback
+        exactly as it does today for a non-required caller, so omitting
+        tools/tool_choice as a compound condition here doesn't relax
+        anything _resolve_tool_choice_mode() doesn't already guard.
+        """
+        architecture = entry.get("architecture")
+        input_modalities = architecture.get("input_modalities") if isinstance(architecture, dict) else None
+        has_image_input = isinstance(input_modalities, list) and "image" in input_modalities
+
+        supported_parameters = entry.get("supported_parameters")
+        has_tools = isinstance(supported_parameters, list) and "tools" in supported_parameters
+
+        return has_image_input and has_tools
+
+    def supports_vision_with_tools(self, model: Optional[str] = None) -> bool:
+        """
+        VISION-TOOL-INTEROP-01 override -- reads the per-instance discovery
+        cache ONLY (zero HTTP here, ever), same contract as
+        reasoning_capabilities() above: `model=None` always returns False,
+        and an unpopulated cache (discovery never run on this instance) or
+        an unrecognized/not-yet-seen model both collapse to False via
+        dict.get()'s default. Populated by the SAME discover_models() HTTP
+        call reasoning-capability discovery already performs -- no
+        separate fetch, no duplicated network/parsing logic.
+        """
+        if model is None:
+            return False
+        return self._vision_tool_cache.get(model, False)
 
     def reasoning_capabilities(self, model: Optional[str] = None) -> ReasoningCapabilities:
         """

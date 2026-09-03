@@ -261,6 +261,31 @@ class BaseLLMBackend(ABC):
         """
         return NO_REASONING_CONTROL
 
+    def supports_vision_with_tools(self, model: Optional[str] = None) -> bool:
+        """
+        VISION-TOOL-INTEROP-01 -- backend/model capability contract:
+        whether this backend can send image content AND tools (with a
+        resolved tool_choice) in the SAME request without the underlying
+        provider silently misbehaving or rejecting the combination.
+
+        Fail-safe default: False for every backend/model without live-
+        verified evidence otherwise. LMStudioBackend.chat()'s has_vision
+        guard uses this to decide whether to keep its existing
+        conservative "no tools once any image is in this request" default
+        (False) or trust a backend/model that has actually been confirmed
+        to handle both together (True) -- see OpenRouterBackend's
+        override, which reuses its existing per-model discover_models()
+        cache (OpenRouter's own /models "architecture.input_modalities"
+        and "supported_parameters" fields) rather than a new fetch or a
+        hardcoded guess.
+
+        Same contract as reasoning_capabilities() above: must stay side-
+        effect-free (no HTTP, no get_model() fallback), and `model=None`
+        always returns False -- a caller that wants a model-aware answer
+        must pass `model` explicitly.
+        """
+        return False
+
     def apply_reasoning(self, payload: dict, requested: Optional[str],
                          model: Optional[str] = None) -> None:
         """
