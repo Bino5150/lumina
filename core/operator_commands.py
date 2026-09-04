@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 
 
-KNOWN_COMMANDS = {"status", "btw", "compact", "stop"}
+KNOWN_COMMANDS = {"status", "btw", "compact", "stop", "context"}
 @dataclass(frozen=True)
 class OperatorCommand:
     name: str
@@ -26,7 +26,10 @@ def parse_operator_command(text: str):
 
 
 def command_help() -> str:
-    return "Available operator commands: /status · /btw <question> · /compact · /stop · /stop all"
+    return (
+        "Available operator commands: /status · /btw <question> · /compact · "
+        "/stop · /stop all · /context · /context status · /context rebuild"
+    )
 
 
 def format_duration(seconds: float) -> str:

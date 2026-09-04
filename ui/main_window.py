@@ -27,6 +27,8 @@ import config
 from comms import telegram_origin_routing as origin_routing
 from core.agent import TurnCancelled, is_error_response
 from core import emergency_stop
+from core.context_checkpoints import get_latest_usable_checkpoint
+from core import context_rebuild
 from core.context_reconstruction import reconstruct_chat_context, resolve_context_skip
 from core.context_transaction import ContextGeneration
 from core.manual_compaction import run_manual_compaction
@@ -174,6 +176,7 @@ class StreamSignals(QObject):
     # explicitly forbidding it from becoming canonical assistant history.
     cancelled      = Signal(str, bool)
     manual_compaction_finished = Signal(object)
+    context_rebuild_finished = Signal(object)
     telegram_origin_dispatch = Signal(object)
     
 class STTSignals(QObject):
@@ -562,6 +565,13 @@ class LuminaWindow(QMainWindow):
         self._manual_compaction_thread = None
         self._manual_compaction_cancel = None
         self._manual_compaction_started_at = None
+        # CONTEXT-GC-01/A6I: /context rebuild's own single-flight bookkeeping,
+        # exactly parallel to the three _manual_compaction_* attrs above --
+        # a second /context rebuild is rejected while one is in flight for
+        # this window, same as a second /compact is.
+        self._context_rebuild_thread = None
+        self._context_rebuild_cancel = None
+        self._context_rebuild_started_at = None
         self._dream_timer = QTimer(self)
         self._dream_timer.timeout.connect(self._check_dream_idle)
         self._dream_timer.start(60_000)  # check once a minute — cheap, no need to be tighter
@@ -964,6 +974,7 @@ class LuminaWindow(QMainWindow):
         self.signals.error.connect(self._on_error)
         self.signals.cancelled.connect(self._on_cancelled)
         self.signals.manual_compaction_finished.connect(self._on_manual_compaction_finished)
+        self.signals.context_rebuild_finished.connect(self._on_context_rebuild_finished)
         self.signals.telegram_origin_dispatch.connect(self._on_telegram_origin_dispatch)
         self.chat_widget.mic_pressed.connect(self._on_mic_pressed)
         self.status_bar.emergency_btn.clicked.connect(self._on_emergency_button_clicked)
@@ -1445,6 +1456,8 @@ class LuminaWindow(QMainWindow):
             self._command_compact(command.argument)
         elif command.name == "stop":
             self._command_stop(command.argument)
+        elif command.name == "context":
+            self._command_context(command.argument)
 
     def _command_status(self, argument: str):
         if argument:
@@ -1689,6 +1702,192 @@ class LuminaWindow(QMainWindow):
             self._refresh_operator_telemetry()
         except Exception as e:
             self.chat_widget.add_operator_message(f"/btw failed to start: {e}")
+
+    # ── CONTEXT-GC-01/A6I: owner /context controls ──────────────────────────
+    #
+    # Desktop-owner authority only. self._telegram_active_dispatch is
+    # non-None for exactly the duration of a Telegram-relayed dispatch (set
+    # immediately before _on_user_message() is called in
+    # _drain_telegram_origin_queue(), reset in every exit path there) --
+    # the same existing signal this reuses rather than inventing a new
+    # channel/origin concept. No model, tool, or headless path can reach
+    # _dispatch_operator_command() at all: core/headless.py's agents (Discord,
+    # email, subagents) are separate LuminaAgent instances with no import of
+    # ui.main_window, and core/agent.py's ToolRegistry has no operator-command
+    # bridge, so this one check is the complete authority boundary for the
+    # whole /context family.
+    def _command_context(self, argument: str):
+        if self._telegram_active_dispatch is not None:
+            self.chat_widget.add_operator_message(
+                "/context is desktop-only and is not available over Telegram."
+            )
+            return
+
+        argument = (argument or "").strip().lower()
+        if argument == "":
+            self.chat_widget.add_operator_message(
+                "Usage: /context · /context status · /context rebuild"
+            )
+        elif argument == "status":
+            self._command_context_status()
+        elif argument == "rebuild":
+            self._command_context_rebuild()
+        else:
+            self.chat_widget.add_operator_message(
+                f"Unknown /context subcommand '{argument}'. "
+                "Usage: /context · /context status · /context rebuild"
+            )
+
+    def _context_rebuild_eligibility(self) -> tuple:
+        """Read-only eligibility check, shared by /context status (reporting
+        only -- never enforcement) and _command_context_rebuild() (the actual
+        gate), so the two can never silently disagree about what /context
+        rebuild would do right now. Mirrors _command_compact()'s own checks
+        one-for-one, plus one more: a rebuild already in flight."""
+        if not self._current_chat_id:
+            return False, "no active chat"
+        if emergency_stop.is_latched():
+            return False, "emergency stop is active"
+        if self.worker is not None and self.worker.isRunning():
+            return False, "foreground turn is running"
+        if getattr(self.agent.ctx, "_compacting", False):
+            return False, "automatic context compaction is running"
+        if self._manual_compaction_thread is not None:
+            return False, "manual /compact is running or finalizing"
+        if self._context_rebuild_thread is not None:
+            return False, "a context rebuild is already in progress"
+        return True, ""
+
+    def _command_context_status(self):
+        """Read-only. Must never compile a checkpoint, create a checkpoint,
+        or reconstruct/mutate context -- every line below is a fresh read of
+        live state, never cached, never narrated."""
+        chat_id = self._current_chat_id
+        if not chat_id:
+            self.chat_widget.add_operator_message("Context: no active chat.")
+            return
+
+        now = time.time()
+        lines = [f"Chat: {chat_id}", f"Live history entries: {len(self.agent.ctx.history)}"]
+
+        try:
+            usage = self.agent.get_context_usage(chat_id=chat_id)
+            lines.append(
+                f"Estimated context: ~{format_tokens(usage['used_tokens'])} / "
+                f"{format_tokens(usage['max_tokens'])} · {usage['percent']:.0f}%"
+            )
+        except Exception:
+            lines.append("Estimated context: unavailable")
+
+        running = self.worker is not None and self.worker.isRunning()
+        lines.append(f"Foreground turn: {'running' if running else 'idle'}")
+        lines.append(
+            "Automatic compaction: "
+            + ("running" if getattr(self.agent.ctx, "_compacting", False) else "idle")
+        )
+        lines.append(
+            "Manual /compact: "
+            + ("running or finalizing" if self._manual_compaction_thread is not None else "idle")
+        )
+
+        if self._context_rebuild_thread is not None:
+            started = self._context_rebuild_started_at or now
+            cancelled = bool(self._context_rebuild_cancel and self._context_rebuild_cancel.is_set())
+            state = "cancel requested" if cancelled else "running"
+            lines.append(f"Context rebuild: {state} · {format_duration(now - started)}")
+        else:
+            lines.append("Context rebuild: idle")
+
+        try:
+            checkpoint = get_latest_usable_checkpoint(chat_id)
+            if checkpoint is None:
+                lines.append("Latest usable checkpoint: none")
+            else:
+                lines.append(f"Latest usable checkpoint: #{checkpoint.id} · ready_at={checkpoint.ready_at}")
+        except Exception:
+            lines.append("Latest usable checkpoint: status unavailable")
+
+        eligible, reason = self._context_rebuild_eligibility()
+        lines.append(
+            f"Rebuild eligible: {'yes' if eligible else 'no'}" + (f" ({reason})" if reason else "")
+        )
+
+        self.chat_widget.add_operator_message("\n".join(lines))
+
+    def _command_context_rebuild(self):
+        eligible, reason = self._context_rebuild_eligibility()
+        if not eligible:
+            self.chat_widget.add_operator_message(f"Rebuild rejected: {reason}.")
+            return
+
+        chat_id = self._current_chat_id
+        ephemeral_history = list(self.agent.ctx.history)
+        backend = self.agent.llm
+        cancel_event = threading.Event()
+        self._context_rebuild_cancel = cancel_event
+        self._context_rebuild_started_at = time.time()
+        self.chat_widget.add_operator_message(
+            "/context rebuild started · compiling a fresh continuity checkpoint · "
+            "persisted transcript remains untouched"
+        )
+
+        # Epoch captured BEFORE the thread starts, exactly like /compact's
+        # own lease -- see _command_compact()'s comment on this pattern.
+        epoch = emergency_stop.current_epoch()
+
+        def _run():
+            try:
+                receipt = context_rebuild.run_rebuild(
+                    chat_id, self, backend, ephemeral_history,
+                    cancel_event=cancel_event, expected_epoch=epoch,
+                    project_context=None,
+                )
+            except Exception as e:
+                receipt = context_rebuild.RebuildReceipt(
+                    status=context_rebuild.STATUS_ERROR,
+                    reason=f"Unexpected rebuild failure: {e}. Live context unchanged.",
+                    chat_id=chat_id,
+                )
+            self.signals.context_rebuild_finished.emit(receipt)
+
+        self._context_rebuild_thread = threading.Thread(target=_run, daemon=True)
+        self._context_rebuild_thread.start()
+
+    def _on_context_rebuild_finished(self, receipt):
+        self._context_rebuild_thread = None
+        self._context_rebuild_cancel = None
+        self._context_rebuild_started_at = None
+        drain_telegram = getattr(self, "_drain_telegram_origin_queue", None)
+        if drain_telegram is not None:
+            QTimer.singleShot(0, drain_telegram)
+
+        if receipt.status != context_rebuild.STATUS_SUCCESS:
+            self.chat_widget.add_operator_message(f"/context rebuild: {receipt.reason}")
+            return
+
+        if receipt.chat_id != self._current_chat_id:
+            self.chat_widget.add_operator_message(
+                f"/context rebuild finished for chat {receipt.chat_id}, which is no longer the "
+                "active chat · nothing changed for the chat now open · durable transcript unchanged"
+            )
+            return
+
+        self._refresh_operator_telemetry(refresh_context=True)
+        try:
+            usage = self.agent.get_context_usage(chat_id=self._current_chat_id, refresh=True)
+            context_now = (
+                f" · context now ~{format_tokens(usage['used_tokens'])} / {format_tokens(usage['max_tokens'])}"
+            )
+        except Exception:
+            context_now = ""
+
+        self.chat_widget.add_operator_message(
+            f"/context rebuild finished · checkpoint #{receipt.checkpoint_id} · "
+            f"live entries {receipt.pre_history_count} → {receipt.post_history_count} · "
+            f"estimated tokens ~{format_tokens(receipt.pre_estimated_tokens)} → "
+            f"~{format_tokens(receipt.post_estimated_tokens)}{context_now} · "
+            "durable transcript unchanged · detailed execution history retained in Flight Recorder"
+        )
 
     def _surface_btw_results(self, get_task_result):
         """Display /btw results independently; never feed them into agent history."""
