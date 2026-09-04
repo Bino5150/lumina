@@ -1055,13 +1055,21 @@ class LuminaWindow(QMainWindow):
         self.chat_widget.clear_messages()
         self.chat_widget.add_system_message("Chat cleared.")
 
-    def _load_chat(self, chat_id: int):
+    def _load_chat(self, chat_id: int, persist_as_last: bool = True):
+        """persist_as_last=False marks a chat switch that isn't an owner
+        navigation decision (e.g. CHAT-STARTUP-RESTORE-01: an inbound
+        Telegram reply gets routed back to its originating conversation via
+        _drain_telegram_origin_queue(), which must move the visible chat but
+        must not overwrite what the owner will see restored on next launch --
+        last_chat_id is the owner's *durable* last-active-chat preference,
+        not merely "whichever chat is on screen right now")."""
         if not self._chat_switch_admitted():
             return
         self._context_generation.bump()
         self._current_chat_id = chat_id
-        self._prefs["last_chat_id"] = chat_id  # read-cache only
-        persistence.update({"last_chat_id": chat_id})
+        if persist_as_last:
+            self._prefs["last_chat_id"] = chat_id  # read-cache only
+            persistence.update({"last_chat_id": chat_id})
 
         # CONTEXT-LIFECYCLE-A2: which durable rows re-enter active context
         # is decided entirely by the neutral kernel (core/context_
@@ -2180,7 +2188,7 @@ class LuminaWindow(QMainWindow):
             return
         if conversation_id != self._current_chat_id:
             try:
-                self._load_chat(conversation_id)
+                self._load_chat(conversation_id, persist_as_last=False)
             except Exception:
                 pass
             if self._current_chat_id != conversation_id:

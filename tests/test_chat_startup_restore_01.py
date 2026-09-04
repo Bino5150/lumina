@@ -171,3 +171,76 @@ def test_empty_database_creates_a_fresh_chat(qapp, hermetic):
         assert window._current_chat_id is not None
     finally:
         window.close()
+
+
+# ── live regression: a background (non-owner) chat switch must not become
+# the durable startup-restore target ──────────────────────────────────────
+#
+# 92f5953's validate-against-`chats` repair (above) covers a stale/deleted/
+# missing last_chat_id, but the currently-reported "owner is in chat N,
+# relaunches, lands on chat #1" symptom survived it. Root cause, established
+# live by tracing comms/telegram_origin_routing.py + _drain_telegram_origin_
+# queue() (added in 2067368 "fix: route Telegram replies to originating
+# conversation"): when an inbound Telegram reply resolves to a conversation
+# other than whatever chat is currently open on the desktop,
+# _drain_telegram_origin_queue() calls self._load_chat(conversation_id) to
+# move the visible chat so the reply lands in the right transcript. That is
+# correct and intentional. But _load_chat() unconditionally treated *every*
+# call as an owner navigation decision and persisted last_chat_id to match --
+# so a Telegram reply arriving in the background, with zero owner action on
+# the desktop, silently overwrote the owner's actual last-viewed chat as the
+# next-launch restore target. If the Telegram-bound conversation is the
+# owner's original/primary chat (commonly chat id 1), the next relaunch
+# reproduces exactly the reported symptom.
+#
+# Repair: _load_chat() gained a persist_as_last=True parameter; the
+# Telegram-drain call site passes persist_as_last=False. The visible chat
+# still moves (the Telegram feature is unchanged) but last_chat_id keeps
+# tracking the owner's own last navigation, not whichever chat a background
+# event happened to touch last.
+
+
+def test_telegram_background_chat_switch_does_not_overwrite_last_chat_id(qapp, hermetic):
+    from comms import telegram_origin_routing as origin_routing
+
+    origin_routing._reset_for_tests()
+
+    telegram_chat_id, owner_chat_id = _seed_chats(["telegram_bound_chat", "owners_current_chat"])
+
+    window = _make_window()
+    try:
+        # A route exists for telegram_chat_id (e.g. an earlier outbound send
+        # from that chat registered it via record_outbound()).
+        route = origin_routing.OriginRoute(
+            destination_chat_id="999888777",
+            telegram_message_id=42,
+            conversation_id=telegram_chat_id,
+            runtime_token=window._telegram_route_token,
+            created_at=time.monotonic(),
+            expires_at=time.monotonic() + 3600,
+        )
+
+        # Owner is actively on a different, later chat -- this is the chat
+        # that must survive as the startup-restore target.
+        window._load_chat(owner_chat_id)
+        assert persistence.load()["last_chat_id"] == owner_chat_id
+
+        # An inbound Telegram reply for the OLD conversation arrives with no
+        # owner action on the desktop.
+        dispatch = origin_routing.OriginDispatch(route=route, text="reply from telegram user")
+        window._on_telegram_origin_dispatch(dispatch)
+        qapp.processEvents()
+
+        # The Telegram feature still works: the reply's chat is now visible.
+        assert window._current_chat_id == telegram_chat_id
+        # But the owner's real last-active chat remains the durable target.
+        assert persistence.load()["last_chat_id"] == owner_chat_id
+    finally:
+        window.close()
+
+    # A clean relaunch restores the owner's chat, not the Telegram-touched one.
+    window2 = _make_window()
+    try:
+        assert window2._current_chat_id == owner_chat_id
+    finally:
+        window2.close()
