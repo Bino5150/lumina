@@ -1659,8 +1659,29 @@ class LuminaWindow(QMainWindow):
             )
             return
 
+        rebuild_thread = self._context_rebuild_thread
+        if rebuild_thread is not None:
+            if not rebuild_thread.is_alive():
+                self.chat_widget.add_operator_message(
+                    "/context rebuild is already finalizing; no safe cancellation boundary remains."
+                )
+                return
+            cancel_event = self._context_rebuild_cancel
+            if cancel_event is None:
+                self.chat_widget.add_operator_message("/context rebuild has no active cancellation handle.")
+                return
+            if cancel_event.is_set():
+                self.chat_widget.add_operator_message("/stop is already requested for /context rebuild.")
+                return
+            cancel_event.set()
+            self.chat_widget.add_operator_message(
+                "/stop requested for /context rebuild · it will cancel before the next safe boundary · "
+                "live context unchanged if it hasn't swapped yet."
+            )
+            return
+
         self.chat_widget.add_operator_message(
-            "/stop: no foreground turn or manual compaction is currently running."
+            "/stop: no foreground turn, manual compaction, or context rebuild is currently running."
         )
 
     def _command_btw(self, question: str):

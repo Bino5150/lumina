@@ -72,6 +72,8 @@ def _window_fake(**overrides):
         status_bar=_StatusBar(),
         _manual_compaction_thread=None,
         _manual_compaction_cancel=None,
+        _context_rebuild_thread=None,
+        _context_rebuild_cancel=None,
         _btw_task_ids={},
         _tracked_operator_task_ids=lambda: set(),
         agent=types.SimpleNamespace(

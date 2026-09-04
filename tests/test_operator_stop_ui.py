@@ -59,6 +59,8 @@ def _window_fake(worker=None):
         status_lbl=_Label(),
         _manual_compaction_thread=None,
         _manual_compaction_cancel=None,
+        _context_rebuild_thread=None,
+        _context_rebuild_cancel=None,
         _btw_task_ids={"sidequest": {"question": "leave me alone"}},
     )
 
@@ -122,8 +124,51 @@ def test_stop_with_no_current_operation_is_a_noop_notice():
 
     LuminaWindow._command_stop(fake, "")
 
-    assert "no foreground turn or manual compaction" in fake.chat_widget.notices[-1]
+    notice = fake.chat_widget.notices[-1]
+    assert "no foreground turn" in notice
+    assert "manual compaction" in notice
+    assert "context rebuild" in notice
     assert fake._btw_task_ids
+
+
+def test_stop_can_cancel_context_rebuild_at_its_existing_safe_boundary():
+    fake = _window_fake(worker=None)
+    fake._context_rebuild_thread = _AliveThread()
+    fake._context_rebuild_cancel = threading.Event()
+
+    LuminaWindow._command_stop(fake, "")
+
+    assert fake._context_rebuild_cancel.is_set()
+    assert "requested for /context rebuild" in fake.chat_widget.notices[-1]
+
+
+def test_stop_does_not_claim_a_finalizing_context_rebuild_was_cancelled():
+    fake = _window_fake(worker=None)
+    fake._context_rebuild_thread = _DeadThread()
+    fake._context_rebuild_cancel = threading.Event()
+
+    LuminaWindow._command_stop(fake, "")
+
+    assert not fake._context_rebuild_cancel.is_set()
+    assert "already finalizing" in fake.chat_widget.notices[-1]
+
+
+def test_stop_prioritizes_manual_compaction_over_context_rebuild():
+    """Section 12's priority ordering: foreground work, then manual
+    compaction, then context reconstruction -- both a compaction and a
+    rebuild are (in principle) mutually exclusive admission-wise, but this
+    pins the fallback order in _command_stop() itself regardless."""
+    fake = _window_fake(worker=None)
+    fake._manual_compaction_thread = _AliveThread()
+    fake._manual_compaction_cancel = threading.Event()
+    fake._context_rebuild_thread = _AliveThread()
+    fake._context_rebuild_cancel = threading.Event()
+
+    LuminaWindow._command_stop(fake, "")
+
+    assert fake._manual_compaction_cancel.is_set()
+    assert not fake._context_rebuild_cancel.is_set()
+    assert "requested for /compact" in fake.chat_widget.notices[-1]
 
 
 class _Bubble:
