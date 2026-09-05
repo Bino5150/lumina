@@ -55,6 +55,57 @@ def save_knowledge(category: str, content: str, title: str = None) -> str:
     return f"Knowledge saved to '{category}': {label}{content[:80]}..."
 
 
+def list_knowledge(category: str = None, limit: int = 20) -> str:
+    """List Knowledge Base entries without needing a search keyword.
+
+    Bounded discovery: id/category/title/preview only, newest first. Use
+    read_knowledge(entry_id) to fetch a listed entry's full content.
+    """
+    limit = max(1, min(int(limit), 50))
+    conn = get_db()
+    if category:
+        rows = conn.execute(
+            "SELECT id, category, title, content, updated_at FROM knowledge WHERE category=? ORDER BY updated_at DESC LIMIT ?",
+            (category.lower(), limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, category, title, content, updated_at FROM knowledge ORDER BY updated_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    if not rows:
+        if category:
+            return f"The knowledge base has no entries in category '{category}'."
+        return "The knowledge base is empty."
+    results = []
+    for r in rows:
+        label = f"[{r['title']}] " if r['title'] else ""
+        preview = r['content'][:100] + ("..." if len(r['content']) > 100 else "")
+        results.append(f"[{r['id']}] ({r['category']}) {label}{preview} (updated {r['updated_at'][:10]})")
+    return "\n".join(results)
+
+
+def read_knowledge(entry_id: int) -> str:
+    """Read the full content of one Knowledge Base entry by its stable numeric ID
+    (from search_knowledge or list_knowledge). Not a filesystem path."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, category, title, content, created_at, updated_at FROM knowledge WHERE id=?",
+        (entry_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return f"Knowledge entry {entry_id} not found."
+    label = f" — {row['title']}" if row['title'] else ""
+    return (
+        f"[{row['id']}] ({row['category']}){label}\n"
+        f"Updated: {row['updated_at']}\n"
+        f"---\n"
+        f"{row['content']}"
+    )
+
+
 def search_knowledge(query: str, category: str = None) -> str:
     """Search knowledge base by keyword. Optionally filter by category."""
     conn = get_db()
@@ -160,6 +211,36 @@ def register_knowledge_tools(registry):
                 "category": {"type": "string"}
             },
             "required": ["query"]
+        }
+    )
+
+    registry.register(
+        "list_knowledge", list_knowledge,
+        "List entries stored in the knowledge base (a database, not the filesystem) "
+        "without needing to guess a search keyword first. Returns bounded id/category/"
+        "title/preview rows, newest first. Optionally filter by category. Follow up "
+        "with read_knowledge(entry_id) for an entry's full content.",
+        {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "Optional category filter."},
+                "limit": {"type": "integer", "description": "Max entries to return (default 20, max 50)."}
+            },
+            "required": []
+        }
+    )
+
+    registry.register(
+        "read_knowledge", read_knowledge,
+        "Read the full content of one knowledge base entry by its stable numeric ID "
+        "(from search_knowledge or list_knowledge). The ID is a database row id, not "
+        "a filesystem path.",
+        {
+            "type": "object",
+            "properties": {
+                "entry_id": {"type": "integer", "description": "The knowledge entry's numeric ID."}
+            },
+            "required": ["entry_id"]
         }
     )
 

@@ -83,6 +83,7 @@ TOOL_TIERS = {
     "get_time": "read_only", "list_tools": "read_only", "view_prompt": "read_only",
     "search_memory": "read_only", "get_recent_memories": "read_only",
     "search_knowledge": "read_only", "search_people": "read_only",
+    "list_knowledge": "read_only", "read_knowledge": "read_only",
     "web_search": "read_only", "get_website": "read_only", "get_wikipedia": "read_only",
     "check_for_updates": "read_only",
     "list_dir": "read_only", "search_files": "read_only", "read_file": "read_only",
