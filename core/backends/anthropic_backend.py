@@ -587,7 +587,7 @@ class AnthropicBackend(BaseLLMBackend):
         # (Part 2A's output_config.effort) after the payload is fully built,
         # before the HTTP call. self.default_model is a stable instance
         # attribute (not a method call) already reused consistently here.
-        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking, model=self.default_model)
         self.apply_reasoning(payload, effective_effort, model=self.default_model)
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:

@@ -86,6 +86,43 @@ class ReasoningCapabilities:
             return requested
         return None
 
+    # UTILITY-RUNTIME-01: canonical ascending-verbosity ladder for the
+    # cross-provider effort vocabulary this codebase's own capability
+    # tables already use (see gemini_backend.py's ("minimal","low",
+    # "medium","high"), openai_backend.py's ("none","low","medium","high",
+    # "xhigh","max"), anthropic_backend.py's ("low","medium","high",
+    # "xhigh","max")). A pure RANKING table for cheapest_effort() below --
+    # never consulted by validate() above, which stays a plain membership
+    # check against a specific model's own advertised `efforts`.
+    _EFFORT_RANK = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+    def cheapest_effort(self) -> Optional[str]:
+        """
+        UTILITY-RUNTIME-01: the least-verbose effort this model positively
+        advertises, or None if it advertises no ranked effort at all.
+
+        Exists for `mandatory=True` models -- reasoning cannot be turned
+        off at all -- where a bounded background utility call still needs
+        SOME lever to avoid the provider's own default effort consuming
+        its entire output budget before any content token is emitted (see
+        BaseLLMBackend._effective_reasoning_effort()'s caller in base.py,
+        live-verified against OpenRouter's z-ai/glm-5.3-flash: mandatory=
+        true, default_effort="max", and "max" alone reliably exhausts a
+        30-token utility budget on reasoning with zero content emitted,
+        while "low"/"high" do not).
+
+        Never guesses at an unranked label: a provider-specific effort
+        string outside _EFFORT_RANK is excluded from ranking entirely,
+        same fail-safe posture as validate() -- an unknown label is never
+        silently treated as the cheapest option just because of where it
+        happens to sort. A model whose `efforts` contains only unranked
+        labels returns None here, same as a model with no efforts at all.
+        """
+        ranked = [e for e in self.efforts if e in self._EFFORT_RANK]
+        if not ranked:
+            return None
+        return min(ranked, key=self._EFFORT_RANK.index)
+
 
 # Fail-safe default instance: no positively advertised capability, so
 # Lumina sends no reasoning override. Every BaseLLMBackend subclass gets

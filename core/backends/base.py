@@ -86,6 +86,36 @@ class ModelDiscoveryResult:
     diagnostic: str = ""
 
 
+# UTILITY-RUNTIME-01: base-level, provider-neutral reasoning-field priority
+# for complete_utility()'s empty-content fallback (below). Deliberately
+# duplicated from -- not imported from -- lmstudio.py's own
+# _REASONING_FIELD_PRIORITY/_first_reasoning_field: those back the OpenAI-
+# compatible-family extract_reasoning() override, an OPT-IN telemetry hook
+# a subclass only implements after live-verifying its own response shape
+# (see extract_reasoning()'s docstring below). complete_utility()'s
+# fallback must work identically for every BaseLLMBackend subclass --
+# including a test stub or a future backend that never overrides
+# extract_reasoning() at all -- so it reads the message dict directly
+# rather than delegating to that narrower, opt-in seam. Same priority
+# order and live-verification history as lmstudio.py's copy: "reasoning_
+# content" (Qwen3/DeepSeek-R1-style local servers) before "reasoning"
+# (OpenRouter's own unified field, live-verified against the real
+# openrouter/z-ai/glm-5.3-flash route) before "thinking".
+_UTILITY_REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
+
+
+def _first_utility_reasoning_field(message: dict) -> str:
+    """First non-empty-after-strip reasoning-lane field on `message`, in
+    _UTILITY_REASONING_FIELDS priority order, or "" if none qualify. Only
+    ever consumes a value that is already a string -- a non-string value
+    (malformed/unexpected shape) is skipped, never coerced."""
+    for key in _UTILITY_REASONING_FIELDS:
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 class BaseLLMBackend(ABC):
 
     # Endpoint ownership contract.  Provider backends are fixed by default;
@@ -95,6 +125,15 @@ class BaseLLMBackend(ABC):
     # redirect a fixed provider's credential-bearing requests.
     default_url = ""
     endpoint_configurable = False
+
+    # UTILITY-RUNTIME-01: safe fallback for any subclass that doesn't
+    # override this (every real backend does; discover_models()'s own
+    # base default above already implicitly assumed this attribute
+    # exists). Not an abstractmethod/required override -- a minimal test
+    # double implementing only the ABC's actual abstract surface must
+    # still be able to call complete_utility()'s diagnostic logging
+    # without an AttributeError.
+    display_name = "backend"
 
     # AGENT-CONTINUATION-01B -- live-verified capability flag, False (safe
     # default) unless a subclass has been individually confirmed to accept
@@ -450,7 +489,8 @@ class BaseLLMBackend(ABC):
         return None
 
     def _effective_reasoning_effort(self, reasoning_effort: Optional[str],
-                                     disable_thinking: bool) -> Optional[str]:
+                                     disable_thinking: bool,
+                                     model: Optional[str] = None) -> Optional[str]:
         """
         Patch 3A.4 Part 3 -- shared disable_thinking-wins precedence guard.
 
@@ -473,8 +513,40 @@ class BaseLLMBackend(ABC):
         at all (confirmed against the abstract signature above), so they
         call apply_reasoning() with reasoning_effort directly and have no
         need for this guard.
+
+        UTILITY-RUNTIME-01: "disable thinking" still always wins over any
+        supplied reasoning_effort, but "disable" no longer unconditionally
+        means "send no reasoning override at all". That was safe for every
+        backend with static capability tables (OpenAI/Anthropic/Gemini/
+        Ollama/LMStudio all hardcode mandatory=False, so this branch is
+        structurally unreachable for them) but not for a backend whose
+        capability data is live-discovered per model -- OpenRouterBackend,
+        whose /models response can positively advertise mandatory=true
+        ("this model cannot turn reasoning off at all"). Live-verified
+        against z-ai/glm-5.3-flash (mandatory=true, default_effort="max"):
+        sending no reasoning override at all leaves the PROVIDER's own
+        default effort in force, which reliably consumed an entire
+        30-token utility budget on reasoning alone with finish_reason=
+        "length" and zero content tokens emitted -- while explicitly
+        requesting "low" or "high" effort against the identical prompt
+        returned a real answer with finish_reason="stop" and 0 reasoning
+        tokens. So for a model whose reasoning_capabilities(model) reports
+        mandatory=True, this requests that model's own cheapest advertised
+        effort (reasoning.cheapest_effort()) instead of None -- a model
+        that CAN actually disable reasoning is completely unaffected and
+        still gets None here, unchanged. A mandatory model with no ranked
+        effort at all still returns None: there is no verified lever left
+        to pull, and this method must never guess one. Capability-driven,
+        not model-name-driven -- this branch only ever activates because
+        reasoning_capabilities(model) positively reported mandatory=True,
+        never because of a string match against a model id.
         """
-        return None if disable_thinking else reasoning_effort
+        if not disable_thinking:
+            return reasoning_effort
+        caps = self.reasoning_capabilities(model)
+        if caps.mandatory:
+            return caps.cheapest_effort()
+        return None
 
     def extract_message(self, response: dict) -> dict:
         try:
@@ -576,7 +648,31 @@ class BaseLLMBackend(ABC):
         "[UTILITY] complete_utility failed: ..." log line is preserved
         byte-for-byte, rather than both methods sharing one generic
         message.
+
+        UTILITY-RUNTIME-01: primes reasoning-capability discovery first
+        (self.reasoning_capabilities_ready()/refresh_reasoning_capabilities(),
+        both pre-existing Patch 3A.4 Part 4 seams) so _effective_reasoning_
+        effort()'s mandatory-reasoning handling has real data to read.
+        get_llm_backend() (core/backends/loader.py) hands back a brand new
+        instance on every call -- every dreaming.py consumer (Dream sweep,
+        My Human curation, compaction) constructs a fresh backend right
+        before its one utility call -- so a per-instance discovery cache
+        populated only by Settings/ordinary-chat's own call sites can never
+        be relied on to already be warm here. Base-class default (every
+        backend except OpenRouterBackend): reasoning_capabilities_ready()
+        is always True, so this never performs I/O for them. OpenRouter
+        only: one real /models GET, exactly once per instance (ready flips
+        True the moment it completes, successfully or not), never raises
+        (refresh_reasoning_capabilities() reports failure as False, same
+        "no positive capability -> no override" fail-safe as an unreached
+        model already gets from reasoning_capabilities()'s dict.get()
+        default) -- a failed refresh just leaves this call exactly as
+        unaware of mandatory-reasoning as it was pre-UTILITY-RUNTIME-01.
         """
+        model = self.configured_model()
+        if model is not None and not self.reasoning_capabilities_ready(model):
+            self.refresh_reasoning_capabilities()
+
         messages = [{"role": "user", "content": prompt}]
         if prefill:
             messages.append({"role": "assistant", "content": prefill})
@@ -604,6 +700,64 @@ class BaseLLMBackend(ABC):
         if prefill:
             content = re.sub(rf'^{re.escape(prefill)}\s*', '', content, flags=re.IGNORECASE)
         return content.strip()
+
+    def _log_utility_failure(self, method: str, exc: Exception) -> None:
+        """
+        UTILITY-RUNTIME-01: truthful, bounded failure diagnostic for the
+        exception paths of complete_utility()/complete_utility_content_only().
+        Classifies purely by exception TYPE and, for a RuntimeError, by the
+        already-established provider-error "kind" vocabulary embedded in
+        its own message text (format_provider_error() in lmstudio.py always
+        renders "<provider> error (<kind>, HTTP <code>): ...", so a
+        RuntimeError raised by any real backend's chat() already carries
+        this without new plumbing) -- never a new per-provider guess, never
+        a model-name string match. Logs provider/model/reason only: no
+        prompt text, no API keys, no full response bodies. `method` is the
+        exact public method name so the pre-existing "distinct log labels"
+        contract (byte-identical prefixes callers/tests already depend on)
+        still holds.
+        """
+        if isinstance(exc, TimeoutError):
+            reason = "timeout"
+        elif isinstance(exc, ConnectionError):
+            reason = "network_error"
+        elif isinstance(exc, ValueError):
+            reason = "malformed_response"
+        elif isinstance(exc, RuntimeError):
+            match = re.search(r"error \(([a-z_]+),", str(exc))
+            reason = match.group(1) if match else "provider_error"
+        else:
+            reason = "provider_error"
+        print(f"[UTILITY] {method} failed: provider={self.display_name} "
+              f"model={self.configured_model()} reason={reason} ({exc})", flush=True)
+
+    def _log_utility_empty_result(self, method: str, had_raw_text: bool) -> None:
+        """
+        UTILITY-RUNTIME-01: truthful diagnostic for the non-exception "we
+        got a response but ended up with nothing usable" path.
+
+        `had_raw_text` distinguishes two genuinely different failures using
+        data the caller already has in hand, no new plumbing required:
+          - False -- content (and, for complete_utility(), the reasoning-
+            lane fallback) were both empty from the provider itself. The
+            provider produced nothing usable at all: reason=empty_output.
+          - True -- SOME text was present (content or reasoning-lane) but
+            _strip_utility_think_leakage() reduced it to nothing -- an
+            unclosed <think> block with no real text after it, or content
+            that was purely the echoed prefill. The provider did respond;
+            the stripping step is what rejected it: reason=parser_rejection.
+
+        Either way this only makes the failure visible at the backend
+        layer -- every real call site already logs its OWN "skip" message
+        right after seeing None (see ui/main_window.py's "[AUTO-NAME]
+        complete_utility returned nothing", core/continuity_compiler.py's
+        "utility_call_returned_none"), so this doesn't duplicate each
+        consumer's own bookkeeping.
+        """
+        reason = "parser_rejection" if had_raw_text else "empty_output"
+        print(f"[UTILITY] {method}: no usable final content "
+              f"provider={self.display_name} model={self.configured_model()} "
+              f"reason={reason}", flush=True)
 
     def complete_utility(self, prompt: str, prefill: str = "",
                           max_tokens: int = 500, temperature: float = 0.3) -> Optional[str]:
@@ -638,24 +792,36 @@ class BaseLLMBackend(ABC):
         call," matching the pre-existing contract both call sites already
         expected.
 
-        CONTEXT-LIFECYCLE-A4I: falls back to `reasoning_content` when
+        CONTEXT-LIFECYCLE-A4I: falls back to a reasoning-lane field when
         `content` is empty (S41/F-62's original fix for thinking-model
-        bleed into that field) — unchanged from every pre-A4I release.
-        A caller that must never accept reasoning-lane text as its result
-        (the continuity compiler) uses complete_utility_content_only()
-        below instead, which has no code path capable of reading
-        reasoning_content at all.
+        bleed) — unchanged in spirit from every pre-A4I release, but
+        UTILITY-RUNTIME-01 widened WHICH field name that fallback reads
+        (see _first_utility_reasoning_field() below): the pre-existing
+        code only ever checked `reasoning_content`, which is correct for
+        Qwen3/DeepSeek-R1-style local servers but not for OpenRouter's own
+        unified field, live-verified as plain `reasoning` (see
+        lmstudio.py's `_REASONING_FIELD_PRIORITY` docstring for the same
+        live discovery, made independently for chat()'s telemetry path —
+        this call site had drifted out of sync with that lesson). A caller
+        that must never accept reasoning-lane text as its result (the
+        continuity compiler) uses complete_utility_content_only() below
+        instead, which has no code path capable of reading any
+        reasoning-lane field at all.
         """
         try:
             message = self._complete_utility_request(prompt, prefill, max_tokens, temperature)
-            content = (message.get("content") or "").strip()
-            if not content:
-                content = (message.get("reasoning_content") or "").strip()
         except Exception as e:
-            print(f"[UTILITY] complete_utility failed: {e}", flush=True)
+            self._log_utility_failure("complete_utility", e)
             return None
 
+        content = (message.get("content") or "").strip()
+        if not content:
+            content = _first_utility_reasoning_field(message)
+        had_raw_text = bool(content)
+
         content = self._strip_utility_think_leakage(content, prefill)
+        if not content:
+            self._log_utility_empty_result("complete_utility", had_raw_text)
         return content or None
 
     def complete_utility_content_only(self, prompt: str, prefill: str = "",
@@ -680,14 +846,18 @@ class BaseLLMBackend(ABC):
 
         Empty `content` after stripping → None (matching complete_utility()'s
         "never raises, None means skip" contract), even if the backend
-        happened to put real text in `reasoning_content` for this response.
+        happened to put real text in a reasoning-lane field for this
+        response.
         """
         try:
             message = self._complete_utility_request(prompt, prefill, max_tokens, temperature)
-            content = (message.get("content") or "").strip()
         except Exception as e:
-            print(f"[UTILITY] complete_utility_content_only failed: {e}", flush=True)
+            self._log_utility_failure("complete_utility_content_only", e)
             return None
 
+        content = (message.get("content") or "").strip()
+        had_raw_text = bool(content)
         content = self._strip_utility_think_leakage(content, prefill)
+        if not content:
+            self._log_utility_empty_result("complete_utility_content_only", had_raw_text)
         return content or None

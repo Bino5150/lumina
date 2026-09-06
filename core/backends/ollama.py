@@ -95,7 +95,7 @@ class OllamaBackend(BaseLLMBackend):
         # Ollama isn't the one asymmetric exception among the backends that
         # accept disable_thinking, but it does NOT give Ollama real
         # reasoning-effort semantics.
-        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking, model=model)
         self.apply_reasoning(payload, effective_effort, model=model)
 
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler

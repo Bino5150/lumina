@@ -384,7 +384,7 @@ class LMStudioBackend(BaseLLMBackend):
         # reasoning_capabilities()/_apply_reasoning_override() themselves)
         # it resolves to each subclass's own real capability data and wire
         # translation -- zero provider conditionals added here.
-        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking, model=model)
         self.apply_reasoning(payload, effective_effort, model=model)
 
         # S41 correction: complete_utility() briefly dropped these when it

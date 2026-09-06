@@ -442,7 +442,7 @@ class OpenAIBackend(LMStudioBackend):
         if not self._reasoning_capable(model):
             payload["temperature"] = temperature
 
-        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking, model=model)
         self.apply_reasoning(payload, effective_effort, model=model)
 
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler

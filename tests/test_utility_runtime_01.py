@@ -76,6 +76,36 @@ class _FakeResponse:
         return self._body
 
 
+class _FakeDiscoveryResponse:
+    def __init__(self, body):
+        self._body = body
+        self.status_code = 200
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._body
+
+
+def _mock_empty_discovery(monkeypatch):
+    """UTILITY-RUNTIME-01 (mandatory-reasoning slice): _complete_utility_
+    request() now primes reasoning-capability discovery (self.
+    reasoning_capabilities_ready()/refresh_reasoning_capabilities()) before
+    its one chat() call, so _effective_reasoning_effort() has real
+    mandatory-reasoning data to read for backends (OpenRouter only) whose
+    capabilities are live-discovered rather than static. That priming step
+    performs a real GET to /models the first time any instance's
+    capabilities aren't ready yet -- mocked here to a valid, empty model
+    list so it resolves deterministically with no reasoning metadata for
+    any model (matching this file's existing 'utility calls request no
+    reasoning override' assertions) instead of reaching real network.
+    Harmless to call for every other backend in this file: their
+    reasoning_capabilities_ready() is always True (static capability
+    tables), so they never reach requests.get at all regardless."""
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: _FakeDiscoveryResponse({"data": []}))
+
+
 def _capture_posts(monkeypatch, body=None):
     """Intercept requests.post immediately before transport; record every
     wire payload. This is the real production translation path — nothing
@@ -149,6 +179,7 @@ def test_cloud_utility_requests_carry_no_local_thinking_fields(monkeypatch, name
     """Every cloud OpenAI-compatible transport must receive a payload free
     of LM Studio's local-only thinking-disable fields. Pre-repair, ALL of
     these leaked both fields via inherited LMStudioBackend.chat()."""
+    _mock_empty_discovery(monkeypatch)
     body = _openai_utility_body("ok") if name == "openai" else None
     payloads = _capture_posts(monkeypatch, body=body)
 
@@ -193,6 +224,7 @@ def test_openrouter_utility_wire_payload_is_provider_valid(monkeypatch):
     OpenAI for this contract: no local-only fields, OpenAI-shaped output
     budget. (Its reasoning-capability translation is separately owned and
     never fires on utility calls — complete_utility passes no effort.)"""
+    _mock_empty_discovery(monkeypatch)
     payloads = _capture_posts(monkeypatch, body=_utility_body())
     backend = OpenRouterBackend(api_key="test-key")
     backend._model = "meta-llama/llama-3.1-8b-instruct:free"

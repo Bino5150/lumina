@@ -600,7 +600,7 @@ class GeminiBackend(BaseLLMBackend):
         # fully built, before the HTTP call. self.default_model is a stable
         # instance attribute, reused consistently for both the URL below
         # and this capability lookup.
-        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking)
+        effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking, model=self.default_model)
         self.apply_reasoning(payload, effective_effort, model=self.default_model)
         url = f"{API_ROOT}/models/{self.default_model}:generateContent"
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
