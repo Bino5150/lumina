@@ -683,7 +683,14 @@ class LuminaWindow(QMainWindow):
             last_id = self._prefs.get("last_chat_id")
             valid_ids = {c["id"] for c in chats}
             target_id = last_id if last_id in valid_ids else chats[0]["id"]
-            self._load_chat(target_id)
+            # CHAT-STARTUP-RESTORE-02: startup restore is never an owner
+            # navigation decision -- on the validated-match path this would
+            # be a same-value no-op, but on the fallback path it would
+            # permanently overwrite last_chat_id with chats[0]'s id, turning
+            # one transient/legitimate validation failure into a sticky
+            # redirect that survives every later relaunch (the fallback id
+            # is itself valid, so it always re-validates from here on).
+            self._load_chat(target_id, persist_as_last=False)
         else:
             self._new_chat()
             
