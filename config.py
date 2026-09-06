@@ -67,7 +67,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 from platformdirs import user_data_dir
 from migrate_state_dir import migrate_legacy_state
 DATA_DIR = os.environ.get("LUMINA_DATA_DIR") or user_data_dir("lumina", appauthor=False)
-migrate_legacy_state(BASE_DIR, DATA_DIR)
+# TEST-DATA-ISOLATION-01: never migrate real in-repo legacy state (shutil.move,
+# not copy) into a throwaway test data dir -- tests/conftest.py sets
+# LUMINA_TESTING before this module is ever imported. A fresh test dir would
+# otherwise always look "unmigrated," relocating (and deleting from BASE_DIR)
+# any legacy file that happened to exist.
+if os.environ.get("LUMINA_TESTING") != "1":
+    migrate_legacy_state(BASE_DIR, DATA_DIR)
 
 DB_PATH = os.path.join(DATA_DIR, "memory", "lumina.db")
 PERSONAS_DIR = os.path.join(BASE_DIR, "personas")

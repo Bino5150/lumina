@@ -4,6 +4,7 @@ Uses a simple JSON file so nothing is lost between sessions.
 """
 import json, os
 import config
+from core.test_isolation import refuse_if_production_path
 
 PREFS_PATH = os.path.join(config.DATA_DIR, "memory", "prefs.json")
 
@@ -20,6 +21,7 @@ _defaults = {
 }
 
 def load() -> dict:
+    refuse_if_production_path(PREFS_PATH)
     try:
         with open(PREFS_PATH, "r") as f:
             data = json.load(f)
@@ -34,6 +36,7 @@ def save(prefs: dict) -> bool:
     place, so a crash mid-write can never leave prefs.json half-written —
     the swap is atomic at the filesystem level; the old file stays intact
     until the new one is fully flushed and ready."""
+    refuse_if_production_path(PREFS_PATH)
     tmp_path = PREFS_PATH + ".tmp"
     try:
         os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)

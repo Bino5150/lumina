@@ -15,6 +15,7 @@ ledger.db the same way. This factory replaces all of them.
 import sqlite3
 import os
 import config
+from core.test_isolation import refuse_if_production_path
 
 
 def connect(path: str = None, row_factory: bool = True, foreign_keys: bool = True,
@@ -43,6 +44,7 @@ def connect(path: str = None, row_factory: bool = True, foreign_keys: bool = Tru
                       lock or similar").
     """
     db_path = path or config.DB_PATH
+    refuse_if_production_path(db_path)
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
     conn.execute("PRAGMA journal_mode=WAL")

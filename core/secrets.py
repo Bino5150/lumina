@@ -4,11 +4,19 @@ prefs.json gets dragged into Project uploads and (genericized) into the
 public repo; this file never should. See blueprint Part 4a.
 """
 import json, os, stat
+from core.test_isolation import refuse_if_production_path
 
-SECRETS_PATH = os.path.expanduser("~/.config/lumina/credentials.json")
+# TEST-DATA-ISOLATION-01: config.py reads get_secret("custom_api_key") at
+# its own import time (for CUSTOM_API_KEY), so -- exactly like config.DATA_DIR
+# -- this path has to be overridable before any project import happens, not
+# just per-test via monkeypatch; a per-test fixture runs too late to stop that
+# one-time read of the real file. LUMINA_SECRETS_PATH mirrors LUMINA_DATA_DIR's
+# convention: unset in normal use, set by tests/conftest.py before collection.
+SECRETS_PATH = os.environ.get("LUMINA_SECRETS_PATH") or os.path.expanduser("~/.config/lumina/credentials.json")
 
 
 def _load() -> dict:
+    refuse_if_production_path(SECRETS_PATH)
     try:
         with open(SECRETS_PATH, "r") as f:
             return json.load(f)
@@ -23,6 +31,7 @@ def _save(data: dict):
     (never exists at any other permission), written to a temp file in the
     same directory, then os.replace()'d into place — same pattern
     persistence.py already uses for prefs.json, applied here too."""
+    refuse_if_production_path(SECRETS_PATH)
     os.makedirs(os.path.dirname(SECRETS_PATH), exist_ok=True)
     tmp_path = SECRETS_PATH + ".tmp"
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
