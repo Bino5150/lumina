@@ -96,6 +96,21 @@ def _utility_body(content="TITLE: Neon Skyline"):
     return {"choices": [{"message": {"role": "assistant", "content": content}}]}
 
 
+def _openai_utility_body(content="TITLE: Neon Skyline"):
+    """OPENAI-RESPONSES-01: OpenAIBackend now speaks /v1/responses, whose
+    response shape is fundamentally different from every other cloud
+    OpenAI-compatible sibling in this file (still Chat Completions) --
+    this is the ONLY body shape OpenAIBackend's normalization understands."""
+    return {
+        "status": "completed",
+        "output": [{"type": "message", "status": "completed",
+                    "content": [{"type": "output_text", "text": content}]}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+                  "input_tokens_details": {"cached_tokens": 0},
+                  "output_tokens_details": {"reasoning_tokens": 0}},
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 1. Cloud OpenAI-compatible family — utility requests must be provider-valid
 # ══════════════════════════════════════════════════════════════════════════
@@ -134,7 +149,8 @@ def test_cloud_utility_requests_carry_no_local_thinking_fields(monkeypatch, name
     """Every cloud OpenAI-compatible transport must receive a payload free
     of LM Studio's local-only thinking-disable fields. Pre-repair, ALL of
     these leaked both fields via inherited LMStudioBackend.chat()."""
-    payloads = _capture_posts(monkeypatch)
+    body = _openai_utility_body("ok") if name == "openai" else None
+    payloads = _capture_posts(monkeypatch, body=body)
 
     result = backend.complete_utility("summarize this", prefill="SUMMARY:", max_tokens=100)
 
@@ -147,10 +163,14 @@ def test_cloud_utility_requests_carry_no_local_thinking_fields(monkeypatch, name
 
 def test_openai_utility_wire_payload_is_exactly_provider_valid(monkeypatch):
     """Strongest form of the contract: the OpenAI utility wire payload is
-    EXACTLY the minimal valid request — no thinking, no chat_template_kwargs,
-    and no other unrequested field of any kind. If a future edit reintroduces
-    any local-only field, this fails before a provider ever sees it."""
-    payloads = _capture_posts(monkeypatch, body=_utility_body())
+    EXACTLY the minimal valid request — no thinking, no
+    chat_template_kwargs, no temperature (UTILITY-OPENAI-PARAMETER-
+    CAPABILITY-01: live-verified 2026-09-05 HTTP 400 for any non-default
+    temperature on this reasoning-capable model), and no other unrequested
+    field of any kind. If a future edit reintroduces any local-only field
+    or reasoning-model-illegal temperature, this fails before a provider
+    ever sees it."""
+    payloads = _capture_posts(monkeypatch, body=_openai_utility_body())
     backend = OpenAIBackend(api_key="test-key")
     backend._model = "gpt-5.6-luna"
 
@@ -159,13 +179,12 @@ def test_openai_utility_wire_payload_is_exactly_provider_valid(monkeypatch):
     assert result == "Neon Skyline"
     assert payloads[0] == {
         "model": "gpt-5.6-luna",
-        "messages": [
+        "input": [
             {"role": "user", "content": "name this chat"},
-            {"role": "assistant", "content": "TITLE:"},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "TITLE:"}]},
         ],
-        "temperature": 0.3,
-        "stream": False,
-        "max_completion_tokens": 30,
+        "store": False,
+        "max_output_tokens": 30,
     }
 
 
@@ -208,7 +227,7 @@ def test_utility_call_against_strict_provider_succeeds_post_contract(monkeypatch
             raise requests.exceptions.HTTPError(
                 f"400 Client Error: Unrecognized request argument: {leaked[0]}"
             )
-        return _FakeResponse(_utility_body())
+        return _FakeResponse(_openai_utility_body())
 
     monkeypatch.setattr(requests, "post", strict_provider_post)
     backend = OpenAIBackend(api_key="test-key")
@@ -342,7 +361,7 @@ def test_openai_ordinary_chat_reasoning_translation_untouched(monkeypatch):
     backend.chat(messages=[{"role": "user", "content": "hi"}],
                  max_tokens=222, reasoning_effort="high")
 
-    assert payloads[0]["reasoning_effort"] == "high"
+    assert payloads[0]["reasoning"] == {"effort": "high", "summary": "auto"}
     for field in LOCAL_ONLY_UTILITY_FIELDS:
         assert field not in payloads[0]
 
@@ -380,6 +399,7 @@ def test_utility_calls_still_ignore_saved_reasoning_effort(monkeypatch):
     backend.complete_utility("summarize this", prefill="SUMMARY:", max_tokens=100)
 
     assert "reasoning_effort" not in payloads[0]
+    assert "reasoning" not in payloads[0]
     for field in LOCAL_ONLY_UTILITY_FIELDS:
         assert field not in payloads[0]
 
@@ -395,7 +415,7 @@ def test_dream_summarization_openai_path_sends_provider_valid_request(monkeypatc
     that failed pre-repair); transport intercepted at requests.post."""
     import core.dreaming as dreaming
 
-    payloads = _capture_posts(monkeypatch, body=_utility_body(
+    payloads = _capture_posts(monkeypatch, body=_openai_utility_body(
         "SUMMARY: - Bino tested the OpenAI backend"))
     backend = OpenAIBackend(api_key="test-key")
     backend._model = "gpt-5.6-luna"
@@ -406,7 +426,8 @@ def test_dream_summarization_openai_path_sends_provider_valid_request(monkeypatc
     assert summary == "- Bino tested the OpenAI backend"
     for field in LOCAL_ONLY_UTILITY_FIELDS:
         assert field not in payloads[0]
-    assert payloads[0]["max_completion_tokens"] == 500
+    assert "temperature" not in payloads[0]
+    assert payloads[0]["max_output_tokens"] == 500
 
 
 def test_dream_summarization_local_path_keeps_thinking_disable_fields(monkeypatch):
@@ -433,7 +454,7 @@ def test_human_profile_curation_openai_path_sends_provider_valid_request(monkeyp
     repaired the persistence side; this proves the wire side."""
     import core.dreaming as dreaming
 
-    payloads = _capture_posts(monkeypatch, body=_utility_body(
+    payloads = _capture_posts(monkeypatch, body=_openai_utility_body(
         "NOTES: - rides motorcycles"))
     backend = OpenAIBackend(api_key="test-key")
     backend._model = "gpt-5.6-luna"
@@ -445,7 +466,8 @@ def test_human_profile_curation_openai_path_sends_provider_valid_request(monkeyp
     assert result == "- rides motorcycles"
     for field in LOCAL_ONLY_UTILITY_FIELDS:
         assert field not in payloads[0]
-    assert payloads[0]["max_completion_tokens"] == 400
+    assert "temperature" not in payloads[0]
+    assert payloads[0]["max_output_tokens"] == 400
 
 
 def test_compaction_openai_path_sends_provider_valid_request(monkeypatch):
@@ -454,7 +476,7 @@ def test_compaction_openai_path_sends_provider_valid_request(monkeypatch):
     shared repair, no compaction-specific code touched."""
     import core.dreaming as dreaming
 
-    payloads = _capture_posts(monkeypatch, body=_utility_body(
+    payloads = _capture_posts(monkeypatch, body=_openai_utility_body(
         "SUMMARY: - decided to ship the fix"))
     backend = OpenAIBackend(api_key="test-key")
     backend._model = "gpt-5.6-luna"
@@ -467,7 +489,8 @@ def test_compaction_openai_path_sends_provider_valid_request(monkeypatch):
     assert summary == "- decided to ship the fix"
     for field in LOCAL_ONLY_UTILITY_FIELDS:
         assert field not in payloads[0]
-    assert payloads[0]["max_completion_tokens"] == 300
+    assert "temperature" not in payloads[0]
+    assert payloads[0]["max_output_tokens"] == 300
 
 
 def test_auto_name_chat_openai_path_sends_provider_valid_request_and_titles(monkeypatch):
@@ -492,7 +515,7 @@ def test_auto_name_chat_openai_path_sends_provider_valid_request_and_titles(monk
 
     def fake_post(*args, **kwargs):
         payloads.append(kwargs["json"])
-        return _FakeResponse(_utility_body())
+        return _FakeResponse(_openai_utility_body())
 
     monkeypatch.setattr(requests, "post", fake_post)
     monkeypatch.setattr(main_window, "threading",
@@ -515,4 +538,5 @@ def test_auto_name_chat_openai_path_sends_provider_valid_request_and_titles(monk
     assert captured_bodies == [(42, "Neon Skyline")]
     for field in LOCAL_ONLY_UTILITY_FIELDS:
         assert field not in payloads[0]
-    assert payloads[0]["max_completion_tokens"] == 30
+    assert "temperature" not in payloads[0]
+    assert payloads[0]["max_output_tokens"] == 30

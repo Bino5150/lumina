@@ -99,28 +99,34 @@ def _drain(gen):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 1. OpenAIBackend -- reasoning_effort key on the Chat Completions payload
+# 1. OpenAIBackend -- reasoning object on the Responses payload
 # ══════════════════════════════════════════════════════════════════════
+#
+# OPENAI-RESPONSES-01: OpenAIBackend now speaks /v1/responses, whose
+# reasoning wire shape is a nested {"reasoning": {"effort": ..., "summary":
+# "auto"}} object, not Chat Completions' flat "reasoning_effort" string
+# field (see core/backends/openai_backend.py's module docstring for the
+# live-verified root cause this migration fixes).
 
-def test_openai_chat_valid_effort_reaches_reasoning_effort_key(monkeypatch):
+def test_openai_chat_valid_effort_reaches_reasoning_object(monkeypatch):
     captured = _capture_post(monkeypatch)
     backend = OpenAIBackend()
     backend._model = "gpt-5.6"
 
     backend.chat(messages=[{"role": "user", "content": "hi"}], reasoning_effort="high")
 
-    assert captured["json"]["reasoning_effort"] == "high"
+    assert captured["json"]["reasoning"] == {"effort": "high", "summary": "auto"}
     assert captured["json"]["model"] == "gpt-5.6"
 
 
-def test_openai_chat_stream_valid_effort_reaches_reasoning_effort_key(monkeypatch):
+def test_openai_chat_stream_valid_effort_reaches_reasoning_object(monkeypatch):
     captured = _capture_post(monkeypatch)
     backend = OpenAIBackend()
     backend._model = "gpt-5.6"
 
     _drain(backend.chat_stream(messages=[{"role": "user", "content": "hi"}], reasoning_effort="high"))
 
-    assert captured["json"]["reasoning_effort"] == "high"
+    assert captured["json"]["reasoning"] == {"effort": "high", "summary": "auto"}
 
 
 def test_openai_chat_provider_default_none_emits_no_field(monkeypatch):
@@ -130,7 +136,7 @@ def test_openai_chat_provider_default_none_emits_no_field(monkeypatch):
 
     backend.chat(messages=[{"role": "user", "content": "hi"}], reasoning_effort=None)
 
-    assert "reasoning_effort" not in captured["json"]
+    assert "reasoning" not in captured["json"]
 
 
 def test_openai_chat_stream_provider_default_none_emits_no_field(monkeypatch):
@@ -140,12 +146,12 @@ def test_openai_chat_stream_provider_default_none_emits_no_field(monkeypatch):
 
     _drain(backend.chat_stream(messages=[{"role": "user", "content": "hi"}], reasoning_effort=None))
 
-    assert "reasoning_effort" not in captured["json"]
+    assert "reasoning" not in captured["json"]
 
 
 def test_openai_chat_unrecognized_model_emits_no_field_even_for_valid_looking_effort(monkeypatch):
     """A model with no entry in OpenAIBackend's capability table (e.g. the
-    default gpt-4o-mini) must never emit reasoning_effort even for a
+    default gpt-4o-mini) must never emit a reasoning object even for a
     string that IS a real effort label on gpt-5.6 -- capability is keyed
     per-model, not accepted globally."""
     captured = _capture_post(monkeypatch)
@@ -154,7 +160,7 @@ def test_openai_chat_unrecognized_model_emits_no_field_even_for_valid_looking_ef
 
     backend.chat(messages=[{"role": "user", "content": "hi"}], reasoning_effort="high")
 
-    assert "reasoning_effort" not in captured["json"]
+    assert "reasoning" not in captured["json"]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -483,7 +489,7 @@ def test_disable_thinking_wins_over_conflicting_valid_effort_openai(monkeypatch)
     backend.chat(messages=[{"role": "assistant", "content": "SUMMARY:"}],
                  disable_thinking=True, reasoning_effort="high")
 
-    assert "reasoning_effort" not in captured["json"]
+    assert "reasoning" not in captured["json"]
 
 
 def test_disable_thinking_wins_over_conflicting_valid_effort_gemini(monkeypatch):
@@ -519,7 +525,7 @@ def test_disable_thinking_false_still_lets_a_valid_effort_through(monkeypatch):
     backend.chat(messages=[{"role": "user", "content": "hi"}],
                  disable_thinking=False, reasoning_effort="high")
 
-    assert captured["json"]["reasoning_effort"] == "high"
+    assert captured["json"]["reasoning"] == {"effort": "high", "summary": "auto"}
 
 
 def test_effective_reasoning_effort_helper_direct():
@@ -546,15 +552,15 @@ def test_openai_backend_two_calls_different_efforts_do_not_cross_contaminate(mon
 
     captured = _capture_post(monkeypatch)
     backend.chat(messages=[{"role": "user", "content": "hi"}], reasoning_effort="low")
-    assert captured["json"]["reasoning_effort"] == "low"
+    assert captured["json"]["reasoning"] == {"effort": "low", "summary": "auto"}
 
     captured = _capture_post(monkeypatch)
     backend.chat(messages=[{"role": "user", "content": "hi"}], reasoning_effort="high")
-    assert captured["json"]["reasoning_effort"] == "high"
+    assert captured["json"]["reasoning"] == {"effort": "high", "summary": "auto"}
 
     captured = _capture_post(monkeypatch)
     backend.chat(messages=[{"role": "user", "content": "hi"}], reasoning_effort=None)
-    assert "reasoning_effort" not in captured["json"]
+    assert "reasoning" not in captured["json"]
 
 
 def test_apply_reasoning_direct_two_fresh_payloads_no_cross_contamination():
@@ -569,9 +575,9 @@ def test_apply_reasoning_direct_two_fresh_payloads_no_cross_contamination():
     payload_b = {"model": "gpt-5.6"}
     backend.apply_reasoning(payload_b, "high", model="gpt-5.6")
 
-    assert payload_a["reasoning_effort"] == "low"
-    assert payload_b["reasoning_effort"] == "high"
+    assert payload_a["reasoning"] == {"effort": "low", "summary": "auto"}
+    assert payload_b["reasoning"] == {"effort": "high", "summary": "auto"}
 
     payload_c = {"model": "gpt-5.6"}
     backend.apply_reasoning(payload_c, None, model="gpt-5.6")
-    assert "reasoning_effort" not in payload_c
+    assert "reasoning" not in payload_c

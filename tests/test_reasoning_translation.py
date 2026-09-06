@@ -149,15 +149,17 @@ def test_openai_provider_default_emits_no_reasoning_effort_key():
     assert "reasoning_effort" not in payload
 
 
-def test_openai_valid_effort_emits_exactly_reasoning_effort_key():
+def test_openai_valid_effort_emits_exactly_reasoning_object():
+    """OPENAI-RESPONSES-01: Responses' reasoning wire shape is a nested
+    {"effort", "summary"} object, not Chat Completions' flat
+    "reasoning_effort" string field."""
     backend = OpenAIBackend()
-    payload = {"model": "gpt-5.6", "messages": [{"role": "user", "content": "hi"}], "temperature": 0.7}
+    payload = {"model": "gpt-5.6", "input": [{"role": "user", "content": "hi"}]}
     backend.apply_reasoning(payload, "high", model="gpt-5.6")
     assert payload == {
         "model": "gpt-5.6",
-        "messages": [{"role": "user", "content": "hi"}],
-        "temperature": 0.7,
-        "reasoning_effort": "high",
+        "input": [{"role": "user", "content": "hi"}],
+        "reasoning": {"effort": "high", "summary": "auto"},
     }
 
 
@@ -166,7 +168,7 @@ def test_openai_unsupported_value_emits_nothing():
     payload = {"model": "gpt-5.6"}
     backend.apply_reasoning(payload, "ultra", model="gpt-5.6")
     assert payload == {"model": "gpt-5.6"}
-    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
 
 
 def test_openai_unknown_model_advertises_no_control():

@@ -879,11 +879,17 @@ def test_complete_utility_ignores_saved_reasoning_effort_entirely(monkeypatch):
 
     def _fake_post(*args, **kwargs):
         captured["json"] = kwargs.get("json")
-        return _FakeResp({"choices": [{"message": {"role": "assistant", "content": "a summary"}}]})
+        return _FakeResp({
+            "status": "completed",
+            "output": [{"type": "message", "status": "completed",
+                        "content": [{"type": "output_text", "text": "a summary"}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        })
 
     monkeypatch.setattr(requests, "post", _fake_post)
 
     result = backend.complete_utility("summarize this")
 
     assert result == "a summary"
+    assert "reasoning" not in captured["json"]
     assert "reasoning_effort" not in captured["json"]

@@ -164,12 +164,113 @@ def test_discover_models_populates_vision_tool_cache_from_the_same_response(monk
     assert backend.reasoning_capabilities("z-ai/glm-5.3-flash").mandatory is True
 
 
+# ── OPENAI-RESPONSES-01: OpenAIBackend's own supports_vision_with_tools ────
+#
+# Live-verified 2026-09-05 against the real api.openai.com/v1/responses
+# endpoint: a single image, two images, function tools, and
+# reasoning.effort="high" all combined in one request returned HTTP 200
+# with a correct function_call output item, for every gpt-5.6-family
+# model. Unlike OpenRouter's per-model discovery-driven cache, this is a
+# static set (the same models reasoning_capabilities() already covers) --
+# there is no per-model discovery mechanism for this on OpenAI.
+
+def test_openai_reports_true_only_for_the_live_verified_gpt56_family():
+    from core.backends.openai_backend import OpenAIBackend
+
+    backend = OpenAIBackend(api_key="test-key")
+    for model in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        assert backend.supports_vision_with_tools(model) is True
+    assert backend.supports_vision_with_tools("gpt-4o") is False
+    assert backend.supports_vision_with_tools("gpt-4o-mini") is False
+    assert backend.supports_vision_with_tools(None) is False
+
+
+def test_openai_keeps_tools_on_a_vision_turn_at_the_wire_level(monkeypatch):
+    import requests
+    from core.backends.openai_backend import OpenAIBackend
+
+    backend = OpenAIBackend(api_key="test-key")
+    backend._model = "gpt-5.6-luna"
+    captured = {}
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return _FakeResp({"content": "a description"})
+
+    monkeypatch.setattr(requests, "post", _fake_post)
+
+    messages = [{"role": "user", "content": [_IMAGE, {"type": "text", "text": "what is this?"}]}]
+    backend.chat(messages, tools=_PRODUCT_TOOLS, tool_choice_mode=ToolChoiceMode.AUTO)
+
+    # _PRODUCT_TOOLS' empty {} parameters is not a valid JSON schema object;
+    # OpenAIBackend._translate_tools() substitutes a minimal valid one
+    # rather than sending an empty dict a real /v1/responses call would
+    # reject -- see core/backends/openai_backend.py's _translate_tools().
+    assert captured["payload"]["tools"] == [{
+        "type": "function", "name": "read_file", "description": "",
+        "parameters": {"type": "object", "properties": {}},
+    }]
+    assert captured["payload"]["tool_choice"] == "auto"
+
+
+def test_openai_keeps_tools_with_multiple_images_at_the_wire_level(monkeypatch):
+    import requests
+    from core.backends.openai_backend import OpenAIBackend
+
+    backend = OpenAIBackend(api_key="test-key")
+    backend._model = "gpt-5.6-luna"
+    captured = {}
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return _FakeResp({"content": "two descriptions"})
+
+    monkeypatch.setattr(requests, "post", _fake_post)
+
+    messages = [{"role": "user", "content": [_IMAGE, _IMAGE_2, {"type": "text", "text": "compare these"}]}]
+    backend.chat(messages, tools=_PRODUCT_TOOLS, tool_choice_mode=ToolChoiceMode.REQUIRED)
+
+    assert captured["payload"]["tool_choice"] == "required"
+    sent_content = captured["payload"]["input"][0]["content"]
+    assert sent_content == [
+        {"type": "input_image", "image_url": _IMAGE["image_url"]["url"]},
+        {"type": "input_image", "image_url": _IMAGE_2["image_url"]["url"]},
+        {"type": "input_text", "text": "compare these"},
+    ]
+
+
+def test_openai_unverified_model_still_drops_tools_on_vision_turn(monkeypatch):
+    """Capability is per-model, not backend-wide -- gpt-4o has no live
+    vision+tools evidence on file, so it keeps the safe suppression
+    default even though it's a real OpenAI vision-capable model."""
+    import requests
+    from core.backends.openai_backend import OpenAIBackend
+
+    backend = OpenAIBackend(api_key="test-key")
+    backend._model = "gpt-4o"
+    captured = {}
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return _FakeResp({"content": "a description"})
+
+    monkeypatch.setattr(requests, "post", _fake_post)
+
+    messages = [{"role": "user", "content": [_IMAGE, {"type": "text", "text": "what is this?"}]}]
+    backend.chat(messages, tools=_PRODUCT_TOOLS, tool_choice_mode=ToolChoiceMode.AUTO)
+
+    assert "tools" not in captured["payload"]
+    assert "tool_choice" not in captured["payload"]
+
+
 # ── LMStudioBackend.chat() wire-level: capability gates the has_vision drop ─
 
 def test_unsupported_backend_still_drops_tools_on_vision_turn(monkeypatch):
     """Unchanged existing behavior for every backend without a
     supports_vision_with_tools() override (DeepSeek/Groq/Kimi/llama.cpp/
-    OmniRoute/OpenAI/Qwen/vLLM/Custom/LM Studio itself) -- no regression."""
+    OmniRoute/Qwen/vLLM/Custom/LM Studio itself) -- no regression. OpenAI
+    is no longer in this list as of OPENAI-RESPONSES-01 -- see the
+    dedicated OpenAI section below."""
     import requests
 
     backend = LMStudioBackend.__new__(LMStudioBackend)

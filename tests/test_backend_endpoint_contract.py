@@ -166,7 +166,11 @@ def test_lm_family_fixed_credentials_never_reach_foreign_endpoint(
 
     assert len(calls) == 1
     url, headers = calls[0]
-    assert url == f"{FIXED_ENDPOINTS[backend]}/chat/completions"
+    # OPENAI-RESPONSES-01: OpenAI now speaks /v1/responses, not
+    # /chat/completions -- every other fixed-endpoint backend in this
+    # parametrization (groq) is unaffected and keeps the old path.
+    expected_path = "responses" if backend == "openai" else "chat/completions"
+    assert url == f"{FIXED_ENDPOINTS[backend]}/{expected_path}"
     assert hostile not in url
     assert key_value in headers["Authorization"]
 
