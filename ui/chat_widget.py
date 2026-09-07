@@ -205,7 +205,7 @@ class MetricsBar(QFrame):
 
     def set_metrics(self, turn_elapsed, stream_elapsed, stream_tokens,
                      tok_in: int, tok_out: int, tool_calls: int, think_time: float,
-                     ttfa=None, final_ttft=None):
+                     ttfa=None, final_ttft=None, tok_total=None):
         """TOKS-STREAM-TIMING-01. Independent values, never conflated:
         turn_elapsed (this bubble's whole dispatch-to-finalize wall time --
         None only for a restored/historical bubble that never actually
@@ -225,11 +225,9 @@ class MetricsBar(QFrame):
         on_final_ttft callback. Deliberately never implies it measures an
         earlier WORK/tool round on a multi-round turn -- it is scoped to
         the SAME request final-stream duration below is scoped to.
-        Never fired at all for a held-candidate promotion, which has no
-        streaming request to observe -- see core/agent.py's
-        _finalize_completion_candidate() docstring: that path shows
-        "Final TTFT n/a · stream n/a" while turn/first-answer stay
-        honest). tok_s is computed ONLY from the stream_elapsed/
+        A held candidate only receives these values when its backend captured
+        native stream boundaries; blocking-only candidates still show
+        "Final TTFT n/a · stream n/a". tok_s is computed ONLY from the stream_elapsed/
         stream_tokens pair; tok_in/tok_out below remain the pre-existing
         approximate usage counters (chunk-count based, not a real token
         count) -- left in place for their existing display role, never
@@ -251,11 +249,14 @@ class MetricsBar(QFrame):
             parts.append(f"{tok_s:.1f} tok/s")
         else:
             parts.append("stream n/a")
-        parts.append(f"{tok_in}in / {tok_out}out / {tok_in+tok_out}total")
+        total = tok_in + tok_out if tok_total is None else tok_total
+        parts.append(f"{tok_in}in / {tok_out}out / {total}total")
         if tool_calls:
             parts.append(f"{tool_calls} tool calls")
         if think_time > 0:
-            parts.append(f"think: {think_time:.1f}s")
+            rendered_think = (f"{think_time:.1f}s" if think_time >= 0.05
+                              else "<0.1s")
+            parts.append(f"think: {rendered_think}")
         self.lbl.setText("  ·  ".join(parts))
         self.copy_btn.setVisible(True)
         if self._tts:
@@ -356,6 +357,9 @@ class LiveResponseBubble(QFrame):
         self._ttfa_s = None
         self._think_start_time = 0.0
         self._think_time = 0.0
+        self._provider_think_time = 0.0
+        self._has_provider_think_timing = False
+        self._provider_usage = None
         self._tok_out = 0
         self._tool_calls = 0
         self._build()
@@ -506,12 +510,9 @@ class LiveResponseBubble(QFrame):
         core/agent.py's on_final_ttft via ui/main_window.py's final_ttft
         signal: the final-PRODUCING request's own dispatch-to-first-
         nonempty-delta latency, scoped to that one request -- never an
-        earlier WORK/tool round's dispatch on a multi-round turn. Never
-        fired for a held-candidate promotion (no streaming request to
-        observe) -- leaves _final_ttft_s at None, which set_metrics()
-        renders as "Final TTFT n/a", alongside "stream n/a" for the same
-        structural reason (see core/agent.py's
-        _finalize_completion_candidate() docstring)."""
+        earlier tool-bearing WORK round's dispatch on a multi-round turn. A
+        held candidate fires only when its backend captured native boundaries;
+        otherwise this remains None and renders as "Final TTFT n/a"."""
         if final_ttft_s and final_ttft_s > 0:
             self._final_ttft_s = final_ttft_s
 
@@ -525,6 +526,22 @@ class LiveResponseBubble(QFrame):
         ever fires for the former."""
         if ttfa_s and ttfa_s > 0:
             self._ttfa_s = ttfa_s
+
+    def set_token_usage(self, usage: dict):
+        """Stash the latest cumulative provider-reported turn usage."""
+        required = ("prompt_tokens", "completion_tokens", "total_tokens")
+        if not isinstance(usage, dict):
+            return
+        if not all(isinstance(usage.get(key), int) and usage[key] >= 0
+                   for key in required):
+            return
+        self._provider_usage = dict(usage)
+
+    def add_think_timing(self, duration_s: float):
+        """Prefer provider/agent-observed Think intervals over Qt queue time."""
+        if isinstance(duration_s, (int, float)) and duration_s > 0:
+            self._provider_think_time += duration_s
+            self._has_provider_think_timing = True
 
     def finalize(self):
         if not shiboken6.isValid(self.bubble_layout):
@@ -561,10 +578,16 @@ class LiveResponseBubble(QFrame):
         else:
             self.stream_lbl.setText("")
 
-        # Show metrics — estimate tok_in from context (~183 shown in screenshot)
+        usage = self._provider_usage or {}
+        tok_in = usage.get("prompt_tokens", 0)
+        tok_out = usage.get("completion_tokens", self._tok_out)
+        tok_total = usage.get("total_tokens")
+        think_time = (self._provider_think_time if self._has_provider_think_timing
+                      else self._think_time)
         self.metrics.set_metrics(turn_elapsed, self._stream_elapsed_s, self._stream_tokens,
-                                  0, self._tok_out, self._tool_calls, self._think_time,
-                                  ttfa=self._ttfa_s, final_ttft=self._final_ttft_s)
+                                  tok_in, tok_out, self._tool_calls, think_time,
+                                  ttfa=self._ttfa_s, final_ttft=self._final_ttft_s,
+                                  tok_total=tok_total)
         self.metrics.setVisible(True)
         self.metrics._response_text = self._response_text
 

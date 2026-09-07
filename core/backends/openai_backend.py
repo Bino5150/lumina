@@ -43,6 +43,7 @@ backend) is preserved without adding any opaque per-turn buffer.
 """
 
 import json
+import time
 from typing import Optional, Generator
 
 import requests
@@ -56,7 +57,12 @@ from .lmstudio import (
     format_provider_error,
     _iter_lines_safe,
 )
-from .base import ModelDiscoveryOutcome, ModelDiscoveryResult, ToolChoiceMode
+from .base import (
+    BackendStreamTelemetry,
+    ModelDiscoveryOutcome,
+    ModelDiscoveryResult,
+    ToolChoiceMode,
+)
 from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
 
@@ -193,7 +199,83 @@ def _translate_tools(tools: list) -> list:
     return translated
 
 
-def _normalize_responses_body(body: dict) -> dict:
+def _normalize_responses_usage(body: dict) -> dict:
+    """Responses-native usage -> Lumina's canonical OpenAI-compatible shape."""
+    usage = body.get("usage") or {}
+    input_details = usage.get("input_tokens_details") or {}
+    output_details = usage.get("output_tokens_details") or {}
+    return {
+        "prompt_tokens": usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("output_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+        "prompt_tokens_details": {
+            "cached_tokens": input_details.get("cached_tokens", 0),
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": output_details.get("reasoning_tokens", 0),
+        },
+    }
+
+
+class _ResponsesTiming:
+    """Request-local observation of native Responses stream boundaries.
+
+    Only provider-permitted reasoning-summary events are timed.  Function-call
+    argument deltas never start Final TTFT, Final stream, or Think clocks.
+    """
+
+    def __init__(self, request_started_at: float):
+        self.request_started_at = request_started_at
+        self.final_started_at = None
+        self.think_started_at = None
+        self.think_duration_s = 0.0
+
+    def observe(self, event: dict, now: float) -> None:
+        event_type = event.get("type")
+        if event_type == "response.reasoning_summary_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta:
+                if self.think_started_at is None:
+                    self.think_started_at = now
+        elif event_type == "response.reasoning_summary_text.done":
+            self._close_think(now)
+        elif event_type == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta:
+                self._close_think(now)
+                if self.final_started_at is None:
+                    self.final_started_at = now
+        elif event_type in {
+            "response.completed", "response.incomplete", "response.failed",
+        }:
+            self._close_think(now)
+
+    def _close_think(self, now: float) -> None:
+        if self.think_started_at is not None:
+            duration = now - self.think_started_at
+            if duration > 0:
+                self.think_duration_s += duration
+            self.think_started_at = None
+
+    def snapshot(self, body: dict, terminal_at: float) -> dict:
+        telemetry = {
+            "request_streamed": True,
+        }
+        if isinstance(body.get("usage"), dict):
+            telemetry["usage"] = _normalize_responses_usage(body)
+        if self.final_started_at is not None:
+            ttft = self.final_started_at - self.request_started_at
+            stream_duration = terminal_at - self.final_started_at
+            if ttft > 0:
+                telemetry["final_ttft_s"] = ttft
+            if stream_duration > 0:
+                telemetry["final_stream_duration_s"] = stream_duration
+        if self.think_duration_s > 0:
+            telemetry["think_duration_s"] = self.think_duration_s
+        return telemetry
+
+
+def _normalize_responses_body(body: dict, telemetry: Optional[dict] = None) -> dict:
     """A raw /v1/responses response body -> the same Chat-Completions-
     shaped dict this backend's Chat Completions transport used to return,
     so BaseLLMBackend.extract_message()/is_tool_call()/get_tool_calls()/
@@ -261,21 +343,13 @@ def _normalize_responses_body(body: dict) -> dict:
     else:
         finish_reason = None
 
-    usage = body.get("usage") or {}
-    input_details = usage.get("input_tokens_details") or {}
-    output_details = usage.get("output_tokens_details") or {}
-    normalized_usage = {
-        "prompt_tokens": usage.get("input_tokens", 0),
-        "completion_tokens": usage.get("output_tokens", 0),
-        "total_tokens": usage.get("total_tokens", 0),
-        "prompt_tokens_details": {"cached_tokens": input_details.get("cached_tokens", 0)},
-        "completion_tokens_details": {"reasoning_tokens": output_details.get("reasoning_tokens", 0)},
-    }
-
-    return {
+    normalized = {
         "choices": [{"message": message, "finish_reason": finish_reason}],
-        "usage": normalized_usage,
+        "usage": _normalize_responses_usage(body),
     }
+    if telemetry:
+        normalized["_lumina_telemetry"] = telemetry
+    return normalized
 
 
 class OpenAIBackend(LMStudioBackend):
@@ -363,6 +437,23 @@ class OpenAIBackend(LMStudioBackend):
         """
         return None
 
+    def extract_response_telemetry(self, response: dict) -> dict:
+        """Canonical per-call telemetry for the foreground agent runtime.
+
+        ``chat()`` always normalizes usage.  When the caller explicitly asks
+        to capture event timing, ``_lumina_telemetry`` also contains native
+        stream boundaries observed request-locally; no state is retained on
+        this backend instance and utility calls never opt in.
+        """
+        telemetry = response.get("_lumina_telemetry")
+        if isinstance(telemetry, dict):
+            return dict(telemetry)
+        result = {}
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            result["usage"] = usage
+        return result
+
     # ------------------------------------------------------------------
     # Patch 3A.4 Part 2A -- reasoning-effort capability + wire translation
     # ------------------------------------------------------------------
@@ -405,7 +496,8 @@ class OpenAIBackend(LMStudioBackend):
              temperature: float = 0.7, max_tokens: int = 1024,
              disable_thinking: bool = False,
              reasoning_effort: Optional[str] = None,
-             tool_choice_mode: Optional[ToolChoiceMode] = None) -> dict:
+             tool_choice_mode: Optional[ToolChoiceMode] = None,
+             capture_telemetry: bool = False) -> dict:
         model = self.get_model()
         payload = {
             "model": model,
@@ -445,6 +537,9 @@ class OpenAIBackend(LMStudioBackend):
         effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking, model=model)
         self.apply_reasoning(payload, effective_effort, model=model)
 
+        if capture_telemetry:
+            return self._chat_with_stream_telemetry(payload)
+
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
             resp = requests.post(
@@ -464,9 +559,70 @@ class OpenAIBackend(LMStudioBackend):
             print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
             raise RuntimeError(format_provider_error(self.display_name, resp.status_code, resp.text, str(e)))
 
+    def _chat_with_stream_telemetry(self, payload: dict) -> dict:
+        """Collect one native stream and return the unchanged normalized body.
+
+        This is opt-in from the foreground agent only.  The terminal event's
+        full ``response`` object remains the source of message/tool/usage
+        truth; deltas are observed solely for timing and are never replayed as
+        model content here.
+        """
+        streamed_payload = dict(payload, stream=True)
+        resp = None
+        request_started_at = time.monotonic()
+        timing = _ResponsesTiming(request_started_at)
+        try:
+            resp = requests.post(
+                join_endpoint(self.base_url, "responses"),
+                headers=self.headers, json=streamed_payload,
+                timeout=config.TOOL_CALL_TIMEOUT,
+                stream=True,
+            )
+            resp.raise_for_status()
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(f"{self.display_name} not reachable at {self.base_url}.")
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"{self.display_name} request timed out.")
+        except requests.exceptions.HTTPError as e:
+            if resp is None:
+                raise RuntimeError(format_provider_error(self.display_name, None, "", str(e)))
+            raise RuntimeError(format_provider_error(self.display_name, resp.status_code, resp.text, str(e)))
+
+        for line in _iter_lines_safe(resp):
+            if not line:
+                continue
+            line = line.decode("utf-8")
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError as e:
+                print(f"[{self.display_name} STREAM] skipped malformed "
+                      f"frame ({type(e).__name__}), len={len(data)}", flush=True)
+                continue
+            observed_at = time.monotonic()
+            timing.observe(event, observed_at)
+            event_type = event.get("type")
+            if event_type in {
+                "response.completed", "response.incomplete", "response.failed",
+            }:
+                body = event.get("response")
+                if not isinstance(body, dict):
+                    raise RuntimeError(f"{self.display_name} stream ended without a response body.")
+                return _normalize_responses_body(
+                    body, telemetry=timing.snapshot(body, observed_at),
+                )
+            if event_type == "error":
+                err = event.get("message") or (event.get("error") or {}).get("message") or "stream error"
+                raise RuntimeError(f"{self.display_name} error: {err}")
+        raise RuntimeError(f"{self.display_name} stream ended before a terminal response event.")
+
     def chat_stream(self, messages: list, max_tokens: int = 4096,
                     temperature: float = 0.7,
-                    reasoning_effort: Optional[str] = None) -> Generator[str, None, None]:
+                    reasoning_effort: Optional[str] = None) -> Generator[object, None, None]:
         """Streams the same '__THINK_START__'/token/'__THINK_END__' contract
         every other backend's chat_stream() uses. This signature never
         carries `tools` (no abstract chat_stream() implementation in this
@@ -551,6 +707,12 @@ class OpenAIBackend(LMStudioBackend):
                 if in_think:
                     in_think = False
                     yield "__THINK_END__"
+                body = chunk.get("response")
+                if isinstance(body, dict) and isinstance(body.get("usage"), dict):
+                    yield BackendStreamTelemetry({
+                        "usage": _normalize_responses_usage(body),
+                        "request_streamed": True,
+                    })
                 break
             elif ctype == "error":
                 if in_think:

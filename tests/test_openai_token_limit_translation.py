@@ -58,6 +58,13 @@ class _FakeResponse:
         return iter(self._stream_lines)
 
 
+def _terminal_stream_response(body):
+    event = {"type": "response.completed", "response": body}
+    return _FakeResponse(stream_lines=(
+        f"data: {json.dumps(event)}".encode("utf-8"),
+    ))
+
+
 def _capture_posts(monkeypatch, responses=None):
     payloads = []
     queued = iter(responses or ())
@@ -328,7 +335,7 @@ def _fake_agent(llm, tool_schema, tool_calls):
 def test_complete_openai_tool_loop_uses_responses_endpoint_on_every_request(
     monkeypatch
 ):
-    tool_call_response = _FakeResponse(_responses_body(output=[
+    tool_call_response = _terminal_stream_response(_responses_body(output=[
         {"type": "function_call", "status": "completed", "call_id": "call-1",
          "name": "lookup", "arguments": "{}"},
     ]))
@@ -338,8 +345,8 @@ def test_complete_openai_tool_loop_uses_responses_endpoint_on_every_request(
     # real tool call, which triggers the completion-control gate (round 3):
     # a REQUIRED request offering ONLY the two internal control
     # primitives, never the product tool schema.
-    work_no_tool_response = _FakeResponse(_responses_body(output=[]))
-    gate_response = _FakeResponse(_responses_body(output=[
+    work_no_tool_response = _terminal_stream_response(_responses_body(output=[]))
+    gate_response = _terminal_stream_response(_responses_body(output=[
         {"type": "function_call", "status": "completed", "call_id": "call-2",
          "name": "finish_tool_work", "arguments": "{}"},
     ]))
@@ -371,7 +378,7 @@ def test_complete_openai_tool_loop_uses_responses_endpoint_on_every_request(
     assert result == "final answer"
     assert tool_calls == [("lookup", {})]
     assert len(payloads) == 4
-    assert [payload.get("stream", False) for payload in payloads] == [False, False, False, True]
+    assert [payload.get("stream", False) for payload in payloads] == [True, True, True, True]
     for payload in payloads:
         assert payload["max_output_tokens"] > 0
         assert "max_tokens" not in payload

@@ -169,6 +169,8 @@ class StreamSignals(QObject):
     # multi-round turn (see core/agent.py's _fire_final_ttft() docstring).
     final_ttft            = Signal(float)
     time_to_first_answer  = Signal(float)
+    token_usage           = Signal(dict)
+    think_timing          = Signal(float)
     finished       = Signal(str)
     error          = Signal(str)
     # SEPT-AC-R1-C01 -- presentation text and persistence authority are
@@ -292,6 +294,12 @@ class AgentWorker(QThread):
         def on_time_to_first_answer(ttfa_s):
             self.signals.time_to_first_answer.emit(ttfa_s)
 
+        def on_token_usage(usage):
+            self.signals.token_usage.emit(usage)
+
+        def on_think_timing(duration_s):
+            self.signals.think_timing.emit(duration_s)
+
         self.agent.on_tool_call      = on_tool_call
         self.agent.on_tool_result    = on_tool_result
         self.agent.on_think_start    = on_think_start
@@ -302,6 +310,8 @@ class AgentWorker(QThread):
         self.agent.on_final_stream_timing = on_final_stream_timing
         self.agent.on_final_ttft = on_final_ttft
         self.agent.on_time_to_first_answer = on_time_to_first_answer
+        self.agent.on_token_usage = on_token_usage
+        self.agent.on_think_timing = on_think_timing
 
         try:
             kwargs = {"chat_id": self.chat_id}
@@ -977,6 +987,8 @@ class LuminaWindow(QMainWindow):
         self.signals.final_stream_timing.connect(self._on_final_stream_timing)
         self.signals.final_ttft.connect(self._on_final_ttft)
         self.signals.time_to_first_answer.connect(self._on_time_to_first_answer)
+        self.signals.token_usage.connect(self._on_token_usage)
+        self.signals.think_timing.connect(self._on_think_timing)
         self.signals.finished.connect(self._on_finished)
         self.signals.error.connect(self._on_error)
         self.signals.cancelled.connect(self._on_cancelled)
@@ -2584,6 +2596,14 @@ class LuminaWindow(QMainWindow):
         onto-the-live-bubble pattern as _on_final_stream_timing() above."""
         if self._live_bubble:
             self._live_bubble.set_time_to_first_answer(ttfa_s)
+
+    def _on_token_usage(self, usage: dict):
+        if self._live_bubble:
+            self._live_bubble.set_token_usage(usage)
+
+    def _on_think_timing(self, duration_s: float):
+        if self._live_bubble:
+            self._live_bubble.add_think_timing(duration_s)
 
     def _on_finished(self, response: str):
         

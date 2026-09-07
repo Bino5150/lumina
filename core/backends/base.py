@@ -86,6 +86,20 @@ class ModelDiscoveryResult:
     diagnostic: str = ""
 
 
+@dataclass(frozen=True)
+class BackendStreamTelemetry:
+    """Provider-neutral, non-text event yielded by ``chat_stream()``.
+
+    Text/Think streaming keeps its long-standing string protocol.  A backend
+    that learns terminal provider metadata only after the final text delta may
+    yield one of these events so the agent can account for it without
+    smuggling JSON through the visible text lane or storing mutable
+    last-request state on a shared backend instance.
+    """
+
+    fields: dict
+
+
 # UTILITY-RUNTIME-01: base-level, provider-neutral reasoning-field priority
 # for complete_utility()'s empty-content fallback (below). Deliberately
 # duplicated from -- not imported from -- lmstudio.py's own
@@ -239,9 +253,11 @@ class BaseLLMBackend(ABC):
     @abstractmethod
     def chat_stream(self, messages: list, max_tokens: int = 1024,
                     temperature: float = 0.7,
-                    reasoning_effort: Optional[str] = None) -> Generator[str, None, None]:
+                    reasoning_effort: Optional[str] = None) -> Generator[object, None, None]:
         """
-        Streaming chat. Yields text chunks + think markers.
+        Streaming chat. Yields text chunks + think markers. A backend may
+        additionally yield BackendStreamTelemetry after visible content so
+        terminal provider metadata never enters the text lane.
         Special yields: '__THINK_START__', '__THINK_END__'
         reasoning_effort: same per-call contract as chat() above. This
         signature has no disable_thinking param (never had one), so
@@ -350,6 +366,16 @@ class BaseLLMBackend(ABC):
         must pass `model` explicitly.
         """
         return False
+
+    def extract_response_telemetry(self, response: dict) -> dict:
+        """Return canonical telemetry attached to one ``chat()`` response.
+
+        Empty by default: a backend must positively normalize its own provider
+        schema before the agent will consume it.  This keeps unfamiliar usage
+        shapes from being guessed at in the runtime/UI layer and gives every
+        backend the same narrow opt-in seam.
+        """
+        return {}
 
     def apply_reasoning(self, payload: dict, requested: Optional[str],
                          model: Optional[str] = None) -> None:

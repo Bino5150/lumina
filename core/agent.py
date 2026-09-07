@@ -15,7 +15,7 @@ import config
 import core.coding_checkpoint as checkpoint_store
 from core import emergency_stop
 from core import flight_recorder
-from core.backends.base import TerminationStatus, ToolChoiceMode
+from core.backends.base import BackendStreamTelemetry, TerminationStatus, ToolChoiceMode
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager, estimate_tokens
 from core.project_context import ProjectContext, ProjectContextState
@@ -166,6 +166,136 @@ def _accepts_tool_choice_mode(llm) -> bool:
     if "tool_choice_mode" in params:
         return True
     return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _accepts_capture_telemetry(llm) -> bool:
+    """True when ``llm.chat()`` supports request-local event capture.
+
+    Like ``_accepts_tool_choice_mode()``, this is signature capability
+    detection rather than a provider-name branch.  Existing backends and test
+    doubles receive no new keyword and keep their request mode unchanged.
+    """
+    try:
+        params = inspect.signature(llm.chat).parameters
+    except (TypeError, ValueError):
+        return False
+    return "capture_telemetry" in params
+
+
+def _new_turn_telemetry() -> dict:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0,
+        "provider_rounds": 0,
+        "usage_consistent": True,
+        "think_duration_s": 0.0,
+        "think_blocks_timed": 0,
+    }
+
+
+def _nonnegative_int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _accumulate_provider_telemetry(agent, telemetry: dict, turn_telemetry: Optional[dict],
+                                   phase: str) -> None:
+    """Fold one provider-normalized telemetry payload into this turn.
+
+    Usage is summed across every foreground provider request (WORK, control
+    gate, and final-producing request).  Utility calls never reach this helper.
+    Missing or malformed usage is ignored rather than estimated.
+    """
+    if turn_telemetry is None or not isinstance(telemetry, dict):
+        return
+    usage = telemetry.get("usage")
+    if not isinstance(usage, dict):
+        return
+    prompt = _nonnegative_int(usage.get("prompt_tokens"))
+    completion = _nonnegative_int(usage.get("completion_tokens"))
+    total = _nonnegative_int(usage.get("total_tokens"))
+    if None in (prompt, completion, total):
+        return
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+    cached = _nonnegative_int(prompt_details.get("cached_tokens")) or 0
+    reasoning = _nonnegative_int(completion_details.get("reasoning_tokens")) or 0
+
+    turn_telemetry["prompt_tokens"] += prompt
+    turn_telemetry["completion_tokens"] += completion
+    turn_telemetry["total_tokens"] += total
+    turn_telemetry["cached_tokens"] += cached
+    turn_telemetry["reasoning_tokens"] += reasoning
+    turn_telemetry["provider_rounds"] += 1
+    if total != prompt + completion:
+        turn_telemetry["usage_consistent"] = False
+    phases = turn_telemetry.setdefault("rounds_by_phase", {})
+    phases[phase] = phases.get(phase, 0) + 1
+
+    on_token_usage = getattr(agent, "on_token_usage", None)
+    if callable(on_token_usage):
+        on_token_usage({
+            key: turn_telemetry[key]
+            for key in (
+                "prompt_tokens", "completion_tokens", "total_tokens",
+                "cached_tokens", "reasoning_tokens", "provider_rounds",
+                "usage_consistent",
+            )
+        })
+
+
+def _capture_response_telemetry(agent, response: dict, turn_telemetry: Optional[dict],
+                                phase: str) -> dict:
+    extractor = getattr(agent.llm, "extract_response_telemetry", None)
+    if not callable(extractor):
+        return {}
+    try:
+        telemetry = extractor(response)
+    except Exception:
+        return {}
+    if not isinstance(telemetry, dict):
+        return {}
+    _accumulate_provider_telemetry(agent, telemetry, turn_telemetry, phase)
+    return telemetry
+
+
+def _fire_think_timing(agent, duration_s: float,
+                       turn_telemetry: Optional[dict] = None) -> None:
+    if not isinstance(duration_s, (int, float)) or duration_s <= 0:
+        return
+    if turn_telemetry is not None:
+        turn_telemetry["think_duration_s"] += duration_s
+        turn_telemetry["think_blocks_timed"] += 1
+    on_think_timing = getattr(agent, "on_think_timing", None)
+    if callable(on_think_timing):
+        on_think_timing(duration_s)
+
+
+def _turn_telemetry_fields(turn_telemetry: Optional[dict]) -> dict:
+    """Flight Recorder-safe aggregate fields (avoid credential redaction keys)."""
+    if not turn_telemetry:
+        return {}
+    fields = {}
+    if turn_telemetry.get("provider_rounds", 0) > 0:
+        fields.update({
+            "provider_rounds": turn_telemetry["provider_rounds"],
+            "provider_rounds_by_phase": dict(turn_telemetry.get("rounds_by_phase", {})),
+            "input_count": turn_telemetry["prompt_tokens"],
+            "output_count": turn_telemetry["completion_tokens"],
+            "total_count": turn_telemetry["total_tokens"],
+            "cached_input_count": turn_telemetry["cached_tokens"],
+            "reasoning_output_count": turn_telemetry["reasoning_tokens"],
+            "usage_consistent": turn_telemetry["usage_consistent"],
+        })
+    if turn_telemetry.get("think_blocks_timed", 0) > 0:
+        fields["think_duration_s"] = turn_telemetry["think_duration_s"]
+        fields["think_blocks_timed"] = turn_telemetry["think_blocks_timed"]
+    for key in ("final_ttft_s", "final_stream_duration_s"):
+        if key in turn_telemetry:
+            fields[key] = turn_telemetry[key]
+    return fields
 
 
 # S51 Part D — how many turns a completed background-task note gets
@@ -424,7 +554,8 @@ def _maybe_emit_vision_tool_capability_notice(agent, messages: list, tool_schema
 def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
                                  reasoning_effort, chat_id, think_step: list,
                                  turn_id: Optional[str] = None,
-                                 relevant_commentary: Optional[list] = None):
+                                 relevant_commentary: Optional[list] = None,
+                                 turn_telemetry: Optional[dict] = None):
     """AGENT-CONTINUATION-CONTROL-GATE-01A -- ask ONLY the two internal
     continuation-control primitives (_CONTROL_GATE_SCHEMAS — never a
     product tool) whether real tool work for this turn is complete. Only
@@ -540,10 +671,15 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
         # is now the ONLY place in the whole tool loop that ever requests
         # REQUIRED.
         chat_kwargs["tool_choice_mode"] = ToolChoiceMode.REQUIRED
+    if _accepts_capture_telemetry(agent.llm):
+        chat_kwargs["capture_telemetry"] = True
 
     response, err = _provider_chat_or_error(agent, chat_kwargs, cancel_event, tools_used_this_turn)
     if err is not None:
         return "error", err
+    response_telemetry = _capture_response_telemetry(
+        agent, response, turn_telemetry, "gate",
+    )
     if _cancel_requested(cancel_event):
         return "cancelled", None
 
@@ -580,6 +716,10 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
         # surfaced as if it were a real tool-decision round.
         reasoning = _collect_tool_round_reasoning(agent.llm, response, message)
         _emit_tool_round_think(agent, think_step, reasoning, turn_id=turn_id)
+        if reasoning:
+            _fire_think_timing(
+                agent, response_telemetry.get("think_duration_s"), turn_telemetry,
+            )
         if _cancel_requested(cancel_event):
             return "cancelled", None
 
@@ -599,6 +739,7 @@ def _promote_completion_candidate(agent, completion_candidate: dict, turn_releva
                                    think_step: list, *, cancel_event=None,
                                    reasoning_effort: Optional[str] = None, chat_id: int = None,
                                    turn_id: Optional[str] = None, turn_started_at: Optional[float] = None,
+                                   turn_telemetry: Optional[dict] = None,
                                    reason: str) -> str:
     """AGENT-COMPLETION-SENTINEL-RECOVERY-01 -- shared promotion logic for
     every way a completion_candidate reaches a confirmed-done state: the
@@ -648,12 +789,14 @@ def _promote_completion_candidate(agent, completion_candidate: dict, turn_releva
             completion_candidate, turn_relevant_commentary, think_step,
             cancel_event=cancel_event, reasoning_effort=reasoning_effort,
             chat_id=chat_id, turn_id=turn_id, turn_started_at=turn_started_at,
+            turn_telemetry=turn_telemetry,
         )
     _fr_machine(agent, "completion_candidate.accepted", turn_id=turn_id, chat_id=chat_id,
                 fields={"source_round": completion_candidate["source_round"], "reason": reason})
     return agent._finalize_completion_candidate(
         completion_candidate, cancel_event=cancel_event, turn_id=turn_id,
         turn_started_at=turn_started_at,
+        turn_telemetry=turn_telemetry,
     )
 
 
@@ -891,43 +1034,42 @@ def _fr_model(agent, event_type: str, text: Optional[str], *, turn_id=None,
         pass
 
 
-def _fire_final_stream_timing(agent, duration_s: float, token_count: int) -> None:
+def _fire_final_stream_timing(agent, duration_s: float, token_count: int,
+                              turn_telemetry: Optional[dict] = None) -> None:
     """TOKS-STREAM-TIMING-01 -- deliver the interval/token-count pair for
     a genuinely OBSERVED provider streaming generation to
     on_final_stream_timing, the ONE callback the UI reads to compute a
-    truthful tok/s. As of this fix, called from exactly one place:
-    _stream_final()'s own successful completion (a direct final, or a
-    reconciliation final -- _finalize_with_reconciliation() re-enters
-    _stream_final(), so it gets this for free). Deliberately NEVER called
-    from _finalize_completion_candidate(): a held candidate's only
-    available timing is its WORK round's whole non-streaming request/
-    response latency, which is not final-content-generation time (see
-    that method's own docstring) -- reporting no timing at all is the
-    truthful choice there, not a missing feature here. Callers only
+    truthful tok/s. Called from _stream_final() after its own successful
+    observed stream, or from _finalize_completion_candidate() only when
+    that candidate's backend explicitly captured the same native event
+    boundaries while producing it. A backend that supplied only blocking
+    whole-call latency still reports no timing; replay delivery time is
+    never substituted. Callers only
     reach this with duration_s > 0 and non-empty content already
     established (see the one call site); this is delivery, not
     validation. Same fail-safe getattr/callable guard every other
     optional streaming callback in this file uses, so the many
     types.SimpleNamespace test fakes across this file that never set
     on_final_stream_timing keep working unchanged."""
+    if turn_telemetry is not None:
+        turn_telemetry["final_stream_duration_s"] = duration_s
     on_final_stream_timing = getattr(agent, "on_final_stream_timing", None)
     if callable(on_final_stream_timing):
         on_final_stream_timing(duration_s, token_count)
 
 
-def _fire_final_ttft(agent, final_ttft_s: float) -> None:
+def _fire_final_ttft(agent, final_ttft_s: float,
+                     turn_telemetry: Optional[dict] = None) -> None:
     """TOKS-STREAM-TIMING-01 (Bino-approved expansion, Bino-corrected
     naming) -- Final TTFT (final-request time-to-first-token): the
     final-PRODUCING provider request's own dispatch to the first
     nonempty output delta OF THAT SAME REQUEST (Think or Final text --
     either counts, a bare __THINK_START__/__THINK_END__ sentinel does
     not, since a protocol marker is not itself model output). Fires at
-    most once per turn, only from _stream_final()'s own request -- never
-    the initial (or any) WORK round's dispatch on a multi-round turn, and
-    never a promoted completion_candidate's WORK round either (that path
-    is non-streaming; it has nothing to observe -- see _finalize_
-    completion_candidate()'s own docstring for why it reports "n/a"
-    instead). The "Final" in the name is load-bearing: on a turn with
+    most once per turn, from _stream_final()'s own request or a promoted
+    completion candidate whose backend captured native stream events for
+    that exact final-producing WORK request. Earlier tool-bearing WORK
+    rounds are never used. The "Final" in the name is load-bearing: on a turn with
     real tool calls before the answer, this is deliberately NOT "time
     since the turn began" -- that would silently re-introduce the exact
     whole-turn-latency conflation TOKS-STREAM-TIMING-01 exists to rule
@@ -937,6 +1079,8 @@ def _fire_final_ttft(agent, final_ttft_s: float) -> None:
     request, but first-Final-delta -> terminal chunk, not request-
     dispatch -> first delta) -- see _stream_final()'s own docstring for
     why these three never share an anchor or a firing site."""
+    if turn_telemetry is not None:
+        turn_telemetry["final_ttft_s"] = final_ttft_s
     on_final_ttft = getattr(agent, "on_final_ttft", None)
     if callable(on_final_ttft):
         on_final_ttft(final_ttft_s)
@@ -1094,6 +1238,8 @@ class LuminaAgent:
                  on_final_stream_timing=None,
                  on_final_ttft=None,
                  on_time_to_first_answer=None,
+                 on_token_usage=None,
+                 on_think_timing=None,
                  tts=None,
                  owner: bool = True,
                  channel_id: str = "default",
@@ -1128,25 +1274,17 @@ class LuminaAgent:
           on_final_stream_timing(duration_s, token_count) — TOKS-STREAM-
               TIMING-01: fires at most once per turn, exactly when this
               turn's visible Final text has trustworthy provider-
-              generation timing to report -- ONLY a completed
-              _stream_final() run (duration_s spans its first real Final
-              delta to its terminal chunk; Think/Commentary never start
-              or extend it), whether reached directly or via
-              _finalize_with_reconciliation()'s re-entry into
-              _stream_final(). Deliberately does NOT fire for a promoted
-              completion_candidate: that path's only available timing is
-              its WORK round's whole non-streaming request/response
-              latency (self.llm.chat(), a single blocking call with no
-              visible boundary between prefill/TTFT/Think and the actual
-              Final text) -- not final-content-generation time, and
-              never mislabeled as "stream" even though it is real,
-              measured latency. See _finalize_completion_candidate()'s
-              own docstring. token_count is estimate_tokens() (core/
+              generation timing to report -- a completed _stream_final()
+              run, or a promoted candidate whose backend explicitly
+              captured native Final-delta-to-terminal boundaries for that
+              exact response. A blocking-only candidate remains unavailable;
+              neither whole-call nor local replay latency is relabeled.
+              token_count is estimate_tokens() (core/
               context.py's existing char/4 estimator) applied to that
               same Final text -- the same counting contract context-
               window accounting already uses, not a new one. Never fires
               for a synthetic notice/error string, an empty/tool-only
-              Final, a cancelled stream, a promoted held candidate, or a
+              Final, a cancelled stream, an unobserved held candidate, or a
               zero/invalid duration -- the UI's only correct default for
               "never fired this turn" is to show throughput as
               unavailable, not compute one.
@@ -1156,12 +1294,10 @@ class LuminaAgent:
               provider request's own dispatch to the first nonempty
               output delta OF THAT SAME REQUEST (Think or Final text
               either counts; a bare think-open/close sentinel does not)
-              -- fires at most once per turn, only from _stream_final()
-              (WORK rounds and the held-candidate path are non-streaming;
-              Final TTFT has nothing to observe there and never fires
-              for them -- see _finalize_completion_candidate()'s own
-              docstring). Deliberately NEVER measures the initial (or
-              any) WORK request on a multi-round turn -- "Final" in the
+              -- fires at most once per turn, from _stream_final() or a
+              promoted candidate with backend-captured native boundaries.
+              Deliberately NEVER measures an earlier tool-bearing WORK
+              request on a multi-round turn -- "Final" in the
               name is load-bearing: this is the responsiveness of the
               request that actually produced the visible answer, not
               time-since-turn-began. A provider-responsiveness
@@ -1184,6 +1320,13 @@ class LuminaAgent:
               empty, error-only, or cancelled-before-Final turn, or for
               a restored/historical message (no live turn ever ran) --
               unavailable in every one of those cases, never fabricated.
+          on_token_usage(usage) — provider-reported, canonical cumulative
+              usage for this foreground turn, summed across WORK/control/
+              Final provider rounds. Never estimated and never populated by
+              utility calls outside this turn.
+          on_think_timing(duration_s) — an observed provider reasoning-
+              summary stream interval. Hidden reasoning is never read or
+              exposed; non-streaming backends keep their existing fallback.
 
         owner: True for the desktop app (you). False for ANY agent constructed
         on behalf of a channel, subagent, or scheduled task — no implicit
@@ -1277,6 +1420,8 @@ class LuminaAgent:
         self.on_final_stream_timing = on_final_stream_timing or (lambda d, t: None)
         self.on_final_ttft = on_final_ttft or (lambda t: None)
         self.on_time_to_first_answer = on_time_to_first_answer or (lambda t: None)
+        self.on_token_usage = on_token_usage or (lambda usage: None)
+        self.on_think_timing = on_think_timing or (lambda duration: None)
         self.tts = tts
         # Persona-local speech policy. This stays independent of the
         # backend/global TTS enabled state so another persona can reuse the
@@ -1486,6 +1631,7 @@ class LuminaAgent:
         if turn_cancellation is not None:
             turn_cancellation._set(cancel_event)
         turn_id = flight_recorder.new_turn_id()
+        turn_telemetry = _new_turn_telemetry()
         # TOKS-STREAM-TIMING-01 -- monotonic, not wall-clock: this is a
         # DURATION (turn dispatch -> terminal completion), and time.time()
         # can jump backward under an NTP/DST adjustment mid-turn, which
@@ -1515,36 +1661,42 @@ class LuminaAgent:
                         self, user_input, source=source, chat_id=chat_id,
                         cancel_event=cancel_event, reasoning_effort=reasoning_effort,
                         turn_id=turn_id, turn_started_at=turn_started_at,
+                        turn_telemetry=turn_telemetry,
                     )
                     duration_s = time.monotonic() - turn_started_at
                     if is_error_response(result):
                         _fr_machine(self, "turn.failed", turn_id=turn_id, chat_id=chat_id,
                                     severity="error",
                                     fields={"reason": "error_sentinel", "duration_s": duration_s,
-                                            "response_preview": result})
+                                            "response_preview": result,
+                                            **_turn_telemetry_fields(turn_telemetry)})
                     else:
                         _fr_machine(self, "turn.completed", turn_id=turn_id, chat_id=chat_id,
                                     fields={"duration_s": duration_s,
-                                            "response_chars": len(result or "")})
+                                            "response_chars": len(result or ""),
+                                            **_turn_telemetry_fields(turn_telemetry)})
                     return result
             except emergency_stop.EmergencyStopError:
                 self.ctx.add_user(user_input, source=source)
                 _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
                             severity="warning",
-                            fields={"reason": "emergency_stop", "duration_s": time.monotonic() - turn_started_at})
+                            fields={"reason": "emergency_stop", "duration_s": time.monotonic() - turn_started_at,
+                                    **_turn_telemetry_fields(turn_telemetry)})
                 cancel_already_recorded = True
                 raise TurnCancelled()
         except TurnCancelled:
             if not cancel_already_recorded:
                 _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
                             severity="warning",
-                            fields={"reason": "cooperative_stop", "duration_s": time.monotonic() - turn_started_at})
+                            fields={"reason": "cooperative_stop", "duration_s": time.monotonic() - turn_started_at,
+                                    **_turn_telemetry_fields(turn_telemetry)})
             raise
         except Exception as e:
             _fr_machine(self, "turn.failed", turn_id=turn_id, chat_id=chat_id,
                         severity="error",
                         fields={"reason": "exception", "error_type": type(e).__name__,
-                                "duration_s": time.monotonic() - turn_started_at})
+                                "duration_s": time.monotonic() - turn_started_at,
+                                **_turn_telemetry_fields(turn_telemetry)})
             raise
         finally:
             if turn_cancellation is not None:
@@ -1553,7 +1705,10 @@ class LuminaAgent:
     def _chat_impl(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
                     cancel_event=None, reasoning_effort: Optional[str] = None,
                     turn_id: Optional[str] = None,
-                    turn_started_at: Optional[float] = None) -> str:
+                    turn_started_at: Optional[float] = None,
+                    turn_telemetry: Optional[dict] = None) -> str:
+        if turn_telemetry is None:
+            turn_telemetry = _new_turn_telemetry()
         tools_used_this_turn = set()
         think_step = [0]
         tool_batch_ordinal = 0  # AGENT-FLIGHT-RECORDER-01A1 -- per-turn, incremented once per tool-bearing WORK round
@@ -1807,6 +1962,7 @@ class LuminaAgent:
                 outcome, gate_error = _run_tool_work_control_gate(
                     self, tools_used_this_turn, cancel_event, reasoning_effort, chat_id,
                     think_step, turn_id, relevant_commentary=turn_relevant_commentary,
+                    turn_telemetry=turn_telemetry,
                 )
                 if outcome == "cancelled":
                     raise TurnCancelled()
@@ -1828,6 +1984,7 @@ class LuminaAgent:
                             self, completion_candidate, turn_relevant_commentary, think_step,
                             cancel_event=cancel_event, reasoning_effort=reasoning_effort,
                             chat_id=chat_id, turn_id=turn_id, turn_started_at=turn_started_at,
+                            turn_telemetry=turn_telemetry,
                             reason="gate_finish",
                         )
                     # The gate's own ephemeral instruction was already
@@ -1837,7 +1994,8 @@ class LuminaAgent:
                     clean_messages = self.ctx.build_messages(chat_id=chat_id)
                     return self._stream_final(clean_messages, think_step, cancel_event=cancel_event,
                                                reasoning_effort=reasoning_effort, turn_id=turn_id,
-                                               turn_started_at=turn_started_at)
+                                               turn_started_at=turn_started_at,
+                                               turn_telemetry=turn_telemetry)
 
                 if outcome == "continue":
                     # AGENT-WORK-COMPLETE-DISCARD-01 -- "continue" means
@@ -1962,6 +2120,7 @@ class LuminaAgent:
                         self, completion_candidate, turn_relevant_commentary, think_step,
                         cancel_event=cancel_event, reasoning_effort=reasoning_effort,
                         chat_id=chat_id, turn_id=turn_id, turn_started_at=turn_started_at,
+                        turn_telemetry=turn_telemetry,
                         reason="gate_contract_violated",
                     )
                 notice = "[Lumina: tool-work continuation ended without confirming completion.]"
@@ -2001,22 +2160,22 @@ class LuminaAgent:
                 # _CONTROL_GATE_SCHEMAS for why offering finish_tool_work
                 # inside this same full-profile request was replaced.
                 chat_kwargs["tool_choice_mode"] = ToolChoiceMode.AUTO
+            if _accepts_capture_telemetry(self.llm):
+                chat_kwargs["capture_telemetry"] = True
 
             # TOKS-STREAM-TIMING-01 -- deliberately NOT timed here. An
             # earlier version of this fix bracketed this call and stored
             # the result as the candidate's "stream" duration -- wrong:
-            # self.llm.chat() is a single blocking, non-streaming request/
-            # response round trip with no visible internal boundary
-            # between prefill, TTFT, Think generation, and Final-content
-            # generation. That whole-call latency is real, but it is NOT
-            # "final-stream wall time" -- it can (and typically does)
-            # include time this turn's visible Final text was never being
-            # produced at all. See _finalize_completion_candidate()'s own
-            # docstring for the resulting contract: a promoted candidate
-            # reports stream timing as unavailable, never this figure.
+            # Never bracket chat() locally and label its whole-call latency as
+            # stream time. A backend may opt into capture_telemetry and return
+            # native event boundaries; otherwise a promoted candidate remains
+            # unavailable for Final TTFT/stream/tok-s exactly as before.
             response, err = _provider_chat_or_error(self, chat_kwargs, cancel_event, tools_used_this_turn)
             if err is not None:
                 return err
+            response_telemetry = _capture_response_telemetry(
+                self, response, turn_telemetry, "work",
+            )
 
             if _cancel_requested(cancel_event):
                 raise TurnCancelled()
@@ -2141,6 +2300,10 @@ class LuminaAgent:
                 # merely for having arrived during WORK.
                 reasoning = _collect_tool_round_reasoning(self.llm, response, message)
                 _emit_tool_round_think(self, think_step, reasoning, turn_id=turn_id)
+                if reasoning:
+                    _fire_think_timing(
+                        self, response_telemetry.get("think_duration_s"), turn_telemetry,
+                    )
                 if message.get("content"):
                     message["content"] = strip_think_blocks(message["content"])
                 candidate_content = (message.get("content") or "").strip()
@@ -2167,6 +2330,7 @@ class LuminaAgent:
                         # internals.
                         "finish_reason": termination.value,
                         "source_round": iteration,
+                        "response_telemetry": response_telemetry,
                     }
                     _fr_machine(self, "completion_candidate.created", turn_id=turn_id, chat_id=chat_id,
                                 fields={"content_chars": len(candidate_content),
@@ -2202,6 +2366,10 @@ class LuminaAgent:
             # boundary -- see that loop below).
             reasoning = _collect_tool_round_reasoning(self.llm, response, message)
             _emit_tool_round_think(self, think_step, reasoning, turn_id=turn_id)
+            if reasoning:
+                _fire_think_timing(
+                    self, response_telemetry.get("think_duration_s"), turn_telemetry,
+                )
 
             if message.get("content"):
                 message["content"] = strip_think_blocks(message["content"])
@@ -2362,13 +2530,15 @@ class LuminaAgent:
         messages.append({"role": "user", "content": "Give your final answer now based on what you have."})
         return self._stream_final(messages, think_step, cancel_event=cancel_event,
                                    reasoning_effort=reasoning_effort, turn_id=turn_id,
-                                   turn_started_at=turn_started_at)
+                                   turn_started_at=turn_started_at,
+                                   turn_telemetry=turn_telemetry)
 
     def _stream_final(self, messages: list, think_step: list, cancel_event=None,
                        reasoning_effort: Optional[str] = None,
                        turn_id: Optional[str] = None,
                        retain_partial_on_cancel: bool = True,
-                       turn_started_at: Optional[float] = None) -> str:
+                       turn_started_at: Optional[float] = None,
+                       turn_telemetry: Optional[dict] = None) -> str:
         """Stream the final response, firing callbacks for UI updates.
 
         ``retain_partial_on_cancel`` separates two facts that used to be
@@ -2420,6 +2590,8 @@ class LuminaAgent:
         # one another.
         final_request_dispatch_at = None
         final_ttft_fired = False
+        think_stream_started_at = None
+        think_stream_pending_close = False
 
         def _raise_cancelled():
             if in_think:
@@ -2468,7 +2640,7 @@ class LuminaAgent:
                 now = time.monotonic()
                 final_ttft_s = now - final_request_dispatch_at
                 if final_ttft_s > 0:
-                    _fire_final_ttft(self, final_ttft_s)
+                    _fire_final_ttft(self, final_ttft_s, turn_telemetry)
                 return now
 
             while True:
@@ -2482,13 +2654,18 @@ class LuminaAgent:
                 # which only happens inside the branches that follow).
                 if _cancel_requested(cancel_event):
                     _raise_cancelled()
-                if chunk == "__THINK_START__":
+                if isinstance(chunk, BackendStreamTelemetry):
+                    _accumulate_provider_telemetry(
+                        self, chunk.fields, turn_telemetry, "final",
+                    )
+                elif chunk == "__THINK_START__":
                     in_think = True
                     think_step[0] += 1
                     self.on_think_start(think_step[0])
                 elif chunk == "__THINK_END__":
                     in_think = False
                     self.on_think_end()
+                    think_stream_pending_close = think_stream_started_at is not None
                     # AGENT-FLIGHT-RECORDER-01A1 -- the final stream's OWN
                     # inline think content (a local model emitting <think>
                     # around its final answer) is provider-exposed
@@ -2500,7 +2677,12 @@ class LuminaAgent:
                               fields={"think_step": think_step[0]})
                     _think_buffer = []
                 elif in_think:
-                    _mark_final_ttft_if_first(chunk)
+                    chunk_received_at = _mark_final_ttft_if_first(chunk)
+                    if think_stream_started_at is None:
+                        think_stream_started_at = (
+                            chunk_received_at if chunk_received_at is not None
+                            else time.monotonic()
+                        )
                     self.on_think_token(chunk)
                     _think_buffer.append(chunk)
                 else:
@@ -2508,6 +2690,11 @@ class LuminaAgent:
                     if final_stream_started_at is None:
                         final_stream_started_at = (chunk_received_at if chunk_received_at is not None
                                                     else time.monotonic())
+                        if think_stream_pending_close:
+                            duration_s = final_stream_started_at - think_stream_started_at
+                            _fire_think_timing(self, duration_s, turn_telemetry)
+                            think_stream_started_at = None
+                            think_stream_pending_close = False
                         # TOKS-STREAM-TIMING-01 (TTFA) -- time-to-first-
                         # answer: turn dispatch (turn_started_at, the SAME
                         # anchor turn wall time uses) to THIS instant, the
@@ -2586,16 +2773,21 @@ class LuminaAgent:
         if final_stream_duration_s is not None:
             final_fields["duration_s"] = final_stream_duration_s
             final_fields["token_count"] = final_stream_token_count
+            final_fields["visible_output_count"] = final_stream_token_count
         _fr_model(self, "turn.final", content, turn_id=turn_id, fields=final_fields)
         if final_stream_duration_s is not None:
-            _fire_final_stream_timing(self, final_stream_duration_s, final_stream_token_count)
+            _fire_final_stream_timing(
+                self, final_stream_duration_s, final_stream_token_count,
+                turn_telemetry,
+            )
         if self.tts and content and not getattr(self, "_persona_speech_suppressed", False):
             self.tts.speak(content)
         return content
 
     def _finalize_completion_candidate(self, candidate: dict, *, cancel_event=None,
                                         turn_id: Optional[str] = None,
-                                        turn_started_at: Optional[float] = None) -> str:
+                                        turn_started_at: Optional[float] = None,
+                                        turn_telemetry: Optional[dict] = None) -> str:
         """AGENT-WORK-COMPLETE-DISCARD-01 -- promote a preserved WORK-round
         completion candidate (see _chat_impl()'s candidate-creation site and
         its "finish" gate-outcome handling) to this turn's final answer,
@@ -2618,40 +2810,18 @@ class LuminaAgent:
         rather than one single on_response_token() call -- see that
         function's own docstring for why this is not fake streaming.
 
-        TOKS-STREAM-TIMING-01 -- deliberately reports NO final-stream
-        timing at all, on either side of the "never time the replay
-        loop" fix. A held candidate came from _chat_impl()'s WORK-round
-        self.llm.chat() call: a single blocking, non-streaming request/
-        response round trip with no visible internal boundary between
-        prefill, TTFT, Think generation, and Final-content generation --
-        that whole-call latency is real, but it is NOT "the interval the
-        provider spent generating the visible Final text" (it can, and
-        often does, include time spent on Think or on the network before
-        any Final content existed at all). Labeling it "stream" would
-        just be a different-shaped version of the same lie this ticket
-        exists to rule out. Absent a way to observe the WORK round's
-        internal Think/Final boundary (this codebase's WORK rounds are
-        never dispatched via chat_stream() -- only _stream_final() is),
-        the only truthful choice is to never call _fire_final_stream_
-        timing() from this method: the UI's already-guarded "no signal
-        this turn" default renders that as "stream n/a", never a
-        fabricated number and never whole-call latency mislabeled as
-        generation speed. Turn wall time (measured independently, in
-        ui/chat_widget.py, from real turn dispatch to finalize) is
-        unaffected and keeps reporting honestly.
+        TOKS-STREAM-TIMING-01 / OPENAI-RESPONSES-TELEMETRY-01 -- never
+        times the local replay loop and never labels a blocking chat() call's
+        whole latency as provider generation. A backend may, however, opt into
+        foreground capture and attach native first-output, first-Final, and
+        terminal event boundaries to the already-complete candidate. Only
+        those observed boundaries are replayed here as Final TTFT/final-stream
+        callbacks; a backend without them keeps the prior honest "Final TTFT
+        n/a / stream n/a" result. The candidate text itself is still promoted
+        unchanged and is never regenerated for telemetry.
 
-        Final TTFT (Bino-approved expansion, Bino-corrected naming) is
-        ALSO never reported here, for the identical reason as final-
-        stream timing above: this method never calls _stream_final() (no
-        streamed request exists for this path to time in the first
-        place), and _fire_final_ttft() is only ever called from inside
-        that method. There is no separate guard to add here -- the
-        absence is structural, not a special case, and renders exactly
-        the same as every other "never fired this turn" default: "Final
-        TTFT n/a" alongside "stream n/a".
-
-        time-to-first-answer (Bino-approved expansion) DOES fire here,
-        unlike Final TTFT/final-stream timing -- it is a fundamentally
+        time-to-first-answer (Bino-approved expansion) always fires here
+        when a turn anchor exists. It is a fundamentally
         different question ("when did the user first see real answer
         text", answerable regardless of whether the mechanism underneath
         was a real stream or a replay) rather than "how fast was the
@@ -2662,12 +2832,20 @@ class LuminaAgent:
         original WORK-round generation time -- see that function's
         on_first_chunk docstring. Turn wall time (measured independently
         in ui/chat_widget.py) is likewise unaffected and keeps reporting
-        honestly -- a promoted held candidate retains two of the four
-        TOKS-STREAM-TIMING-01 values (turn wall time, time-to-first-
-        answer) and reports the other two (Final TTFT, final-stream
-        duration/tok-s) as unavailable, never fabricated."""
+        honestly. Final TTFT/final-stream duration are additionally present
+        only when provider-native capture supplied their boundaries; otherwise
+        they remain unavailable, never fabricated."""
         content = candidate["content"]
         on_response_token = getattr(self, "on_response_token", None)
+        response_telemetry = candidate.get("response_telemetry") or {}
+        captured_ttft_s = response_telemetry.get("final_ttft_s")
+        if isinstance(captured_ttft_s, (int, float)) and captured_ttft_s > 0:
+            _fire_final_ttft(self, captured_ttft_s, turn_telemetry)
+        captured_stream_s = response_telemetry.get("final_stream_duration_s")
+        if isinstance(captured_stream_s, (int, float)) and captured_stream_s > 0 and content:
+            _fire_final_stream_timing(
+                self, captured_stream_s, estimate_tokens(content), turn_telemetry,
+            )
 
         def _mark_first_answer_chunk():
             if turn_started_at is not None:
@@ -2681,8 +2859,13 @@ class LuminaAgent:
         if _cancel_requested(cancel_event):
             raise TurnCancelled()
         self.ctx.add_assistant(content)
+        final_fields = {"char_count": len(content)}
+        if isinstance(captured_stream_s, (int, float)) and captured_stream_s > 0:
+            final_fields["duration_s"] = captured_stream_s
+            final_fields["token_count"] = estimate_tokens(content)
+            final_fields["visible_output_count"] = estimate_tokens(content)
         _fr_model(self, "turn.final", content, turn_id=turn_id,
-                  fields={"char_count": len(content)})
+                  fields=final_fields)
         if self.tts and content and not getattr(self, "_persona_speech_suppressed", False):
             self.tts.speak(content)
         return content
@@ -2690,7 +2873,8 @@ class LuminaAgent:
     def _finalize_with_reconciliation(self, candidate: dict, relevant_commentary: list, think_step: list,
                                         cancel_event=None, reasoning_effort: Optional[str] = None,
                                         chat_id: int = None, turn_id: Optional[str] = None,
-                                        turn_started_at: Optional[float] = None) -> str:
+                                        turn_started_at: Optional[float] = None,
+                                        turn_telemetry: Optional[dict] = None) -> str:
         """AGENT-FINAL-INTEGRITY-01 -- reconcile a preserved completion_
         candidate against Commentary already emitted earlier this same
         unfinalized attempt, via exactly one additional provider call,
@@ -2829,7 +3013,8 @@ class LuminaAgent:
         messages = self.ctx.build_messages(chat_id=chat_id)
         return self._stream_final(messages, think_step, cancel_event=cancel_event,
                                    reasoning_effort=reasoning_effort, turn_id=turn_id,
-                                   retain_partial_on_cancel=False, turn_started_at=turn_started_at)
+                                   retain_partial_on_cancel=False, turn_started_at=turn_started_at,
+                                   turn_telemetry=turn_telemetry)
 
     def clear_persona_speech_suppression(self):
         """Restore ordinary speech when no persona is active."""
