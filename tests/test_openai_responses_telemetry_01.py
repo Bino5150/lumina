@@ -14,21 +14,20 @@ import types
 
 import pytest
 import requests
-from PySide6.QtWidgets import QApplication
 
 import core.backends.openai_backend as openai_module
-import ui.chat_widget as chat_widget_module
 from core.agent import LuminaAgent, FINISH_TOOL_WORK_NAME
 from core.backends.base import BackendStreamTelemetry, TerminationStatus
 from core.backends.openai_backend import OpenAIBackend
 from core.context import estimate_tokens
 from core.flight_recorder import FlightRecorder
-from ui.chat_widget import LiveResponseBubble
-from ui.main_window import AgentWorker, COLORS, StreamSignals
 
 
 @pytest.fixture
 def qapp():
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
     return QApplication.instance() or QApplication([])
 
 
@@ -348,6 +347,10 @@ def test_reasoning_multi_tool_turn_aggregates_usage_timings_and_recorder(
 def test_gui_footer_prefers_provider_usage_and_preserves_non_openai_fallback(
     qapp, monkeypatch,
 ):
+    import ui.chat_widget as chat_widget_module
+    from ui.chat_widget import LiveResponseBubble
+    from ui.main_window import COLORS
+
     ticks = iter((1.0, 3.0, 10.0, 12.0))
     monkeypatch.setattr(chat_widget_module.time, "monotonic", lambda: next(ticks))
 
@@ -380,6 +383,8 @@ def test_gui_footer_prefers_provider_usage_and_preserves_non_openai_fallback(
 
 
 def test_agent_worker_routes_usage_and_think_timing_as_dedicated_signals(qapp):
+    from ui.main_window import AgentWorker, StreamSignals
+
     class _Agent:
         def chat(self, user_input, chat_id=None, cancel_event=None,
                  reasoning_effort=None):
