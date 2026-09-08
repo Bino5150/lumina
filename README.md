@@ -14,7 +14,7 @@ A full featured, powerful, and efficient local-first AI Agentic Harness/Desktop 
 - ⚡ Native PySide6/Qt desktop UI
 - 🔄 Runtime backend switching
 - 📁 Codebase indexing
-- 🔧 ~70 pre-installed tools, plus the ability to create more
+- 🔧 ~90 pre-installed tools, plus the ability to create more
 - 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe)
 - 🧩 Specialized sub-agents for delegated tasks
 - ⏰ Background and scheduled task execution
@@ -32,6 +32,8 @@ A full featured, powerful, and efficient local-first AI Agentic Harness/Desktop 
 - 🦹 Skynet
 - 🌌 Neil deGrasse Tyson
 - 🍺 Bender
+- 🤖 Mr. Robot
+- ⚒️ Mara Voss
 
 **Built and tested on a 4GB Nvidia Quadro T1000 because local AI should be accessible to normal hardware.**
 
@@ -67,6 +69,7 @@ Lumina's LLM layer is fully abstracted behind one shared interface, so swapping 
 - LM Studio
 - Ollama
 - vLLM
+- Oracle (coming soon)
 
 **Self-hosted gateway**
 - OmniRoute — routes through a local endpoint you run yourself to 200+ upstream providers, many free
@@ -105,6 +108,13 @@ Everything above assumes the risk comes from outside the trust boundary — untr
 **Tier 2 — staging + approval gate.** Four tools with real blast radius if they fire on a bad call — edit_prompt, reset_chat, delete_knowledge, delete_memory — don't execute directly. They stage the request instead, and it only applies through an explicit approve/reject in the Pending Actions panel in Settings, reaching the live running agent directly — no restart needed once approved.
 Same posture, no exceptions for being a trusted actor: irreversible actions get a checkpoint, not a rubber stamp.
 
+### Flight Recorder: Forensic Logging
+Lumina’s Flight Recorder is a local observability and forensic logging system for reconstructing what actually happened during an agent run. It records structured runtime events including turns, tool calls and results, reasoning/Think activity, Commentary, backend activity, context lifecycle events, errors, and other execution telemetry.
+
+The recorder is designed to separate machine evidence from model narration: when behavior is ambiguous, Flight Recorder provides the durable receipts needed to trace the real execution path, debug failures, validate agent-control behavior, and investigate background or provider-runtime issues.
+
+Normal event history is retained for 7 days, while promoted warning and error records are retained for 90 days. Logs remain local to the Lumina data directory and are intended for diagnostics, auditing, and forensic reconstruction rather than conversational memory.
+
 
 ## Comms — Reach Her From Anywhere
 
@@ -137,7 +147,7 @@ The base layers hold information that never expires: core identity facts, critic
 **Layer 2 — Decaying Episodic Memory**
 L2 holds recent, session-based knowledge — ongoing projects, recent decisions, active context. It uses a temporal decay algorithm with a default λ=0.0083, giving roughly 78% retention after 30 days, 61% after 60, and 47% after 90. Old L2 entries don't lose rank suddenly; they fade gracefully, like actual human memory. The decay constant is tunable — higher values make memories fade faster, while lower values preserve them longer.
 
-The MemPalace uses AAAK compression to fit more meaningful content in fewer tokens, and is stored in SQLite with a FTS5 full-text search index. All three layers are automatically injected into the system prompt on every turn. Lumina always knows who you are, what you've been working on, and what matters.
+The MemPalace uses AAAK compression to fit more meaningful content in fewer tokens, and is stored in SQLite with a FTS5 full-text search index. The MemPalace contributes a bounded context block on each turn, keeping permanent identity/structural knowledge available while selecting relevant episodic memory under a configurable injection budget. Exact names, email addresses, URLs, hashes, handles, paths, and other opaque identifiers are protected from lossy abbreviation. Lumina always knows who you are, what you've been working on, and what matters.
 
 ### Context Compaction
 Every context window has a ceiling, and most agents handle it by just dropping the oldest turns. Lumina's raw messages are already persisted and full-text searchable, so nothing that rolls off is gone forever — but she won't think to search for something she doesn't know happened. That's recall loss, not just context loss.
@@ -173,79 +183,174 @@ When Lumina completes a complex task — say, a multi-step build process for a C
 
 After 5 tool calls in a session, Lumina is nudged to consider whether a skill should be saved. She can also self-direct skill creation at any time. This is a memory system that gets smarter as you use it.
 
-### Projects System — Long-Term Workspace Management
-Lumina can manage ongoing projects across sessions. The Projects system gives each project a persistent workspace with three components:
-- project.md — a running handoff document Lumina maintains herself, summarizing state, decisions, and next steps
-- codebase.md — a FTS5-indexed file tree map Lumina can refresh on demand, giving her a navigable map of an entire codebase
-- chats.json — a linked log of relevant conversations for continuity across sessions
-A projectlist.md is always injected into Lumina's context — a tiny overview of all active projects so she always knows what's in flight without you having to remind her.
-Lumina manages her own lumina-dev project this way — tracking her own source tree, linking development sessions, and maintaining her own architectural awareness. She literally reads her own codebase and updates her own project notes.
-Tools: create_project, load_project, update_project, refresh_codebase_index, load_codebase, link_chat, get_project_chats.
+### Projects — Persistent Workspaces & Execution Context
+
+Lumina's Projects system is more than a collection of notes attached to a folder. A Project is a persistent workspace that gives her both **long-term knowledge about what you're building** and a **real execution context for working on it**.
+
+Each Project can maintain:
+
+* `project.md` — the running handoff: current state, decisions, architecture, open questions, and next steps.
+* `codebase.md` — a searchable map of the codebase that Lumina can refresh as the project changes.
+* linked conversations — relevant chats stay associated with the Project so previous work can be found and carried forward.
+* a machine-local project binding — the verified location of that Project's working tree on the current machine.
+
+That last part matters. Activating a Project doesn't merely remind Lumina what you're talking about; it gives her tools a stable working frame.
+
+Project-aware filesystem operations, code search, terminal commands, Git inspection, persistent processes, structured test execution, coding checkpoints, and review workflows can resolve relative work against the active Project instead of relying on whatever directory happens to be current.
+
+Projects are deliberately **execution frames, not sandboxes**. Selecting one does not grant new filesystem permissions, Git authority, or owner privileges. Explicit paths remain explicit, and project knowledge such as `project.md` or `codebase.md` is never treated as machine authority over where tools are allowed to operate.
+
+Project context is also isolated per agent. Background work and delegated agents receive an immutable snapshot of the Project context they were dispatched with instead of sharing one mutable global working directory.
+
+For larger coding jobs, Projects compose with Lumina's managed Git worktrees. A verified worktree can receive its own temporary Project context, allowing a subagent to search, edit, run processes, execute tests, and review changes inside an isolated checkout without rebinding or disturbing the owner's active Project.
+
+That makes Projects the connective tissue between Lumina's long-term memory and her engineering runtime: she can remember what a project is, know where it lives, recover the conversations and decisions behind it, understand its source tree, and then actually operate inside it.
+
+Lumina manages her own development this way — tracking her source tree, development conversations, architectural notes, test state, and ongoing engineering work through the same Project system available to the user.
+
+Tools include `create_project`, `load_project`, `update_project`, `refresh_codebase_index`, `load_codebase`, `link_chat`, and `get_project_chats`, alongside the broader Project-aware filesystem, coding, testing, Git, process, worktree, and review toolchain.
+
 
 ### Backup
 Memory you can't get back out isn't memory, it's a liability. A one-click Memory Backup button in Settings checkpoints the database (PRAGMA wal_checkpoint(TRUNCATE)) and zips the entire data directory in one pass — chat history, the MemPalace, flat memories, Knowledge Base,the pending-actions queue and its audit log, the tool-creation audit log, custom tools, projects, and your Settings preferences. Credentials never make it in: credentials.json lives outside DATA_DIR by design, so there's no accidental path for it to end up in an archive you hand to someone or drop on a USB stick.
 
 
 ## Tools — An Agent That Actually Acts
-Lumina is not a chatbot with tool use bolted on as an afterthought. The entire system is designed around agentic operation. She has around 70 pre-installed tools, and a modular tool registry with support for named tool profiles — curated subsets of tools appropriate for different tasks.
 
-Here's some of what she can do:
+Lumina is not a chatbot with tool use bolted on as an afterthought. Tool use is part of the runtime architecture.
 
-**Filesystem Access**
-- Read, write, list, and navigate files. Copy, move, delete. Lumina can manage your project directories, generate files, and modify documents without you touching the terminal.
-**Sandboxed Code Execution**
-- Execute Python in a controlled sandbox. Lumina can write code, run it, observe the output, and iterate — a real code execution loop, not just code generation.
-**Terminal Access**
-- Full shell command execution for when you need to go deeper. Git operations, build commands, package management, system queries — Lumina can run them and report back.
-**Web — Lightweight and Full-Power**
-Two complementary web tools:
+She ships with **roughly 90 built-in tools**, a modular tool registry, and named tool profiles that expose task-appropriate capability sets without treating every tool as appropriate for every session. The dedicated **Coding** profile alone contains around 50 tools.
 
-**web.py — A lightweight scraper using requests + BeautifulSoup.** 
-- For static pages, documentation, and fast lookups with no browser overhead.
+And under the hood, Lumina has grown into a serious software-engineering agent.
 
-**browser.py — A full Playwright-powered Chromium browser suite for the heavy lifting:**
+### Coding, Projects & Git
 
-Browser Tool Capability:
-- browser_navigate	Load any URL, return visible text (8k cap)
-- browser_click	Click elements by CSS selector or visible text
-- browser_type	Fill input fields
-- browser_screenshot	Capture the page — path and base64 both returned
-- browser_extract	Pull specific CSS-selected content
-- browser_scroll	Scroll by pixel amount
-- browser_get_links	Extract all unique links (capped at 50)
-- browser_current_url	Current URL and page title
-- browser_close	Free resources cleanly
+This is much more than text diffing.
 
-The browser runs headless by default. Set LUMINA_BROWSER_HEADLESS=0 to watch what she's doing. Screenshots are timestamped and saved automatically. The browser persists across tool calls within a session — no cold-start penalty on page 2. Crashes auto-recover via ensure_running().
+Lumina can work across a real codebase as an ongoing engineering environment: inspect it, search it, edit it safely, run it, test it, review the resulting changes, manage isolated Git worktrees, delegate work into those worktrees, and maintain durable coding state across long-running tasks.
 
-Lumina can navigate to a page, read it, click a link, fill a form, take a screenshot, and report back — all as part of a single agentic chain.
+Her coding stack includes:
 
-**Text Diff & Patch**
-diff_texts, diff_files, apply_patch — Lumina can compare files, generate patches, and apply them. For collaborative document editing, iterative code revision, and config management.
+* **Project-aware execution** — bind work to a specific repository or Project so searches, edits, tests, processes, and Git operations resolve against the intended target instead of whichever directory happens to be current.
+* **Safe surgical editing** — targeted file edits, whole-file writes, structured patches, file-to-file diffs, text diffs, and bounded modification workflows.
+* **Real code search** — recursive source search with literal or regex matching, file filtering, surrounding context, deterministic traversal, binary avoidance, and bounded results.
+* **Persistent process management** — start long-running programs, read their output incrementally, send input, stop them, and inspect active jobs without reducing everything to one blocking shell command.
+* **Structured test execution** — run pytest through Lumina's managed execution path and capture the actual result and process exit status instead of trusting a model-written claim that “the tests passed.”
+* **Machine-backed coding checkpoints** — preserve repository identity, measured Git state, relevant-file state, validation evidence, and workflow context so previous engineering work can be checked for freshness rather than blindly trusted.
+* **Git repository management** — inspect status, diffs, history, branches, repository state, hidden Git operations, and other Git metadata; perform owner-authorized Git workflows through Lumina's managed execution surfaces.
+* **Managed Git worktrees** — create isolated worktrees for parallel feature or review work, verify their real Git/filesystem identity, prevent unsafe removal while managed processes are still using them, and explicitly clean them up when finished.
+* **Worktree-aware subagents** — dispatch a child agent directly into a verified isolated worktree with its own immutable Project context instead of letting multiple agents stomp through the same checkout.
+* **Trusted diff review** — inspect staged, unstaged, and untracked changes through a structured Git-observation layer with bounded retrieval, stale-snapshot detection, binary/symlink/submodule handling, and safe treatment of hostile repository content.
+* **Owner-facing Review cockpit** — a first-class Qt review surface for navigating repository changes and inspecting unified diffs without using model narration as Git truth.
 
-**Tool Self-Creation (Toolmaker)**
-One of her more unique features; Lumina can write new tools for herself. Give her a description of what you want, and she'll generate the tool definition, register it, and have it available in the same session. The agent's own capability surface can expand at runtime. She adapts as the need arises. 
+The important part is that these pieces compose. Lumina can investigate a codebase, modify it, launch the program, observe failures, search for the cause, patch the source, run focused tests, run the full suite, inspect the Git delta, delegate a second opinion into an isolated worktree, and report the machine evidence — all inside one agentic workflow.
 
-**Meta-Cognition**
-Tools for Lumina to inspect and reason about her own state: what tools are available, what's in her context, what she knows about the current session. Self-awareness as a practical tool.
+Git and other high-impact operations still respect Lumina's authority and safety boundaries. Coding capability is not treated as automatic permission to publish or destructively modify a repository.
 
-**Subagents**
-Most agentic frameworks either fake delegation — one model juggling everything in a single context window — or hand you unrestrained parallel spawning with no guardrails. Lumina takes the middle path: real delegation, sequential and bounded.
+### Filesystem Access
 
-When a task calls for it, Lumina can spawn a subagent — a fully headless instance of herself with her own isolated context, given a specific task and a specific, caller-defined subset of tools, never an automatic inheritance of everything she has access to. The parent blocks until the child returns a structured result; nothing from the subagent's own conversation bleeds back into the parent's context, just the outcome.
+Read, write, list, search, copy, move, and delete files and directories. Lumina can create project files, modify source and configuration, inspect local data, and manage working directories without requiring you to manually shuttle content between the chat and terminal.
 
-Because the architecture is backend-agnostic, a local parent can spawn a subagent on a completely different backend — hand a quick research task to a cheap cloud model while she keeps working locally, or the reverse. Depth is hard-capped at two and enforced outside the model's own control, so there's no path to a runaway recursive spawn chain. And regardless of who initiated it, a subagent runs at the same trust floor as any non-owner session — the delegation itself is trusted, but anything the subagent reads while doing its job stays exactly as untrusted as if a stranger had sent it.
+Filesystem operations also feed the larger coding and Project systems rather than existing as isolated convenience commands.
 
-Off by default — spawning a second inference context is a real cost on a 4GB card — toggle it on in Settings once you've got the headroom. Cloud backends and the V100 tier make it a lot more interesting.
+### Python & Command Execution
 
-**Scheduled & Background Tasks**
-Two flavors of the same idea: work that happens without you sitting there watching it run.
+Lumina can execute Python and inspect the result as part of an iterative code-development loop.
 
-Background tasks let Lumina kick off a longer job — a multi-step tool chain, a slow crawl, whatever the task needs — and hand the conversation back to you immediately instead of making you wait: "I've kicked that off, I'll let you know when it's done." The result surfaces the moment it's ready, on whatever turn you're on when it lands.
+For deeper system work she also has shell access for build systems, package managers, compilers, diagnostics, scripts, Git, and other command-line software.
 
-Scheduled tasks are the same underlying queue, fired on a timer instead of on demand. A dedicated Scheduled Tasks panel in Settings shows what's pending, running, or finished, and lets you cancel anything still waiting its turn.
+For jobs that do not finish immediately, her persistent process runtime provides a proper lifecycle instead of pretending every command is a one-shot subprocess.
 
-Also off by default, same reasoning as subagents — flip it on in Settings when you want Lumina working in the background instead of only when you're actively talking to her.
+### Web — Lightweight and Full-Power
+
+Lumina has two complementary web stacks.
+
+**`web.py` — lightweight HTTP retrieval**
+
+Uses requests and BeautifulSoup for static pages, documentation, quick research, and other jobs that do not need a browser.
+
+**`browser.py` — Playwright-powered Chromium automation**
+
+For interactive sites Lumina can:
+
+* navigate to URLs;
+* read visible page content;
+* click elements;
+* type into fields;
+* extract selected content;
+* scroll pages;
+* enumerate links;
+* inspect the current URL and title;
+* capture screenshots;
+* maintain a browser session across multiple tool calls;
+* close browser resources cleanly.
+
+The browser runs headless by default. Set `LUMINA_BROWSER_HEADLESS=0` to watch the session.
+
+This lets Lumina move beyond “search the web”: she can navigate a site, inspect it, interact with it, capture evidence, and continue reasoning from the results as part of a longer tool chain.
+
+### Diff, Patch & Review
+
+The original `diff_texts`, `diff_files`, and `apply_patch` tools are still here — they just aren't the whole story anymore.
+
+They provide fast text and file comparison plus patch application for source code, configuration, documents, and other iterative editing tasks.
+
+For repository-scale engineering, those tools now sit alongside Lumina's structured Git observation, coding checkpoints, test evidence, worktrees, and trusted Review system.
+
+### Tool Self-Creation — Toolmaker
+
+Lumina can extend her own capability surface by creating custom tools.
+
+Given a description of a missing capability, Toolmaker can generate a tool implementation and move it through Lumina's tool-management workflow so specialized functionality does not always require modifying the core application.
+
+This makes the tool registry an extensible runtime rather than a permanently fixed list of commands.
+
+### Tool Profiles & Authority
+
+Not every session needs — or should receive — the entire tool registry.
+
+Lumina supports named tool profiles such as Coding and other curated capability sets. Profiles control what enters the active model tool surface while the runtime separately enforces owner-only operations, explicit disabled tools, non-owner restrictions, Project grants, worktree grants, emergency-stop state, and other authority boundaries.
+
+Tool availability and tool authority are deliberately separate concepts.
+
+### Meta-Cognition & Runtime Introspection
+
+Lumina has tools for inspecting parts of her own runtime state: available capabilities, active Project/context information, coding state, processes, and other machine-visible facts.
+
+The goal is practical self-observation rather than fictional omniscience: when Lumina can query the runtime directly, she does not have to guess what state she is in.
+
+### Subagents
+
+Lumina supports real delegated agents rather than pretending one model context is several people.
+
+A subagent runs as a separate headless Lumina instance with:
+
+* its own isolated conversational context;
+* a specific task;
+* an explicitly selected tool surface;
+* inherited execution context only where the runtime deliberately grants it;
+* structured results returned to the parent rather than its entire internal conversation.
+
+A parent can also delegate work into a managed Git worktree, giving the child an isolated copy of the repository and an immutable Project context rooted at that exact worktree.
+
+Because Lumina is backend-agnostic, parent and child do not inherently need to use the same model provider.
+
+Delegation does **not** elevate trust: a child remains non-owner and does not inherit the owner's entire authority simply because the owner launched it.
+
+Subagents are optional and can be disabled when the additional inference/runtime cost is not desirable.
+
+### Scheduled & Background Tasks
+
+Lumina can also perform work outside the immediate foreground turn.
+
+**Background tasks** allow longer agent work to continue while the main conversation becomes available again.
+
+**Scheduled tasks** use the same general execution model but are triggered by time rather than an immediate request.
+
+The Settings interface exposes scheduled work so pending, running, and completed jobs can be inspected and eligible work can be cancelled.
+
+These capabilities are optional and can be disabled when you want Lumina to operate only during direct interaction.
+
 
 
 ## Personas — More Than Skins
