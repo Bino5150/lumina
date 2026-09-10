@@ -1,0 +1,32 @@
+{
+  "files": {
+    "assets/avatars/LUMINA - avatar.png": "a84e6f5dce010de4172924ab8c7e1392fe5dc26fa542ff6000b81bc5b41ac94b",
+    "assets/avatars/Mara Voss.png": "a39fdc17e61a86d9b4d375b78aaa9d4dd9669b009495bb6d14fcff063bdbe134",
+    "assets/avatars/Neon Hooded Cyberpunk Vigilante.png": "56fb358a6fd164d0895074bcd6591ba8c21b7ee90b7acd6241a5f9d61f7b8921",
+    "assets/voices/lumina.wav": "844811b3eb4de96e2e8e6ed073cc076f7e8103d5ac27d98148e35d034295ebb2",
+    "personas/discord_template.json": "f573f7444c2ae2ea3281d46d30abdba66da78eb5103285e407a96135f28b86dd",
+    "personas/lumina.json": "80024438bdf6cbb4725ac9ff483837606a5495669f0482e1b32e373d17099d7c",
+    "personas/mara_voss.json": "2bed07fda290332a6e9c5a0c74b5e075851a228f7e2a6594b4a18c0ec1529202",
+    "personas/mr_robot.json": "b85893b0c81754d43bf4896ea9b20c39f9700347bc0588942c2d6e651c70e4b9",
+    "projects/projectlist.md": "164b98aaaa42764b0a0a77ab73de099503999868ccee1fa28effad2d3766b569",
+    "skills/copy-file-between-directories.md": "cfce5a3f7c91a4caf14a7e7395c1ce319f3801bdb7d6f5ffd8d7aabeaa60163c",
+    "skills/save-technical-memory-before-context-limits.md": "cd69fe3feae7ed6964ad97499ff378103528998750ac4a016df37628935e0178",
+    "skills/search-chat-history-across-sessions.md": "a42654b14b44d45cd9c303930bebe3313b80dae82ca6999b66abe2ea811eb6ef",
+    "skills/temporal-decay-engine-implementation.md": "79e0549c19d18a7ef4616348a298062f2c3bd4eba168c87318db54eac0d76728",
+    "skills/test-skill-feature-verification.md": "cbe8746aefc3260dc264e092680ea0c2cec496bf402418a1f68b32808ef0281f",
+    "tool_profiles/all_tools.json": "c41714d8e6c5bea4988653258d85424f5987e26598a371c6b491f6c945f4bbfb",
+    "tool_profiles/chat.json": "2c9b5ff192bb54e9ba237c856194492d4b9d64b8501ab5ec23b63b21feede788",
+    "tool_profiles/coding.json": "2848d98a1e2d6ff6b018d99964f2cc0caf1966a30f91142a61df5042b16bd499",
+    "tool_profiles/discord_safe.json": "b8b37cf329d07bd5cf4b77acac64e00d8eb6af9b11066c4dc30725df21224d07",
+    "tool_profiles/minimal.json": "b3b302b4793780359003aa623d5e015ca0e24421f1a431197ae3e2e6d4ee6f47",
+    "tool_profiles/research.json": "7aa41f484d71d59ad61cdf62f5b70eadc8779baf6a601f8697884e353a45d3da"
+  },
+  "format": "lumina-shipped-baseline",
+  "format_version": {
+    "major": 1,
+    "minor": 0
+  },
+  "git_commit": "ee40259c980d3c6fcca56fc2f27dcefd3814c178",
+  "hash_algorithm": "sha256",
+  "lumina_version": "0.2.7-beta.2"
+}
