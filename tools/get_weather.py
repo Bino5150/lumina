@@ -1,13 +1,14 @@
 # Mock weather report generator
 # Returns structured JSON with temperature, conditions, humidity, wind
 
+import json
+
+
 def get_weather(city: str) -> dict:
     """
     Generate a mock weather report for the given city.
     Uses simple hash-based randomness to vary results per city.
     """
-    import json
-    
     # Simple hash function for consistent but varied results
     def hash_string(s):
         h = 0
@@ -18,9 +19,11 @@ def get_weather(city: str) -> dict:
     city_hash = hash_string(city)
     seed = city_hash % 256
     
-    # Generate mock weather data
-    temp_min = int((seed % 24) - 5)
-    temp_max = int(((seed + 7) % 28) - 3)
+    # Generate mock weather data. The two temperature formulas are independent,
+    # so order them to keep the daily high at or above the current reading.
+    temp_a = int((seed % 24) - 5)
+    temp_b = int(((seed + 7) % 28) - 3)
+    temp_min, temp_max = min(temp_a, temp_b), max(temp_a, temp_b)
     humidity = (seed * 137) % 90
     wind_speed = ((seed + 19) % 20) + 2
     
