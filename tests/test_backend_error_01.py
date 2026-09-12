@@ -195,6 +195,76 @@ def test_httperror_from_transport_call_not_masked_on_stream_path(kind, monkeypat
     assert "503 adapter-level failure" in str(excinfo.value)
 
 
+# ── D. MB-35 — the underlying transport diagnostic survives, sanitized ──
+#
+# lmstudio.py (inherited unmodified by OpenRouter/Groq/DeepSeek/Kimi/Qwen/
+# OpenAI/vLLM/OmniRoute/Custom) previously discarded the original requests.
+# exceptions.ConnectionError/Timeout entirely: `except ...ConnectionError:`
+# with no `as e`, so the real diagnostic (DNS failure, refused connection,
+# reset, TLS error, ...) never reached anywhere the resulting message was
+# displayed (print/UI/Flight Recorder), regardless of Python's own implicit
+# __context__ chaining. anthropic/gemini/ollama have the identical
+# discard-the-diagnostic shape but are NOT touched by this campaign (MB-35
+# is an OpenRouter/lmstudio-family incident) -- flagged separately.
+
+def test_connection_error_preserves_and_chains_underlying_diagnostic(monkeypatch):
+    backend, mod = make_backend("lmstudio")
+
+    def boom(*a, **kw):
+        raise requests.exceptions.ConnectionError("Connection refused by peer")
+    patch_transport(monkeypatch, mod, boom)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        backend.chat([{"role": "user", "content": "hi"}])
+    assert "Connection refused by peer" in str(excinfo.value)
+    # Exception chaining: the ORIGINAL requests exception is still
+    # reachable programmatically, not just paraphrased in text.
+    assert isinstance(excinfo.value.__cause__, requests.exceptions.ConnectionError)
+    assert "Connection refused by peer" in str(excinfo.value.__cause__)
+
+
+def test_timeout_preserves_and_chains_underlying_diagnostic(monkeypatch):
+    backend, mod = make_backend("lmstudio")
+
+    def boom(*a, **kw):
+        raise requests.exceptions.Timeout("Read timed out after 600s")
+    patch_transport(monkeypatch, mod, boom)
+
+    with pytest.raises(TimeoutError) as excinfo:
+        backend.chat([{"role": "user", "content": "hi"}])
+    assert "Read timed out after 600s" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, requests.exceptions.Timeout)
+
+
+def test_connection_error_diagnostic_is_redacted_of_secret_shapes(monkeypatch):
+    """Defensive redaction: even though urllib3/requests connection-level
+    exceptions don't normally echo headers, the folded diagnostic must
+    never be assumed secret-free (mission section 5/12)."""
+    backend, mod = make_backend("lmstudio")
+    secret = "sk-realsecretkey1234567890abcdef"
+
+    def boom(*a, **kw):
+        raise requests.exceptions.ConnectionError(f"proxy error, Authorization: Bearer {secret}")
+    patch_transport(monkeypatch, mod, boom)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        backend.chat([{"role": "user", "content": "hi"}])
+    assert secret not in str(excinfo.value)
+    assert "[REDACTED]" in str(excinfo.value)
+
+
+def test_connection_error_diagnostic_is_length_bounded(monkeypatch):
+    backend, mod = make_backend("lmstudio")
+
+    def boom(*a, **kw):
+        raise requests.exceptions.ConnectionError("x" * 5000)
+    patch_transport(monkeypatch, mod, boom)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        backend.chat([{"role": "user", "content": "hi"}])
+    assert len(str(excinfo.value)) < 1000
+
+
 # ── success path unchanged ───────────────────────────────────────────────
 
 @pytest.mark.parametrize("kind", KINDS)

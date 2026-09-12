@@ -54,13 +54,17 @@ def _fake_agent(llm, tool_result="tool ran fine"):
 
 class _RaisingAfterNCallsLLM:
     """Fake backend: first N calls behave like a normal tool-call turn, then
-    raises like GeminiBackend.chat() does on an HTTP error."""
+    raises like GeminiBackend.chat() does on an HTTP error (or, MB-35, any
+    other exception type a caller wants to exercise -- e.g. the builtin
+    ConnectionError/TimeoutError a real transport failure raises)."""
     name = "gemini"
     display_name = "Gemini (Google)"
 
-    def __init__(self, calls_before_raise, raise_msg="Gemini API HTTP error: 400 Client Error"):
+    def __init__(self, calls_before_raise, raise_msg="Gemini API HTTP error: 400 Client Error",
+                 raise_exc_factory=None):
         self.calls_before_raise = calls_before_raise
         self.raise_msg = raise_msg
+        self.raise_exc_factory = raise_exc_factory or (lambda msg: RuntimeError(msg))
         self.call_count = 0
 
     def get_model(self):
@@ -69,7 +73,7 @@ class _RaisingAfterNCallsLLM:
     def chat(self, messages, tools=None, max_tokens=None, reasoning_effort=None):
         self.call_count += 1
         if self.call_count > self.calls_before_raise:
-            raise RuntimeError(self.raise_msg)
+            raise self.raise_exc_factory(self.raise_msg)
         return {"_round": self.call_count}
 
     def extract_message(self, response):
@@ -151,3 +155,42 @@ def test_two_sequential_tool_calls_then_continuation_failure_names_both():
     assert "read_file" in result
     assert "rejected the continuation" in result
     assert calls["tool_calls"] == [("search_memory", {}), ("read_file", {})]
+
+
+# ── MB-35: transport-class failures must not claim a provider rejection ──
+
+def test_continuation_failure_by_connection_error_is_not_labeled_rejection():
+    """MB-35 — the confirmed live defect: a real post-tool WORK request
+    hitting requests.exceptions.ConnectionError (wrapped by every lmstudio-
+    family backend's chat() as a builtin ConnectionError) used to be
+    reported identically to a genuine HTTP rejection. A transport failure
+    never established that the provider received or rejected anything."""
+    llm = _RaisingAfterNCallsLLM(
+        calls_before_raise=1,
+        raise_msg="OpenRouter not reachable at https://openrouter.ai/api/v1.",
+        raise_exc_factory=lambda msg: ConnectionError(msg),
+    )
+    fake_self, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake_self, "what's the launch date?")
+
+    assert "search_memory" in result
+    assert "completed" in result
+    assert "rejected the continuation" not in result
+    assert "before a response was received" in result
+    assert calls["response_tokens"] == [result]
+
+
+def test_continuation_failure_by_timeout_is_not_labeled_rejection():
+    llm = _RaisingAfterNCallsLLM(
+        calls_before_raise=1,
+        raise_msg="OpenRouter request timed out.",
+        raise_exc_factory=lambda msg: TimeoutError(msg),
+    )
+    fake_self, calls = _fake_agent(llm)
+
+    result = LuminaAgent.chat(fake_self, "what's the launch date?")
+
+    assert "search_memory" in result
+    assert "rejected the continuation" not in result
+    assert "timed out waiting for a response" in result

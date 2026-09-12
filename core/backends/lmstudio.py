@@ -7,6 +7,7 @@ import json
 import requests
 from typing import Optional, Generator
 from .base import BaseLLMBackend, ModelDiscoveryOutcome, ModelDiscoveryResult, ToolChoiceMode
+from core.redaction import redact_secret_shapes
 import config
 
 
@@ -242,6 +243,23 @@ def extract_openai_compatible_reasoning(response: dict) -> Optional[str]:
     return _first_reasoning_field(message)
 
 
+def _sanitize_transport_detail(e: Exception) -> str:
+    """MB-35 -- bounded, redacted str() of a transport-layer exception
+    (requests.exceptions.ConnectionError/Timeout), for folding into the
+    ConnectionError/TimeoutError chat() raises so the underlying requests/
+    urllib3 diagnostic (DNS failure, connection reset, refused connection,
+    TLS error, ...) survives into the displayed message instead of being
+    silently discarded. Bounded to keep a pathological chained-exception
+    repr from ballooning the user-facing string; redacted because these
+    exceptions occasionally echo request context (host/port/path — never
+    headers, which urllib3 does not include in its own exception text, but
+    treated defensively rather than assumed safe)."""
+    text = redact_secret_shapes(str(e))
+    if len(text) > 300:
+        text = text[:300] + f"...[truncated, {len(text)} chars total]"
+    return f"{type(e).__name__}: {text}"
+
+
 def _iter_lines_safe(resp):
     """FE-15: requests.exceptions.RequestException (e.g. ChunkedEncodingError
     from a mid-stream disconnect) raises from *inside* iter_lines(), outside
@@ -418,10 +436,27 @@ class LMStudioBackend(BaseLLMBackend):
             )
             resp.raise_for_status()
             return resp.json()
-        except requests.exceptions.ConnectionError:
-            raise ConnectionError(f"{self.display_name} not reachable at {base_url}.")
-        except requests.exceptions.Timeout:
-            raise TimeoutError(f"{self.display_name} request timed out.")
+        except requests.exceptions.ConnectionError as e:
+            # MB-35 -- this is a TRANSPORT failure: the request never got a
+            # response, so this does NOT establish that {base_url} received
+            # or rejected anything (see core/agent.py's _provider_chat_or_
+            # error(), which must not describe this as "rejected"). `from e`
+            # plus the folded _sanitize_transport_detail() keep the real
+            # underlying requests/urllib3 diagnostic (DNS failure, refused
+            # connection, reset, TLS error, ...) visible in the displayed
+            # message instead of silently discarding it -- previously this
+            # branch didn't even bind `e`, so the actual cause was lost the
+            # moment this message was rendered as a plain string anywhere
+            # (print/UI/telemetry), regardless of __context__ chaining.
+            raise ConnectionError(
+                f"{self.display_name} not reachable at {base_url} "
+                f"({_sanitize_transport_detail(e)})."
+            ) from e
+        except requests.exceptions.Timeout as e:
+            raise TimeoutError(
+                f"{self.display_name} request timed out "
+                f"({_sanitize_transport_detail(e)})."
+            ) from e
         except requests.exceptions.HTTPError as e:
             if resp is None:
                 # HTTPError escaped the transport call itself (custom adapter,
@@ -466,10 +501,19 @@ class LMStudioBackend(BaseLLMBackend):
                 stream=True,
             )
             resp.raise_for_status()
-        except requests.exceptions.ConnectionError:
-            raise ConnectionError(f"{self.display_name} not reachable at {base_url}.")
-        except requests.exceptions.Timeout:
-            raise TimeoutError(f"{self.display_name} request timed out.")
+        except requests.exceptions.ConnectionError as e:
+            # MB-35 -- see chat()'s identical branch above for why this
+            # preserves and chains the underlying transport diagnostic
+            # instead of discarding it.
+            raise ConnectionError(
+                f"{self.display_name} not reachable at {base_url} "
+                f"({_sanitize_transport_detail(e)})."
+            ) from e
+        except requests.exceptions.Timeout as e:
+            raise TimeoutError(
+                f"{self.display_name} request timed out "
+                f"({_sanitize_transport_detail(e)})."
+            ) from e
         except requests.exceptions.HTTPError as e:
             if resp is None:
                 # See chat(): HTTPError from the transport call itself must

@@ -4,6 +4,7 @@ Full turn cycle: receive → think → tool calls → stream final response.
 """
 
 import inspect
+import json
 import re
 import sys
 import os
@@ -18,6 +19,7 @@ from core import flight_recorder
 from core.backends.base import BackendStreamTelemetry, TerminationStatus, ToolChoiceMode
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager, estimate_tokens
+from core.redaction import redact_secret_shapes
 from core.project_context import ProjectContext, ProjectContextState
 from core.tool_profiles import TOOL_TIERS
 from tools.registry import ToolRegistry
@@ -365,7 +367,93 @@ def _close_cancelled_tool_calls(agent, tool_calls):
         agent.ctx.add_cancelled_tool_result(tool_id, name)
 
 
-def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_this_turn: set):
+# MB-35 -- per-role "known" message fields for a wire-bound OpenAI-shaped
+# request. Everything ELSE present on a message (e.g. OpenRouter/GLM's
+# "reasoning"/"reasoning_details" siblings on an assistant tool-call
+# message -- see core/backends/openrouter.py's _REASONING_FIELD_PRIORITY
+# comment) is a provider-specific field this codebase has never hardcoded
+# and must still be measured, never silently missed. Used only for
+# forensic/telemetry field-name bookkeeping (_dispatch_measurements()
+# below) -- NOT for accounting (core/context.py's estimate_message_tokens()
+# measures the whole serialized dict so it can never drift from this list).
+_KNOWN_MESSAGE_FIELDS_BY_ROLE = {
+    "assistant": {"role", "content", "tool_calls", "refusal", "name"},
+    "tool": {"role", "content", "tool_call_id", "name"},
+    "user": {"role", "content", "name"},
+    "system": {"role", "content", "name"},
+}
+_DEFAULT_KNOWN_MESSAGE_FIELDS = frozenset({"role", "content"})
+
+
+def _json_byte_len(value) -> int:
+    """Best-effort UTF-8 serialized byte length of `value`, never raising --
+    falls back to str() for anything json.dumps can't handle so a
+    measurement helper can never be the reason a real turn breaks."""
+    try:
+        return len(json.dumps(value, default=str, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return len(str(value).encode("utf-8", errors="replace"))
+
+
+def _dispatch_measurements(chat_kwargs: dict) -> dict:
+    """MB-35 -- sanitized, provider-neutral STRUCTURAL measurements of a
+    provider-dispatch request, computed from the exact `messages`/`tools`
+    objects about to be passed to agent.llm.chat(**chat_kwargs) -- never a
+    copy that could drift from what's actually serialized on the wire.
+    Counts/byte-lengths/type/role names only, never raw message content --
+    safe to hand to Flight Recorder's own field sanitizer (core/
+    flight_recorder.py's _sanitize_fields(), a second independent layer of
+    defense this does not replace, only precede).
+
+    Answers MB-35's forensic questions C/D/E/F/L from measurements rather
+    than guesses: message_count/role_counts (C/D), sibling_field_names/
+    sibling_bearing_tool_call_message_count (E), *_bytes (F), and
+    multipart_message_count (L -- image/audio content blocks in history).
+    Never raises: any failure collapses to an empty dict, exactly like
+    every other Flight Recorder field-gathering call site in this file."""
+    messages = chat_kwargs.get("messages") or []
+    tools = chat_kwargs.get("tools") or []
+    role_counts: dict = {}
+    tool_call_message_count = 0
+    sibling_bearing_tool_call_message_count = 0
+    sibling_field_names: set = set()
+    sibling_field_bytes = 0
+    multipart_message_count = 0
+    max_message_bytes = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "unknown")
+        role_counts[role] = role_counts.get(role, 0) + 1
+        if isinstance(m.get("content"), list):
+            multipart_message_count += 1
+        is_tool_call_msg = role == "assistant" and bool(m.get("tool_calls"))
+        if is_tool_call_msg:
+            tool_call_message_count += 1
+        known = _KNOWN_MESSAGE_FIELDS_BY_ROLE.get(role, _DEFAULT_KNOWN_MESSAGE_FIELDS)
+        extra_keys = set(m.keys()) - known
+        if extra_keys:
+            sibling_field_names |= extra_keys
+            if is_tool_call_msg:
+                sibling_bearing_tool_call_message_count += 1
+            sibling_field_bytes += sum(_json_byte_len(m[k]) for k in extra_keys)
+        max_message_bytes = max(max_message_bytes, _json_byte_len(m))
+    return {
+        "message_count": len(messages),
+        "role_counts": role_counts,
+        "tool_call_message_count": tool_call_message_count,
+        "sibling_bearing_tool_call_message_count": sibling_bearing_tool_call_message_count,
+        "sibling_field_names": sorted(sibling_field_names),
+        "sibling_field_bytes": sibling_field_bytes,
+        "multipart_message_count": multipart_message_count,
+        "messages_bytes": _json_byte_len(messages),
+        "schema_bytes": _json_byte_len(tools) if tools else 0,
+        "max_message_bytes": max_message_bytes,
+    }
+
+
+def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_this_turn: set,
+                             *, turn_id: Optional[str] = None, chat_id: int = None):
     """Call agent.llm.chat(**chat_kwargs); on success return (response,
     None). On a genuine provider exception, print the same diagnostic the
     tool loop has always printed and return (None, error_text) -- ready to
@@ -381,11 +469,36 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
     on_response_token attributes.
 
     Shared by both the WORK-phase request and _run_tool_work_control_gate()
-    below, so a provider rejecting either one gets identical "tool already
-    ran, provider rejected the continuation" observability -- the gate's
-    own request IS a tool-continuation request, same as the old design's
+    below, so both get identical dispatch instrumentation and identical,
+    exception-class-accurate observability on failure -- the gate's own
+    request IS a tool-continuation request, same as the old design's
     post-tool round was, so tools_used_this_turn is always already
-    non-empty by the time this is called for a gate request."""
+    non-empty by the time this is called for a gate request.
+
+    MB-35 -- root-cause-discipline wording fix: this used to label EVERY
+    exception here as "{provider} rejected the continuation", including a
+    transport-class ConnectionError that never received any response at
+    all. A transport failure does not establish that the provider received
+    or rejected anything (see core/backends/lmstudio.py's chat(), whose
+    ConnectionError/TimeoutError handlers are explicitly transport- and
+    timeout-scoped, never raised from an HTTPError branch) -- only a
+    RuntimeError arriving from a backend's own HTTPError handler
+    (format_provider_error()/format_gemini_error()/format_anthropic_error(),
+    every concrete backend's convention) represents an actual received
+    provider response. `stage`/wording below now branch on the real
+    exception class instead of collapsing every failure into "rejected"."""
+    try:
+        dispatch_fields = _dispatch_measurements(chat_kwargs)
+    except Exception:
+        dispatch_fields = {}
+    _llm = getattr(agent, "llm", None)
+    _configured_model = getattr(_llm, "configured_model", None)
+    _fr_machine(
+        agent, "provider.dispatch", turn_id=turn_id, chat_id=chat_id,
+        backend=getattr(_llm, "name", None),
+        model=_configured_model() if callable(_configured_model) else None,
+        fields=dispatch_fields,
+    )
     try:
         return agent.llm.chat(**chat_kwargs), None
     except Exception as e:
@@ -397,26 +510,68 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
         stage = "tool_continuation" if tools_used_this_turn else "initial_request"
         print(f"[AGENT ERROR] provider={provider} model={model} "
               f"stage={stage} {type(e).__name__}: {e}", flush=True)
+        # MB-35 -- exception chaining (core/backends/lmstudio.py's `raise
+        # ... from e`) means the ORIGINAL transport/urllib3 exception is
+        # reachable here as __cause__ (explicit) or __context__ (implicit,
+        # set whenever a new exception is raised inside an except block) --
+        # recorded sanitized/bounded, never assumed secret-free.
+        cause = e.__cause__ or e.__context__
+        _fr_machine(
+            agent, "provider.dispatch_failed", turn_id=turn_id, chat_id=chat_id,
+            severity="error",
+            backend=getattr(_llm, "name", None), model=model,
+            fields={
+                "stage": stage,
+                "provider": provider,
+                "exception_type": type(e).__name__,
+                "cause_type": type(cause).__name__ if cause is not None else None,
+                "cause_detail": (redact_secret_shapes(str(cause))[:300] if cause is not None else None),
+                **dispatch_fields,
+            },
+        )
         if tools_used_this_turn:
-            # A tool already ran successfully this turn — the failure is
-            # the PROVIDER rejecting the continuation request, not a
-            # silent hang. Name it explicitly so this doesn't read as
-            # "the model just stopped responding" — the actual symptom
-            # Bug B produced before the thoughtSignature-preservation
-            # fix in gemini_backend.py. Streamed via on_response_token
-            # (the same path _stream_final's own error handler already
-            # uses) rather than just returned, because agent.chat()
-            # deliberately never raises — main.py's CLI loop calls it
-            # with no try/except around the call, relying on that
-            # contract — so the only way to make this visible in the
-            # GUI without touching that contract is to push it through
-            # the token-streaming callback the GUI already renders live
-            # (AgentWorker → _on_response_chunk → the live bubble),
-            # rather than routing through the separate signals.error /
-            # _on_error path, which only fires on a raised exception and
-            # is never reached from inside this try/except at all.
+            # A tool already ran successfully this turn — the follow-up
+            # provider call then failed. Name the tool(s) explicitly so
+            # this doesn't read as "the model just stopped responding" —
+            # the actual symptom Bug B produced before the thoughtSignature-
+            # preservation fix in gemini_backend.py. Streamed via
+            # on_response_token (the same path _stream_final's own error
+            # handler already uses) rather than just returned, because
+            # agent.chat() deliberately never raises — main.py's CLI loop
+            # calls it with no try/except around the call, relying on that
+            # contract — so the only way to make this visible in the GUI
+            # without touching that contract is to push it through the
+            # token-streaming callback the GUI already renders live
+            # (AgentWorker → _on_response_chunk → the live bubble), rather
+            # than routing through the separate signals.error / _on_error
+            # path, which only fires on a raised exception and is never
+            # reached from inside this try/except at all.
+            #
+            # MB-35 -- the wording itself is now exception-class-accurate
+            # instead of universally claiming "rejected": only a
+            # RuntimeError (every backend's own convention for "an HTTP
+            # response was actually received and treated as an error" --
+            # see format_provider_error()/format_gemini_error()/
+            # format_anthropic_error()) is a confirmed provider rejection.
+            # ConnectionError/TimeoutError are transport/timeout failures
+            # that never established the provider received or rejected
+            # anything; anything else is left unclassified rather than
+            # guessed at. ERROR_RESPONSE_SUBSTRINGS below must keep
+            # matching all four phrasings.
             just_ran = ", ".join(f"`{n}`" for n in sorted(tools_used_this_turn))
-            err = f"[Tool {just_ran} completed, but {provider} rejected the continuation: {e}]"
+            if isinstance(e, ConnectionError):
+                detail = (
+                    f"the connection to {provider} failed before a response "
+                    f"was received (transport failure — not a confirmed "
+                    f"provider rejection): {e}"
+                )
+            elif isinstance(e, TimeoutError):
+                detail = f"the request to {provider} timed out waiting for a response: {e}"
+            elif isinstance(e, RuntimeError):
+                detail = f"{provider} rejected the continuation: {e}"
+            else:
+                detail = f"the continuation request to {provider} failed before a response was confirmed: {e}"
+            err = f"[Tool {just_ran} completed, but {detail}]"
         else:
             err = f"[Lumina error: {e}]"
         on_response_token = getattr(agent, "on_response_token", None)
@@ -674,7 +829,8 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
     if _accepts_capture_telemetry(agent.llm):
         chat_kwargs["capture_telemetry"] = True
 
-    response, err = _provider_chat_or_error(agent, chat_kwargs, cancel_event, tools_used_this_turn)
+    response, err = _provider_chat_or_error(agent, chat_kwargs, cancel_event, tools_used_this_turn,
+                                             turn_id=turn_id, chat_id=chat_id)
     if err is not None:
         return "error", err
     response_telemetry = _capture_response_telemetry(
@@ -1211,7 +1367,18 @@ ERROR_RESPONSE_PREFIXES = ("[Lumina error:", "[Stream error:")
 # and the Bug C patch-review report that found this gap. Anchoring on that
 # substring instead of guessing the surrounding prefix: if the actual
 # wording differs, update this rather than trust it silently.
-ERROR_RESPONSE_SUBSTRINGS = ("rejected the continuation",)
+#
+# MB-35 -- _provider_chat_or_error() now emits three additional exception-
+# class-accurate phrasings for the same "tool ran, then the continuation
+# failed" sentinel (transport/timeout/unclassified, alongside the original
+# genuine-rejection case above) — each needs its own distinctive substring
+# here so is_error_response() keeps recognizing all four as non-content.
+ERROR_RESPONSE_SUBSTRINGS = (
+    "rejected the continuation",
+    "before a response was received",
+    "timed out waiting for a response",
+    "failed before a response was confirmed",
+)
 
 
 def is_error_response(text: str) -> bool:
@@ -2170,7 +2337,8 @@ class LuminaAgent:
             # stream time. A backend may opt into capture_telemetry and return
             # native event boundaries; otherwise a promoted candidate remains
             # unavailable for Final TTFT/stream/tok-s exactly as before.
-            response, err = _provider_chat_or_error(self, chat_kwargs, cancel_event, tools_used_this_turn)
+            response, err = _provider_chat_or_error(self, chat_kwargs, cancel_event, tools_used_this_turn,
+                                                     turn_id=turn_id, chat_id=chat_id)
             if err is not None:
                 return err
             response_telemetry = _capture_response_telemetry(

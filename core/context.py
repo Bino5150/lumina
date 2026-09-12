@@ -26,18 +26,35 @@ def estimate_tokens(text: str) -> int:
 
 
 def estimate_message_tokens(msg: dict) -> int:
-    content = msg.get("content") or ""
-    if isinstance(content, list):
-        content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-    tokens = estimate_tokens(content) + 4  # 4 overhead per message
-    tool_calls = msg.get("tool_calls")
-    if tool_calls:
-        # FE-19: an assistant message carrying tool_calls was previously
-        # counted as ~4 tokens regardless of payload size (often
-        # 200-1000+ chars of JSON), systematically undercounting
-        # tool-heavy conversations and eating into the response reserve.
-        tokens += len(json.dumps(tool_calls)) // 4
-    return tokens
+    """MB-35 -- provider-neutral token estimate for one wire-bound message
+    dict, measured from the WHOLE dict as it will actually be JSON-
+    serialized, not a hand-picked subset of keys.
+
+    Before this fix, only "content" and "tool_calls" were counted (the
+    latter added by FE-19 specifically because tool_calls payloads were
+    being undercounted at a flat ~4 tokens). That missed any OTHER sibling
+    field a provider's own response message carries -- confirmed live for
+    OpenRouter/GLM: a real tool_calls-bearing assistant message returns
+    {"role", "content": null, "tool_calls": [...], "reasoning": "<text>",
+    "reasoning_details": [...]} (see core/backends/openrouter.py's
+    _REASONING_FIELD_PRIORITY comment), and core/agent.py's add_tool_call()
+    stores that ENTIRE message dict verbatim -- every key in it is replayed
+    to the provider on the next request (that's the tool-continuation
+    protocol), so every key must count here too. Hardcoding "reasoning"/
+    "reasoning_details" by name would only fix today's known provider and
+    silently drift again the moment another provider adds a different
+    sibling key -- measuring the whole dict is provider-neutral by
+    construction and can never miss a future field.
+
+    default=str/ensure_ascii=False keep this a faithful proxy for the real
+    wire bytes (requests' own json.dumps call uses the same defaults for
+    non-ASCII); the fallback to str(msg) only exists so a malformed/
+    unserializable message can never crash the estimator itself."""
+    try:
+        serialized = json.dumps(msg, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        serialized = str(msg)
+    return estimate_tokens(serialized) + 4  # 4 overhead per message
 
 def _strip_image_blocks(content):
     """Remove image content blocks from tool result messages before API serialization."""
@@ -321,8 +338,17 @@ class ContextManager:
         history_copy, system_tokens = self._fit_history_to_budget(
             system_prompt, tool_budget=tool_budget, capture_compaction=True
         )
+        # MB-35 -- the snapshot must count ephemeral_messages too: they are
+        # appended to the actual returned/wire-bound list below (real
+        # request content, not decoration), but were previously left out of
+        # the snapshot computed here, so "used_tokens"/"percent" silently
+        # undercounted whatever this specific request actually sent the
+        # moment a one-shot reconciliation message was queued. The trim
+        # loop above is deliberately left untouched -- ephemeral messages
+        # bypass trimming by design (SEPT-AC-R1-F03/F04), this only fixes
+        # the number reported for what's really on the wire.
         self._last_usage_snapshot = self._make_usage_snapshot(
-            system_tokens, history_copy, tool_budget, chat_id
+            system_tokens, history_copy + list(ephemeral_messages), tool_budget, chat_id
         )
 
         # F-61 fix: self.history itself used to grow unbounded — only the
