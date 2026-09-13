@@ -693,16 +693,39 @@ def _maybe_emit_vision_tool_capability_notice(agent, messages: list, tool_schema
         return False
 
     display_name = getattr(llm, "display_name", "this backend")
-    notice = (
-        f"[Lumina: {display_name} doesn't support combining tools with "
-        "image input on this model -- tools are unavailable this turn "
-        "while an image is present in the conversation.]"
-    )
+    # MB-34-LIVE-VISION-TOOL-CAPABILITY-01 -- when the backend can report a
+    # capability STATE, the notice must not claim "doesn't support" when
+    # the truth is "unknown" (discovery never established an answer, or
+    # the model was absent from the discovery response). UNKNOWN IS NOT
+    # UNSUPPORTED. Backends without the state seam (every non-OpenRouter
+    # backend today) keep the exact historical wording.
+    capability_state = None
+    state_fn = getattr(llm, "vision_tool_capability_state", None)
+    if callable(state_fn):
+        try:
+            capability_state = state_fn(configured_model)
+        except Exception:
+            capability_state = None
+    if isinstance(capability_state, str) and capability_state.startswith("unknown"):
+        notice = (
+            f"[Lumina: {display_name} capability for combining tools with "
+            "image input is unknown on this model -- capability discovery "
+            "did not establish an answer, so tools are unavailable this "
+            "turn while an image is present. Unknown is not unsupported; "
+            "the model may still support the combination.]"
+        )
+    else:
+        notice = (
+            f"[Lumina: {display_name} doesn't support combining tools with "
+            "image input on this model -- tools are unavailable this turn "
+            "while an image is present in the conversation.]"
+        )
     on_commentary = getattr(agent, "on_commentary", None)
     if callable(on_commentary):
         on_commentary(notice)
     _fr_machine(agent, "turn.vision_tool_capability_notice", turn_id=turn_id, chat_id=chat_id,
-                fields={"backend": getattr(llm, "name", None), "model": configured_model})
+                fields={"backend": getattr(llm, "name", None), "model": configured_model,
+                        "capability_state": capability_state})
     return True
 
 

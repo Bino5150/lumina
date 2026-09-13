@@ -570,6 +570,20 @@ def test_work_round_still_loses_product_tools_on_vision_turn_unchanged_policy(mo
     backend._reasoning_cache_ready = False
     backend._vision_tool_cache = {}
 
+    # MB-34-LIVE-VISION-TOOL-CAPABILITY-01: with the live-instance hydration
+    # repair, an empty cache on an undiscovered instance triggers its ONE
+    # bounded discovery attempt at the capability-sensitive consult. This
+    # test's semantic is "capability unknown -> tools stay dropped"; pin
+    # that deterministically by failing the discovery attempt instead of
+    # letting it reach the network. The assertion below is unchanged.
+    from core.backends.base import ModelDiscoveryOutcome, ModelDiscoveryResult
+
+    def _failed_discovery():
+        return ModelDiscoveryResult(ModelDiscoveryOutcome.FAILED,
+                                    diagnostic="OpenRouter model discovery failed (test).")
+
+    backend.discover_models = _failed_discovery
+
     captured = {}
 
     class _FakeResp:

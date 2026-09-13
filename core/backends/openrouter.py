@@ -69,6 +69,46 @@ class OpenRouterBackend(LMStudioBackend):
         # dict.get() -- no distinction between "never discovered" and
         # "discovered but doesn't support the combination".
         self._vision_tool_cache: dict = {}
+        # MB-34-LIVE-VISION-TOOL-CAPABILITY-01 -- per-instance hydration
+        # ledger for the vision+tools capability cache. The live
+        # conversational instance is constructed by loader.get_llm_backend()
+        # and, unlike the Settings probe instances, historically NEVER ran
+        # discover_models() -- so its cache stayed empty forever and the
+        # inherited has_vision transport guard truthfully-but-wrongly
+        # dropped tools from every image-bearing request. The repair makes
+        # THIS instance establish capability truth itself: the first
+        # capability-sensitive consultation (see supports_vision_with_tools)
+        # performs exactly ONE bounded discovery attempt per instance
+        # lifetime, outcome latched here either way. Fields:
+        #   attempted  -- True once this instance has made its single
+        #                 hydration attempt. Never reset: another attempt
+        #                 requires a new instance (model switch / restart),
+        #                 the same recovery path Settings refreshes always
+        #                 effectively required. Repeated capability-
+        #                 sensitive calls therefore never hammer a down
+        #                 provider once per WORK round.
+        #   succeeded  -- None until attempted, then the outcome of THAT
+        #                 attempt. Externally driven discover_models()
+        #                 calls (e.g. refresh_reasoning_capabilities()) do
+        #                 not flow through here; capability-state
+        #                 reporting reads _reasoning_cache_ready for those,
+        #                 so externally established truth is still
+        #                 reflected honestly.
+        #   diagnostic -- sanitized failure text from the latched attempt
+        #                 (display name + HTTP status + exception class
+        #                 only -- never keys, headers, or payloads).
+        self._vision_tool_discovery: dict = {
+            "attempted": False, "succeeded": None, "diagnostic": "",
+        }
+        # Model ids positively seen in the last successful discovery
+        # response on this instance. Lets vision_tool_capability_state()
+        # distinguish "discovered and does NOT advertise the combination"
+        # (unsupported) from "absent from the discovery response" (unknown)
+        # -- UNKNOWN IS NOT UNSUPPORTED. Set by discover_models() alongside
+        # the cache replace; getattr-defaulted at read sites so partially
+        # constructed test doubles (the established __new__ convention)
+        # never AttributeError.
+        self._discovered_model_ids: frozenset = frozenset()
         # Patch 3A.4 Part 4 -- readiness/refresh seam state.
         #
         # _reasoning_cache_ready: True once ANY discover_models() call has ever
@@ -176,6 +216,11 @@ class OpenRouterBackend(LMStudioBackend):
                 continue
         self._reasoning_cache = new_cache
         self._vision_tool_cache = new_vision_tool_cache
+        # MB-34-LIVE-VISION-TOOL-CAPABILITY-01 -- record which model ids
+        # this successful response positively contained, so capability-
+        # state reporting can distinguish "seen but lacking the required
+        # signals" (unsupported) from "absent from the response" (unknown).
+        self._discovered_model_ids = frozenset(models)
         # Patch 3A.4 Part 4 -- atomic alongside the cache replace above:
         # this call reached a full success, so both flags reflect that.
         self._reasoning_cache_ready = True
@@ -313,18 +358,151 @@ class OpenRouterBackend(LMStudioBackend):
 
     def supports_vision_with_tools(self, model: Optional[str] = None) -> bool:
         """
-        VISION-TOOL-INTEROP-01 override -- reads the per-instance discovery
-        cache ONLY (zero HTTP here, ever), same contract as
-        reasoning_capabilities() above: `model=None` always returns False,
-        and an unpopulated cache (discovery never run on this instance) or
-        an unrecognized/not-yet-seen model both collapse to False via
-        dict.get()'s default. Populated by the SAME discover_models() HTTP
-        call reasoning-capability discovery already performs -- no
-        separate fetch, no duplicated network/parsing logic.
+        VISION-TOOL-INTEROP-01 override, repaired by
+        MB-34-LIVE-VISION-TOOL-CAPABILITY-01 -- answers from the per-instance
+        discovery cache, and (the repair) ESTABLISHES that truth on THIS
+        instance when it has never been established: if the asked model has
+        no cache entry and no successful discovery has ever completed on
+        this instance (_reasoning_cache_ready False), exactly ONE bounded
+        discover_models() attempt is made here, latched for the instance
+        lifetime in _vision_tool_discovery regardless of outcome.
+
+        Previously this method was strictly cache-read-only ("zero HTTP
+        here, ever") -- which made the LIVE conversation backend's answer
+        depend on whether a throwaway Settings probe happened to run, the
+        exact MB-34 defect: the live instance never discovers, so its cache
+        stayed empty forever and the inherited has_vision transport guard
+        (lmstudio.py chat()) silently dropped tools/tool_choice from every
+        image-bearing request. The contract change IS the repair: the
+        instance that carries the conversation owns its own capability
+        truth.
+
+        Contract after repair:
+          model=None -> False, no HTTP (unchanged).
+          model in cache -> cached answer, zero HTTP (unchanged).
+          model absent + a discovery already succeeded on this instance ->
+              cache-miss answer (False) with NO further HTTP: the model was
+              positively seen by that response and lacks the required
+              signal combination (unsupported), or was absent from it
+              (unknown) -- re-discovery cannot change this instance's
+              established truth.
+          model absent + discovery never succeeded here -> ONE latched
+              discover_models() attempt (10s timeout, never raises). On
+              success the caches are atomically replaced and the answer
+              re-read; on failure the answer stays False (the safest
+              established behavior -- never manufacture support from a
+              failed discovery) and the sanitized reason is recorded for
+              vision_tool_capability_state().
+
+        Populated by the SAME discover_models() HTTP call reasoning-
+        capability discovery already performs -- no separate fetch, no
+        duplicated network/parsing logic. Settings probes keep using their
+        own separate instances; THIS instance's correctness never depends
+        on them (a throwaway probe is never required to make the live
+        backend true).
         """
         if model is None:
             return False
+        if model not in self._vision_tool_cache and not getattr(
+            self, "_reasoning_cache_ready", False
+        ):
+            self._ensure_vision_tool_capability()
         return self._vision_tool_cache.get(model, False)
+
+    def _ensure_vision_tool_capability(self) -> None:
+        """
+        MB-34-LIVE-VISION-TOOL-CAPABILITY-01 -- the single bounded
+        capability-hydration attempt for THIS instance. Called only from
+        supports_vision_with_tools() when the asked model has no
+        established truth and no successful discovery has ever completed
+        here. Exactly one attempt per instance lifetime (latched in
+        _vision_tool_discovery regardless of outcome), so repeated
+        capability-sensitive calls never re-discover and an unreachable
+        OpenRouter is never hammered once per WORK round.
+
+        Reuses discover_models() -- the one established provider-owned
+        population path (same HTTP call, same parsing, same atomic cache
+        replacement the Settings probes use) -- so there is exactly one
+        ownership rule: the instance that carries the conversation
+        establishes its own capability truth, at the first consultation
+        that needs it, at most once.
+
+        Failure semantics: discover_models() never raises by contract
+        (returns a FAILED ModelDiscoveryResult); a raised exception (e.g.
+        a test double) is caught and recorded the same way. A failed
+        attempt is NEVER converted into a positive capability answer --
+        the cache stays empty, supports_vision_with_tools() keeps the
+        conservative False, and the sanitized diagnostic is preserved for
+        vision_tool_capability_state(). No lock: an instance's chat() runs
+        on a single worker thread in this codebase, and the worst case of
+        a theoretical race is one duplicate idempotent GET whose atomic
+        cache replace preserves correctness.
+        """
+        meta = getattr(self, "_vision_tool_discovery", None)
+        if not isinstance(meta, dict):
+            meta = {"attempted": False, "succeeded": None, "diagnostic": ""}
+            self._vision_tool_discovery = meta
+        if meta.get("attempted"):
+            return
+        meta["attempted"] = True
+        try:
+            result = self.discover_models()
+        except Exception as exc:  # defensive: discover_models() never raises by contract
+            meta["succeeded"] = False
+            meta["diagnostic"] = (
+                f"{self.display_name} capability discovery attempt failed "
+                f"({type(exc).__name__})."
+            )
+            return
+        if result.outcome in (ModelDiscoveryOutcome.SUCCESS, ModelDiscoveryOutcome.EMPTY):
+            meta["succeeded"] = True
+        else:
+            meta["succeeded"] = False
+        meta["diagnostic"] = result.diagnostic
+
+    def vision_tool_capability_state(self, model: Optional[str] = None) -> str:
+        """
+        MB-34-LIVE-VISION-TOOL-CAPABILITY-01 -- truthful capability-state
+        reporting for observability and the agent's vision-tool capability
+        notice. Returns exactly one of:
+
+          "supported"               -- this model is positively advertised
+                                       as vision+tools capable by a
+                                       successful discovery on this
+                                       instance.
+          "unsupported"             -- a successful discovery on this
+                                       instance positively saw this model
+                                       id, and the model lacks the
+                                       required signal combination.
+          "unknown_model_absent"    -- a successful discovery completed on
+                                       this instance, but this model id
+                                       was absent from its response (e.g.
+                                       a brand-new route not yet listed).
+          "unknown_discovery_failed" -- this instance's single latched
+                                       hydration attempt failed; no truth
+                                       was established by it.
+          "unknown_not_discovered"  -- no discovery has ever succeeded or
+                                       been attempted on this instance
+                                       (includes model=None).
+
+        UNKNOWN IS NOT UNSUPPORTED: the unknown states mean truth was
+        never established, NOT that the model lacks the combination.
+        Read-only; zero HTTP; never raises on partially constructed test
+        doubles (getattr defaults throughout).
+        """
+        if model is None:
+            return "unknown_not_discovered"
+        if model in self._vision_tool_cache:
+            return "supported"
+        if getattr(self, "_reasoning_cache_ready", False):
+            ids = getattr(self, "_discovered_model_ids", None)
+            if isinstance(ids, frozenset) and model in ids:
+                return "unsupported"
+            return "unknown_model_absent"
+        meta = getattr(self, "_vision_tool_discovery", None)
+        if isinstance(meta, dict) and meta.get("attempted") and meta.get("succeeded") is False:
+            return "unknown_discovery_failed"
+        return "unknown_not_discovered"
 
     def reasoning_capabilities(self, model: Optional[str] = None) -> ReasoningCapabilities:
         """

@@ -100,9 +100,26 @@ def test_base_backend_default_is_false_for_any_model():
 
 def test_openrouter_reports_true_only_for_a_discovered_capable_model():
     backend = _openrouter_backend(vision_tool_models=["z-ai/glm-5.3-flash"])
+    # MB-34-LIVE-VISION-TOOL-CAPABILITY-01: an unknown-model consult on an
+    # instance with no established discovery now performs its ONE latched
+    # hydration attempt; pin it to a failed discovery so this unit test
+    # stays deterministic and network-free while preserving the original
+    # semantic (unknown -> False). Also proves the latch: exactly one
+    # attempt across repeated unknown-model consults.
+    from core.backends.base import ModelDiscoveryOutcome, ModelDiscoveryResult
+    _discovery_calls = []
+
+    def _failed_discovery():
+        _discovery_calls.append(1)
+        return ModelDiscoveryResult(ModelDiscoveryOutcome.FAILED,
+                                    diagnostic="OpenRouter model discovery failed (test).")
+
+    backend.discover_models = _failed_discovery
     assert backend.supports_vision_with_tools("z-ai/glm-5.3-flash") is True
     assert backend.supports_vision_with_tools("some/other-model") is False
+    assert backend.supports_vision_with_tools("some/other-model") is False  # latched, no re-attempt
     assert backend.supports_vision_with_tools(None) is False
+    assert len(_discovery_calls) == 1
 
 
 def test_openrouter_parses_vision_tool_capability_from_models_entry():
@@ -362,6 +379,26 @@ def test_incapable_model_on_openrouter_still_drops_tools(monkeypatch):
 
     backend = _openrouter_backend(vision_tool_models=["some/other-capable-model"])
     assert backend._model == "z-ai/glm-5.3-flash"  # not in the capable set above
+    # MB-34-LIVE-VISION-TOOL-CAPABILITY-01: the configured model has no
+    # established truth on this instance, so the capability-sensitive chat
+    # performs its ONE latched hydration attempt. Pin it to a discovery
+    # response that positively lists the configured model WITHOUT the
+    # vision+tools signal combination -- the honest "incapable model"
+    # simulation -- so the test stays deterministic and network-free. The
+    # suppression assertion below is unchanged.
+    class _ModelsResp:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"data": [
+                {"id": "z-ai/glm-5.3-flash",
+                 "architecture": {"input_modalities": ["text"]},
+                 "supported_parameters": ["tools", "tool_choice"]},
+            ]}
+    def _fake_get(url, headers=None, timeout=None):
+        return _ModelsResp()
+    monkeypatch.setattr(requests, "get", _fake_get)
     captured = {}
     def _fake_post(url, headers=None, json=None, timeout=None):
         captured["payload"] = json
@@ -372,6 +409,7 @@ def test_incapable_model_on_openrouter_still_drops_tools(monkeypatch):
     backend.chat(messages, tools=_PRODUCT_TOOLS, tool_choice_mode=ToolChoiceMode.AUTO)
 
     assert "tools" not in captured["payload"]
+    assert backend.vision_tool_capability_state("z-ai/glm-5.3-flash") == "unsupported"
 
 
 def test_text_only_turn_never_affected_either_way(monkeypatch):
