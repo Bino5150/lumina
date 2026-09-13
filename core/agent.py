@@ -1822,6 +1822,35 @@ class LuminaAgent:
             turn_cancellation._set(cancel_event)
         turn_id = flight_recorder.new_turn_id()
         turn_telemetry = _new_turn_telemetry()
+
+        # MULTIMODAL-M2-BOUNDED-VISION-LANE-01 -- routed vision interception.
+        # A multipart turn carrying image blocks may be committed to routed
+        # semantics by the owner's configured M1 vision route: the raw image
+        # blocks are extracted HERE, before either add_user site (the normal
+        # path in _chat_impl and the emergency-stop admission path below) can
+        # ever see them, and the turn carries a truthful image-free notice
+        # instead. The bounded specialist call itself runs inside
+        # _chat_impl(), after the user turn is safely in hot history -- so a
+        # mid-call cancellation still preserves the submitted turn exactly
+        # like every established pre-work cancellation path, with no
+        # half-observation and no raw-media residue. Lane inert (no route
+        # configured / lane owner-disabled) leaves user_input untouched --
+        # byte-identical legacy behavior, MB-34 guard fully in force. A lane
+        # defect must never brick an image turn: unexpected prepare failures
+        # fall back to the legacy image path loudly (print), the same
+        # session-protection posture as skill injection below.
+        vision_route_ctx = None
+        if isinstance(user_input, list) and any(
+            isinstance(block, dict) and block.get("type") == "image_url"
+            for block in user_input
+        ):
+            try:
+                from core.vision_lane import prepare_routed_turn
+                user_input, vision_route_ctx = prepare_routed_turn(self, user_input)
+            except Exception as exc:
+                vision_route_ctx = None
+                print(f"[VISION LANE] prepare failed ({type(exc).__name__}); "
+                      "turn proceeds on the legacy image path", flush=True)
         # TOKS-STREAM-TIMING-01 -- monotonic, not wall-clock: this is a
         # DURATION (turn dispatch -> terminal completion), and time.time()
         # can jump backward under an NTP/DST adjustment mid-turn, which
@@ -1852,6 +1881,7 @@ class LuminaAgent:
                         cancel_event=cancel_event, reasoning_effort=reasoning_effort,
                         turn_id=turn_id, turn_started_at=turn_started_at,
                         turn_telemetry=turn_telemetry,
+                        vision_route_ctx=vision_route_ctx,
                     )
                     duration_s = time.monotonic() - turn_started_at
                     if is_error_response(result):
@@ -1896,7 +1926,8 @@ class LuminaAgent:
                     cancel_event=None, reasoning_effort: Optional[str] = None,
                     turn_id: Optional[str] = None,
                     turn_started_at: Optional[float] = None,
-                    turn_telemetry: Optional[dict] = None) -> str:
+                    turn_telemetry: Optional[dict] = None,
+                    vision_route_ctx: Optional[object] = None) -> str:
         if turn_telemetry is None:
             turn_telemetry = _new_turn_telemetry()
         tools_used_this_turn = set()
@@ -2068,6 +2099,27 @@ class LuminaAgent:
             self._background_task_notifications = notifications
 
         self.ctx.add_user(user_input, source=source)
+
+        # MULTIMODAL-M2-BOUNDED-VISION-LANE-01 -- execute the bounded vision
+        # specialist operation for routed turns. The user turn above is
+        # already image-free (routed mode replaced raw blocks at chat()
+        # entry), so the specialist call runs with the turn safely in hot
+        # history: cancellation preserves the submitted turn exactly like
+        # every established pre-work cancellation path, with no
+        # half-observation and no raw-media residue. The observation or the
+        # truthful failure notice is appended to THIS turn's user message as
+        # hot-only machine-derived data -- never durable rows, never Palace,
+        # never SYSTEM authority. The specialist is a fresh backend instance
+        # via the established loader; agent.llm is never read, mutated, or
+        # replaced by the lane.
+        if vision_route_ctx is not None:
+            from core.vision_lane import execute_routed_vision
+            _vision_result = execute_routed_vision(
+                self, vision_route_ctx, cancel_event=cancel_event,
+                turn_id=turn_id, chat_id=chat_id,
+            )
+            if _vision_result.outcome == "cancelled":
+                raise TurnCancelled()
 
         # Inject relevant skill docs into system prompt for this turn.
         # Skill injection is a nice-to-have — never allowed to kill the turn.
