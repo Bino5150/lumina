@@ -287,4 +287,14 @@ def register_my_tool_tool(registry):
         }
     )""")
 
+# --- Multimodal capability routing (MULTIMODAL-M1-CAPABILITY-REGISTRY-01) ---
+# Persistence seam for the capability router's owner routing table
+# (core/capability_router.py). Empty defaults preserve existing behavior
+# exactly: every capability lane is default-disabled and no specialist is
+# ever selected until the owner configures routes. See
+# capability_router.parse_routes() for the fail-closed interpretation of
+# hand-edited values.
+MULTIMODAL_ROUTES = _p.get("multimodal_routes", {})
+MULTIMODAL_DISABLED_PROVIDERS = _p.get("multimodal_disabled_providers", [])
+
 del _p
