@@ -9,9 +9,9 @@ from core import persistence
 from ._widgets import _sec, _lbl, _le, _btn, _combo, _scroll_wrap
 
 
-# ── Tab: TTS ───────────────────────────────────────────────────────────────────
+# ── Tab: Multimodal ────────────────────────────────────────────────────────────
 
-class TTSTab(QWidget):
+class MultimodalTab(QWidget):
     backend_changed = Signal(str)
     # Backend construction (get_tts_backend(force_reload=True)) now runs on a
     # worker thread -- loader.py may block it joining a previous in-flight
@@ -23,6 +23,15 @@ class TTSTab(QWidget):
     _tts_swap_done = Signal(bool, str)
 
     _RESULT_HOLD_MS = 1750  # ~1.5-2s truthful-outcome display before button text reverts
+
+    # Same established backend vocabulary exposed by General Settings and
+    # consumed by core.backends.loader.  Keeping the list data-only avoids
+    # importing/constructing providers merely because Settings was opened.
+    _VISION_PROVIDERS = (
+        "llamacpp", "lmstudio", "ollama", "vllm", "openrouter",
+        "deepseek", "groq", "openai", "anthropic", "gemini", "kimi",
+        "qwen", "custom", "omniroute",
+    )
 
     def __init__(self, agent, c: dict, parent=None):
         super().__init__(parent)
@@ -117,6 +126,8 @@ class TTSTab(QWidget):
         layout.setContentsMargins(28, 20, 28, 20)
         layout.setSpacing(8)
 
+        layout.addWidget(_sec("VOICE I/O", self.c))
+
         # ── TTS Backend ──
         layout.addWidget(_sec("TTS BACKEND", self.c))
 
@@ -209,6 +220,118 @@ class TTSTab(QWidget):
         stt_note.setStyleSheet(f"color:{self.c['text_dim']};font-size:11px;font-style:italic;background:transparent;")
         layout.addWidget(stt_note)
 
+        # ── Existing M1/M2 routed-vision policy ──
+        # This is configuration only.  Passive construction performs no
+        # provider discovery, backend construction, model call, or media I/O.
+        layout.addWidget(_sec("VISION / IMAGE UNDERSTANDING", self.c))
+        vision_note = _lbl(
+            "Configure the existing M1 capability route used by the bounded "
+            "M2 vision lane. The primary conversation backend is never "
+            "switched by this policy.",
+            self.c,
+        )
+        vision_note.setWordWrap(True)
+        layout.addWidget(vision_note)
+
+        from core.capability_router import parse_routes
+
+        raw_routes = getattr(config, "MULTIMODAL_ROUTES", {})
+        parsed_routes, route_warnings = parse_routes(raw_routes)
+        route = parsed_routes.get("vision_understanding")
+        raw_vision = (
+            raw_routes.get("vision_understanding", {})
+            if isinstance(raw_routes, dict) else {}
+        )
+        self._vision_route_present = (
+            isinstance(raw_routes, dict)
+            and "vision_understanding" in raw_routes
+        )
+        self._vision_route_template = (
+            dict(raw_vision) if isinstance(raw_vision, dict) else {}
+        )
+
+        route_row = QHBoxLayout()
+        route_row.setSpacing(12)
+
+        mode_col = QVBoxLayout()
+        mode_col.addWidget(_lbl("Route mode", self.c))
+        self.vision_mode_combo = _combo(self.c)
+        self.vision_mode_combo.addItem("Disabled", "disabled")
+        self.vision_mode_combo.addItem("Auto", "auto")
+        self.vision_mode_combo.addItem("Specialist", "specialist")
+        mode = route.mode if route is not None else "disabled"
+        self.vision_mode_combo.setCurrentIndex(
+            self.vision_mode_combo.findData(mode)
+        )
+        mode_col.addWidget(self.vision_mode_combo)
+
+        provider_col = QVBoxLayout()
+        provider_col.addWidget(_lbl("Preferred specialist provider", self.c))
+        self.vision_provider_combo = _combo(self.c)
+        self.vision_provider_combo.addItem("")
+        self.vision_provider_combo.addItems(list(self._VISION_PROVIDERS))
+        configured_provider = route.specialist if route is not None else None
+        if configured_provider and self.vision_provider_combo.findText(configured_provider) < 0:
+            # Preserve owner-authored provider identities even if the current
+            # UI catalog does not know them; the label below does not claim
+            # support or perform discovery.
+            self.vision_provider_combo.addItem(configured_provider)
+        self.vision_provider_combo.setCurrentText(configured_provider or "")
+        provider_col.addWidget(self.vision_provider_combo)
+
+        route_row.addLayout(mode_col, 1)
+        route_row.addLayout(provider_col, 2)
+        layout.addLayout(route_row)
+
+        fallback_row = QHBoxLayout()
+        fallback_row.setSpacing(12)
+
+        fallback_col = QVBoxLayout()
+        fallback_col.addWidget(_lbl("Owner-permitted fallbacks (comma-separated)", self.c))
+        self.vision_fallbacks = _le(
+            ", ".join(route.fallbacks) if route is not None else "", self.c
+        )
+        fallback_col.addWidget(self.vision_fallbacks)
+
+        disabled_col = QVBoxLayout()
+        disabled_col.addWidget(_lbl("Disabled specialist providers (comma-separated)", self.c))
+        self.vision_disabled_providers = _le(
+            ", ".join(getattr(config, "MULTIMODAL_DISABLED_PROVIDERS", []) or ()),
+            self.c,
+        )
+        disabled_col.addWidget(self.vision_disabled_providers)
+
+        fallback_row.addLayout(fallback_col, 1)
+        fallback_row.addLayout(disabled_col, 1)
+        layout.addLayout(fallback_row)
+
+        model_col = QVBoxLayout()
+        model_col.addWidget(_lbl("Configured provider model (read-only)", self.c))
+        self.vision_model_value = QLabel("")
+        self.vision_model_value.setStyleSheet(
+            f"color:{self.c['text_primary']};font-size:12px;"
+            "padding:8px 10px;background:transparent;"
+        )
+        model_col.addWidget(self.vision_model_value)
+        layout.addLayout(model_col)
+
+        route_truth = _lbl(
+            "M1 resolves this owner policy at execution time. Model choice "
+            "remains owned by the selected provider's existing configuration.",
+            self.c,
+        )
+        route_truth.setWordWrap(True)
+        layout.addWidget(route_truth)
+        if route_warnings:
+            warning = _lbl("Invalid stored route is fail-closed: " + "; ".join(route_warnings), self.c)
+            warning.setWordWrap(True)
+            layout.addWidget(warning)
+
+        self.vision_mode_combo.currentIndexChanged.connect(self._sync_vision_controls)
+        self.vision_provider_combo.currentTextChanged.connect(self._refresh_vision_model)
+        self._sync_vision_controls()
+        self._refresh_vision_model()
+
         # ── Save ──
         btn_row = QHBoxLayout()
         self.test_btn = _btn("▶ Test TTS", self.c)
@@ -230,6 +353,80 @@ class TTSTab(QWidget):
         self.setLayout(QVBoxLayout())
         self.layout().setContentsMargins(0, 0, 0, 0)
         self.layout().addWidget(_scroll_wrap(outer, self.c))
+
+    @staticmethod
+    def _csv_values(text: str) -> list[str]:
+        """Ordered, de-duplicated non-empty values from a compact UI field."""
+        values = []
+        for value in (part.strip() for part in text.split(",")):
+            if value and value not in values:
+                values.append(value)
+        return values
+
+    def _configured_vision_model(self, provider: str) -> str:
+        if not provider:
+            return "No specialist provider configured"
+        model_attrs = {
+            "openrouter": "OPENROUTER_DEFAULT_MODEL",
+            "deepseek": "DEEPSEEK_DEFAULT_MODEL",
+            "groq": "GROQ_DEFAULT_MODEL",
+            "openai": "OPENAI_DEFAULT_MODEL",
+            "anthropic": "ANTHROPIC_DEFAULT_MODEL",
+            "gemini": "GEMINI_DEFAULT_MODEL",
+            "kimi": "KIMI_DEFAULT_MODEL",
+            "qwen": "QWEN_DEFAULT_MODEL",
+            "custom": "CUSTOM_DEFAULT_MODEL",
+            "omniroute": "OMNIROUTE_DEFAULT_MODEL",
+        }
+        attr = model_attrs.get(provider, "DEFAULT_MODEL")
+        model = getattr(config, attr, None)
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        if provider in self._VISION_PROVIDERS:
+            return "Provider default / auto-detect at execution"
+        return "Not available from current provider settings"
+
+    def _refresh_vision_model(self, *_args):
+        self.vision_model_value.setText(
+            self._configured_vision_model(self.vision_provider_combo.currentText())
+        )
+
+    def _sync_vision_controls(self, *_args):
+        enabled = self.vision_mode_combo.currentData() != "disabled"
+        self.vision_provider_combo.setEnabled(enabled)
+        self.vision_fallbacks.setEnabled(enabled)
+        self._refresh_vision_model()
+
+    def _vision_settings_payload(self) -> tuple[dict, list[str]]:
+        mode = self.vision_mode_combo.currentData()
+        provider = self.vision_provider_combo.currentText().strip()
+        if mode == "specialist" and not provider:
+            raise ValueError("Specialist route requires a provider.")
+
+        route = dict(self._vision_route_template)
+        route["mode"] = mode
+        if provider:
+            route["specialist"] = provider
+        else:
+            route.pop("specialist", None)
+        route["fallbacks"] = self._csv_values(self.vision_fallbacks.text())
+
+        raw_routes = getattr(config, "MULTIMODAL_ROUTES", {})
+        routes = dict(raw_routes) if isinstance(raw_routes, dict) else {}
+        if (
+            not self._vision_route_present
+            and mode == "disabled"
+            and not provider
+            and not route["fallbacks"]
+        ):
+            # Preserve M1's canonical unconfigured/default-disabled state.
+            # Saving unrelated speech settings must not manufacture an
+            # explicit route that the owner never configured.
+            routes.pop("vision_understanding", None)
+        else:
+            routes["vision_understanding"] = route
+        disabled = self._csv_values(self.vision_disabled_providers.text())
+        return routes, disabled
 
     _BACKEND_URLS = {
         "kokoro":   "http://localhost:8880",
@@ -313,6 +510,11 @@ class TTSTab(QWidget):
         self._leave_busy()
 
     def _save(self):
+        try:
+            multimodal_routes, disabled_providers = self._vision_settings_payload()
+        except ValueError as exc:
+            self.status_lbl.setText(str(exc))
+            return
         if not self._try_enter_busy():
             return
         self.test_btn.setEnabled(False)
@@ -346,6 +548,8 @@ class TTSTab(QWidget):
         config.STT_BACKEND = self.stt_backend_combo.currentText()
         config.STT_MODEL = self.stt_model_combo.currentText()
         config.STT_DEVICE = self.stt_device_combo.currentText()
+        config.MULTIMODAL_ROUTES = multimodal_routes
+        config.MULTIMODAL_DISABLED_PROVIDERS = disabled_providers
 
         prefs = persistence.load()
         prefs["tts_enabled"] = config.TTS_ENABLED
@@ -357,6 +561,8 @@ class TTSTab(QWidget):
         prefs["stt_backend"] = config.STT_BACKEND
         prefs["stt_model"] = config.STT_MODEL
         prefs["stt_device"] = config.STT_DEVICE
+        prefs["multimodal_routes"] = config.MULTIMODAL_ROUTES
+        prefs["multimodal_disabled_providers"] = config.MULTIMODAL_DISABLED_PROVIDERS
 
         # persistence.save() reports failure via its return value, not an
         # exception (see core/persistence.py) -- it was previously called
@@ -434,3 +640,9 @@ class TTSTab(QWidget):
         self.save_btn.setText("✓ Saved" if ok else "⚠ Swap Failed")
         self._schedule_feedback_reset(lambda: self.save_btn.setText("Save Settings"))
         self._leave_busy()
+
+
+# Compatibility for existing imports and focused TTS/STT behavior tests.  The
+# widget itself is now the promoted Multimodal surface; no duplicate page is
+# constructed.
+TTSTab = MultimodalTab

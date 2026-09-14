@@ -7,7 +7,7 @@ from .memory_tab import MemoryTab
 from .knowledge_tab import KnowledgeTab
 from .skills_tab import SkillsTab
 from .tools_tab import ToolsTab
-from .tts_tab import TTSTab
+from .tts_tab import MultimodalTab
 from .communications_tab import CommunicationsTab
 from .personas_tab import PersonasTab
 from .scheduled_tasks_tab import ScheduledTasksTab
@@ -43,8 +43,8 @@ class SettingsPanel(QWidget):
                 color: {self.colors['text_muted']};
                 border: none;
                 border-bottom: 2px solid transparent;
-                padding: 10px 20px;
-                font-size: 12px;
+                padding: 10px 8px;
+                font-size: 11px;
                 font-family: 'JetBrains Mono', monospace;
             }}
             QTabBar::tab:selected {{
@@ -63,7 +63,10 @@ class SettingsPanel(QWidget):
         tabs.addTab(self.general_tab,      "⚙  General")
         tabs.addTab(UserProfileTab(self.agent, c),  "👤  User Profile")
         self.personas_tab = PersonasTab(self.agent, c)
-        self.tts_tab = TTSTab(self.agent, c)
+        self.multimodal_tab = MultimodalTab(self.agent, c)
+        # Compatibility alias for existing internal/tests code.  The page is
+        # promoted in place; there is not a second TTS surface.
+        self.tts_tab = self.multimodal_tab
         tabs.addTab(self.personas_tab,              "🎭  Personas")
         tabs.addTab(CommunicationsTab(self.agent, c), "📡  Communications")
         tabs.addTab(MemoryTab(self.agent, c),       "🧠  Memory")
@@ -71,12 +74,11 @@ class SettingsPanel(QWidget):
         tabs.addTab(SkillsTab(self.agent, c),       "🧩  Skills")
         tabs.addTab(ToolsTab(self.agent, c),        "🔧  Tools")
         tabs.addTab(ScheduledTasksTab(self.agent, c), "🗓  Scheduled Tasks")
-        tabs.addTab(self.tts_tab,                   "🔊  TTS")
+        tabs.addTab(self.multimodal_tab,            "🖼  Multimodal")
         self.tts_tab.backend_changed.connect(self.personas_tab.refresh_voices)
         self.general_tab.backend_connection_changed.connect(
             self.backend_connection_changed
         )
-        tabs.addTab(ComingSoonTab("Image Generation", "Native inline image generation — local and cloud backends. Tracked as MB-21.", c), "🎨  Image Gen")
         tabs.addTab(ComingSoonTab("Oracle", "A performance-oriented, full featured local inference server with integrated dashboard.", c), "🔮  Oracle")
         tabs.addTab(AboutTab(c),                    "✨  About")
 
