@@ -41,17 +41,30 @@ tests/test_generation_manifest_law_01.py):
   L10 no secret material enters   -- key-marker + value-shape scan on every
                                      free-text field and the whole params body
 
-PROVIDER VOCABULARY SHIPS DELIBERATELY EMPTY. CANONICAL_PROVIDERS is an
-empty frozenset at freeze time on purpose. A provider entry is added by a
-deliberate, owner-authorized production edit as part of that provider's
+PROVIDER VOCABULARY IS REGISTERED DELIBERATELY, ONE ENTRY AT A TIME.
+CANONICAL_PROVIDERS shipped as an empty frozenset at freeze time
+(MULTIMODAL-M4-GENERATION-MANIFEST-LAW-01). A provider entry is added by a
+deliberate, owner-authorized production edit as part of that provider's own
 integration rollout -- never by a test, never to make a failing check pass.
 Until an entry exists, every manifest naming that provider is refused; that
 refusal is the guard working, not a bug ("you gave my hands a new tool, but
-nobody updated the paperwork"). Higgsfield's entry lands during the M4
-integration rollout, deliberately.
+nobody updated the paperwork").
 
-Tests use fake provider identities injected via monkeypatch; the production
-vocabulary itself remains empty.
+Higgsfield's entry landed via MULTIMODAL-M4-HIGGSFIELD-PROVIDER-
+REGISTRATION-01 (2026-09-17), once its real server-REST adapter
+(core.higgsfield_adapter.HiggsfieldAdapter) had landed and was verified --
+the exact canonical identity that adapter's own describe_model() already
+names as `"provider": "higgsfield"`. No alias, no model name (e.g.
+"nano-banana"), and no CLI-only identity was registered alongside it; the
+provider axis and core.capability_router's capability axis remain
+completely independent (L2) -- registering a provider identity says
+nothing about which capabilities it is wired to elsewhere.
+
+Most tests use fake provider identities injected via monkeypatch so every
+other law can be exercised without depending on production registration; a
+small group opts out via the `real_provider_vocabulary` fixture to prove
+the real production vocabulary directly -- both that Higgsfield is
+registered and that every other identity still fails closed.
 """
 from __future__ import annotations
 
@@ -91,11 +104,16 @@ __all__ = [
 # Provider / manifest identity vocabulary (the one NEW axis this module owns)
 # ---------------------------------------------------------------------------
 
-# Deliberately EMPTY at freeze. See module docstring: entries are added by
-# deliberate owner-authorized production edits only, one per provider, as
-# part of that provider's integration rollout. Never extended by tests
-# (tests inject fakes via monkeypatch), never extended to make a check pass.
-CANONICAL_PROVIDERS: frozenset = frozenset()
+# Higgsfield is the first (and, at this freeze, only) deliberately
+# registered provider identity -- added by MULTIMODAL-M4-HIGGSFIELD-
+# PROVIDER-REGISTRATION-01 once core.higgsfield_adapter.HiggsfieldAdapter
+# (the real server-REST adapter) had landed and was verified. See module
+# docstring: every other provider entry is added the same way -- a
+# deliberate, owner-authorized production edit as part of that provider's
+# own integration rollout. Never extended by tests (tests inject fakes via
+# monkeypatch), never extended to make a check pass, never extended with an
+# alias.
+CANONICAL_PROVIDERS: frozenset = frozenset({"higgsfield"})
 
 # Owner-facing lifecycle axis for the ARTIFACT (motion-design law, adopted):
 # provider completion, local ingestion, and owner review are three different

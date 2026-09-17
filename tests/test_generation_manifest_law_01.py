@@ -2,10 +2,15 @@
 tests/test_generation_manifest_law_01.py -- MULTIMODAL-M4-GENERATION-MANIFEST-LAW-01
 
 Law-by-law proof for core/generation_manifest.py. Every test name carries the
-law it proves. Fully offline: no DB, no network, no Qt, no real provider
-identities -- fake providers are injected via monkeypatch, and the production
-provider vocabulary itself is asserted to ship deliberately EMPTY (Higgsfield's
-entry lands deliberately during the M4 integration rollout, never here).
+law it proves. Fully offline: no DB, no network, no Qt. Most laws are proven
+against FAKE provider identities injected via monkeypatch (`fake-flickr`,
+`fake-motion`) so they can be exercised without depending on production
+registration. A dedicated `real_provider_vocabulary`-fixtured group instead
+proves the REAL production vocabulary directly: that Higgsfield is now
+deliberately registered (MULTIMODAL-M4-HIGGSFIELD-PROVIDER-REGISTRATION-01,
+once its real REST adapter landed and was verified) and that every other
+provider identity still fails closed -- registering one identity never
+broadens acceptance to anything else.
 """
 from __future__ import annotations
 
@@ -38,9 +43,10 @@ FAKE_PROVIDERS = frozenset({"fake-flickr", "fake-motion"})
 @pytest.fixture(autouse=True)
 def _fake_provider_vocabulary(request, monkeypatch):
     """Inject FAKE provider identities for every test by default, so laws
-    other than L3 can be exercised without touching the production
-    vocabulary. Tests declaring the `real_provider_vocabulary` fixture opt
-    out: they see the production vocabulary exactly as shipped -- empty."""
+    other than provider registration itself can be exercised without
+    touching production. Tests declaring the `real_provider_vocabulary`
+    fixture opt out: they see the production vocabulary exactly as shipped
+    -- the deliberately registered set, Higgsfield only at this freeze."""
     if "real_provider_vocabulary" in request.fixturenames:
         return
     monkeypatch.setattr(gm, "CANONICAL_PROVIDERS", FAKE_PROVIDERS)
@@ -55,7 +61,8 @@ def fake_providers():
 @pytest.fixture
 def real_provider_vocabulary():
     """Opt-out declaration: this test needs the production provider
-    vocabulary UNTOUCHED (deliberately empty at freeze)."""
+    vocabulary UNTOUCHED (the deliberately registered set, Higgsfield only
+    at this freeze)."""
 
 
 def _job(**over) -> GenerationJob:
@@ -191,21 +198,29 @@ def test_L3_unknown_provider_fails_closed(fake_providers):
     assert "unknown provider" in str(exc.value)
 
 
-def test_L3_production_provider_vocabulary_ships_deliberately_empty(real_provider_vocabulary):
-    # The frozen law: no provider is registered at freeze time. Entries are
-    # added by deliberate owner-authorized production edits only.
-    assert gm.CANONICAL_PROVIDERS == frozenset()
+def test_L3_production_provider_vocabulary_is_exactly_the_registered_set(real_provider_vocabulary):
+    # The frozen law: registration is deliberate and enumerable, never
+    # dynamic. At this freeze, exactly one identity has been registered --
+    # Higgsfield, added by a deliberate owner-authorized production edit
+    # (MULTIMODAL-M4-HIGGSFIELD-PROVIDER-REGISTRATION-01) once its real REST
+    # adapter landed and was verified. No alias, no model name.
+    assert gm.CANONICAL_PROVIDERS == frozenset({"higgsfield"})
 
 
-def test_L3_higgsfield_rejected_until_deliberate_registration(real_provider_vocabulary):
+def test_L3_higgsfield_registered_other_unknown_providers_still_fail_closed(real_provider_vocabulary):
     # The guard earning its keep, verbatim: with the REAL production
-    # vocabulary (no fake injection), the first Higgsfield manifest is
-    # refused. That refusal is the paperwork working -- NOT a bug, and NOT
-    # fixed by adding the entry here. Fake providers above exist so the
-    # guard's mechanics can be proven without polluting production.
+    # vocabulary (no fake injection), a Higgsfield manifest is now accepted
+    # -- the deliberate registration is live -- but the guard still refuses
+    # every OTHER identity. Registering one provider never broadens
+    # acceptance to anything else. Fake providers above exist so the rest
+    # of this module's laws can be exercised without depending on
+    # production registration.
+    validated = validate_manifest(_manifest(provider="higgsfield"))
+    assert validated["provider"] == "higgsfield"
+
     with pytest.raises(UnknownManifestProvider) as exc:
-        validate_manifest(_manifest(provider="higgsfield"))
-    assert "higgsfield" in str(exc.value)
+        validate_manifest(_manifest(provider="fake-unknown"))
+    assert "unknown provider" in str(exc.value)
     assert "deliberate" in str(exc.value)
 
 
@@ -213,6 +228,49 @@ def test_L3_provider_must_be_plain_string_not_enum():
     from core.capability_router import Capability
     with pytest.raises(UnknownManifestProvider):
         validate_manifest(_manifest(provider=Capability.IMAGE_GENERATION))
+
+
+# ---------------------------------------------------------------------------
+# Higgsfield production registration -- proving registration is narrow: a
+# Higgsfield manifest is accepted on the provider axis ONLY, and every other
+# law in this module still applies to it in full, against the REAL
+# production vocabulary (not the fake injection used elsewhere).
+# ---------------------------------------------------------------------------
+
+def test_higgsfield_manifest_still_requires_valid_capability(real_provider_vocabulary):
+    with pytest.raises(UnknownManifestCapability):
+        validate_manifest(_manifest(provider="higgsfield", capability="not-a-real-capability"))
+
+
+def test_higgsfield_manifest_still_requires_authorization_ref_when_cost_bearing(real_provider_vocabulary):
+    with pytest.raises(MissingAuthorizationRef):
+        validate_manifest(_manifest(provider="higgsfield", authorization_ref=None))
+
+
+def test_higgsfield_manifest_still_enforces_exact_field_set(real_provider_vocabulary):
+    missing_field = _manifest(provider="higgsfield")
+    del missing_field["model"]
+    with pytest.raises(gm.ManifestValidationError):
+        validate_manifest(missing_field)
+
+    with pytest.raises(gm.ManifestValidationError) as exc:
+        validate_manifest(_manifest(provider="higgsfield", success=True))
+    assert "extra" in str(exc.value)
+
+
+def test_higgsfield_manifest_still_refuses_secret_material(real_provider_vocabulary):
+    with pytest.raises(SecretMaterialInManifest):
+        validate_manifest(_manifest(provider="higgsfield", params={"api_key": "harmless-value"}))
+
+
+def test_higgsfield_manifest_still_snapshots_ingestion_and_review_state_honestly(real_provider_vocabulary):
+    m = _manifest(provider="higgsfield", job_ingestion_state="partial", review_state="reviewed")
+    validated = validate_manifest(m)
+    assert validated["job_ingestion_state"] == "partial"  # never upgraded (L8)
+    assert validated["review_state"] == "reviewed"        # owner axis stays distinct (L7)
+
+    with pytest.raises(gm.ManifestValidationError):
+        validate_manifest(_manifest(provider="higgsfield", job_ingestion_state="all_good"))
 
 
 # ---------------------------------------------------------------------------
