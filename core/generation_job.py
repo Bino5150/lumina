@@ -54,6 +54,20 @@ only: queued/running/succeeded/failed/cancelled/unknown. It is never
 extended with a Lumina-side ingestion concept -- see generation_artifact.py
 for why "succeeded" and "a GeneratedArtifact exists" are different events
 that must stay independently observable.
+
+Amendment (MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01, 2026-09-17):
+this module originally assumed one GenerationJob produces at most one
+GeneratedArtifact. MULTIMODAL-M4-HIGGSFIELD-API-VET-01 found real,
+OpenAPI-specified evidence that a single request can legitimately return
+multiple outputs in one terminal event (e.g. `num_images` up to 4 on
+several endpoints; `RequestStatus.images`/`.audios` are arrays). That
+assumption was wrong and is corrected as of this amendment -- see
+core/generation_artifact.py for the artifact-side change and
+MULTIMODAL_M4_GENERATION_SUBSTRATE_AMENDMENT_01_2026-09-17.md for the full
+record. The one piece of THIS module that the old assumption touched is
+set_ingestion_result(): see its docstring for the corrected, additive
+INGESTION_PARTIAL semantics. The status vocabulary itself, the job
+record's shape, and everything else in this module is unchanged.
 """
 from __future__ import annotations
 
@@ -81,7 +95,7 @@ __all__ = [
     "STATUS_QUEUED", "STATUS_RUNNING", "STATUS_SUCCEEDED", "STATUS_FAILED",
     "STATUS_CANCELLED", "STATUS_UNKNOWN",
     "TERMINAL_STATUSES",
-    "INGESTION_PENDING", "INGESTION_INGESTED", "INGESTION_FAILED",
+    "INGESTION_PENDING", "INGESTION_INGESTED", "INGESTION_FAILED", "INGESTION_PARTIAL",
     "compute_submission_fingerprint",
     "normalize_provider_status",
     "init_generation_job_db",
@@ -116,7 +130,17 @@ TERMINAL_STATUSES = frozenset({STATUS_SUCCEEDED, STATUS_FAILED, STATUS_CANCELLED
 INGESTION_PENDING = "pending"
 INGESTION_INGESTED = "ingested"
 INGESTION_FAILED = "failed"
-_ALL_INGESTION_STATES = frozenset({INGESTION_PENDING, INGESTION_INGESTED, INGESTION_FAILED})
+# Amendment (MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01): a job may now
+# own multiple artifacts, each with its own independent ingestion outcome.
+# INGESTION_PARTIAL is the honest aggregate when at least one sibling
+# ingestion succeeded and at least one failed -- see set_ingestion_result().
+# It is a DERIVED state, never a value a caller passes in directly.
+INGESTION_PARTIAL = "partial"
+_ALL_INGESTION_STATES = frozenset({
+    INGESTION_PENDING, INGESTION_INGESTED, INGESTION_FAILED, INGESTION_PARTIAL,
+})
+# The only two outcomes a single ingestion ATTEMPT can actually report.
+_MERGEABLE_INGESTION_STATES = frozenset({INGESTION_INGESTED, INGESTION_FAILED})
 
 _MAX_SETTINGS_BYTES = 16 * 1024
 _MAX_ERROR_LEN = 500
@@ -514,14 +538,42 @@ def update_status(lumina_job_id: str, new_status: str, failure_class: Optional[s
 
 def set_ingestion_result(lumina_job_id: str, ingestion_state: str,
                           error: Optional[str] = None) -> GenerationJob:
-    """Records the OUTCOME of local ingestion, kept structurally separate
-    from the provider status vocabulary (see module docstring). Only legal
-    once the job's provider status is STATUS_SUCCEEDED -- ingestion is
-    meaningless before the provider says the result exists. Called by
-    core.generation_artifact.ingest_artifact(); not expected to be called
-    directly by application code."""
-    if ingestion_state not in _ALL_INGESTION_STATES:
-        raise GenerationJobError(f"not a canonical ingestion state: {ingestion_state!r}")
+    """Records the outcome of ONE artifact's local ingestion attempt for
+    this job, MERGED into the job's aggregate ingestion_state.
+
+    Amendment (MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01): a job may
+    now own zero, one, or many GeneratedArtifact rows, so a job-level
+    ingestion_state can no longer mean "the one artifact this job
+    produces" -- it means the aggregate across every ingestion attempt
+    made so far for this job:
+      - first attempt (current value is NULL)     -> becomes that outcome
+      - a repeated attempt with the SAME outcome   -> stays that outcome
+      - an outcome that DIFFERS from the current aggregate (including the
+        current aggregate already being INGESTION_PARTIAL) -> becomes
+        INGESTION_PARTIAL and stays INGESTION_PARTIAL for the rest of this
+        job's life -- once mixed, always mixed.
+    This keeps the field honest: a job can legitimately be
+    status=succeeded with ingestion_state=partial (some outputs ingested,
+    some didn't), and that is a distinct, first-class, observable state
+    from both ingestion_state=ingested (all attempted so far succeeded)
+    and ingestion_state=failed (all attempted so far failed) -- nobody
+    should be able to see ingestion_state=ingested and assume EVERY output
+    for this job exists; list_artifacts_for_job() is the actual source of
+    truth for which ones do.
+
+    Only INGESTION_INGESTED or INGESTION_FAILED may be passed in --
+    INGESTION_PARTIAL is derived here, never supplied by a caller.
+
+    Only legal once the job's provider status is STATUS_SUCCEEDED --
+    ingestion is meaningless before the provider says a result exists.
+    Called by core.generation_artifact.ingest_artifact(); not expected to
+    be called directly by application code."""
+    if ingestion_state not in _MERGEABLE_INGESTION_STATES:
+        raise GenerationJobError(
+            f"set_ingestion_result() only accepts a per-attempt outcome "
+            f"({sorted(_MERGEABLE_INGESTION_STATES)}); {ingestion_state!r} is not one "
+            "(INGESTION_PARTIAL is derived automatically, never passed in directly)"
+        )
 
     init_generation_job_db()
     from core.db import connect
@@ -541,9 +593,14 @@ def set_ingestion_result(lumina_job_id: str, ingestion_state: str,
                 f"job {lumina_job_id} has provider status {row['status']!r}, not succeeded; "
                 "ingestion is not yet meaningful"
             )
+        current = row["ingestion_state"]
+        new_value = ingestion_state if (current is None or current == ingestion_state) else INGESTION_PARTIAL
+        sanitized = _sanitize_error(error)
+        prior_error = row["ingestion_error"]
+        combined_error = f"{prior_error}; {sanitized}" if (prior_error and sanitized) else (sanitized or prior_error)
         conn.execute(
             "UPDATE generation_jobs SET ingestion_state=?, ingestion_error=? WHERE lumina_job_id=?",
-            (ingestion_state, _sanitize_error(error), lumina_job_id),
+            (new_value, _sanitize_error(combined_error), lumina_job_id),
         )
         conn.execute("COMMIT")
     finally:

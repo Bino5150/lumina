@@ -24,6 +24,33 @@ but Lumina's own fetch/hash/store step failed. That combination is a real,
 first-class state this module makes reachable and observable on purpose,
 not an edge case papered over -- the whole point is that nobody should be
 able to see "succeeded" and assume the remote URL is the deliverable.
+
+Amendment (MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01, 2026-09-17):
+this module originally allowed at most one GeneratedArtifact per
+GenerationJob (ingest_artifact() refused a second call). That assumption
+was wrong: MULTIMODAL-M4-HIGGSFIELD-API-VET-01 found real,
+OpenAPI-specified evidence that a single completed request can return
+multiple outputs (e.g. `num_images` up to 4 on several endpoints;
+`RequestStatus.images`/`.audios` are typed as arrays, not singular
+objects). The relationship is now genuinely one-to-many:
+
+    GenerationJob
+        1
+        |
+        L-- 0..N GeneratedArtifact
+
+The database schema already supported this (lumina_job_id is a plain
+foreign key, never UNIQUE) -- only the application-level refusal in
+ingest_artifact() has been removed; see that function's docstring for the
+corrected contract, and provider_output_index below for the ordinal that
+makes multiple outputs distinguishable and reproducible without inventing
+a provider-native identifier the API does not actually supply (Higgsfield's
+own MediaOutput schema is exactly `{"url": ...}` -- no id or index field
+at all). Every other structural law in this module -- ingestion as the
+only constructor path, per-attempt success/failure independence, remote
+URLs staying non-durable until individually ingested -- is unchanged and,
+if anything, more clearly load-bearing now that "succeeded" can mean
+"between zero and several individually-fallible outputs."
 """
 from __future__ import annotations
 
@@ -88,6 +115,15 @@ class GeneratedArtifact:
     metadata: Mapping[str, object]
     provenance: Mapping[str, object]
     created_at: str
+    # Amendment (MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01): Lumina-
+    # assigned zero-based ordinal reflecting this artifact's position among
+    # its job's other outputs (e.g. its index in a provider's `images`
+    # array), or None when the caller doesn't distinguish/care. NEVER a
+    # provider-native id -- no provider evidence gathered so far supplies
+    # one (Higgsfield's MediaOutput is exactly `{"url": ...}`). Exists
+    # because created_at alone (second-granularity) cannot reliably order
+    # several artifacts ingested for one job within the same second.
+    provider_output_index: Optional[int]
 
 
 def init_generation_artifact_db():
@@ -118,6 +154,7 @@ def init_generation_artifact_db():
                 metadata_json   TEXT NOT NULL,
                 provenance_json TEXT NOT NULL,
                 created_at      TEXT NOT NULL,
+                provider_output_index INTEGER,
                 FOREIGN KEY (lumina_job_id) REFERENCES generation_jobs(lumina_job_id)
             )
         """)
@@ -176,6 +213,7 @@ def _row_to_record(row) -> GeneratedArtifact:
         metadata=json.loads(row["metadata_json"]),
         provenance=json.loads(row["provenance_json"]),
         created_at=row["created_at"],
+        provider_output_index=row["provider_output_index"],
     )
 
 
@@ -195,7 +233,8 @@ def _write_atomic(path: str, data: bytes) -> None:
 
 def ingest_artifact(lumina_job_id: str, data: bytes, mime_type: str,
                      metadata: Optional[Mapping[str, object]] = None,
-                     provenance: Optional[Mapping[str, object]] = None) -> GeneratedArtifact:
+                     provenance: Optional[Mapping[str, object]] = None,
+                     provider_output_index: Optional[int] = None) -> GeneratedArtifact:
     """The ONLY constructor path for a GeneratedArtifact. `data` is the
     already-fetched remote result -- fetching it from wherever the
     provider's adapter says it lives (a URL, a signed blob endpoint, etc.)
@@ -203,19 +242,41 @@ def ingest_artifact(lumina_job_id: str, data: bytes, mime_type: str,
     once the bytes are already in the caller's hand, and is entirely about
     making them durable and trustworthy: hash, store, record.
 
-    Requires the job's provider status to already be STATUS_SUCCEEDED and
-    that no artifact has already been ingested for this job -- both checked
-    BEFORE any bytes are written or any row inserted, so a precondition
-    violation never leaves a half-written artifact or a misleading
-    ingestion_state behind. Only once those checks pass does a failure
-    (bad mime_type, oversized metadata, a disk write error) get recorded as
-    ingestion_state=INGESTION_FAILED with a sanitized reason; this function
-    always re-raises on failure, and no artifact row is left behind for a
-    failed attempt."""
+    Requires the job's provider status to already be STATUS_SUCCEEDED --
+    checked BEFORE any bytes are written or any row inserted, so a
+    precondition violation never leaves a half-written artifact behind.
+    Only once that check passes does a failure (bad mime_type, oversized
+    metadata, a disk write error) get recorded as this ONE attempt's
+    outcome via core.generation_job.set_ingestion_result(), which merges
+    it into the job's aggregate ingestion_state; this function always
+    re-raises on failure, and no artifact row is left behind for the
+    failed attempt.
+
+    A job may own zero, one, or many GeneratedArtifact rows -- this
+    function may be called more than once for the same lumina_job_id (a
+    provider that returns several outputs from one completed request,
+    e.g. Higgsfield's `num_images` up to 4 on several models). Every call
+    is independent: one sibling's ingestion failure never erases,
+    invalidates, or blocks a previously-ingested sibling, and repeated
+    calls -- even with identical bytes -- each mint their own artifact_id
+    and local_path, so they can never corrupt or overwrite an existing
+    artifact's row or bytes. `provider_output_index` is an optional,
+    Lumina-assigned (never provider-native) zero-based ordinal for callers
+    that want ingestion order preserved and distinguishable -- see
+    GeneratedArtifact's docstring. It is not validated for uniqueness or
+    contiguity; that discipline belongs to whatever calls this function
+    with knowledge of the full output set, not to this substrate-level
+    primitive."""
     if not isinstance(data, (bytes, bytearray)) or len(data) == 0:
         raise IngestionError("data must be non-empty bytes")
     if not isinstance(mime_type, str) or not mime_type:
         raise IngestionError("mime_type must be a non-empty string")
+    if provider_output_index is not None and (
+        not isinstance(provider_output_index, int)
+        or isinstance(provider_output_index, bool)
+        or provider_output_index < 0
+    ):
+        raise IngestionError("provider_output_index must be a non-negative int or None")
 
     init_generation_artifact_db()
     from core.generation_job import get_generation_job
@@ -228,12 +289,6 @@ def ingest_artifact(lumina_job_id: str, data: bytes, mime_type: str,
         raise IngestionError(
             f"job {lumina_job_id} has provider status {job.status!r}, not succeeded; "
             "ingestion is not yet meaningful"
-        )
-    existing = list_artifacts_for_job(lumina_job_id)
-    if existing:
-        raise IngestionError(
-            f"job {lumina_job_id} already has an ingested artifact ({existing[0].artifact_id}); "
-            "ingest_artifact() is not a re-ingestion path"
         )
 
     try:
@@ -256,10 +311,10 @@ def ingest_artifact(lumina_job_id: str, data: bytes, mime_type: str,
             conn.execute(
                 "INSERT INTO generation_artifacts "
                 "(artifact_id, lumina_job_id, local_path, sha256, mime_type, size_bytes, "
-                " metadata_json, provenance_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " metadata_json, provenance_json, created_at, provider_output_index) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (artifact_id, lumina_job_id, local_path, sha256, mime_type, len(data),
-                 metadata_json, provenance_json, now),
+                 metadata_json, provenance_json, now, provider_output_index),
             )
             conn.commit()
         finally:
@@ -305,12 +360,20 @@ def get_artifact_bytes(artifact_id: str) -> bytes:
 
 
 def list_artifacts_for_job(lumina_job_id: str) -> list:
+    """Ordered by created_at, then provider_output_index, then artifact_id.
+    created_at has only second-level precision (core.generation_job's own
+    _utcnow_iso() convention), so several artifacts ingested for one job
+    within the same second would otherwise have no deterministic order --
+    provider_output_index (when the caller supplied one) and finally the
+    artifact_id itself guarantee a fully stable, repeatable ordering
+    regardless."""
     init_generation_artifact_db()
     from core.db import connect
     conn = connect()
     try:
         rows = conn.execute(
-            "SELECT * FROM generation_artifacts WHERE lumina_job_id=? ORDER BY created_at",
+            "SELECT * FROM generation_artifacts WHERE lumina_job_id=? "
+            "ORDER BY created_at, provider_output_index, artifact_id",
             (lumina_job_id,),
         ).fetchall()
     finally:

@@ -23,10 +23,21 @@ Higgsfield's specific API shape define it.
 `GenerationAdapter` is a typing.Protocol, not an ABC -- structural typing,
 matching this codebase's existing backend-loader convention rather than
 introducing a new plugin-registration mechanism.
+
+Amendment (MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01, 2026-09-17):
+this Protocol originally had no cancellation seam at all.
+MULTIMODAL-M4-HIGGSFIELD-API-VET-01 found a real, OpenAPI-specified
+`POST /requests/{id}/cancel` endpoint (also wrapped by the official
+Python/TypeScript SDKs), while core.generation_job's STATUS_CANCELLED
+already existed as a first-class terminal status with nothing able to
+reach it through this seam. cancel() below closes that gap -- purely
+additive, no other method's signature changed.
 """
 from __future__ import annotations
 
 from typing import Optional, Protocol, Tuple
+
+from core.generation_job import GenerationJob
 
 
 class GenerationAdapter(Protocol):
@@ -79,4 +90,43 @@ class GenerationAdapter(Protocol):
         only, matching the source-vet finding that Higgsfield's own CLI
         keeps `generate cost` a fully separate, non-submitting command from
         `generate create`."""
+        ...
+
+    def cancel(self, job: GenerationJob) -> GenerationJob:
+        """Request cancellation of an in-flight job and return the
+        refreshed GenerationJob reflecting whatever the provider actually
+        confirmed. Unlike the other methods here, this one takes and
+        returns the full record (not just a provider_job_id/raw string)
+        because a well-behaved implementation needs the current status to
+        decide whether attempting cancellation even makes sense, and is
+        expected to call core.generation_job.update_status() itself to
+        durably record the outcome before returning.
+
+        Cancellation is PROVIDER work, never a local status-assignment
+        shortcut:
+          - MUST refuse rather than contact the provider at all when
+            `job.status` is already in core.generation_job.TERMINAL_STATUSES
+            (succeeded/failed/cancelled) -- raise
+            core.generation_job.JobStateConflict. A job that already
+            resolved must never be treated as if new cancellation work
+            occurred, silently or otherwise.
+          - MUST NOT set the returned job's status to STATUS_CANCELLED
+            before the provider's response actually supports it. If the
+            provider only ACKNOWLEDGES the cancellation request without
+            confirming a terminal outcome, the returned job may legitimately
+            remain in its current non-terminal status (queued/running) --
+            a later poll() is what eventually confirms the real outcome,
+            exactly like any other status change.
+          - Whatever the provider reports must be mapped into the
+            canonical status vocabulary the same way poll() results are
+            (via core.generation_job.normalize_provider_status() or an
+            adapter's own more precise translation) -- an unrecognized or
+            unnormalizable provider response fails closed into
+            STATUS_UNKNOWN, never assumed to mean cancelled.
+          - STATUS_CANCELLED remains the only cancellation-terminal value;
+            do not invent an intermediate "cancel requested" status --
+            neither this Protocol nor core.generation_job's vocabulary has
+            one, and none should be added without real provider evidence
+            forcing it (see MULTIMODAL_M4_HIGGSFIELD_API_VET_2026-09-17.md
+            Sec 13, finding 2 and the amendment record for why)."""
         ...

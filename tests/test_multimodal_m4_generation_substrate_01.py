@@ -11,6 +11,15 @@ Higgsfield HTTP contract is a separate, later campaign). Every test
 isolates config.DB_PATH to tmp_path, same convention
 tests/test_context_checkpoints.py already uses; config.DATA_DIR is already
 isolated for the whole test session by tests/conftest.py.
+
+Amendment (MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01, 2026-09-17):
+adds multi-artifact-per-job tests (the "GeneratedArtifact: only
+constructible via successful ingestion" section) and FakeAdapter.cancel()
+tests (a new section at the end). test_ingest_refuses_second_ingestion_for_same_job
+from the original campaign is removed -- that law was wrong, corrected by
+this amendment; see the module docstrings of core/generation_job.py and
+core/generation_artifact.py for the evidence and rationale, not restated
+here.
 """
 import hashlib
 
@@ -55,14 +64,43 @@ def _succeeded_job(**kw):
     return gj.update_status(job.lumina_job_id, gj.STATUS_SUCCEEDED)
 
 
+def _queued_job(provider_job_id="provider-1", **kw):
+    job = _begin(**kw)
+    return gj.mark_submitted(job.lumina_job_id, provider_job_id, "queued")
+
+
+def _running_job(provider_job_id="provider-1", **kw):
+    job = _queued_job(provider_job_id=provider_job_id, **kw)
+    return gj.update_status(job.lumina_job_id, gj.STATUS_RUNNING)
+
+
+def _failed_job(**kw):
+    job = _begin(**kw)
+    gj.mark_submitted(job.lumina_job_id, "provider-1", "queued")
+    return gj.update_status(job.lumina_job_id, gj.STATUS_FAILED)
+
+
 class FakeAdapter:
     """Minimal core.generation_adapter.GenerationAdapter implementation.
     In-memory only -- no network, no credentials. Every submitted job
-    reports "succeeded" on first poll() so tests don't need real waiting."""
+    reports "succeeded" on first poll() so tests don't need real waiting.
+
+    cancel() demonstrates the required contract precisely (see
+    core/generation_adapter.py's GenerationAdapter.cancel() docstring):
+    refuse terminal jobs before contacting "the provider" at all, map
+    whatever the configured fake response is into the canonical
+    vocabulary via the SAME normalize_provider_status() poll() results go
+    through, and never locally assume STATUS_CANCELLED without a
+    provider-shaped confirmation. configure_cancel() is a test-only hook
+    letting each test pick which of the real, plausible provider behaviors
+    (immediate terminal confirmation / accepted-but-still-pending /
+    rejected-because-already-processing / an unrecognized response) this
+    fake adapter simulates for a given provider_job_id."""
 
     def __init__(self):
         self._jobs = {}
         self._next_id = 0
+        self._cancel_behavior = {}
 
     def submit(self, *, model, settings, reference_assets, provider_idempotency_key=None):
         self._next_id += 1
@@ -81,6 +119,44 @@ class FakeAdapter:
 
     def estimate_cost(self, *, model, settings):
         return 0.04
+
+    def configure_cancel(self, provider_job_id, behavior):
+        """behavior is one of:
+        'terminal_cancelled'  -- provider confirms cancellation immediately
+        'acknowledged_pending' -- provider accepts the request but the job
+                                  is not yet terminal; caller must poll again
+        'rejected_running'    -- provider refuses (already processing);
+                                  job is left exactly as it was
+        'unrecognized'        -- provider returns something this adapter
+                                  can't classify at all
+        Defaults to 'terminal_cancelled' if never configured."""
+        self._cancel_behavior[provider_job_id] = behavior
+
+    def cancel(self, job):
+        if job.status in gj.TERMINAL_STATUSES:
+            raise gj.JobStateConflict(
+                f"job {job.lumina_job_id} is already terminal ({job.status!r}); "
+                "refusing to treat this as new cancellation work"
+            )
+        behavior = self._cancel_behavior.get(job.provider_job_id, "terminal_cancelled")
+        if behavior == "terminal_cancelled":
+            self._jobs[job.provider_job_id] = "canceled"
+            return gj.update_status(job.lumina_job_id, gj.STATUS_CANCELLED)
+        if behavior == "acknowledged_pending":
+            # Provider accepted the request but hasn't confirmed a terminal
+            # outcome yet -- the job stays exactly as it was; a later
+            # poll() is what will eventually observe the real outcome.
+            return job
+        if behavior == "rejected_running":
+            # Provider refused (already processing) -- no change, same as
+            # Higgsfield's real documented 400 "already started" response.
+            return job
+        # 'unrecognized': simulate a provider response this adapter cannot
+        # classify at all. Fails closed via the exact same
+        # normalize_provider_status() path poll() results go through --
+        # never assumed to mean cancelled.
+        normalized = gj.normalize_provider_status("some-garbage-response-xyz")
+        return gj.update_status(job.lumina_job_id, normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -342,11 +418,129 @@ def test_ingest_bytes_readable_back_and_hash_verified():
     assert ga.get_artifact_bytes(artifact.artifact_id) == b"round-trip-bytes"
 
 
-def test_ingest_refuses_second_ingestion_for_same_job():
+def test_one_job_one_artifact_is_still_the_common_case():
+    """Baseline: nothing about the amendment changes the single-output
+    path most jobs will actually take."""
     job = _succeeded_job()
-    ga.ingest_artifact(job.lumina_job_id, b"first", "image/png")
+    artifact = ga.ingest_artifact(job.lumina_job_id, b"only-output", "image/png")
+    siblings = ga.list_artifacts_for_job(job.lumina_job_id)
+    assert [a.artifact_id for a in siblings] == [artifact.artifact_id]
+
+
+def test_one_job_many_artifacts_all_succeed():
+    """MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01, finding 1: a
+    single job may legitimately own several artifacts (Higgsfield's
+    num_images up to 4 in one completed request). Every ingest_artifact()
+    call for the same job is independent and none refuses because a prior
+    one already succeeded."""
+    job = _succeeded_job()
+    artifacts = [
+        ga.ingest_artifact(job.lumina_job_id, f"output-{i}".encode(), "image/png",
+                            provider_output_index=i)
+        for i in range(4)
+    ]
+    assert len({a.artifact_id for a in artifacts}) == 4  # all distinct identities
+    siblings = ga.list_artifacts_for_job(job.lumina_job_id)
+    assert [a.provider_output_index for a in siblings] == [0, 1, 2, 3]
+    assert [ga.get_artifact_bytes(a.artifact_id) for a in siblings] == [
+        f"output-{i}".encode() for i in range(4)
+    ]
+    final_job = gj.get_generation_job(job.lumina_job_id)
+    assert final_job.ingestion_state == gj.INGESTION_INGESTED  # all four succeeded, no mixing
+    assert final_job.status == gj.STATUS_SUCCEEDED
+
+
+def test_one_sibling_fails_another_succeeds_neither_corrupts_the_other(monkeypatch):
+    """The exact scenario the amendment exists to make honestly
+    representable: partial success across a job's outputs."""
+    job = _succeeded_job()
+    good = ga.ingest_artifact(job.lumina_job_id, b"sibling-that-succeeds", "image/png",
+                               provider_output_index=0)
+
+    real_write = ga._write_atomic
+    def _boom_once(path, data):
+        raise OSError("simulated failure for the second sibling only")
+    monkeypatch.setattr(ga, "_write_atomic", _boom_once)
     with pytest.raises(ga.IngestionError):
-        ga.ingest_artifact(job.lumina_job_id, b"second", "image/png")
+        ga.ingest_artifact(job.lumina_job_id, b"sibling-that-fails", "image/png",
+                            provider_output_index=1)
+    monkeypatch.setattr(ga, "_write_atomic", real_write)
+
+    # The successful sibling is untouched -- same id, same bytes.
+    assert ga.get_artifact_bytes(good.artifact_id) == b"sibling-that-succeeds"
+    siblings = ga.list_artifacts_for_job(job.lumina_job_id)
+    assert [a.artifact_id for a in siblings] == [good.artifact_id]  # the failed one left no row
+
+    final_job = gj.get_generation_job(job.lumina_job_id)
+    assert final_job.status == gj.STATUS_SUCCEEDED  # provider status untouched
+    assert final_job.ingestion_state == gj.INGESTION_PARTIAL  # honest: mixed outcome
+    assert final_job.ingestion_error is not None
+
+
+def test_ingestion_state_partial_regardless_of_attempt_order():
+    """A failure recorded before a success merges to PARTIAL exactly the
+    same as the reverse order -- set_ingestion_result()'s merge is
+    symmetric, not order-dependent."""
+    job = _succeeded_job()
+    gj.set_ingestion_result(job.lumina_job_id, gj.INGESTION_FAILED, error="first attempt failed")
+    gj.set_ingestion_result(job.lumina_job_id, gj.INGESTION_INGESTED)
+    assert gj.get_generation_job(job.lumina_job_id).ingestion_state == gj.INGESTION_PARTIAL
+
+
+def test_ingestion_state_stays_partial_once_mixed():
+    job = _succeeded_job()
+    gj.set_ingestion_result(job.lumina_job_id, gj.INGESTION_INGESTED)
+    gj.set_ingestion_result(job.lumina_job_id, gj.INGESTION_FAILED, error="second failed")
+    gj.set_ingestion_result(job.lumina_job_id, gj.INGESTION_INGESTED)  # a third, later success
+    assert gj.get_generation_job(job.lumina_job_id).ingestion_state == gj.INGESTION_PARTIAL
+
+
+def test_set_ingestion_result_rejects_partial_as_caller_input():
+    """INGESTION_PARTIAL is derived, never a value a caller may assert
+    directly."""
+    job = _succeeded_job()
+    with pytest.raises(gj.GenerationJobError):
+        gj.set_ingestion_result(job.lumina_job_id, gj.INGESTION_PARTIAL)
+
+
+def test_repeated_ingestion_of_identical_bytes_does_not_corrupt_the_original():
+    """'Duplicate/repeated ingestion cannot silently corrupt an existing
+    artifact.' Each call mints its own artifact_id/local_path by
+    construction, so two ingestions of the SAME bytes for the same job
+    produce two independently-verifiable rows, neither overwriting the
+    other."""
+    job = _succeeded_job()
+    first = ga.ingest_artifact(job.lumina_job_id, b"identical-bytes", "image/png")
+    second = ga.ingest_artifact(job.lumina_job_id, b"identical-bytes", "image/png")
+    assert first.artifact_id != second.artifact_id
+    assert first.local_path != second.local_path
+    assert ga.get_artifact_bytes(first.artifact_id) == b"identical-bytes"
+    assert ga.get_artifact_bytes(second.artifact_id) == b"identical-bytes"
+
+
+def test_multi_artifact_relationship_survives_a_fresh_connection():
+    """'Restart/durable reload preserves the one-to-many relationship.'
+    Bypasses this module's own functions entirely and re-queries the
+    on-disk SQLite file directly with a brand new connection -- the
+    closest thing to an actual process restart this test suite can
+    exercise without a real one."""
+    import sqlite3
+    job = _succeeded_job()
+    ids = {
+        ga.ingest_artifact(job.lumina_job_id, f"restart-{i}".encode(), "image/png",
+                            provider_output_index=i).artifact_id
+        for i in range(3)
+    }
+    raw_conn = sqlite3.connect(config.DB_PATH)
+    try:
+        rows = raw_conn.execute(
+            "SELECT artifact_id, lumina_job_id FROM generation_artifacts WHERE lumina_job_id=?",
+            (job.lumina_job_id,),
+        ).fetchall()
+    finally:
+        raw_conn.close()
+    assert {row[0] for row in rows} == ids
+    assert all(row[1] == job.lumina_job_id for row in rows)
 
 
 def test_ingest_rejects_empty_data_without_touching_job():
@@ -498,3 +692,124 @@ def test_full_lifecycle_via_fake_adapter():
     assert final.ingestion_state == gj.INGESTION_INGESTED
     assert ga.get_artifact_bytes(artifact.artifact_id) == data
     assert artifact.mime_type == "image/png"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation (MULTIMODAL-M4-GENERATION-SUBSTRATE-AMENDMENT-01, finding 2):
+# GenerationAdapter.cancel(job) -> GenerationJob. Cancellation is provider
+# work -- these tests exercise FakeAdapter.cancel()'s contract exactly as
+# specified in core/generation_adapter.py's GenerationAdapter.cancel()
+# docstring, never a local status-assignment shortcut.
+# ---------------------------------------------------------------------------
+
+def test_cancel_queued_job_provider_confirms_terminal():
+    adapter = FakeAdapter()
+    job = _queued_job(provider_job_id="p-cancel-1")
+    updated = adapter.cancel(job)
+    assert updated.status == gj.STATUS_CANCELLED
+    assert updated.terminal_at is not None
+    # Persisted, not just returned in-memory.
+    assert gj.get_generation_job(job.lumina_job_id).status == gj.STATUS_CANCELLED
+
+
+def test_cancel_running_job_provider_confirms_terminal():
+    """Cancellation succeeding isn't tied to a specific pre-cancel status --
+    the substrate itself doesn't restrict which non-terminal status can
+    transition to cancelled; that's the provider's call, faithfully
+    reflected here."""
+    adapter = FakeAdapter()
+    job = _running_job(provider_job_id="p-cancel-2")
+    updated = adapter.cancel(job)
+    assert updated.status == gj.STATUS_CANCELLED
+
+
+def test_cancel_running_job_rejected_because_already_processing():
+    """Mirrors Higgsfield's real, documented behavior (400 'already
+    started') without this being Higgsfield-specific: the provider can
+    refuse, and refusal must leave the job exactly as it was -- no
+    exception, no status change, just an unsuccessful attempt."""
+    adapter = FakeAdapter()
+    job = _running_job(provider_job_id="p-cancel-3")
+    adapter.configure_cancel("p-cancel-3", "rejected_running")
+    updated = adapter.cancel(job)
+    assert updated.status == gj.STATUS_RUNNING
+    assert updated.lumina_job_id == job.lumina_job_id
+    assert gj.get_generation_job(job.lumina_job_id).status == gj.STATUS_RUNNING
+
+
+def test_cancel_accepted_but_not_yet_terminal():
+    """'If cancellation is accepted but not yet terminal, the job may
+    remain queued/running until poll confirms cancellation.' No
+    cancel_requested status is invented -- the job simply stays in its
+    existing non-terminal status until a later poll() resolves it."""
+    adapter = FakeAdapter()
+    job = _queued_job(provider_job_id="p-cancel-4")
+    adapter.configure_cancel("p-cancel-4", "acknowledged_pending")
+    updated = adapter.cancel(job)
+    assert updated.status == gj.STATUS_QUEUED  # unchanged -- not silently promoted to cancelled
+    # A later poll() is what actually confirms the outcome, same as any
+    # other status change -- demonstrated here, not just asserted:
+    adapter._jobs["p-cancel-4"] = "canceled"
+    raw = adapter.poll("p-cancel-4")
+    resolved = gj.update_status(job.lumina_job_id, gj.normalize_provider_status(raw))
+    assert resolved.status == gj.STATUS_CANCELLED
+
+
+def test_cancel_terminal_succeeded_job_refused():
+    adapter = FakeAdapter()
+    job = _succeeded_job()
+    with pytest.raises(gj.JobStateConflict):
+        adapter.cancel(job)
+    # Refused before even consulting "the provider" -- status is untouched.
+    assert gj.get_generation_job(job.lumina_job_id).status == gj.STATUS_SUCCEEDED
+
+
+def test_cancel_terminal_failed_job_refused():
+    adapter = FakeAdapter()
+    job = _failed_job()
+    with pytest.raises(gj.JobStateConflict):
+        adapter.cancel(job)
+    assert gj.get_generation_job(job.lumina_job_id).status == gj.STATUS_FAILED
+
+
+def test_cancel_already_cancelled_job_refused():
+    """'Succeeded/failed/cancelled jobs must not be silently re-cancelled
+    as though new work occurred.' Cancelling twice is refused the same way
+    as cancelling any other terminal job."""
+    adapter = FakeAdapter()
+    job = _queued_job(provider_job_id="p-cancel-5")
+    cancelled = adapter.cancel(job)
+    assert cancelled.status == gj.STATUS_CANCELLED
+    with pytest.raises(gj.JobStateConflict):
+        adapter.cancel(cancelled)
+
+
+def test_cancel_unknown_provider_response_fails_closed():
+    """An unrecognized provider response to a cancellation attempt must
+    never be assumed to mean cancelled -- it fails closed into
+    STATUS_UNKNOWN via the same normalize_provider_status() path poll()
+    results already go through."""
+    adapter = FakeAdapter()
+    job = _queued_job(provider_job_id="p-cancel-6")
+    adapter.configure_cancel("p-cancel-6", "unrecognized")
+    updated = adapter.cancel(job)
+    assert updated.status == gj.STATUS_UNKNOWN
+    assert updated.status != gj.STATUS_CANCELLED
+
+
+def test_fake_adapter_cancel_is_fully_offline(monkeypatch):
+    """'Fake adapter remains fully offline/deterministic.' Proven, not just
+    asserted: patch socket creation to raise, then run a full
+    submit->cancel lifecycle through FakeAdapter and confirm nothing tried
+    to open a network connection."""
+    import socket
+
+    def _no_sockets(*args, **kwargs):
+        raise AssertionError("FakeAdapter attempted to open a network socket")
+
+    monkeypatch.setattr(socket, "socket", _no_sockets)
+
+    adapter = FakeAdapter()
+    job = _queued_job(provider_job_id="p-cancel-offline")
+    updated = adapter.cancel(job)
+    assert updated.status == gj.STATUS_CANCELLED
