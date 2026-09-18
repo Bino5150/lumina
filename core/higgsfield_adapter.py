@@ -81,11 +81,35 @@ that concluded neither actually required a Protocol change):
     end to end in this campaign. Promoting this into the shared Protocol
     is deferred until more than one provider's real shape proves it's the
     right generalization, not assumed from a single provider.
+
+Amendment (MULTIMODAL-M4-HIGGSFIELD-PRICING-REPAIR-01, 2026-09-18):
+estimate_cost() originally called a remote `POST /estimate/{model}` endpoint.
+MULTIMODAL-M4-HIGGSFIELD-LIVE-SMOKE-01 (same day) found that call returns
+HTTP 404 `{"detail":"model_not_found"}` live, and that Higgsfield's own
+OpenAPI 3.1.0 spec has zero paths under an `/estimate` namespace for any
+model -- the endpoint this module depended on does not exist in the current
+API surface. estimate_cost() is now a pure, local, zero-network lookup
+against a small hand-verified pricing table (below), independently
+re-verified against Higgsfield's current live documentation
+(console.higgsfield.ai model pages) on 2026-09-18 -- see
+MULTIMODAL_M4_HIGGSFIELD_PRICING_REPAIR_01_2026-09-18.md for the full
+evidence record. Only `higgsfield-ai/soul/standard` has a verified price;
+`nano-banana` has none (no current official source verifies its identity or
+price) and estimate_cost() always returns None for it -- never guessed,
+never treated as free, consistent with core.generation_spending_policy's
+own fail-closed law. That same evidence record also documents a SEPARATE,
+NOT-fixed-here defect: this module's own `_MODEL_CATALOG` entry for
+`higgsfield-ai/soul/standard` declares stale parameter values (resolution
+"2K"/"4K", key name "num_images") that do not match the real, current API
+(resolution "720p"/"1080p", key name "batch_size") -- pricing below is
+keyed to the real documented surface regardless, independent of
+`_MODEL_CATALOG`/`_validate_settings()`.
 """
 from __future__ import annotations
 
 import json as _json
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import List, Mapping, Optional, Sequence, Tuple
 
 from core.capability_router import Capability
@@ -95,7 +119,6 @@ from core.higgsfield_transport import (
     HiggsfieldConnectionError,
     HiggsfieldTimeoutError,
     HiggsfieldTransport,
-    HiggsfieldTransportError,
     RequestsHiggsfieldTransport,
     TransportResponse,
 )
@@ -257,6 +280,81 @@ _MODEL_CATALOG: Mapping[str, dict] = {
     },
 }
 SUPPORTED_MODELS = tuple(sorted(_MODEL_CATALOG))
+
+
+# ---------------------------------------------------------------------------
+# Local, deterministic pricing -- MULTIMODAL-M4-HIGGSFIELD-PRICING-REPAIR-01.
+# Closed, hand-maintained table; no network, no credentials. Every entry was
+# independently re-verified against Higgsfield's current live documentation
+# on 2026-09-18 -- see MULTIMODAL_M4_HIGGSFIELD_PRICING_REPAIR_01_2026-09-18.md
+# for the full evidence record (this module's own docstring amendment above
+# has the short version). Deliberately keyed to the REAL documented parameter
+# surface (resolution "720p"/"1080p", "batch_size"), not to this file's own
+# (stale, unfixed-here) _MODEL_CATALOG validation values -- see that same
+# evidence doc Sec 4. A model absent from this table (e.g. "nano-banana") is
+# never priced by guesswork; PRICE_TABLE.get(model) returning None is the
+# correct, honest outcome, not a bug.
+PRICE_TABLE: Mapping[str, dict] = {
+    "higgsfield-ai/soul/standard": {
+        "price_per_image_usd": {
+            "720p": Decimal("0.0938"),
+            "1080p": Decimal("0.1875"),
+        },
+        "default_resolution": "720p",
+        "supported_batch_sizes": (1, 4),  # the only values Higgsfield documents
+        "default_batch_size": 1,
+    },
+    # "nano-banana" intentionally absent: no current official Higgsfield
+    # source (dedicated docs page, docs-site search, or the console's live
+    # model/pricing catalog) verifies its identity or price as of
+    # 2026-09-18, even though its raw generation path still appears in the
+    # OpenAPI catalog. See the evidence doc for the full absence trail.
+}
+
+
+def _is_real_int(value) -> bool:
+    """True only for a genuine int -- bool is an int subclass in Python and
+    a batch size of True/False is nonsensical, never silently coerced."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _local_price_estimate(model: str, settings: Mapping[str, object]) -> Optional[Decimal]:
+    """Pure, local, deterministic USD-per-request lookup. Returns None
+    whenever the model isn't in PRICE_TABLE, or any pricing-relevant
+    parameter value isn't in the documented, priced set -- never guesses,
+    never extrapolates, never treats an unknown combination as free.
+    Accepts either the real documented parameter name (`batch_size`) or
+    this catalog's currently-declared name (`num_images`, see PRICE_TABLE's
+    comment) for the image count; the two disagreeing is genuinely
+    ambiguous and also fails closed."""
+    entry = PRICE_TABLE.get(model)
+    if entry is None:
+        return None
+
+    resolution = settings.get("resolution", entry["default_resolution"])
+    if not isinstance(resolution, str):
+        return None
+    price_per_image = entry["price_per_image_usd"].get(resolution)
+    if price_per_image is None:
+        return None
+
+    has_batch_size = "batch_size" in settings
+    has_num_images = "num_images" in settings
+    if has_batch_size and has_num_images:
+        if settings["batch_size"] != settings["num_images"]:
+            return None
+        count = settings["batch_size"]
+    elif has_batch_size:
+        count = settings["batch_size"]
+    elif has_num_images:
+        count = settings["num_images"]
+    else:
+        count = entry["default_batch_size"]
+
+    if not _is_real_int(count) or count not in entry["supported_batch_sizes"]:
+        return None
+
+    return price_per_image * Decimal(count)
 
 
 def _validate_param_value(key: str, value, spec: dict, *, model: str) -> None:
@@ -642,31 +740,19 @@ class HiggsfieldAdapter:
         }
 
     def estimate_cost(self, *, model: str, settings: dict) -> Optional[float]:
-        """Fail-closed by design: any validation, network, HTTP, or
-        parsing failure returns None (unavailable), matching
-        core.generation_spending_policy's own "unknown cost, never treated
-        as free" law. A caller-side bug (unknown model/parameter) still
-        raises -- that's not the provider's estimate being unavailable,
-        it's an invalid request that would fail at submit() too."""
-        entry = self._catalog_entry(model)
-        _validate_settings(model, entry, settings)
-        try:
-            response = self._transport.post(f"/estimate{entry['path']}", json=dict(settings))
-        except HiggsfieldTransportError:
-            return None
-        if response.status_code >= 400:
-            return None
-        try:
-            body = self._parse_json(response, context="estimate")
-        except HiggsfieldMalformedResponseError:
-            return None
-        usd = body.get("usd")
-        if usd is None:
-            return None
-        try:
-            return float(usd)
-        except (TypeError, ValueError):
-            return None
+        """MULTIMODAL-M4-HIGGSFIELD-PRICING-REPAIR-01: a pure, local,
+        zero-network lookup against PRICE_TABLE above -- never calls the
+        provider (see this module's docstring amendment for why: the
+        remote /estimate/{model} endpoint this method used to call does
+        not exist in Higgsfield's current API). Fail-closed by design:
+        an unknown model, an unpriced parameter combination, or an
+        internally ambiguous settings dict all return None (unavailable),
+        matching core.generation_spending_policy's own "unknown cost,
+        never treated as free" law. Never raises for a pricing-data
+        problem -- None is the only "can't tell you" signal this method
+        gives."""
+        price = _local_price_estimate(model, dict(settings))
+        return float(price) if price is not None else None
 
     # -- Media upload (adapter-internal; used by submit() only) -------
 

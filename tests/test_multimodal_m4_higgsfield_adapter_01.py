@@ -402,58 +402,175 @@ def test_cancel_unknown_response_fails_closed():
 
 
 # ===========================================================================
-# COST
+# COST -- MULTIMODAL-M4-HIGGSFIELD-PRICING-REPAIR-01
+#
+# estimate_cost() is now a pure, local, zero-network lookup (the old remote
+# /estimate/{model} endpoint returned live HTTP 404 -- see
+# MULTIMODAL_M4_HIGGSFIELD_PRICING_REPAIR_01_2026-09-18.md). A transport
+# that raises on ANY call is used throughout this section, proving the
+# no-network-call law directly rather than merely by absence of configured
+# responses.
 # ===========================================================================
 
-def test_estimate_valid():
-    transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/estimate/nano-banana", _json_response(200, {"credits": "1.500", "usd": "0.094"}))
-    adapter = ha.HiggsfieldAdapter(transport=transport)
-    estimate = adapter.estimate_cost(model="nano-banana", settings={"prompt": "x"})
-    assert estimate == pytest.approx(0.094)
+class _NoNetworkTransport:
+    """Every method raises immediately -- proves estimate_cost() for a
+    locally-priced model never reaches the transport at all (required
+    case 10)."""
+
+    def post(self, *a, **kw):
+        raise AssertionError("estimate_cost() must not make an HTTP call for a locally priced model")
+
+    def get(self, *a, **kw):
+        raise AssertionError("estimate_cost() must not make an HTTP call for a locally priced model")
+
+    def put_bytes(self, *a, **kw):
+        raise AssertionError("estimate_cost() must not make an HTTP call for a locally priced model")
+
+    def get_raw(self, *a, **kw):
+        raise AssertionError("estimate_cost() must not make an HTTP call for a locally priced model")
 
 
-def test_estimate_missing_usd_field_fails_closed():
-    transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/estimate/nano-banana", _json_response(200, {"credits": "1.500"}))
-    adapter = ha.HiggsfieldAdapter(transport=transport)
+def test_estimate_soul_standard_cheapest_configuration_exact_cost():
+    """Required case 1: cheapest supported Soul Standard configuration
+    (720p, default batch_size=1) returns the exact documented price."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(model="higgsfield-ai/soul/standard", settings={"prompt": "x"})
+    assert estimate == pytest.approx(0.0938)
+
+
+def test_estimate_soul_standard_other_documented_resolution_exact_cost():
+    """Required case 2: the other documented resolution tier (1080p)."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(
+        model="higgsfield-ai/soul/standard", settings={"prompt": "x", "resolution": "1080p"},
+    )
+    assert estimate == pytest.approx(0.1875)
+
+
+@pytest.mark.parametrize("resolution,expected", [("720p", 0.3752), ("1080p", 0.75)])
+def test_estimate_soul_standard_batch_size_scales_linearly(resolution, expected):
+    """Required case 3: batch_size (the real documented parameter name)
+    scales the per-image price exactly, at both documented resolutions."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(
+        model="higgsfield-ai/soul/standard",
+        settings={"prompt": "x", "resolution": resolution, "batch_size": 4},
+    )
+    assert estimate == pytest.approx(expected)
+
+
+def test_estimate_soul_standard_num_images_alias_scales_too():
+    """This adapter's own (stale) _MODEL_CATALOG key is 'num_images', not
+    'batch_size' -- pricing accepts either name for the count so a caller
+    constrained by today's submit() validation still gets priced."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(
+        model="higgsfield-ai/soul/standard", settings={"prompt": "x", "num_images": 4},
+    )
+    assert estimate == pytest.approx(0.3752)
+
+
+def test_estimate_soul_standard_conflicting_count_aliases_fails_closed():
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(
+        model="higgsfield-ai/soul/standard",
+        settings={"prompt": "x", "batch_size": 1, "num_images": 4},
+    )
+    assert estimate is None
+
+
+def test_estimate_unsupported_resolution_fails_closed():
+    """Required case 4: this catalog's own currently-valid (but real-API-
+    stale) '2K'/'4K' values have no documented price -- refused rather
+    than guessed."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    for bogus_resolution in ("2K", "4K", "8K", "some-future-tier"):
+        assert adapter.estimate_cost(
+            model="higgsfield-ai/soul/standard",
+            settings={"prompt": "x", "resolution": bogus_resolution},
+        ) is None
+
+
+def test_estimate_unknown_model_returns_none():
+    """Required case 5."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    assert adapter.estimate_cost(model="totally-bogus-model-not-in-any-catalog", settings={"prompt": "x"}) is None
+
+
+@pytest.mark.parametrize("batch_size", [0, 2, 3, 5, True, False, 1.0, "1", None])
+def test_estimate_pricing_sensitive_unknown_parameter_combination_returns_none(batch_size):
+    """Required case 6: batch sizes Higgsfield doesn't document (only 1
+    and 4 are real), plus bool-as-int and other type ambiguity, all fail
+    closed rather than being guessed at."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    assert adapter.estimate_cost(
+        model="higgsfield-ai/soul/standard", settings={"prompt": "x", "batch_size": batch_size},
+    ) is None
+
+
+def test_estimate_nano_banana_always_none():
+    """nano-banana's current identity/price could not be verified against
+    any current official Higgsfield source (see the evidence doc) --
+    estimate_cost() never guesses a price for it."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
     assert adapter.estimate_cost(model="nano-banana", settings={"prompt": "x"}) is None
 
 
-def test_estimate_malformed_json_fails_closed():
-    transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/estimate/nano-banana", _raw_response(200, b"not json at all"))
-    adapter = ha.HiggsfieldAdapter(transport=transport)
-    assert adapter.estimate_cost(model="nano-banana", settings={"prompt": "x"}) is None
-
-
-def test_estimate_http_error_fails_closed():
-    transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/estimate/nano-banana", _json_response(500, {"detail": "boom"}))
-    adapter = ha.HiggsfieldAdapter(transport=transport)
-    assert adapter.estimate_cost(model="nano-banana", settings={"prompt": "x"}) is None
-
-
-def test_estimate_unsupported_parameter_still_raises():
-    """A caller bug (unknown parameter) is not the same as 'estimate
-    unavailable' -- it raises exactly like submit() would for the same
-    settings, rather than silently returning None."""
-    adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
-    with pytest.raises(ha.UnsupportedParameterError):
-        adapter.estimate_cost(model="nano-banana", settings={"prompt": "x", "bogus": 1})
+def test_estimate_never_makes_an_http_request_for_a_locally_priced_model():
+    """Required case 10, proven directly: _NoNetworkTransport raises on
+    ANY call, so simply not raising here proves zero network calls."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    adapter.estimate_cost(model="higgsfield-ai/soul/standard", settings={"prompt": "x", "resolution": "1080p"})
+    adapter.estimate_cost(model="nano-banana", settings={"prompt": "x"})
+    adapter.estimate_cost(model="unknown-model", settings={"prompt": "x"})
+    # no AssertionError raised above == no transport method was ever called
 
 
 def test_estimate_never_autonomously_approves_spend():
     """The adapter returns a number (or None); SpendingPolicy, evaluated
     by the caller, is what actually allows or blocks submission -- the
     adapter has no opinion and no gate of its own."""
-    transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/estimate/nano-banana", _json_response(200, {"credits": "160.0", "usd": "9.99"}))
-    adapter = ha.HiggsfieldAdapter(transport=transport)
-    estimate = adapter.estimate_cost(model="nano-banana", settings={"prompt": "x"})
-    policy = sp.SpendingPolicy(single_job_ceiling=1.0)
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(model="higgsfield-ai/soul/standard", settings={"prompt": "x", "resolution": "1080p"})
+    policy = sp.SpendingPolicy(single_job_ceiling=0.10)
     decision = sp.evaluate_spend(policy, estimate)
     assert decision.outcome == sp.OUTCOME_REQUIRES_APPROVAL  # adapter never decided this itself
+
+
+def test_spending_policy_permits_estimate_below_ceiling():
+    """Required case 7."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(model="higgsfield-ai/soul/standard", settings={"prompt": "x"})  # 0.0938
+    policy = sp.SpendingPolicy(single_job_ceiling=1.0)
+    decision = sp.evaluate_spend(policy, estimate)
+    assert decision.outcome == sp.OUTCOME_ALLOWED
+
+
+def test_spending_policy_rejects_estimate_above_ceiling():
+    """Required case 8."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(
+        model="higgsfield-ai/soul/standard", settings={"prompt": "x", "resolution": "1080p", "batch_size": 4},
+    )  # 0.75
+    policy = sp.SpendingPolicy(single_job_ceiling=0.50)
+    decision = sp.evaluate_spend(policy, estimate)
+    assert decision.outcome == sp.OUTCOME_REQUIRES_APPROVAL
+
+
+def test_no_estimate_fail_closed_behavior_remains_intact():
+    """Required case 9: core.generation_spending_policy itself is
+    untouched by this repair -- an unavailable estimate (nano-banana,
+    or any unknown model) still fails closed exactly as before, both in
+    its default (deny) and opt-out (require approval) configurations."""
+    adapter = ha.HiggsfieldAdapter(transport=_NoNetworkTransport())
+    estimate = adapter.estimate_cost(model="nano-banana", settings={"prompt": "x"})
+    assert estimate is None
+
+    deny_policy = sp.SpendingPolicy(require_estimate=True, fail_closed_on_unknown_cost=True)
+    assert sp.evaluate_spend(deny_policy, estimate).outcome == sp.OUTCOME_DENIED
+
+    approval_policy = sp.SpendingPolicy(require_estimate=True, fail_closed_on_unknown_cost=False)
+    assert sp.evaluate_spend(approval_policy, estimate).outcome == sp.OUTCOME_REQUIRES_APPROVAL
 
 
 # ===========================================================================
@@ -905,7 +1022,6 @@ def test_offline_law_full_adapter_lifecycle_never_touches_a_socket(monkeypatch):
     }))
     transport.configure("GET_RAW", "https://cdn.example.com/offline.jpg",
                          _raw_response(200, b"offline-bytes", headers={"Content-Type": "image/jpeg"}))
-    transport.configure("POST", "/estimate/nano-banana", _json_response(200, {"credits": "1.0", "usd": "0.05"}))
     transport.configure("POST", "/requests/req-offline-2/cancel", _raw_response(202, b""))
 
     adapter = ha.HiggsfieldAdapter(transport=transport)
@@ -916,8 +1032,10 @@ def test_offline_law_full_adapter_lifecycle_never_touches_a_socket(monkeypatch):
     assert result.canonical_status == gj.STATUS_SUCCEEDED
     data, mime_type = adapter.fetch_output(request_id, 0)
     assert data == b"offline-bytes"
-    estimate = adapter.estimate_cost(model="nano-banana", settings={"prompt": "x"})
-    assert estimate == pytest.approx(0.05)
+    # estimate_cost() is now local/zero-network (MULTIMODAL-M4-HIGGSFIELD-
+    # PRICING-REPAIR-01) -- no transport response to configure for it.
+    estimate = adapter.estimate_cost(model="higgsfield-ai/soul/standard", settings={"prompt": "x"})
+    assert estimate == pytest.approx(0.0938)
 
     job = _queued_job(provider_job_id="req-offline-2")
     cancelled = adapter.cancel(job)

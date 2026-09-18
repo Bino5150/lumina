@@ -622,9 +622,12 @@ def test_higgsfield_adapter_contract_compatibility_offline(monkeypatch):
     # module-level fake vocabulary for just this test, never the real one.
     monkeypatch.setattr(gm, "CANONICAL_PROVIDERS", frozenset({"higgsfield"}))
 
+    # estimate_cost() is local/zero-network as of MULTIMODAL-M4-HIGGSFIELD-
+    # PRICING-REPAIR-01 -- no /estimate/... transport response to configure.
+    # "higgsfield-ai/soul/standard" is the one model with a verified local
+    # price (nano-banana has none -- see that campaign's evidence doc).
     transport = _FakeHiggsfieldTransport()
-    transport.configure("POST", "/estimate/nano-banana", _json_response(200, {"usd": 0.05}))
-    transport.configure("POST", "/nano-banana", _json_response(200, {
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(200, {
         "status": "queued", "request_id": "req-svc-1",
     }))
     transport.configure("GET", "/requests/req-svc-1/status", _json_response(200, {
@@ -637,7 +640,7 @@ def test_higgsfield_adapter_contract_compatibility_offline(monkeypatch):
     adapter = ha.HiggsfieldAdapter(transport=transport)
     registry, policy = _registry_and_policy("higgsfield")
     result = svc.generate_image(
-        registry=registry, policy=policy, specialist="higgsfield", model="nano-banana",
+        registry=registry, policy=policy, specialist="higgsfield", model="higgsfield-ai/soul/standard",
         adapter=adapter, settings={"prompt": "a lighthouse at dawn", "aspect_ratio": "16:9"},
         spending_policy=sp.SpendingPolicy(single_job_ceiling=1.0),
         manifest_provider="higgsfield", authorization_ref="owner-envelope-77", cost_unit="usd",
@@ -645,12 +648,14 @@ def test_higgsfield_adapter_contract_compatibility_offline(monkeypatch):
     )
 
     assert result.outcome == svc.OUTCOME_SUCCESS
-    assert result.cost_estimate == 0.05
+    assert result.cost_estimate == pytest.approx(0.0938)
     assert len(result.artifacts) == 1
     assert ga.get_artifact_bytes(result.artifacts[0].artifact_id) == b"real-adapter-bytes"
     manifest = result.manifests[0]
     assert manifest["provider"] == "higgsfield"
     assert manifest["capability"] == "image_generation"
     assert manifest["authorization_ref"] == "owner-envelope-77"
-    # No live call: every response came from the fake transport's fixed table.
+    # No /estimate/... call: pricing is local now, and no live call either --
+    # every response that WAS made came from the fake transport's fixed table.
     assert all(method in ("POST", "GET", "GET_RAW") for method, _, _ in transport.calls)
+    assert not any(path.startswith("/estimate") for method, path, _ in transport.calls)
