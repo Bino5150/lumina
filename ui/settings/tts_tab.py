@@ -9,6 +9,30 @@ from core import persistence
 from ._widgets import _sec, _lbl, _le, _btn, _combo, _scroll_wrap, ButtonFeedback, safe_error_detail
 
 
+# ── Image Generation -- Higgsfield display-only model labels ───────────────
+# MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01: cosmetic labels ONLY, keyed by
+# the canonical model identifiers core.higgsfield_adapter.SUPPORTED_MODELS
+# already owns. This is deliberately NOT a second model catalog -- it adds
+# no model, no capability, no parameter, no pricing fact; an id missing from
+# this dict just displays as itself (see _higgsfield_model_label() below).
+# Persistence/invocation always use the canonical id, never this label.
+_HIGGSFIELD_MODEL_LABELS = {
+    "higgsfield-ai/soul/standard": "Soul Standard",
+}
+
+# Source-vetted 2026-09-18 (see project-evidence/campaign-reports/
+# MULTIMODAL_M4_HIGGSFIELD_PRICING_REPAIR_01_2026-09-18.md Sec 2): the
+# official public Higgsfield model/pricing marketplace -- lists every
+# current model's live price, so this link stays correct even if a future
+# model is added here without a Settings code change. No API key, no
+# account identifier, no query string -- a bare, static, official URL.
+_HIGGSFIELD_PRICING_URL = "https://console.higgsfield.ai"
+
+
+def _higgsfield_model_label(model_id: str) -> str:
+    return _HIGGSFIELD_MODEL_LABELS.get(model_id, model_id)
+
+
 # ── Tab: Multimodal ────────────────────────────────────────────────────────────
 
 class MultimodalTab(QWidget):
@@ -306,22 +330,25 @@ class MultimodalTab(QWidget):
         layout.addLayout(fallback_row)
 
         model_col = QVBoxLayout()
-        model_col.addWidget(_lbl("Configured provider model (read-only)", self.c))
-        self.vision_model_value = QLabel("")
-        self.vision_model_value.setStyleSheet(
-            f"color:{self.c['text_primary']};font-size:12px;"
-            "padding:8px 10px;background:transparent;"
-        )
-        model_col.addWidget(self.vision_model_value)
+        model_col.addWidget(_lbl("Model", self.c))
+        self.vision_model_combo = _combo(self.c)
+        self.vision_model_combo.setEditable(True)
+        self.vision_model_combo.addItem("Provider default", "")
+        configured_model_override = (route.model or "") if route is not None else ""
+        if configured_model_override:
+            self.vision_model_combo.addItem(configured_model_override, configured_model_override)
+        model_col.addWidget(self.vision_model_combo)
         layout.addLayout(model_col)
 
-        route_truth = _lbl(
-            "M1 resolves this owner policy at execution time. Model choice "
-            "remains owned by the selected provider's existing configuration.",
+        model_note = _lbl(
+            "Provider default follows that provider's own configured model "
+            "(General Settings). Type a specific model id to override it "
+            "for vision_understanding only -- the primary conversation "
+            "backend/model is never changed by this selection.",
             self.c,
         )
-        route_truth.setWordWrap(True)
-        layout.addWidget(route_truth)
+        model_note.setWordWrap(True)
+        layout.addWidget(model_note)
         if route_warnings:
             warning = _lbl("Invalid stored route is fail-closed: " + "; ".join(route_warnings), self.c)
             warning.setWordWrap(True)
@@ -329,21 +356,90 @@ class MultimodalTab(QWidget):
 
         self.vision_mode_combo.currentIndexChanged.connect(self._sync_vision_controls)
         self.vision_provider_combo.currentTextChanged.connect(self._refresh_vision_model)
+        if configured_model_override:
+            self.vision_model_combo.setCurrentIndex(1)
         self._sync_vision_controls()
         self._refresh_vision_model()
 
-        # ── Image Generation -- Higgsfield credentials ──
-        # First-class multimodal-provider credential surface
-        # (MULTIMODAL-M4-HIGGSFIELD-CREDENTIALS-SURFACE-01). Higgsfield is
-        # not a conversational backend, so -- unlike the vision route above,
-        # which reuses an existing chat provider's own API key field --
-        # there is no chat-backend credential slot to piggyback on here.
-        # Credentials only: capability route/model selection for
-        # image_generation is a separate, not-yet-built concern and stays
-        # out of this section. Values are read/written only through
-        # core.secrets (see that module's docstring) -- never prefs.json,
-        # never config.py, never logged, never re-displayed in plaintext.
-        layout.addWidget(_sec("IMAGE GENERATION — HIGGSFIELD", self.c))
+        # ── Image Generation -- provider/model binding + Higgsfield
+        # credentials ──
+        # MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 adds the provider/model
+        # binding below; credentials remain in this same section per that
+        # campaign's own scope note (moving them would expand scope
+        # unnecessarily). Higgsfield is not a conversational backend, so --
+        # unlike the vision route above, which reuses an existing chat
+        # provider's own API key field -- there is no chat-backend
+        # credential slot to piggyback on here. Credential values are
+        # read/written only through core.secrets (see that module's
+        # docstring) -- never prefs.json, never config.py, never logged,
+        # never re-displayed in plaintext.
+        layout.addWidget(_sec("IMAGE GENERATION", self.c))
+
+        from core.higgsfield_adapter import SUPPORTED_MODELS as _HF_SUPPORTED_MODELS
+
+        raw_image_route = (
+            raw_routes.get("image_generation", {})
+            if isinstance(raw_routes, dict) else {}
+        )
+        image_route = parsed_routes.get("image_generation")
+        configured_image_model = (
+            (image_route.model or "") if image_route is not None else ""
+        )
+        self._image_route_template = (
+            dict(raw_image_route) if isinstance(raw_image_route, dict) else {}
+        )
+
+        image_row = QHBoxLayout()
+        image_row.setSpacing(12)
+
+        image_provider_col = QVBoxLayout()
+        image_provider_col.addWidget(_lbl("Provider", self.c))
+        self.image_provider_combo = _combo(self.c)
+        self.image_provider_combo.addItem("Higgsfield", "higgsfield")
+        image_provider_col.addWidget(self.image_provider_combo)
+
+        image_model_col = QVBoxLayout()
+        image_model_col.addWidget(_lbl("Model", self.c))
+        self.image_model_combo = _combo(self.c)
+        for model_id in _HF_SUPPORTED_MODELS:
+            self.image_model_combo.addItem(_higgsfield_model_label(model_id), model_id)
+        image_model_index = 0
+        if configured_image_model:
+            found = self.image_model_combo.findData(configured_image_model)
+            if found >= 0:
+                image_model_index = found
+            else:
+                # Preserve a stale/owner-authored id rather than silently
+                # dropping it -- fail-closed resolution happens at
+                # execution time (core.image_generation_service.
+                # resolve_image_generation_target()), never here.
+                self.image_model_combo.addItem(configured_image_model, configured_image_model)
+                image_model_index = self.image_model_combo.count() - 1
+        self.image_model_combo.setCurrentIndex(image_model_index)
+        image_model_col.addWidget(self.image_model_combo)
+
+        image_row.addLayout(image_provider_col, 1)
+        image_row.addLayout(image_model_col, 2)
+        layout.addLayout(image_row)
+
+        image_pricing_row = QHBoxLayout()
+        self.image_pricing_btn = _btn("View Higgsfield pricing", self.c)
+        self.image_pricing_btn.clicked.connect(
+            lambda: __import__("webbrowser").open(_HIGGSFIELD_PRICING_URL)
+        )
+        image_pricing_row.addWidget(self.image_pricing_btn)
+        image_pricing_row.addStretch()
+        layout.addLayout(image_pricing_row)
+
+        image_pricing_note = _lbl(
+            "Opens Higgsfield's own current pricing/model page. Lumina's "
+            "local cost estimate (used for the spend gate) is informational "
+            "only -- the provider's page is the authoritative, current price.",
+            self.c,
+        )
+        image_pricing_note.setWordWrap(True)
+        layout.addWidget(image_pricing_note)
+
         hf_note = _lbl(
             "API credentials for the Higgsfield image-generation adapter. "
             "Stored in Lumina's OS-local credential store, separate from "
@@ -439,14 +535,28 @@ class MultimodalTab(QWidget):
         return "Not available from current provider settings"
 
     def _refresh_vision_model(self, *_args):
-        self.vision_model_value.setText(
-            self._configured_vision_model(self.vision_provider_combo.currentText())
-        )
+        default_text = self._configured_vision_model(self.vision_provider_combo.currentText())
+        self.vision_model_combo.setItemText(0, f"Provider default — {default_text}")
+
+    def _vision_model_override(self) -> str:
+        """The owner's typed/selected capability-specific model override for
+        vision_understanding, or "" for "Provider default" -- never a
+        display label. Editable-combo semantics: selecting an existing
+        item (including the item-0 "Provider default" sentinel, whose
+        userData is always "") keeps currentIndex >= 0 and currentData()
+        authoritative; typing free text that matches no item's text
+        drops currentIndex to -1 (standard QComboBox behavior for an
+        editable combo), so the typed text itself is the override."""
+        combo = self.vision_model_combo
+        if combo.currentIndex() >= 0:
+            return (combo.currentData() or "").strip()
+        return combo.currentText().strip()
 
     def _sync_vision_controls(self, *_args):
         enabled = self.vision_mode_combo.currentData() != "disabled"
         self.vision_provider_combo.setEnabled(enabled)
         self.vision_fallbacks.setEnabled(enabled)
+        self.vision_model_combo.setEnabled(enabled)
         self._refresh_vision_model()
 
     # ── Higgsfield credentials ──
@@ -522,6 +632,11 @@ class MultimodalTab(QWidget):
         else:
             route.pop("specialist", None)
         route["fallbacks"] = self._csv_values(self.vision_fallbacks.text())
+        model_override = self._vision_model_override()
+        if model_override:
+            route["model"] = model_override
+        else:
+            route.pop("model", None)
 
         raw_routes = getattr(config, "MULTIMODAL_ROUTES", {})
         routes = dict(raw_routes) if isinstance(raw_routes, dict) else {}
@@ -530,6 +645,7 @@ class MultimodalTab(QWidget):
             and mode == "disabled"
             and not provider
             and not route["fallbacks"]
+            and not model_override
         ):
             # Preserve M1's canonical unconfigured/default-disabled state.
             # Saving unrelated speech settings must not manufacture an
@@ -539,6 +655,21 @@ class MultimodalTab(QWidget):
             routes["vision_understanding"] = route
         disabled = self._csv_values(self.vision_disabled_providers.text())
         return routes, disabled
+
+    def _image_generation_settings_payload(self) -> dict:
+        """The persisted image_generation route. Unlike vision_understanding
+        there is no Disabled/Auto mode here and no provider-global default
+        to fall back to (Higgsfield is not a conversational backend) -- the
+        Provider/Model controls always have a concrete selection, so the
+        route is always written as an explicit "specialist" binding.
+        Canonical identifiers only (never the friendly Model label)."""
+        provider = self.image_provider_combo.currentData() or self.image_provider_combo.currentText().strip()
+        model = self.image_model_combo.currentData() or self.image_model_combo.currentText().strip()
+        route = dict(self._image_route_template)
+        route["mode"] = "specialist"
+        route["specialist"] = provider
+        route["model"] = model
+        return route
 
     _BACKEND_URLS = {
         "kokoro":   "http://localhost:8880",
@@ -627,6 +758,8 @@ class MultimodalTab(QWidget):
         except ValueError as exc:
             self.status_lbl.setText(str(exc))
             return
+        multimodal_routes = dict(multimodal_routes)
+        multimodal_routes["image_generation"] = self._image_generation_settings_payload()
         if not self._try_enter_busy():
             return
         self.test_btn.setEnabled(False)

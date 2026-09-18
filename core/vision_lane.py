@@ -142,12 +142,21 @@ class VisionRouteContext:
     primary_content:
         The image-free content list the primary session carries for this
         turn: one text block (routed notice + the user's own words).
+    model_override:
+        MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 -- the owner's
+        capability-specific model for the admitted specialist, resolved
+        once here via core.capability_router.resolve_capability_target()
+        (never re-derived at call time). "" (never None, so this stays a
+        plain falsy default like every other str field here) means no
+        override: the specialist's own provider-global/default model
+        applies, exactly as before this field existed.
     """
 
     decision: object
     images: Tuple[dict, ...]
     task_text: str
     primary_content: Tuple[dict, ...]
+    model_override: str = ""
 
 
 @dataclass(frozen=True)
@@ -308,11 +317,13 @@ def prepare_routed_turn(agent, user_input):
 
     user_text = _text_of_content(user_input)
     primary_content = _routed_primary_content(len(images), user_text)
+    model_override = cr.resolve_capability_target(route, decision) or ""
     route_ctx = VisionRouteContext(
         decision=decision,
         images=tuple(images),
         task_text=_capped_task_text(user_text),
         primary_content=tuple(primary_content),
+        model_override=model_override,
     )
     return list(primary_content), route_ctx
 
@@ -450,7 +461,20 @@ def execute_routed_vision(agent, route_ctx, cancel_event=None,
 
     try:
         from core.backends.loader import get_llm_backend
-        specialist = get_llm_backend(name=provider)
+        # MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01: `model=` is only ever
+        # passed when the owner configured an explicit capability-specific
+        # model for THIS admitted specialist (resolved once in
+        # prepare_routed_turn() via core.capability_router.
+        # resolve_capability_target()). Omitting the kwarg entirely when
+        # there is no override reproduces the exact pre-binding call shape
+        # byte-for-byte -- no behavior change for every install that has
+        # never configured one. get_llm_backend() always hands back a
+        # fresh, non-shared instance, so this is a per-invocation
+        # parameter, never a mutation of any provider-global/shared state.
+        if route_ctx.model_override:
+            specialist = get_llm_backend(name=provider, model=route_ctx.model_override)
+        else:
+            specialist = get_llm_backend(name=provider)
     except Exception as exc:
         result = VisionLaneResult(
             outcome=_OUTCOME_PROVIDER_UNAVAILABLE,

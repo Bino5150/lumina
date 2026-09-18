@@ -75,6 +75,7 @@ __all__ = [
     "RoutingPolicy",
     "CapabilityRegistry",
     "RoutingDecision",
+    "resolve_capability_target",
     "CANONICAL_CAPABILITIES",
     "LANE_DISABLED",
     "LANE_AUTO",
@@ -246,12 +247,27 @@ class CapabilityRoute:
         Owner-declared floor label; ``None`` = unconstrained. Compared
         only against owner-declared specialist labels via
         ``RoutingPolicy.quality_order``.
+    model:
+        MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 -- optional capability-
+        specific model override, meaningful ONLY for the specialist named
+        in ``specialist`` above (never a fallback, never an Auto pick --
+        see ``resolve_capability_target()`` below for the exact admission
+        rule). ``None`` (the default, and what every route stored before
+        this field existed still parses as) means "no override": the
+        admitted specialist's own provider-global/default model applies,
+        exactly as before this field was added. This module never reads,
+        constructs, or mutates a provider/backend to apply the override --
+        it only carries the owner's declared string; a caller (e.g.
+        core.vision_lane, core.image_generation_service) is responsible
+        for threading it into a per-invocation call, never into shared
+        provider state.
     """
 
     mode: str
     specialist: Optional[str] = None
     fallbacks: Tuple[str, ...] = ()
     quality_floor: Optional[str] = None
+    model: Optional[str] = None
 
     def __post_init__(self):
         if self.mode not in _LANE_MODES:
@@ -264,6 +280,8 @@ class CapabilityRoute:
                 raise ValueError(f"fallback entries must be non-empty strings, got {fb!r}")
         if self.quality_floor is not None and not isinstance(self.quality_floor, str):
             raise ValueError("quality_floor must be a string or None")
+        if self.model is not None and not isinstance(self.model, str):
+            raise ValueError("model must be a string or None")
 
 
 def _coerce_route(value) -> Tuple[Optional[CapabilityRoute], Optional[str]]:
@@ -282,6 +300,7 @@ def _coerce_route(value) -> Tuple[Optional[CapabilityRoute], Optional[str]]:
                     specialist=value.get("specialist"),
                     fallbacks=value.get("fallbacks") or (),
                     quality_floor=value.get("quality_floor"),
+                    model=value.get("model"),
                 ),
                 None,
             )
@@ -612,6 +631,39 @@ def resolve_capability(
         evidence=ledger,
         excluded_primary_backend=primary_backend,
     )
+
+
+def resolve_capability_target(route: CapabilityRoute, decision: RoutingDecision) -> Optional[str]:
+    """MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 -- the model a caller
+    should use for the specialist ``decision`` just admitted, or ``None``
+    for "no override, use that specialist's own provider-global/default
+    model" (existing pre-binding behavior, unchanged).
+
+    PURE, like resolve_capability() itself: no I/O, no mutation, identical
+    inputs -> identical output.
+
+    Admission rule (deliberately narrow): ``route.model`` only ever
+    applies when the admitted specialist IS the route's own explicit
+    ``specialist`` -- i.e. ``decision.outcome == OUTCOME_ROUTED``,
+    ``decision.selected == route.specialist``, and
+    ``decision.classification == CLASSIFICATION_EXPLICIT``. An owner-
+    permitted fallback or an Auto pick never inherits a model string that
+    was declared for a DIFFERENT provider -- that would silently hand one
+    provider's model id to another provider's request. This mirrors the
+    architectural law that a capability-specific model is bound to the
+    (capability, provider) pair, never to the capability alone.
+
+    A falsy ``route.model`` (``None`` or ``""``) always resolves to
+    ``None`` here -- "explicitly configured but empty" and "never
+    configured" are treated identically: no override.
+    """
+    if decision.outcome != OUTCOME_ROUTED:
+        return None
+    if not route.specialist or decision.selected != route.specialist:
+        return None
+    if decision.classification != CLASSIFICATION_EXPLICIT:
+        return None
+    return route.model or None
 
 
 def parse_routes(raw) -> Tuple[dict, list]:

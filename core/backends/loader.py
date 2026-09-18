@@ -170,10 +170,44 @@ def get_backend_endpoint(name: str) -> str:
             return legacy_url.rstrip("/")
     return cls.default_url.rstrip("/")
 
-def get_llm_backend(name: str = None, url: str = None, api_key: str = None):
+def _apply_model_override(instance, model: str) -> None:
+    """MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 -- per-invocation model
+    override on a FRESHLY CONSTRUCTED, non-shared backend instance.
+
+    ``get_llm_backend()`` always returns a brand new instance (no cache,
+    no singleton) -- see core.backends.base.BaseLLMBackend's own
+    ``_complete_utility_request()`` docstring, which already documents
+    this for every real caller. Writing to this one instance's own model
+    attribute is therefore never a global/shared-state mutation and never
+    needs a save/restore dance: nothing else holds a reference to it, and
+    it is never `config`, never a persisted preference, never
+    `agent.llm`, never a cached/reused probe.
+
+    Writes to whichever attribute this backend actually tracks its
+    configured model on -- ``self._model`` for every backend except
+    AnthropicBackend/GeminiBackend, which use ``self.default_model``
+    instead (see BaseLLMBackend.configured_model()'s own documented
+    distinction). ``hasattr`` is reliable here because every real
+    backend's ``__init__`` already sets exactly one of the two before
+    this function can ever see the instance.
+    """
+    if hasattr(instance, "default_model"):
+        instance.default_model = model
+    else:
+        instance._model = model
+
+
+def get_llm_backend(name: str = None, url: str = None, api_key: str = None, model: str = None):
     """
     Instantiate and return a backend by name.
     Falls back to config.LLM_BACKEND, then 'llamacpp'.
+
+    `model`: MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 -- optional per-
+    invocation model override applied to the freshly constructed instance
+    this call returns (see _apply_model_override() above). Omitted/None/
+    empty leaves the instance exactly as its own __init__ configured it
+    from `config` -- byte-identical to every pre-existing caller of this
+    function.
     """
     backend_name = (name or getattr(config, "LLM_BACKEND", "llamacpp")).lower()
     cls = BACKENDS.get(backend_name)
@@ -194,5 +228,9 @@ def get_llm_backend(name: str = None, url: str = None, api_key: str = None):
         "openrouter", "deepseek", "groq", "openai", "anthropic",
         "gemini", "kimi", "qwen", "custom", "omniroute",
     }:
-        return cls(base_url=endpoint, api_key=api_key)
-    return cls(base_url=endpoint)
+        instance = cls(base_url=endpoint, api_key=api_key)
+    else:
+        instance = cls(base_url=endpoint)
+    if model:
+        _apply_model_override(instance, model)
+    return instance

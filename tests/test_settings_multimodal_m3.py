@@ -15,7 +15,7 @@ import pytest
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QTabWidget, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QScrollArea, QTabWidget, QWidget
 
 import config
 from core import persistence
@@ -118,8 +118,9 @@ def test_opening_multimodal_exposes_real_route_without_provider_or_model_calls(
     assert tab.vision_provider_combo.currentText() == "openai"
     assert tab.vision_fallbacks.text() == "gemini"
     assert tab.vision_disabled_providers.text() == "openrouter"
-    assert tab.vision_model_value.text() == "gpt-5.6-luna"
-    assert isinstance(tab.vision_model_value, QLabel)
+    assert tab.vision_model_combo.itemText(0) == "Provider default — gpt-5.6-luna"
+    assert tab.vision_model_combo.currentIndex() == 0
+    assert isinstance(tab.vision_model_combo, QComboBox)
 
 
 def test_multimodal_save_round_trips_speech_and_writes_only_existing_vision_seams(
@@ -166,6 +167,15 @@ def test_multimodal_save_round_trips_speech_and_writes_only_existing_vision_seam
             "fallbacks": ["openai", "qwen"],
             "quality_floor": "high",
         },
+        # image_generation is now always written on every save
+        # (MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01): unlike vision there
+        # is no Disabled mode and no provider-global default to fall back
+        # to, so Provider/Model always resolve to a concrete selection.
+        "image_generation": {
+            "mode": "specialist",
+            "specialist": "higgsfield",
+            "model": "higgsfield-ai/soul/standard",
+        },
     }
     assert saved["multimodal_disabled_providers"] == ["deepseek"]
     assert config.MULTIMODAL_ROUTES == saved["multimodal_routes"]
@@ -202,8 +212,19 @@ def test_speech_only_save_preserves_absent_default_disabled_vision_route(
     tab = MultimodalTab(_agent(), COLORS)
     tab._save()
 
-    assert config.MULTIMODAL_ROUTES == {}
-    assert persistence.load()["multimodal_routes"] == {}
+    # vision_understanding stays absent (untouched, still Disabled/no
+    # provider) -- image_generation is always written on every save
+    # (MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01: no Disabled mode, no
+    # provider-global default to preserve absence against).
+    assert "vision_understanding" not in config.MULTIMODAL_ROUTES
+    assert config.MULTIMODAL_ROUTES == {
+        "image_generation": {
+            "mode": "specialist",
+            "specialist": "higgsfield",
+            "model": "higgsfield-ai/soul/standard",
+        },
+    }
+    assert persistence.load()["multimodal_routes"] == config.MULTIMODAL_ROUTES
 
 
 def test_multimodal_page_degrades_vertically_without_horizontal_scrolling(

@@ -105,7 +105,9 @@ from core.redaction import redact_secret_shapes
 __all__ = [
     "ImageGenerationResult",
     "ImageGenerationServiceError",
+    "ImageGenerationTarget",
     "generate_image",
+    "resolve_image_generation_target",
     "OUTCOME_SUCCESS",
     "OUTCOME_PARTIAL",
     "OUTCOME_ZERO_OUTPUTS",
@@ -571,4 +573,118 @@ def generate_image(
         job_status=final_job.status, cost_estimate=estimate,
         artifacts=tuple(ingested), manifests=manifests,
         failed_output_indices=tuple(failed_indices),
+    )
+
+
+# ---------------------------------------------------------------------------
+# MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 -- the resolver seam
+# ---------------------------------------------------------------------------
+#
+# generate_image() above deliberately takes `registry`/`policy`/`specialist`/
+# `model` as explicit, caller-supplied parameters -- it has never built them
+# itself, so it stays provider-neutral and fully testable offline. Something
+# still has to read what Multimodal Settings actually persisted (the owner's
+# image_generation route in config.MULTIMODAL_ROUTES) and turn it into that
+# exact call shape. This is the smallest such seam: read-only, no adapter
+# construction, no credentials touched, no network I/O -- mirrors
+# core.vision_lane._build_routing()'s own config-reading pattern for
+# vision_understanding, so the two capabilities share the same read/resolve
+# idiom even though this module owns the image_generation-specific piece.
+
+@dataclass(frozen=True)
+class ImageGenerationTarget:
+    """Everything a caller needs to invoke generate_image() for real, once
+    the owner's Multimodal Settings selection has been resolved via M1.
+
+    registry/policy: exactly what resolve_image_generation_target() used
+        to admit `specialist` -- a caller may pass these straight through
+        to generate_image() so its own internal resolve_capability() call
+        reaches the identical decision, rather than re-deriving policy
+        from config a second time.
+    specialist/model: the canonical provider/model identity pair --
+        never a friendly display label, never inferred, never
+        substituted.
+    """
+
+    registry: CapabilityRegistry
+    policy: RoutingPolicy
+    specialist: str
+    model: str
+
+
+def resolve_image_generation_target(primary_backend: Optional[str] = None) -> Optional[ImageGenerationTarget]:
+    """Read the owner's configured image_generation route (Multimodal
+    Settings, ``config.MULTIMODAL_ROUTES``) and resolve it via M1 to a
+    concrete, truthful (specialist, model) target -- exactly the shape
+    generate_image() requires.
+
+    Returns ``None`` -- never a guess, never a silently substituted
+    provider or model -- when:
+      - the image_generation lane is unconfigured or owner-disabled
+        (mirrors every other capability's default-disabled contract);
+      - M1 does not admit the route's own explicit specialist (owner-
+        disabled provider, unknown specialist, unhealthy candidate);
+      - the admitted specialist has no usable model at all (image
+        generation has no provider-global default the way a
+        conversational backend does -- there is nothing to fall back to,
+        so an unset/empty model is a fail-closed "not configured", not a
+        guess);
+      - the persisted model is not in that specialist's own, truthfully-
+        supported catalog (today: Higgsfield's
+        ``core.higgsfield_adapter.SUPPORTED_MODELS`` -- a stale/invalid
+        explicit preference from a prior release is refused, never
+        silently swapped for a different model the owner never chose).
+
+    Read-only and side-effect-free beyond reading `config`: builds no
+    adapter, touches no credentials, performs no network I/O. A future
+    caller is expected to pass the result straight into generate_image()
+    once it also has an adapter, spending policy, and authorization_ref
+    in hand -- none of which this function is responsible for.
+    """
+    import config
+    from core import capability_router as cr
+
+    routes, _warnings = cr.parse_routes(getattr(config, "MULTIMODAL_ROUTES", {}))
+    route = routes.get(cr.Capability.IMAGE_GENERATION.value)
+    if route is None or route.mode == cr.LANE_DISABLED:
+        return None
+
+    policy = cr.RoutingPolicy(
+        routes=routes,
+        disabled_providers=tuple(getattr(config, "MULTIMODAL_DISABLED_PROVIDERS", []) or ()),
+    )
+    names = {route.specialist} if route.specialist else set()
+    names.update(route.fallbacks or ())
+    registry = cr.CapabilityRegistry([
+        cr.SpecialistRecord(
+            name=name, kind="external", local=False,
+            capabilities={cr.Capability.IMAGE_GENERATION: cr.EvidenceClass.EVIDENCED},
+        )
+        for name in sorted(names)
+    ])
+
+    decision = cr.resolve_capability(
+        registry, policy, cr.Capability.IMAGE_GENERATION, primary_backend=primary_backend,
+    )
+    if decision.outcome != cr.OUTCOME_ROUTED:
+        return None
+
+    model = cr.resolve_capability_target(route, decision)
+    if not model:
+        # No usable model for the admitted specialist -- image_generation
+        # has no provider-global default to fall back to, so this is a
+        # fail-closed "not configured," never a guess.
+        return None
+
+    if decision.selected == "higgsfield":
+        # The only specialist with a truthfully-supported model catalog
+        # today. A future second provider gets its own equivalent guard
+        # when it is actually built -- never a generic mechanism invented
+        # ahead of the second real case.
+        from core.higgsfield_adapter import SUPPORTED_MODELS
+        if model not in SUPPORTED_MODELS:
+            return None
+
+    return ImageGenerationTarget(
+        registry=registry, policy=policy, specialist=decision.selected, model=model,
     )
