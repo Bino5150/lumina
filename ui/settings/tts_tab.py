@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import config
 from core import persistence
 
-from ._widgets import _sec, _lbl, _le, _btn, _combo, _scroll_wrap
+from ._widgets import _sec, _lbl, _le, _btn, _combo, _scroll_wrap, ButtonFeedback, safe_error_detail
 
 
 # ── Tab: Multimodal ────────────────────────────────────────────────────────────
@@ -332,6 +332,58 @@ class MultimodalTab(QWidget):
         self._sync_vision_controls()
         self._refresh_vision_model()
 
+        # ── Image Generation -- Higgsfield credentials ──
+        # First-class multimodal-provider credential surface
+        # (MULTIMODAL-M4-HIGGSFIELD-CREDENTIALS-SURFACE-01). Higgsfield is
+        # not a conversational backend, so -- unlike the vision route above,
+        # which reuses an existing chat provider's own API key field --
+        # there is no chat-backend credential slot to piggyback on here.
+        # Credentials only: capability route/model selection for
+        # image_generation is a separate, not-yet-built concern and stays
+        # out of this section. Values are read/written only through
+        # core.secrets (see that module's docstring) -- never prefs.json,
+        # never config.py, never logged, never re-displayed in plaintext.
+        layout.addWidget(_sec("IMAGE GENERATION — HIGGSFIELD", self.c))
+        hf_note = _lbl(
+            "API credentials for the Higgsfield image-generation adapter. "
+            "Stored in Lumina's OS-local credential store, separate from "
+            "prefs.json and from any conversational backend configuration.",
+            self.c,
+        )
+        hf_note.setWordWrap(True)
+        layout.addWidget(hf_note)
+
+        self.hf_status_lbl = _lbl("", self.c)
+        layout.addWidget(self.hf_status_lbl)
+
+        hf_id_col = QVBoxLayout()
+        hf_id_col.addWidget(_lbl("Key ID", self.c))
+        self.hf_key_id = _le("", self.c)
+        self.hf_key_id.setEchoMode(QLineEdit.EchoMode.Password)
+        hf_id_col.addWidget(self.hf_key_id)
+        layout.addLayout(hf_id_col)
+
+        hf_secret_col = QVBoxLayout()
+        hf_secret_col.addWidget(_lbl("Key Secret", self.c))
+        self.hf_key_secret = _le("", self.c)
+        self.hf_key_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        hf_secret_col.addWidget(self.hf_key_secret)
+        layout.addLayout(hf_secret_col)
+
+        hf_save_row = QHBoxLayout()
+        self.hf_save_btn = _btn("Save", self.c)
+        self.hf_save_btn.clicked.connect(self._save_higgsfield_credentials)
+        hf_save_row.addStretch()
+        hf_save_row.addWidget(self.hf_save_btn)
+        layout.addLayout(hf_save_row)
+        self._hf_feedback = ButtonFeedback(self.hf_save_btn)
+
+        self.hf_save_status_lbl = _lbl("", self.c)
+        self.hf_save_status_lbl.setWordWrap(True)
+        layout.addWidget(self.hf_save_status_lbl)
+
+        self._refresh_higgsfield_status()
+
         # ── Save ──
         btn_row = QHBoxLayout()
         self.test_btn = _btn("▶ Test TTS", self.c)
@@ -396,6 +448,66 @@ class MultimodalTab(QWidget):
         self.vision_provider_combo.setEnabled(enabled)
         self.vision_fallbacks.setEnabled(enabled)
         self._refresh_vision_model()
+
+    # ── Higgsfield credentials ──
+    # Deliberately its own Save action, independent of the tab-wide "Save
+    # Settings" button below (which persists TTS/STT/vision-route state to
+    # prefs.json/config). Keeping it separate means opening or saving those
+    # unrelated fields can never read, write, or clear these two secrets --
+    # that code path simply never references them.
+
+    def _refresh_higgsfield_status(self):
+        """Truthful Configured/Not configured status, read fresh from the
+        secrets store every time -- never cached across a save, so a failed
+        or partial write can't leave a stale 'Configured' on screen."""
+        has_id = bool(get_secret_safe("higgsfield_key_id"))
+        has_secret = bool(get_secret_safe("higgsfield_key_secret"))
+        self.hf_status_lbl.setText(
+            "API credentials: Configured" if (has_id and has_secret)
+            else "API credentials: Not configured"
+        )
+        self.hf_key_id.setPlaceholderText("•••• configured" if has_id else "Not set")
+        self.hf_key_secret.setPlaceholderText("•••• configured" if has_secret else "Not set")
+
+    def _save_higgsfield_credentials(self):
+        key_id = self.hf_key_id.text().strip()
+        key_secret = self.hf_key_secret.text().strip()
+        if not key_id and not key_secret:
+            # An untouched (empty) field must never be treated as "clear
+            # this credential" -- with nothing typed in either field there
+            # is nothing to do, and any existing credential is left exactly
+            # as it was.
+            self._hf_feedback.success("No credentials entered")
+            self.hf_save_status_lbl.setText("")
+            return
+        from core.secrets import set_secret, set_secrets
+        try:
+            if key_id and key_secret:
+                # Both typed together: one atomic write so the pair can
+                # never land half-written (see core.secrets.set_secrets()).
+                set_secrets({
+                    "higgsfield_key_id": key_id,
+                    "higgsfield_key_secret": key_secret,
+                })
+            elif key_id:
+                set_secret("higgsfield_key_id", key_id)
+            else:
+                set_secret("higgsfield_key_secret", key_secret)
+        except Exception as e:
+            self._hf_feedback.failure("✗ Failed")
+            # Never str(e) -- see safe_error_detail()'s docstring; the
+            # exception body is untrusted and must never be able to carry a
+            # credential value into a visible label.
+            self.hf_save_status_lbl.setText(
+                f"Higgsfield credentials were not stored (credential store error: {safe_error_detail(e)})."
+            )
+            self._refresh_higgsfield_status()
+            return
+        self.hf_key_id.clear()
+        self.hf_key_secret.clear()
+        self.hf_save_status_lbl.setText("")
+        self._refresh_higgsfield_status()
+        self._hf_feedback.success("✓ Saved")
 
     def _vision_settings_payload(self) -> tuple[dict, list[str]]:
         mode = self.vision_mode_combo.currentData()
@@ -640,6 +752,18 @@ class MultimodalTab(QWidget):
         self.save_btn.setText("✓ Saved" if ok else "⚠ Swap Failed")
         self._schedule_feedback_reset(lambda: self.save_btn.setText("Save Settings"))
         self._leave_busy()
+
+
+def get_secret_safe(key: str):
+    """Local import wrapper so this file doesn't need a hard top-level
+    dependency on core.secrets just to check "is something configured"
+    (same convention as communications_tab.py's own helper of the same
+    name)."""
+    try:
+        from core.secrets import get_secret
+        return get_secret(key)
+    except Exception:
+        return None
 
 
 # Compatibility for existing imports and focused TTS/STT behavior tests.  The

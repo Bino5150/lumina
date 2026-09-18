@@ -59,6 +59,18 @@ def set_secret(key: str, value: str):
     _save(data)
 
 
+def set_secrets(mapping: dict):
+    """Write multiple keys in a single load/modify/save cycle. set_secret()
+    calls each do their own independent load+save, so writing a related pair
+    (e.g. an API key ID and its secret) as two sequential set_secret() calls
+    risks a real half-written pair on disk if the process dies or the second
+    write fails between them. Use this instead whenever more than one
+    credential must land together or not at all."""
+    data = _load()
+    data.update(mapping)
+    _save(data)
+
+
 def migrate_legacy_cloud_keys():
     """FE-09: cloud API keys used to live in prefs.json's cloud_credentials
     block (and custom_api_key) — the exact file this module's docstring says
