@@ -104,7 +104,7 @@ def _routed_decision(specialist="higgsfield", capability=Capability.IMAGE_GENERA
                             classification="explicit", reason="test fixture")
 
 
-def _begin(model="nano-banana", settings=None, refs=(), **kw):
+def _begin(model="higgsfield-ai/soul/standard", settings=None, refs=(), **kw):
     return gj.begin_generation_job(
         Capability.IMAGE_GENERATION, "higgsfield", model, _routed_decision(),
         settings if settings is not None else {"prompt": "a red bicycle"},
@@ -144,9 +144,9 @@ def test_transport_auth_header_construction(monkeypatch):
 
     monkeypatch.setattr(ht.requests, "post", fake_post)
     transport = ht.RequestsHiggsfieldTransport("my-key-id", "my-key-secret")
-    transport.post("/nano-banana", json={"prompt": "x"})
+    transport.post("/higgsfield-ai/soul/standard", json={"prompt": "x"})
     assert captured["headers"]["Authorization"] == "Key my-key-id:my-key-secret"
-    assert captured["url"] == "https://api.higgsfield.ai/nano-banana"
+    assert captured["url"] == "https://api.higgsfield.ai/higgsfield-ai/soul/standard"
     assert captured["headers"]["Content-Type"] == "application/json"
 
 
@@ -174,7 +174,7 @@ def test_credentials_never_in_error_message(monkeypatch):
     transport = ht.RequestsHiggsfieldTransport("id-should-not-leak-2", "secret-should-not-leak-2")
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert "id-should-not-leak-2" not in str(excinfo.value)
     assert "secret-should-not-leak-2" not in str(excinfo.value)
 
@@ -185,14 +185,14 @@ def test_credentials_never_in_error_message(monkeypatch):
 
 def test_submit_valid_image_generation_request():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(200, {
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(200, {
         "status": "queued", "request_id": "req-abc",
         "status_url": "https://api.higgsfield.ai/requests/req-abc/status",
         "cancel_url": "https://api.higgsfield.ai/requests/req-abc/cancel",
     }))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     request_id, raw_status = adapter.submit(
-        model="nano-banana", settings={"prompt": "a lighthouse", "aspect_ratio": "16:9"},
+        model="higgsfield-ai/soul/standard", settings={"prompt": "a lighthouse", "aspect_ratio": "16:9"},
         reference_assets=(),
     )
     assert request_id == "req-abc"
@@ -201,12 +201,13 @@ def test_submit_valid_image_generation_request():
 
 
 def test_submit_captures_provider_job_id_into_generation_job():
-    job = _begin(model="nano-banana", settings={"prompt": "a lighthouse"})
+    job = _begin(model="higgsfield-ai/soul/standard", settings={"prompt": "a lighthouse"})
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(200, {"status": "queued", "request_id": "req-xyz"}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard",
+                         _json_response(200, {"status": "queued", "request_id": "req-xyz"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
-    request_id, raw_status = adapter.submit(model="nano-banana", settings={"prompt": "a lighthouse"},
-                                             reference_assets=())
+    request_id, raw_status = adapter.submit(model="higgsfield-ai/soul/standard",
+                                             settings={"prompt": "a lighthouse"}, reference_assets=())
     updated = gj.mark_submitted(job.lumina_job_id, request_id, raw_status)
     assert updated.provider_job_id == "req-xyz"
     assert updated.status == gj.STATUS_QUEUED
@@ -214,17 +215,17 @@ def test_submit_captures_provider_job_id_into_generation_job():
 
 def test_submit_malformed_response_missing_request_id():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(200, {"status": "queued"}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(200, {"status": "queued"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldMalformedResponseError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
 
 
 def test_submit_unsupported_parameter_fails_explicitly():
     transport = FakeHiggsfieldTransport()
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.UnsupportedParameterError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x", "totally_bogus_param": 1},
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x", "totally_bogus_param": 1},
                         reference_assets=())
     assert transport.calls == []  # rejected client-side, no HTTP call made
 
@@ -233,7 +234,7 @@ def test_submit_missing_required_parameter_fails_explicitly():
     transport = FakeHiggsfieldTransport()
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.UnsupportedParameterError):
-        adapter.submit(model="nano-banana", settings={"aspect_ratio": "16:9"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"aspect_ratio": "16:9"}, reference_assets=())
     assert transport.calls == []
 
 
@@ -249,22 +250,135 @@ def test_submit_rejects_provider_idempotency_key():
     (source-vet Sec 5) -- refuses rather than silently discarding it."""
     adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
     with pytest.raises(ha.HiggsfieldAdapterError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=(),
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=(),
                         provider_idempotency_key="some-key")
-
-
-def test_submit_param_value_out_of_range_fails_explicitly():
-    adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
-    with pytest.raises(ha.UnsupportedParameterError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x", "num_images": 99},
-                        reference_assets=())
 
 
 def test_submit_param_enum_violation_fails_explicitly():
     adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
     with pytest.raises(ha.UnsupportedParameterError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x", "aspect_ratio": "not-a-real-ratio"},
+        adapter.submit(model="higgsfield-ai/soul/standard",
+                        settings={"prompt": "x", "aspect_ratio": "not-a-real-ratio"},
                         reference_assets=())
+
+
+# ===========================================================================
+# SOUL STANDARD SCHEMA -- MULTIMODAL-M4-HIGGSFIELD-CATALOG-SCHEMA-ALIGNMENT-01
+#
+# _MODEL_CATALOG["higgsfield-ai/soul/standard"] was re-aligned to the real,
+# live-re-vetted official schema: resolution enum 720p/1080p, batch_size
+# (not num_images) enum 1/4, aspect_ratio 7 documented values. The tests
+# below are this repair's required proof (task's required cases 1-9): every
+# documented combination validates and reaches the transport with the exact
+# provider request shape, and every stale/undocumented value is rejected
+# client-side rather than silently translated or forwarded.
+# ===========================================================================
+
+_SOUL_STANDARD = "higgsfield-ai/soul/standard"
+_SOUL_STANDARD_PATH = "/higgsfield-ai/soul/standard"
+
+
+@pytest.mark.parametrize("resolution,batch_size", [
+    ("720p", 1), ("720p", 4), ("1080p", 1), ("1080p", 4),
+])
+def test_submit_soul_standard_documented_resolution_batch_combinations_validate(resolution, batch_size):
+    """Required cases 1-4: every documented (resolution, batch_size) pair
+    validates client-side and reaches the transport."""
+    transport = FakeHiggsfieldTransport()
+    transport.configure("POST", _SOUL_STANDARD_PATH, _json_response(200, {
+        "status": "queued", "request_id": "req-schema-1",
+    }))
+    adapter = ha.HiggsfieldAdapter(transport=transport)
+    request_id, raw_status = adapter.submit(
+        model=_SOUL_STANDARD,
+        settings={"prompt": "x", "resolution": resolution, "batch_size": batch_size},
+        reference_assets=(),
+    )
+    assert request_id == "req-schema-1"
+    assert raw_status == "queued"
+    # Required case 9: the exact provider request shape -- real documented
+    # parameter names only, nothing translated or invented.
+    assert transport.calls[0]["json"] == {
+        "prompt": "x", "resolution": resolution, "batch_size": batch_size,
+    }
+
+
+@pytest.mark.parametrize("stale_resolution", ["2K", "4K"])
+def test_submit_soul_standard_stale_resolution_rejected(stale_resolution):
+    """Required cases 5-6: this catalog's OLD resolution values ('2K'/'4K')
+    are no longer valid -- the real API has never documented them."""
+    adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
+    with pytest.raises(ha.UnsupportedParameterError):
+        adapter.submit(model=_SOUL_STANDARD, settings={"prompt": "x", "resolution": stale_resolution},
+                        reference_assets=())
+
+
+def test_submit_soul_standard_stale_num_images_key_rejected():
+    """Required case 7: the real, current schema has no 'num_images' field
+    for this model (it's 'batch_size') -- never silently translated,
+    rejected as an unknown parameter, not forwarded to the provider."""
+    adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
+    with pytest.raises(ha.UnsupportedParameterError):
+        adapter.submit(model=_SOUL_STANDARD, settings={"prompt": "x", "num_images": 4},
+                        reference_assets=())
+
+
+@pytest.mark.parametrize("bogus_batch_size", [0, 2, 3, 5, True, False, 1.0, "1", None])
+def test_submit_soul_standard_unsupported_batch_size_fails_closed(bogus_batch_size):
+    """Required case 8: only 1 and 4 are real documented batch sizes --
+    every other value, including bool-as-int aliasing (True == 1 in
+    Python), fails closed rather than being silently accepted."""
+    adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
+    with pytest.raises(ha.UnsupportedParameterError):
+        adapter.submit(model=_SOUL_STANDARD, settings={"prompt": "x", "batch_size": bogus_batch_size},
+                        reference_assets=())
+
+
+def test_submit_soul_standard_documented_aspect_ratio_values_validate():
+    """The re-vetted aspect_ratio enum is the real 7-value set -- not the
+    prior catalog's stale 10-value set."""
+    transport = FakeHiggsfieldTransport()
+    transport.configure("POST", _SOUL_STANDARD_PATH, _json_response(200, {
+        "status": "queued", "request_id": "req-schema-2",
+    }))
+    adapter = ha.HiggsfieldAdapter(transport=transport)
+    for ratio in ("9:16", "16:9", "4:3", "3:4", "1:1", "2:3", "3:2"):
+        adapter.submit(model=_SOUL_STANDARD, settings={"prompt": "x", "aspect_ratio": ratio},
+                        reference_assets=())
+
+
+@pytest.mark.parametrize("stale_ratio", ["5:4", "4:5", "21:9", "auto"])
+def test_submit_soul_standard_stale_aspect_ratio_values_rejected(stale_ratio):
+    """The prior catalog's 10-value aspect_ratio set (and nano-banana's own
+    'auto' value) are not part of soul/standard's real, current schema."""
+    adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
+    with pytest.raises(ha.UnsupportedParameterError):
+        adapter.submit(model=_SOUL_STANDARD, settings={"prompt": "x", "aspect_ratio": stale_ratio},
+                        reference_assets=())
+
+
+# ===========================================================================
+# CATALOG TRUTH -- nano-banana decision (required cases 12-14)
+# ===========================================================================
+
+def test_supported_models_advertises_only_soul_standard():
+    """Required case 12: nano-banana removed -- the production catalog
+    tells the truth about what this adapter can actually submit."""
+    assert ha.SUPPORTED_MODELS == ("higgsfield-ai/soul/standard",)
+
+
+def test_nano_banana_no_longer_supported():
+    """Required case 13: nano-banana's OpenAPI route is still technically
+    declared, but a live smoke preflight returned 404 model_not_found and
+    no current official source (dedicated docs page, docs-site search, or
+    the console's live model/pricing catalog) documents it as a supported
+    production model -- removed rather than kept as a known-dead entry.
+    See MULTIMODAL_M4_HIGGSFIELD_CATALOG_SCHEMA_ALIGNMENT_01_2026-09-18.md."""
+    adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
+    assert "nano-banana" not in ha.SUPPORTED_MODELS
+    assert adapter.describe_model("nano-banana") is None
+    with pytest.raises(ha.UnsupportedModelError):
+        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
 
 
 # ===========================================================================
@@ -574,15 +688,43 @@ def test_no_estimate_fail_closed_behavior_remains_intact():
 
 
 # ===========================================================================
-# UPLOAD
+# UPLOAD -- exercised via a test-only synthetic catalog entry.
+#
+# The adapter's real v1 catalog has exactly one model
+# (higgsfield-ai/soul/standard), which does not accept reference images
+# (reference_role=None). nano-banana was the only catalog entry that ever
+# did, and it was removed (see the CATALOG TRUTH section above). The
+# presigned-upload/reference-payload mechanism itself is still real,
+# general adapter code -- not nano-banana-specific -- so it stays covered
+# here via a synthetic, clearly-test-only catalog entry injected through
+# monkeypatch. Never a real Higgsfield model identity; never implies any
+# production model currently accepts a reference image through this
+# adapter.
 # ===========================================================================
+
+_TEST_REFERENCE_MODEL = "test-only/reference-model"
+
+
+@pytest.fixture
+def reference_model(monkeypatch):
+    monkeypatch.setitem(ha._MODEL_CATALOG, _TEST_REFERENCE_MODEL, {
+        "path": "/test-only/reference-model",
+        "capability": Capability.IMAGE_GENERATION.value,
+        "required_params": frozenset({"prompt"}),
+        "optional_params": {},
+        "reference_role": "input_images",
+        "reference_max": 8,
+        "cost_estimate_supported": False,
+    })
+    return _TEST_REFERENCE_MODEL
+
 
 def _ingest_local_reference_artifact():
     job = _succeeded_job(provider_job_id="req-ref-source")
     return ga.ingest_artifact(job.lumina_job_id, b"\x89PNGfake-reference-bytes", "image/png")
 
 
-def test_upload_supported_local_media_full_presigned_flow():
+def test_upload_supported_local_media_full_presigned_flow(reference_model):
     artifact = _ingest_local_reference_artifact()
     transport = FakeHiggsfieldTransport()
     transport.configure("POST", "/files/generate-upload-url", _json_response(200, {
@@ -592,11 +734,12 @@ def test_upload_supported_local_media_full_presigned_flow():
         "upload_headers": {"Content-Type": "image/png", "x-amz-tagging": "retention=temporary"},
     }))
     transport.configure("PUT", "https://storage.example.com/presigned-upload-url", _raw_response(200, b""))
-    transport.configure("POST", "/nano-banana", _json_response(200, {"status": "queued", "request_id": "req-up-1"}))
+    transport.configure("POST", "/test-only/reference-model",
+                         _json_response(200, {"status": "queued", "request_id": "req-up-1"}))
 
     adapter = ha.HiggsfieldAdapter(transport=transport)
     request_id, _ = adapter.submit(
-        model="nano-banana", settings={"prompt": "stylize this"},
+        model=reference_model, settings={"prompt": "stylize this"},
         reference_assets=(("style", artifact.artifact_id),),
     )
     assert request_id == "req-up-1"
@@ -606,13 +749,13 @@ def test_upload_supported_local_media_full_presigned_flow():
     assert upload_call["data"] == b"\x89PNGfake-reference-bytes"
     assert upload_call["headers"] == {"Content-Type": "image/png", "x-amz-tagging": "retention=temporary"}
 
-    submit_call = next(c for c in transport.calls if c["method"] == "POST" and c["path"] == "/nano-banana")
+    submit_call = next(c for c in transport.calls if c["method"] == "POST" and c["path"] == "/test-only/reference-model")
     assert submit_call["json"]["input_images"] == [
         {"type": "image_url", "image_url": "https://cdn.example.com/input/uploaded.png"}
     ]
 
 
-def test_upload_no_local_path_leaked_into_final_request():
+def test_upload_no_local_path_leaked_into_final_request(reference_model):
     artifact = _ingest_local_reference_artifact()
     assert artifact.local_path  # sanity: the artifact really has a local filesystem path
     transport = FakeHiggsfieldTransport()
@@ -623,9 +766,10 @@ def test_upload_no_local_path_leaked_into_final_request():
         "upload_headers": {"Content-Type": "image/png"},
     }))
     transport.configure("PUT", "https://storage.example.com/presigned-upload-url", _raw_response(200, b""))
-    transport.configure("POST", "/nano-banana", _json_response(200, {"status": "queued", "request_id": "req-up-2"}))
+    transport.configure("POST", "/test-only/reference-model",
+                         _json_response(200, {"status": "queued", "request_id": "req-up-2"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
-    adapter.submit(model="nano-banana", settings={"prompt": "x"},
+    adapter.submit(model=reference_model, settings={"prompt": "x"},
                     reference_assets=(("style", artifact.artifact_id),))
     for call in transport.calls:
         serialized = json.dumps({k: v for k, v in call.items() if k != "data"}, default=str)
@@ -640,22 +784,22 @@ def test_upload_rejected_model_without_reference_support():
                         reference_assets=(("identity", artifact.artifact_id),))
 
 
-def test_upload_rejected_too_many_references():
-    artifacts = [_ingest_local_reference_artifact() for _ in range(9)]  # nano-banana max is 8
+def test_upload_rejected_too_many_references(reference_model):
+    artifacts = [_ingest_local_reference_artifact() for _ in range(9)]  # test model max is 8
     adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
     with pytest.raises(ha.UnsupportedParameterError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x"},
+        adapter.submit(model=reference_model, settings={"prompt": "x"},
                         reference_assets=tuple(("ref", a.artifact_id) for a in artifacts))
 
 
-def test_upload_rejects_unknown_artifact_id():
+def test_upload_rejects_unknown_artifact_id(reference_model):
     adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
     with pytest.raises(ga.ArtifactNotFound):
-        adapter.submit(model="nano-banana", settings={"prompt": "x"},
+        adapter.submit(model=reference_model, settings={"prompt": "x"},
                         reference_assets=(("style", "does-not-exist"),))
 
 
-def test_upload_presigned_put_never_receives_higgsfield_auth_header():
+def test_upload_presigned_put_never_receives_higgsfield_auth_header(reference_model):
     """file-uploads.md: 'Do not send Higgsfield API credentials to the
     presigned storage URL.' Proven against the REAL transport (with real
     credential strings) and real `requests` calls, all monkeypatched."""
@@ -689,7 +833,7 @@ def test_upload_presigned_put_never_receives_higgsfield_auth_header():
         transport = ht_module.RequestsHiggsfieldTransport("real-key-id-not-a-fixture", "real-key-secret-not-a-fixture")
         adapter = ha.HiggsfieldAdapter(transport=transport)
         artifact = _ingest_local_reference_artifact()
-        adapter.submit(model="nano-banana", settings={"prompt": "x"},
+        adapter.submit(model=reference_model, settings={"prompt": "x"},
                         reference_assets=(("style", artifact.artifact_id),))
     finally:
         mp.undo()
@@ -857,78 +1001,78 @@ def test_fetch_output_http_error_from_cdn():
 
 def test_error_401_auth_failure():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(401, {"detail": "Invalid credentials"}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(401, {"detail": "Invalid credentials"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert excinfo.value.kind == ha.ERROR_AUTH_FAILURE
     assert excinfo.value.status_code == 401
 
 
 def test_error_403_insufficient_credits():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(403, {"detail": "Insufficient credits"}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(403, {"detail": "Insufficient credits"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert excinfo.value.kind == ha.ERROR_INSUFFICIENT_CREDITS
 
 
 def test_error_400_validation_failure():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(400, {"detail": "Invalid aspect_ratio"}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(400, {"detail": "Invalid aspect_ratio"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert excinfo.value.kind == ha.ERROR_VALIDATION_FAILURE
 
 
 def test_error_400_concurrency_classified_as_rate_limited():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana",
+    transport.configure("POST", "/higgsfield-ai/soul/standard",
                          _json_response(400, {"detail": "Maximum number of concurrent requests (4) has been reached"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert excinfo.value.kind == ha.ERROR_RATE_LIMITED
 
 
 def test_error_422_validation_failure():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(422, {"detail": [{"msg": "field required"}]}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(422, {"detail": [{"msg": "field required"}]}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert excinfo.value.kind == ha.ERROR_VALIDATION_FAILURE
 
 
 def test_error_429_rate_limited_with_retry_after():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana",
+    transport.configure("POST", "/higgsfield-ai/soul/standard",
                          _json_response(429, {"detail": "Too many requests"}, headers={"Retry-After": "30"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert excinfo.value.kind == ha.ERROR_RATE_LIMITED
     assert excinfo.value.retry_after == 30.0
 
 
 def test_error_5xx_provider_error():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(500, {"detail": "Unexpected server error"}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(500, {"detail": "Unexpected server error"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert excinfo.value.kind == ha.ERROR_PROVIDER_ERROR
     assert excinfo.value.status_code == 500
 
 
 def test_error_503_model_unavailable():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(503, {"detail": "Model is disabled or not ready"}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _json_response(503, {"detail": "Model is disabled or not ready"}))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldProviderError) as excinfo:
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
     assert excinfo.value.kind == ha.ERROR_MODEL_UNAVAILABLE
 
 
@@ -940,7 +1084,7 @@ def test_error_timeout(monkeypatch):
     transport = ht.RequestsHiggsfieldTransport("k", "s")
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ht.HiggsfieldTimeoutError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
 
 
 def test_error_connection_failure(monkeypatch):
@@ -951,23 +1095,23 @@ def test_error_connection_failure(monkeypatch):
     transport = ht.RequestsHiggsfieldTransport("k", "s")
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ht.HiggsfieldConnectionError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
 
 
 def test_error_malformed_json_body():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _raw_response(200, b"this is not json"))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _raw_response(200, b"this is not json"))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldMalformedResponseError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
 
 
 def test_error_body_not_json_object():
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _raw_response(200, b"[1, 2, 3]"))
+    transport.configure("POST", "/higgsfield-ai/soul/standard", _raw_response(200, b"[1, 2, 3]"))
     adapter = ha.HiggsfieldAdapter(transport=transport)
     with pytest.raises(ha.HiggsfieldMalformedResponseError):
-        adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+        adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"}, reference_assets=())
 
 
 # ===========================================================================
@@ -976,10 +1120,10 @@ def test_error_body_not_json_object():
 
 def test_describe_model_known():
     adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
-    desc = adapter.describe_model("nano-banana")
+    desc = adapter.describe_model("higgsfield-ai/soul/standard")
     assert desc["provider"] == "higgsfield"
     assert desc["capability"] == Capability.IMAGE_GENERATION.value
-    assert desc["reference_role"] == "input_images"
+    assert desc["reference_role"] is None
     assert "source" in desc and "openapi.json" in desc["source"]
 
 
@@ -995,7 +1139,7 @@ def test_describe_model_never_claims_cli_only_catalog():
     adapter = ha.HiggsfieldAdapter(transport=FakeHiggsfieldTransport())
     assert adapter.describe_model("gpt_image_2_5") is None
     assert adapter.describe_model("brain_activity") is None
-    assert set(ha.SUPPORTED_MODELS) == {"nano-banana", "higgsfield-ai/soul/standard"}
+    assert set(ha.SUPPORTED_MODELS) == {"higgsfield-ai/soul/standard"}
 
 
 # ===========================================================================
@@ -1015,7 +1159,8 @@ def test_offline_law_full_adapter_lifecycle_never_touches_a_socket(monkeypatch):
     monkeypatch.setattr(socket, "socket", _no_sockets)
 
     transport = FakeHiggsfieldTransport()
-    transport.configure("POST", "/nano-banana", _json_response(200, {"status": "queued", "request_id": "req-offline"}))
+    transport.configure("POST", "/higgsfield-ai/soul/standard",
+                         _json_response(200, {"status": "queued", "request_id": "req-offline"}))
     transport.configure("GET", "/requests/req-offline/status", _json_response(200, {
         "status": "completed", "request_id": "req-offline",
         "images": [{"url": "https://cdn.example.com/offline.jpg"}],
@@ -1026,7 +1171,8 @@ def test_offline_law_full_adapter_lifecycle_never_touches_a_socket(monkeypatch):
 
     adapter = ha.HiggsfieldAdapter(transport=transport)
 
-    request_id, raw_status = adapter.submit(model="nano-banana", settings={"prompt": "x"}, reference_assets=())
+    request_id, raw_status = adapter.submit(model="higgsfield-ai/soul/standard", settings={"prompt": "x"},
+                                             reference_assets=())
     assert request_id == "req-offline"
     result = adapter.poll_detailed(request_id)
     assert result.canonical_status == gj.STATUS_SUCCEEDED

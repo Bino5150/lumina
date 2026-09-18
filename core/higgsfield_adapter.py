@@ -33,16 +33,23 @@ this module's own request/response parsing.
 
 REST catalog scope (v1, deliberately narrow -- truthful narrow support
 over fictional broad support, per the CLI-vs-REST catalog gap the API-vet
-report flagged as unreconciled, Sec 14 item 1): only `nano-banana` and
-`higgsfield-ai/soul/standard` are implemented, chosen because between them
-they exercise the two structurally different request shapes the real
-OpenAPI spec actually has for image endpoints -- one with a reference-image
-array (`input_images`) and one prompt-only. The CLI's much larger
+report flagged as unreconciled, Sec 14 item 1): only
+`higgsfield-ai/soul/standard` is implemented as of
+MULTIMODAL-M4-HIGGSFIELD-CATALOG-SCHEMA-ALIGNMENT-01 (2026-09-18), which
+also removed `nano-banana` from this catalog entirely (see the Amendment
+below for the full decision record) -- it no longer accepts a reference-
+image array through this adapter, so `submit()`'s reference/media-upload
+machinery (_build_reference_payload/_resolve_reference/_upload_bytes)
+currently has no catalog entry that exercises it in production; it is kept
+as real, general adapter code (the documented presigned-upload flow is
+model-independent) rather than removed, ready for a future model that
+documents reference-image support with its own vetted evidence -- never
+assumed from soul/standard's own shape. The CLI's much larger
 device-flow-authenticated catalog (23 image models, Marketing Studio,
 Virality Predictor, 3D, audio -- none of it proven against this
-server-credential surface) is intentionally NOT imported here. See
+server-credential surface) remains intentionally NOT imported here. See
 _CATALOG_SOURCE below and MULTIMODAL_M4_HIGGSFIELD_ADAPTER_01_2026-09-17.md
-Sec 3 for the full accounting of what was left out and why.
+Sec 3 for the original accounting of what was left out and why.
 
 Credentials: sourced from core.secrets.get_secret() -- the established,
 already-existing OS-local credential store this project already uses for
@@ -104,6 +111,64 @@ NOT-fixed-here defect: this module's own `_MODEL_CATALOG` entry for
 (resolution "720p"/"1080p", key name "batch_size") -- pricing below is
 keyed to the real documented surface regardless, independent of
 `_MODEL_CATALOG`/`_validate_settings()`.
+
+Amendment (MULTIMODAL-M4-HIGGSFIELD-CATALOG-SCHEMA-ALIGNMENT-01, 2026-09-18):
+the stale `_MODEL_CATALOG` defect the pricing-repair evidence record
+flagged but deliberately left unfixed is repaired here. A fresh fetch of
+docs.higgsfield.ai/docs/higgsfield-ai/soul/standard (re-verified live this
+same day, independent of the pricing-repair campaign's own fetch)
+confirms the real, current input schema: `resolution` is an enum of
+exactly `"720p"`/`"1080p"` (default `"720p"`), `batch_size` (not
+`num_images`) is an enum of exactly `1`/`4` (default `1`), and
+`aspect_ratio` is a 7-value enum (`9:16, 16:9, 4:3, 3:4, 1:1, 2:3, 3:2`,
+default `4:3`) -- not the prior catalog's 10-value set, which included
+`5:4`/`4:5`/`21:9`. `_MODEL_CATALOG["higgsfield-ai/soul/standard"]` now
+matches this exactly; `submit()`'s `_validate_settings()` rejects the old
+`"2K"`/`"4K"`/`num_images` values instead of silently accepting them, and
+`_validate_param_value()`'s enum check was hardened to reject `bool` and
+`float` values against an int-valued enum (`batch_size`) -- Python's
+`True == 1` and `1.0 == 1` would otherwise silently alias either into a
+valid batch size (caught live by this campaign's own new test,
+`test_submit_soul_standard_unsupported_batch_size_fails_closed[1.0]`,
+before it was fixed). The
+model's real, current *additional* optional fields (`style_id`,
+`style_strength`, `enhance_prompt`, `seed`) are deliberately NOT added
+here -- encoding them is real future work, not required by this bounded
+schema-alignment pass, and leaving them out only means this adapter
+under-accepts (fails closed on a genuinely valid extra field) rather than
+over-claims, which is the safe direction for the Model Catalog Truth Law.
+
+This same campaign also removed `nano-banana` from `_MODEL_CATALOG`
+entirely (not merely left unpriced, as the pricing-repair pass did).
+`POST /nano-banana` is still a declared path in the live OpenAPI spec
+(re-fetched and re-diffed this same day: 50 paths, `/nano-banana` present,
+tag "Nano Banana", schema unchanged from the pricing-repair campaign's own
+capture), but MULTIMODAL-M4-HIGGSFIELD-LIVE-SMOKE-01 (the same day, prior
+campaign) recorded a live account-authenticated call against it returning
+HTTP 404 `{"detail":"model_not_found"}` -- the real server refuses the
+model the spec still declares. Cross-checked again live in this pass:
+`docs.higgsfield.ai/docs/nano-banana` 404s with zero "did you mean"
+suggestions (contrast `/docs/higgsfield-ai/soul/standard`, which 404s but
+suggests three real SOUL pages -- nano-banana has no docs-site presence to
+redirect from at all), the docs-site search returns zero indexed hits for
+"nano-banana", and open.higgsfield.ai's live public model/pricing
+catalog -- which does list "higgsfield / Soul Standard -- from $0.0938 /
+img", confirming that catalog is current -- contains no "banana" entry of
+any kind. Four independent, convergent signals (dead live endpoint, no
+docs page, no docs-search hit, no pricing-catalog entry), none of them
+merely re-read from a prior report, all re-obtained fresh this same day.
+This is category (C) from this campaign's own decision rubric --
+obsolete/removed from the current production API, despite an undeleted
+spec entry -- not a rename (no evidence points at any successor identity)
+and not "impossible to establish" (the evidence converges cleanly).
+`_MODEL_CATALOG` and `SUPPORTED_MODELS` no longer contain it;
+`describe_model("nano-banana")` returns `None`; `submit()` raises
+`UnsupportedModelError` for it exactly like any other unknown model
+string -- an endpoint the live server itself refuses is a dead one, not a
+truthfully "supported" one, per this module's Model Catalog Truth Law. No
+alias or replacement identity is substituted -- none is evidenced. See
+MULTIMODAL_M4_HIGGSFIELD_CATALOG_SCHEMA_ALIGNMENT_01_2026-09-18.md for the
+full record.
 """
 from __future__ import annotations
 
@@ -240,38 +305,30 @@ def _parse_retry_after(headers: Mapping[str, str]) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 CATALOG_SOURCE = (
-    "https://docs.higgsfield.ai/docs/openapi.json -- openapi 3.1.0, "
-    "info.title='Higgsfield API', info.version='2.0.0'. Fetched during "
-    "MULTIMODAL-M4-HIGGSFIELD-API-VET-01 (2026-09-17) and re-fetched "
-    "immediately before this module was written (also 2026-09-17) -- "
-    "byte-identical, zero drift between the two fetches."
+    "https://docs.higgsfield.ai/docs/openapi.json (openapi 3.1.0, "
+    "info.title='Higgsfield API', info.version='2.0.0') and "
+    "https://docs.higgsfield.ai/docs/higgsfield-ai/soul/standard (model "
+    "reference page, live input-schema source of truth). Fetched during "
+    "MULTIMODAL-M4-HIGGSFIELD-API-VET-01 (2026-09-17), re-fetched "
+    "immediately before HiggsfieldAdapter was first written (also "
+    "2026-09-17) -- byte-identical, zero drift -- and re-fetched again "
+    "during MULTIMODAL-M4-HIGGSFIELD-CATALOG-SCHEMA-ALIGNMENT-01 "
+    "(2026-09-18) to correct this catalog's own stale soul/standard "
+    "parameter values and to re-confirm nano-banana's removal; the "
+    "openapi.json path list was unchanged, the soul/standard schema page "
+    "confirmed resolution/batch_size/aspect_ratio exactly as encoded below."
 )
 
 _MODEL_CATALOG: Mapping[str, dict] = {
-    "nano-banana": {
-        "path": "/nano-banana",
-        "capability": Capability.IMAGE_GENERATION.value,
-        "required_params": frozenset({"prompt"}),
-        "optional_params": {
-            "num_images": {"type": "integer", "minimum": 1, "maximum": 4},
-            "aspect_ratio": {"type": "enum", "values": (
-                "auto", "1:1", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9",
-            )},
-            "output_format": {"type": "enum", "values": ("jpeg", "png")},
-        },
-        "reference_role": "input_images",
-        "reference_max": 8,
-        "cost_estimate_supported": True,
-    },
     "higgsfield-ai/soul/standard": {
         "path": "/higgsfield-ai/soul/standard",
         "capability": Capability.IMAGE_GENERATION.value,
         "required_params": frozenset({"prompt"}),
         "optional_params": {
-            "num_images": {"type": "integer", "minimum": 1, "maximum": 4},
-            "resolution": {"type": "enum", "values": ("2K", "4K")},
+            "batch_size": {"type": "enum", "values": (1, 4)},
+            "resolution": {"type": "enum", "values": ("720p", "1080p")},
             "aspect_ratio": {"type": "enum", "values": (
-                "1:1", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9",
+                "9:16", "16:9", "4:3", "3:4", "1:1", "2:3", "3:2",
             )},
         },
         "reference_role": None,
@@ -289,9 +346,12 @@ SUPPORTED_MODELS = tuple(sorted(_MODEL_CATALOG))
 # on 2026-09-18 -- see MULTIMODAL_M4_HIGGSFIELD_PRICING_REPAIR_01_2026-09-18.md
 # for the full evidence record (this module's own docstring amendment above
 # has the short version). Deliberately keyed to the REAL documented parameter
-# surface (resolution "720p"/"1080p", "batch_size"), not to this file's own
-# (stale, unfixed-here) _MODEL_CATALOG validation values -- see that same
-# evidence doc Sec 4. A model absent from this table (e.g. "nano-banana") is
+# surface (resolution "720p"/"1080p", "batch_size") -- as of
+# MULTIMODAL-M4-HIGGSFIELD-CATALOG-SCHEMA-ALIGNMENT-01 (2026-09-18) this is
+# also exactly what _MODEL_CATALOG/_validate_settings() now accept, closing
+# the gap the pricing-repair evidence doc's Sec 4 originally flagged (this
+# table was always independent of _MODEL_CATALOG by design and needed no
+# change itself). A model absent from this table (e.g. "nano-banana") is
 # never priced by guesswork; PRICE_TABLE.get(model) returning None is the
 # correct, honest outcome, not a bug.
 PRICE_TABLE: Mapping[str, dict] = {
@@ -308,7 +368,11 @@ PRICE_TABLE: Mapping[str, dict] = {
     # source (dedicated docs page, docs-site search, or the console's live
     # model/pricing catalog) verifies its identity or price as of
     # 2026-09-18, even though its raw generation path still appears in the
-    # OpenAPI catalog. See the evidence doc for the full absence trail.
+    # OpenAPI catalog -- and, as of MULTIMODAL-M4-HIGGSFIELD-CATALOG-SCHEMA-
+    # ALIGNMENT-01 (same day), it is no longer in _MODEL_CATALOG /
+    # SUPPORTED_MODELS at all (a live smoke preflight found the real server
+    # itself returns 404 model_not_found for it). See the evidence docs for
+    # the full absence trail.
 }
 
 
@@ -366,9 +430,17 @@ def _validate_param_value(key: str, value, spec: dict, *, model: str) -> None:
         if (lo is not None and value < lo) or (hi is not None and value > hi):
             raise UnsupportedParameterError(f"{model}: {key!r}={value!r} outside [{lo}, {hi}]")
     elif kind == "enum":
-        if value not in spec["values"]:
+        values = spec["values"]
+        # bool and float alias into Python's numeric equality (True == 1,
+        # 1.0 == 1) -- an int-valued enum (e.g. batch_size's (1, 4)) must
+        # only ever accept a genuine int, never a look-alike.
+        if any(_is_real_int(v) for v in values) and not _is_real_int(value):
             raise UnsupportedParameterError(
-                f"{model}: {key!r}={value!r} not one of {spec['values']}"
+                f"{model}: {key!r}={value!r} not one of {values}"
+            )
+        if value not in values:
+            raise UnsupportedParameterError(
+                f"{model}: {key!r}={value!r} not one of {values}"
             )
 
 
