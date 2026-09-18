@@ -2,6 +2,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckB
 from PySide6.QtCore import Signal, QTimer
 
 import os, sys, threading
+from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
 from core import persistence
@@ -388,6 +389,28 @@ class MultimodalTab(QWidget):
         self._image_route_template = (
             dict(raw_image_route) if isinstance(raw_image_route, dict) else {}
         )
+        # MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 (post-review fix):
+        # absence of an image_generation route must stay absence until the
+        # owner deliberately configures this capability -- opening Settings
+        # and saving an UNRELATED field must never silently admit a new,
+        # potentially cost-bearing route. Mirrors vision_understanding's own
+        # `_vision_route_present` contract exactly.
+        self._image_route_present = (
+            isinstance(raw_routes, dict) and "image_generation" in raw_routes
+        )
+
+        image_mode_row = QHBoxLayout()
+        image_mode_col = QVBoxLayout()
+        image_mode_col.addWidget(_lbl("Route mode", self.c))
+        self.image_mode_combo = _combo(self.c)
+        self.image_mode_combo.addItem("Disabled", "disabled")
+        self.image_mode_combo.addItem("Specialist", "specialist")
+        image_mode = image_route.mode if image_route is not None else "disabled"
+        self.image_mode_combo.setCurrentIndex(self.image_mode_combo.findData(image_mode))
+        image_mode_col.addWidget(self.image_mode_combo)
+        image_mode_row.addLayout(image_mode_col, 1)
+        image_mode_row.addStretch(2)
+        layout.addLayout(image_mode_row)
 
         image_row = QHBoxLayout()
         image_row.setSpacing(12)
@@ -439,6 +462,9 @@ class MultimodalTab(QWidget):
         )
         image_pricing_note.setWordWrap(True)
         layout.addWidget(image_pricing_note)
+
+        self.image_mode_combo.currentIndexChanged.connect(self._sync_image_controls)
+        self._sync_image_controls()
 
         hf_note = _lbl(
             "API credentials for the Higgsfield image-generation adapter. "
@@ -559,6 +585,11 @@ class MultimodalTab(QWidget):
         self.vision_model_combo.setEnabled(enabled)
         self._refresh_vision_model()
 
+    def _sync_image_controls(self, *_args):
+        enabled = self.image_mode_combo.currentData() != "disabled"
+        self.image_provider_combo.setEnabled(enabled)
+        self.image_model_combo.setEnabled(enabled)
+
     # ── Higgsfield credentials ──
     # Deliberately its own Save action, independent of the tab-wide "Save
     # Settings" button below (which persists TTS/STT/vision-route state to
@@ -656,19 +687,38 @@ class MultimodalTab(QWidget):
         disabled = self._csv_values(self.vision_disabled_providers.text())
         return routes, disabled
 
-    def _image_generation_settings_payload(self) -> dict:
-        """The persisted image_generation route. Unlike vision_understanding
-        there is no Disabled/Auto mode here and no provider-global default
-        to fall back to (Higgsfield is not a conversational backend) -- the
-        Provider/Model controls always have a concrete selection, so the
-        route is always written as an explicit "specialist" binding.
+    def _image_generation_settings_payload(self) -> Optional[dict]:
+        """The persisted image_generation route, or ``None`` when it must
+        stay absent.
+
+        Absence-preservation law (mirrors vision_understanding's own
+        ``_vision_route_present`` contract exactly): opening Multimodal
+        Settings and saving an UNRELATED field must never silently admit a
+        new, potentially cost-bearing capability route. A never-configured
+        Route mode of "Disabled" therefore stays absent from
+        ``multimodal_routes`` entirely -- not merely persisted with
+        ``mode: "disabled"`` -- so a caller reading raw prefs sees exactly
+        the same "unconfigured" shape as before this campaign. Once the
+        route IS present (owner previously enabled it, or enables it this
+        save), an explicit disable is recorded truthfully rather than
+        erased, exactly like vision's own rule.
+
         Canonical identifiers only (never the friendly Model label)."""
+        mode = self.image_mode_combo.currentData()
         provider = self.image_provider_combo.currentData() or self.image_provider_combo.currentText().strip()
         model = self.image_model_combo.currentData() or self.image_model_combo.currentText().strip()
+
+        if not self._image_route_present and mode == "disabled":
+            return None
+
         route = dict(self._image_route_template)
-        route["mode"] = "specialist"
-        route["specialist"] = provider
-        route["model"] = model
+        route["mode"] = mode
+        if mode == "disabled":
+            route.pop("specialist", None)
+            route.pop("model", None)
+        else:
+            route["specialist"] = provider
+            route["model"] = model
         return route
 
     _BACKEND_URLS = {
@@ -759,7 +809,11 @@ class MultimodalTab(QWidget):
             self.status_lbl.setText(str(exc))
             return
         multimodal_routes = dict(multimodal_routes)
-        multimodal_routes["image_generation"] = self._image_generation_settings_payload()
+        image_route = self._image_generation_settings_payload()
+        if image_route is None:
+            multimodal_routes.pop("image_generation", None)
+        else:
+            multimodal_routes["image_generation"] = image_route
         if not self._try_enter_busy():
             return
         self.test_btn.setEnabled(False)

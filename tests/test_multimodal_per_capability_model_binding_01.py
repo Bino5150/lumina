@@ -24,6 +24,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 
 import config
+from core import persistence as persistence_module
 import core.backends.loader as loader_module
 import core.generation_manifest as gm
 import core.generation_spending_policy as sp
@@ -410,6 +411,108 @@ def test_soul_standard_appears_and_nano_banana_does_not():
     assert "Soul Standard" in labels
     assert "nano-banana" not in model_ids
     assert not any("banana" in (label or "").lower() for label in labels)
+
+
+def test_image_generation_route_defaults_disabled_and_unadmitted():
+    """A never-configured install: the Route mode control itself defaults
+    to Disabled -- the same explicit, deliberate-opt-in mechanism
+    vision_understanding already has."""
+    pytest.importorskip("PySide6")
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from ui.settings.tts_tab import MultimodalTab
+    from ui.main_window import COLORS
+
+    app = QApplication.instance() or QApplication([])
+    tab = MultimodalTab(SimpleNamespace(tts=SimpleNamespace(enabled=True)), COLORS)
+    assert tab.image_mode_combo.currentData() == "disabled"
+    assert not tab.image_provider_combo.isEnabled()
+    assert not tab.image_model_combo.isEnabled()
+
+
+def test_unrelated_settings_save_never_admits_image_generation(monkeypatch, tmp_path):
+    """THE regression this section exists to prevent: an existing user with
+    no image_generation route, opening Multimodal Settings and saving for
+    an unrelated reason (here: nothing at all is touched), must not
+    acquire a newly-admitted, potentially cost-bearing capability route.
+    Absence must stay absence until the owner deliberately flips Route
+    mode to Specialist -- mirrors vision_understanding's own
+    already-established contract exactly."""
+    pytest.importorskip("PySide6")
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from ui.settings.tts_tab import MultimodalTab
+    from ui.main_window import COLORS
+
+    monkeypatch.setattr(persistence_module, "PREFS_PATH", str(tmp_path / "prefs.json"))
+    monkeypatch.setattr(config, "MULTIMODAL_ROUTES", {})
+    monkeypatch.setattr(config, "MULTIMODAL_DISABLED_PROVIDERS", [])
+
+    app = QApplication.instance() or QApplication([])
+    tab = MultimodalTab(SimpleNamespace(tts=SimpleNamespace(enabled=True)), COLORS)
+    tab._save()
+
+    assert "image_generation" not in config.MULTIMODAL_ROUTES
+    assert "image_generation" not in persistence_module.load()["multimodal_routes"]
+    assert svc.resolve_image_generation_target() is None
+
+
+def test_deliberate_route_mode_change_is_what_admits_the_route(monkeypatch, tmp_path):
+    """The flip side: once the owner deliberately selects Specialist mode
+    and saves, the route DOES persist and DOES resolve/admit -- this is
+    the one and only way the capability becomes reachable."""
+    pytest.importorskip("PySide6")
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from ui.settings.tts_tab import MultimodalTab
+    from ui.main_window import COLORS
+
+    monkeypatch.setattr(persistence_module, "PREFS_PATH", str(tmp_path / "prefs.json"))
+    monkeypatch.setattr(config, "MULTIMODAL_ROUTES", {})
+    monkeypatch.setattr(config, "MULTIMODAL_DISABLED_PROVIDERS", [])
+
+    app = QApplication.instance() or QApplication([])
+    tab = MultimodalTab(SimpleNamespace(tts=SimpleNamespace(enabled=True)), COLORS)
+    tab.image_mode_combo.setCurrentIndex(tab.image_mode_combo.findData("specialist"))
+    tab._save()
+
+    assert config.MULTIMODAL_ROUTES["image_generation"] == {
+        "mode": "specialist", "specialist": "higgsfield",
+        "model": "higgsfield-ai/soul/standard",
+    }
+    target = svc.resolve_image_generation_target()
+    assert target is not None
+    assert (target.specialist, target.model) == ("higgsfield", "higgsfield-ai/soul/standard")
+
+
+def test_already_enabled_route_survives_an_unrelated_save(monkeypatch, tmp_path):
+    """The mirror image: an owner who already enabled Image Generation in
+    a prior session must not lose it merely by saving an unrelated field
+    later -- absence-preservation only ever protects a NEVER-configured
+    route, never an already-configured one."""
+    pytest.importorskip("PySide6")
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from ui.settings.tts_tab import MultimodalTab
+    from ui.main_window import COLORS
+
+    monkeypatch.setattr(persistence_module, "PREFS_PATH", str(tmp_path / "prefs.json"))
+    monkeypatch.setattr(config, "MULTIMODAL_ROUTES", {
+        "image_generation": {
+            "mode": "specialist", "specialist": "higgsfield",
+            "model": "higgsfield-ai/soul/standard",
+        },
+    })
+    monkeypatch.setattr(config, "MULTIMODAL_DISABLED_PROVIDERS", [])
+
+    app = QApplication.instance() or QApplication([])
+    tab = MultimodalTab(SimpleNamespace(tts=SimpleNamespace(enabled=True)), COLORS)
+    tab._save()
+
+    assert config.MULTIMODAL_ROUTES["image_generation"] == {
+        "mode": "specialist", "specialist": "higgsfield",
+        "model": "higgsfield-ai/soul/standard",
+    }
 
 
 def test_persisted_image_generation_selection_resolves_via_m1(monkeypatch):

@@ -160,21 +160,16 @@ def test_multimodal_save_round_trips_speech_and_writes_only_existing_vision_seam
     assert saved["stt_backend"] == "faster-whisper"
     assert saved["stt_model"] == "small"
     assert saved["stt_device"] == "cpu"
+    # image_generation stays absent: it was never configured before this
+    # save and Route mode was never touched away from "Disabled" --
+    # MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01's absence-preservation
+    # law (mirrors vision_understanding's own contract exactly).
     assert saved["multimodal_routes"] == {
         "vision_understanding": {
             "mode": "specialist",
             "specialist": "gemini",
             "fallbacks": ["openai", "qwen"],
             "quality_floor": "high",
-        },
-        # image_generation is now always written on every save
-        # (MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01): unlike vision there
-        # is no Disabled mode and no provider-global default to fall back
-        # to, so Provider/Model always resolve to a concrete selection.
-        "image_generation": {
-            "mode": "specialist",
-            "specialist": "higgsfield",
-            "model": "higgsfield-ai/soul/standard",
         },
     }
     assert saved["multimodal_disabled_providers"] == ["deepseek"]
@@ -212,19 +207,14 @@ def test_speech_only_save_preserves_absent_default_disabled_vision_route(
     tab = MultimodalTab(_agent(), COLORS)
     tab._save()
 
-    # vision_understanding stays absent (untouched, still Disabled/no
-    # provider) -- image_generation is always written on every save
-    # (MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01: no Disabled mode, no
-    # provider-global default to preserve absence against).
-    assert "vision_understanding" not in config.MULTIMODAL_ROUTES
-    assert config.MULTIMODAL_ROUTES == {
-        "image_generation": {
-            "mode": "specialist",
-            "specialist": "higgsfield",
-            "model": "higgsfield-ai/soul/standard",
-        },
-    }
-    assert persistence.load()["multimodal_routes"] == config.MULTIMODAL_ROUTES
+    # Both vision_understanding AND image_generation stay absent: neither
+    # was configured before this save, and neither Route mode control was
+    # touched away from "Disabled" (MULTIMODAL-PER-CAPABILITY-MODEL-
+    # BINDING-01's absence-preservation law applies identically to both
+    # capabilities -- opening Settings and saving an unrelated field must
+    # never silently admit a new, potentially cost-bearing route).
+    assert config.MULTIMODAL_ROUTES == {}
+    assert persistence.load()["multimodal_routes"] == {}
 
 
 def test_multimodal_page_degrades_vertically_without_horizontal_scrolling(
