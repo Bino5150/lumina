@@ -9,29 +9,18 @@ from core import persistence
 
 from ._widgets import _sec, _lbl, _le, _btn, _combo, _scroll_wrap, ButtonFeedback, safe_error_detail
 
-
-# ── Image Generation -- Higgsfield display-only model labels ───────────────
-# MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01: cosmetic labels ONLY, keyed by
-# the canonical model identifiers core.higgsfield_adapter.SUPPORTED_MODELS
-# already owns. This is deliberately NOT a second model catalog -- it adds
-# no model, no capability, no parameter, no pricing fact; an id missing from
-# this dict just displays as itself (see _higgsfield_model_label() below).
-# Persistence/invocation always use the canonical id, never this label.
-_HIGGSFIELD_MODEL_LABELS = {
-    "higgsfield-ai/soul/standard": "Soul Standard",
-}
-
-# Source-vetted 2026-09-18 (see project-evidence/campaign-reports/
-# MULTIMODAL_M4_HIGGSFIELD_PRICING_REPAIR_01_2026-09-18.md Sec 2): the
-# official public Higgsfield model/pricing marketplace -- lists every
-# current model's live price, so this link stays correct even if a future
-# model is added here without a Settings code change. No API key, no
-# account identifier, no query string -- a bare, static, official URL.
-_HIGGSFIELD_PRICING_URL = "https://console.higgsfield.ai"
-
-
-def _higgsfield_model_label(model_id: str) -> str:
-    return _HIGGSFIELD_MODEL_LABELS.get(model_id, model_id)
+# MULTIMODAL-PER-CAPABILITY-MODEL-BINDING-01 (CI repair): the Higgsfield
+# display-only label map and pricing URL live in ui.multimodal_display --
+# a Qt-free module outside the ui.settings package -- specifically so pure
+# data/constant tests can import them without pulling in PySide6 (importing
+# ANY ui.settings submodule runs ui/settings/__init__.py first, which
+# unconditionally imports every Settings tab). Re-imported under their
+# original private names here so nothing else in this file needs to change.
+from ui.multimodal_display import (
+    HIGGSFIELD_MODEL_LABELS as _HIGGSFIELD_MODEL_LABELS,
+    HIGGSFIELD_PRICING_URL as _HIGGSFIELD_PRICING_URL,
+    higgsfield_model_label as _higgsfield_model_label,
+)
 
 
 # ── Tab: Multimodal ────────────────────────────────────────────────────────────

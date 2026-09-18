@@ -65,9 +65,15 @@ def test_model_override_persists_and_reloads_through_parse_routes():
 
 
 def test_canonical_identifiers_stored_not_friendly_labels():
-    from ui.settings.tts_tab import _higgsfield_model_label
+    # Deliberately NOT imported from ui.settings.tts_tab: that module (and
+    # any ui.settings submodule) drags in PySide6 as a side effect of
+    # ui/settings/__init__.py's own unconditional tab imports, so a pure
+    # data assertion like this one must not depend on Qt being installed
+    # (this exact gap broke headless CI -- see ui.multimodal_display's
+    # own docstring for why the helper lives there instead).
+    from ui.multimodal_display import higgsfield_model_label
 
-    assert _higgsfield_model_label("higgsfield-ai/soul/standard") == "Soul Standard"
+    assert higgsfield_model_label("higgsfield-ai/soul/standard") == "Soul Standard"
     # The canonical id itself is what a route stores/resolves -- the
     # friendly label is display-only and never round-trips through
     # persistence or resolve_capability_target().
@@ -662,18 +668,20 @@ def test_resolver_driven_generation_reaches_real_artifact_and_manifest(monkeypat
 # ---------------------------------------------------------------------------
 
 def test_pricing_link_targets_vetted_official_url():
-    from ui.settings.tts_tab import _HIGGSFIELD_PRICING_URL
+    # Same Qt-free import as above -- this is a pure constant, not a UI
+    # rendering assertion, so it must not require PySide6.
+    from ui.multimodal_display import HIGGSFIELD_PRICING_URL
 
-    assert _HIGGSFIELD_PRICING_URL == "https://console.higgsfield.ai"
-    assert _HIGGSFIELD_PRICING_URL.startswith("https://")
+    assert HIGGSFIELD_PRICING_URL == "https://console.higgsfield.ai"
+    assert HIGGSFIELD_PRICING_URL.startswith("https://")
 
 
 def test_pricing_link_contains_no_secrets_or_query_string():
-    from ui.settings.tts_tab import _HIGGSFIELD_PRICING_URL
+    from ui.multimodal_display import HIGGSFIELD_PRICING_URL
 
-    assert "?" not in _HIGGSFIELD_PRICING_URL
+    assert "?" not in HIGGSFIELD_PRICING_URL
     for marker in ("key", "secret", "token", "@"):
-        assert marker not in _HIGGSFIELD_PRICING_URL.lower()
+        assert marker not in HIGGSFIELD_PRICING_URL.lower()
 
 
 def test_clicking_pricing_button_does_not_mutate_provider_settings(monkeypatch, tmp_path):
