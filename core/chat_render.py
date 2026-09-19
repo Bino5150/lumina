@@ -6,7 +6,43 @@ ui.chat_widget, which pulls in PySide6 at module level, and CI's test job
 deliberately never installs it).
 """
 
+import os
 import re
+import urllib.parse
+
+# MEDIA-GENERATION-CONVERSATIONAL-RUNTIME-01 — the chat surface had no
+# outbound image primitive at all: md_to_html() handled headers/bold/
+# italic/tables/`[text](link)` but never `![alt](path)`, so a generated
+# image's local path had no way to actually render in a response bubble
+# (QTextBrowser natively renders a local `<img src="file://...">`, so this
+# is the smallest correct addition rather than a new widget or IPC path).
+# Deliberately file:// ONLY — never http(s) — so text a model might echo
+# from an untrusted source (a fetched web page, provider-supplied text)
+# can never turn into a live network image request from this renderer;
+# see core/image_generation_service.py's "remote URL is never durable"
+# law, mirrored here as "remote URL is never rendered." A path that
+# doesn't resolve to a real local file is left completely untouched
+# (falls through to the existing link-rendering behavior below) rather
+# than ever claiming an image exists when it doesn't.
+_LOCAL_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(file://([^)\s]+)\)')
+
+
+def _convert_local_images(text: str) -> str:
+    def _replace(match: re.Match) -> str:
+        alt, raw_path = match.group(1), match.group(2)
+        path = urllib.parse.unquote(raw_path)
+        if not os.path.isfile(path):
+            return match.group(0)
+        safe_alt = (
+            alt.replace('&', '&amp;').replace('<', '&lt;')
+               .replace('>', '&gt;').replace('"', '&quot;')
+        )
+        src = 'file://' + urllib.parse.quote(path)
+        return (
+            f'<img src="{src}" alt="{safe_alt}" '
+            'style="max-width:100%;border-radius:6px;margin:6px 0;display:block;">'
+        )
+    return _LOCAL_IMAGE_RE.sub(_replace, text)
 
 
 def _diff_to_html(code: str) -> str:
@@ -52,6 +88,11 @@ def md_to_html(text: str, colors: dict) -> str:
                 result.append(f'<code style="background:#0d1117;padding:2px 5px;border-radius:3px;font-family:monospace;font-size:12px;">{code}</code>')
         else:
             p = part
+            # Must run before the `[text](url)` link regex below — that
+            # regex doesn't care about a leading `!`, so it would otherwise
+            # consume `![alt](file://...)` first and leave a stray `!` plus
+            # a clickable link instead of an image.
+            p = _convert_local_images(p)
             p = re.sub(r'^### (.+)$', rf'<h4 style="color:{colors["accent"]};margin:8px 0 4px;">\1</h4>', p, flags=re.MULTILINE)
             p = re.sub(r'^## (.+)$',  rf'<h3 style="color:{colors["accent"]};margin:10px 0 4px;">\1</h3>', p, flags=re.MULTILINE)
             p = re.sub(r'^# (.+)$',   rf'<h2 style="color:{colors["accent"]};margin:12px 0 4px;">\1</h2>', p, flags=re.MULTILINE)

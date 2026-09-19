@@ -168,6 +168,16 @@ TOOL_TIERS = {
     # non-owner session these tools, this tier is what PIN-gates them
     # instead of letting them fire free.
     "send_telegram_file": "outbound_action", "send_telegram_message": "outbound_action",
+
+    # MEDIA-GENERATION-CONVERSATIONAL-RUNTIME-01: real paid external API
+    # calls (Higgsfield). estimate_image_generation never spends but still
+    # reaches out to resolve a live route/adapter; generate_image is the
+    # one call in the entire registry that spends real owner money. Tier
+    # here documents that outbound-action semantics; OWNER_ONLY_TOOLS below
+    # is what actually enforces the exclusion for any non-owner path
+    # (including a subagent's profile/tools_enabled), same split as every
+    # other owner-only tool in this file.
+    "estimate_image_generation": "outbound_action", "generate_image": "outbound_action",
 }
 
 # Hard-excluded from every non-owner session, independent of tier, independent
@@ -204,6 +214,15 @@ OWNER_ONLY_TOOLS = {
     # calling agent's own in-memory ProjectContextState and stay available
     # to a non-owner session that's been explicitly granted them.
     "set_project_root",
+    # MEDIA-GENERATION-CONVERSATIONAL-RUNTIME-01: cost-bearing, real-money
+    # calls to a paid external provider. core/agent.py already never
+    # registers these for a non-owner top-level session (same `if owner:`
+    # hard exclusion as create_tool/delete_tool above); this is the second,
+    # independent axis that also strips them from a subagent's profile/
+    # tools_enabled regardless of what's requested -- trust does not
+    # transitively inherit just because the owner session that spawned the
+    # subagent is trusted.
+    "estimate_image_generation", "generate_image",
     # CODING-02B-A1: create_project also calls save_project_binding()
     # directly (tools/projects.py) -- it writes the exact same
     # DATA_DIR/projects/<name>/binding.json as set_project_root, so it must

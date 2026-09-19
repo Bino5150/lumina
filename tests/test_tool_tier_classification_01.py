@@ -305,8 +305,12 @@ def test_newly_classified_tool_not_resurrected_by_profile_application(
 # ── 5. Owner-only boundary intact ────────────────────────────────────────
 
 def test_owner_only_boundary_frozen():
-    """The owner-only set itself is unchanged by this slice, and none of
-    the newly classified tools are (or may become) owner-only."""
+    """The owner-only set is unchanged by THIS slice (TOOL-TIER-
+    CLASSIFICATION-01), and none of the newly classified tools are (or may
+    become) owner-only. estimate_image_generation/generate_image were
+    added later, by MEDIA-GENERATION-CONVERSATIONAL-RUNTIME-01 -- a real,
+    deliberate expansion (the only two real-money tools in the registry),
+    not drift; see core/tool_profiles.py's own comment on that addition."""
     assert OWNER_ONLY_TOOLS == {
         "create_tool", "list_custom_tools", "delete_tool",
         "list_pending_tools", "show_pending_tool_source", "reject_pending_tool",
@@ -318,6 +322,7 @@ def test_owner_only_boundary_frozen():
         "create_worktree", "list_worktrees", "remove_worktree",
         "set_project_root",
         "create_project",
+        "estimate_image_generation", "generate_image",
     }
     assert NEWLY_CLASSIFIED.isdisjoint(OWNER_ONLY_TOOLS)
 

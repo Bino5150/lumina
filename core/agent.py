@@ -1667,6 +1667,12 @@ class LuminaAgent:
             # exist in the registry at all. Not disabled, not absent from a
             # profile — absent from _tools, period.
             register_toolmaker_tools(self.registry, self)
+            # MEDIA-GENERATION-CONVERSATIONAL-RUNTIME-01 — same hard exclusion,
+            # for the same reason: this is the only capability in the registry
+            # that spends real money, so it must never exist at all for a
+            # non-owner/subagent session, not merely be disabled.
+            from tools.image_generation import register_image_generation_tools
+            register_image_generation_tools(self.registry)
         register_palace_tools(self.registry)
         from tools.pin import register_pin_tools
         register_pin_tools(self.registry, channel_id)
