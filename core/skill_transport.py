@@ -30,13 +30,12 @@ with content+ownership so a same-name-different-payload package (or a
 same-name-different-origin package) fails closed instead of silently
 replacing what's installed (T7/T8/T9).
 
-One function here breaks the "never ambient config" rule on purpose:
-ensure_official_skills_bootstrapped() is the real-process-startup entry
-point (wired into main.py's run_cli()/run_gui() and core/headless.py's
+ensure_official_skills_bootstrapped() is the real-process-startup wrapper
+(wired into main.py's run_cli()/run_gui() and core/headless.py's
 get_headless_agent(), never into LuminaAgent.__init__ itself -- see that
-function's own docstring for why). It resolves config.DATA_DIR/config.DB_PATH
-the same way write_skill()/list_skills() already legitimately do for
-interactive, single-machine use.
+function's own docstring for why). Its callers must pass data_dir and db_path
+explicitly. A standalone harness therefore cannot silently fall back to the
+owner's platformdirs runtime merely because LUMINA_DATA_DIR was omitted.
 """
 
 import contextlib
@@ -44,6 +43,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from datetime import datetime
@@ -86,6 +86,91 @@ REQUIRED_MANIFEST_FIELDS = {
 ALLOWED_ORIGINS = {"official", "user"}
 _NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 _.,:()/-]{0,199}$')
 _SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+MAX_SKILL_PAYLOAD_BYTES = 262144
+MAX_PACKAGE_MANIFEST_BYTES = 65536
+_BOUNDED_READ_CHUNK_BYTES = 65536
+
+
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise PackageValidationError(
+                "duplicate_metadata", f"manifest.json contains duplicate field {key!r}"
+            )
+        result[key] = value
+    return result
+
+
+def _read_bounded_regular_file(path: str, *, max_bytes: int, label: str,
+                               missing_code: str, too_large_code: str) -> bytes:
+    """Read at most max_bytes + 1 from one descriptor-bound regular file.
+
+    lstat + O_NOFOLLOW + inode comparison closes pathname/symlink swaps before
+    the read. fstat rejects an already-oversized object without reading it;
+    the bounded descriptor read remains authoritative if the same inode grows
+    or shrinks after that check.
+    """
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError:
+        raise PackageValidationError(missing_code, f"{label} not found: {path}")
+    except OSError as e:
+        raise PackageValidationError(missing_code, f"Cannot inspect {label} at {path}: {e}")
+
+    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+        raise PackageValidationError(
+            "path_unsafe", f"{label} must be a regular, non-symlink file: {path}"
+        )
+    if path_stat.st_size > max_bytes:
+        raise PackageValidationError(
+            too_large_code,
+            f"{label} is {path_stat.st_size} bytes; maximum is {max_bytes}",
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as e:
+        raise PackageValidationError(
+            "path_unsafe", f"Cannot safely open {label} at {path}: {e}"
+        )
+
+    try:
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise PackageValidationError(
+                "path_unsafe", f"{label} changed to a non-regular file: {path}"
+            )
+        if ((opened_stat.st_dev, opened_stat.st_ino)
+                != (path_stat.st_dev, path_stat.st_ino)):
+            raise PackageValidationError(
+                "source_changed", f"{label} changed between lstat and open: {path}"
+            )
+        if opened_stat.st_size > max_bytes:
+            raise PackageValidationError(
+                too_large_code,
+                f"{label} is {opened_stat.st_size} bytes; maximum is {max_bytes}",
+            )
+
+        chunks = []
+        admitted = 0
+        while admitted <= max_bytes:
+            request = min(_BOUNDED_READ_CHUNK_BYTES, max_bytes + 1 - admitted)
+            chunk = os.read(fd, request)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            admitted += len(chunk)
+
+        if admitted > max_bytes:
+            raise PackageValidationError(
+                too_large_code,
+                f"{label} grew beyond the {max_bytes}-byte maximum while being read",
+            )
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 # ── Validation (pure, read-only, no target touched) ─────────────────────────────
@@ -105,13 +190,18 @@ def validate_package(package_dir: str) -> dict:
         raise PackageValidationError("not_a_directory", f"{package_dir} is not a directory")
 
     manifest_path = os.path.join(package_dir, "manifest.json")
-    if not os.path.isfile(manifest_path):
-        raise PackageValidationError("missing_manifest", f"No manifest.json in {package_dir}")
-
     try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
+        manifest_bytes = _read_bounded_regular_file(
+            manifest_path,
+            max_bytes=MAX_PACKAGE_MANIFEST_BYTES,
+            label="manifest.json",
+            missing_code="missing_manifest",
+            too_large_code="manifest_too_large",
+        )
+        manifest = json.loads(
+            manifest_bytes.decode("utf-8"), object_pairs_hook=_strict_json_object
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise PackageValidationError("malformed_manifest", f"manifest.json is not valid JSON: {e}")
 
     if not isinstance(manifest, dict):
@@ -122,6 +212,11 @@ def validate_package(package_dir: str) -> dict:
         raise PackageValidationError(
             "missing_metadata", f"manifest.json missing required fields: {sorted(missing)}"
         )
+    extra = manifest.keys() - REQUIRED_MANIFEST_FIELDS
+    if extra:
+        raise PackageValidationError(
+            "extra_metadata", f"manifest.json contains unknown fields: {sorted(extra)}"
+        )
 
     name = manifest["name"]
     description = manifest["description"]
@@ -129,6 +224,13 @@ def validate_package(package_dir: str) -> dict:
     payload_filename = manifest["payload_filename"]
     payload_bytes = manifest["payload_bytes"]
     payload_sha256 = manifest["payload_sha256"]
+
+    if (not isinstance(manifest["schema_version"], int)
+            or isinstance(manifest["schema_version"], bool)
+            or manifest["schema_version"] != 1):
+        raise PackageValidationError(
+            "unsupported_schema", "schema_version must be the integer 1"
+        )
 
     if not isinstance(name, str) or not _NAME_RE.match(name):
         raise PackageValidationError("invalid_name", f"Invalid skill name: {name!r}")
@@ -139,6 +241,8 @@ def validate_package(package_dir: str) -> dict:
             "invalid_origin", f"origin must be one of {sorted(ALLOWED_ORIGINS)}, got {origin!r}"
         )
     if (not isinstance(payload_filename, str) or not payload_filename
+            or "\x00" in payload_filename or "/" in payload_filename
+            or "\\" in payload_filename
             or os.path.basename(payload_filename) != payload_filename
             or payload_filename in (".", "..")):
         # Bare filename only -- no separators, no traversal, no absolute path.
@@ -147,21 +251,49 @@ def validate_package(package_dir: str) -> dict:
         )
     if not isinstance(payload_bytes, int) or isinstance(payload_bytes, bool) or payload_bytes < 0:
         raise PackageValidationError("malformed_manifest", "payload_bytes must be a non-negative integer")
+    if payload_bytes > MAX_SKILL_PAYLOAD_BYTES:
+        raise PackageValidationError(
+            "declared_payload_too_large",
+            f"manifest declares {payload_bytes} payload bytes; maximum is "
+            f"{MAX_SKILL_PAYLOAD_BYTES}",
+        )
     if not isinstance(payload_sha256, str) or not _SHA256_RE.match(payload_sha256.lower()):
         raise PackageValidationError("malformed_manifest", "payload_sha256 must be a 64-char hex string")
 
+    if payload_filename == "manifest.json":
+        raise PackageValidationError(
+            "path_unsafe", "payload_filename must be distinct from manifest.json"
+        )
     payload_path = os.path.join(package_dir, payload_filename)
+    try:
+        package_entries = set(os.listdir(package_dir))
+    except OSError as e:
+        raise PackageValidationError(
+            "malformed_package", f"Cannot enumerate package directory: {e}"
+        )
+    expected_entries = {"manifest.json", payload_filename}
+    if payload_filename not in package_entries:
+        raise PackageValidationError(
+            "missing_payload", f"Payload file not found: {payload_path}"
+        )
+    if package_entries != expected_entries:
+        raise PackageValidationError(
+            "package_shape",
+            f"Package must contain exactly {sorted(expected_entries)}, found "
+            f"{sorted(package_entries)}",
+        )
+
     real_pkg_dir = os.path.realpath(package_dir)
     real_payload_path = os.path.realpath(payload_path)
     if os.path.commonpath([real_pkg_dir, real_payload_path]) != real_pkg_dir:
         raise PackageValidationError("path_unsafe", "payload path escapes package directory")
-    if os.path.islink(payload_path):
-        raise PackageValidationError("path_unsafe", "payload_filename must not be a symlink")
-    if not os.path.isfile(payload_path):
-        raise PackageValidationError("missing_payload", f"Payload file not found: {payload_path}")
-
-    with open(payload_path, "rb") as f:
-        actual_bytes = f.read()
+    actual_bytes = _read_bounded_regular_file(
+        payload_path,
+        max_bytes=MAX_SKILL_PAYLOAD_BYTES,
+        label="skill payload",
+        missing_code="missing_payload",
+        too_large_code="payload_too_large",
+    )
 
     if len(actual_bytes) != payload_bytes:
         raise PackageValidationError(
@@ -204,7 +336,8 @@ def _now() -> str:
 def _atomic_write(path: str, data: bytes) -> None:
     """Write `data` to `path` with no partial-file window at the final path:
     write to a same-directory temp file, fsync, then os.replace (atomic
-    rename on the same filesystem)."""
+    rename on the same filesystem), then fsync the parent directory so the
+    name publication itself is durable."""
     d = os.path.dirname(path)
     fd, tmp_path = tempfile.mkstemp(dir=d, prefix=".skill-import-", suffix=".tmp")
     try:
@@ -213,15 +346,77 @@ def _atomic_write(path: str, data: bytes) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        _fsync_dir(d)
     except BaseException:
         with contextlib.suppress(OSError):
             os.remove(tmp_path)
         raise
 
 
+def _fsync_dir(path: str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _remove_and_sync(path: str) -> None:
+    os.remove(path)
+    _fsync_dir(os.path.dirname(path))
+
+
+def _cleanup_stale_import_temps(skills_dir: str) -> None:
+    """Remove only transporter-owned temp residue while the DB write lock is
+    held. Live importers use the same lock, so their temp files cannot be
+    mistaken for crash residue."""
+    removed = False
+    with os.scandir(skills_dir) as entries:
+        for entry in entries:
+            if (entry.name.startswith(".skill-import-")
+                    and entry.name.endswith(".tmp")
+                    and entry.is_file(follow_symlinks=False)):
+                os.remove(entry.path)
+                removed = True
+    if removed:
+        _fsync_dir(skills_dir)
+
+
+def _prepare_explicit_targets(*, skills_dir: str, db_path: str) -> tuple[str, str]:
+    """Create and then pin explicit targets to non-symlinked absolute paths."""
+    skills_dir = os.path.abspath(skills_dir)
+    db_path = os.path.abspath(db_path)
+    db_parent = os.path.dirname(db_path)
+    # TEST-DATA-ISOLATION-01: fail before even directory preparation if a
+    # test/harness explicitly resolves either target back into owner state.
+    # This guard is a no-op in ordinary application processes.
+    from core.test_isolation import refuse_if_production_path
+    refuse_if_production_path(skills_dir)
+    refuse_if_production_path(db_path)
+    os.makedirs(skills_dir, exist_ok=True)
+    os.makedirs(db_parent, exist_ok=True)
+
+    if os.path.realpath(skills_dir) != skills_dir:
+        raise PackageValidationError(
+            "target_unsafe", f"skills_dir resolves through a symlink: {skills_dir}"
+        )
+    if os.path.realpath(db_parent) != db_parent or os.path.islink(db_path):
+        raise PackageValidationError(
+            "target_unsafe", f"db_path resolves through a symlink: {db_path}"
+        )
+    return skills_dir, db_path
+
+
 def _hash_file(path: str) -> str:
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
+    content = _read_bounded_regular_file(
+        path,
+        max_bytes=MAX_SKILL_PAYLOAD_BYTES,
+        label="installed skill payload",
+        missing_code="missing_payload",
+        too_large_code="payload_too_large",
+    )
+    return hashlib.sha256(content).hexdigest()
 
 
 def _verify_installed(*, name: str, db_path: str, expected_sha256: str) -> dict:
@@ -231,18 +426,28 @@ def _verify_installed(*, name: str, db_path: str, expected_sha256: str) -> dict:
     conn = db_connect(path=db_path)
     try:
         row = conn.execute(
-            "SELECT name, description, path, origin FROM skills WHERE name=?", (name,)
+            "SELECT name, description, path, origin, content_sha256 "
+            "FROM skills WHERE name=?", (name,)
         ).fetchone()
     finally:
         conn.close()
 
     if row is None:
         raise SkillTransportError(f"Post-install verification failed: no DB row for '{name}'.")
+    if os.path.islink(row["path"]):
+        raise SkillTransportError(
+            f"Post-install verification failed: '{name}' points to a symlink."
+        )
     if not os.path.exists(row["path"]):
         raise SkillTransportError(
             f"Post-install verification failed: file missing at {row['path']}."
         )
     actual_hash = _hash_file(row["path"])
+    if row["content_sha256"] != expected_sha256:
+        raise SkillTransportError(
+            f"Post-install verification failed: registry hash mismatch for '{name}' "
+            f"(expected {expected_sha256}, stored {row['content_sha256']})."
+        )
     if actual_hash != expected_sha256:
         raise SkillTransportError(
             f"Post-install verification failed: hash mismatch for '{name}' "
@@ -276,16 +481,35 @@ def import_skill_package(package_dir: str, *, skills_dir: str, db_path: str) -> 
     info = validate_package(package_dir)
     raw_bytes = info["_raw_bytes"]
 
+    skills_dir, db_path = _prepare_explicit_targets(
+        skills_dir=skills_dir, db_path=db_path
+    )
     init_skills_db(db_path=db_path)
-    os.makedirs(skills_dir, exist_ok=True)
+    target_path = os.path.join(skills_dir, _safe_filename(info["name"]))
 
     conn = db_connect(path=db_path)
+    wrote_file = False
     try:
+        # Serialize the identity check, deterministic path claim, filesystem
+        # publication, and registry commit across processes. A losing importer
+        # observes the winner instead of writing and then deleting its file.
+        conn.execute("BEGIN IMMEDIATE")
+        _cleanup_stale_import_temps(skills_dir)
         existing = conn.execute(
-            "SELECT id, description, path, origin FROM skills WHERE name=?", (info["name"],)
+            "SELECT id, description, path, origin, content_sha256 "
+            "FROM skills WHERE name=?", (info["name"],)
         ).fetchone()
 
         if existing:
+            if os.path.abspath(existing["path"]) != target_path:
+                raise SkillTransportError(
+                    f"Existing DB row for '{info['name']}' points outside its explicit "
+                    f"deterministic target (stored {existing['path']}, expected {target_path})."
+                )
+            if os.path.islink(existing["path"]):
+                raise SkillTransportError(
+                    f"Existing DB row for '{info['name']}' points to a symlink -- refusing it."
+                )
             if not os.path.exists(existing["path"]):
                 raise SkillTransportError(
                     f"Existing DB row for '{info['name']}' has no backing file at "
@@ -298,7 +522,20 @@ def import_skill_package(package_dir: str, *, skills_dir: str, db_path: str) -> 
             }
             incoming_identity = {"sha256": info["payload_sha256"], "origin": info["origin"]}
 
+            if (existing["content_sha256"] is not None
+                    and existing_hash != existing["content_sha256"]):
+                raise SkillTransportError(
+                    f"Existing '{info['name']}' content disagrees with its persisted identity "
+                    f"(expected {existing['content_sha256']}, found {existing_hash})."
+                )
+
             if existing_hash == info["payload_sha256"] and existing["origin"] == info["origin"]:
+                if existing["content_sha256"] is None:
+                    conn.execute(
+                        "UPDATE skills SET content_sha256=? WHERE id=?",
+                        (info["payload_sha256"], existing["id"]),
+                    )
+                conn.commit()
                 return {
                     "status": "already_installed",
                     "name": info["name"],
@@ -315,11 +552,29 @@ def import_skill_package(package_dir: str, *, skills_dir: str, db_path: str) -> 
                 existing=existing_identity, incoming=incoming_identity,
             )
 
-        target_filename = _safe_filename(info["name"])
-        target_path = os.path.join(skills_dir, target_filename)
+        for claimed in conn.execute(
+            "SELECT name, path, origin, content_sha256 FROM skills WHERE name<>?",
+            (info["name"],),
+        ).fetchall():
+            if os.path.abspath(claimed["path"]) == target_path:
+                raise SkillCollisionError(
+                    f"'{info['name']}' maps to {target_path}, already claimed by distinct "
+                    f"skill {claimed['name']!r}; refusing a shared installed path.",
+                    existing={
+                        "name": claimed["name"], "origin": claimed["origin"],
+                        "sha256": claimed["content_sha256"], "path": claimed["path"],
+                    },
+                    incoming={
+                        "name": info["name"], "origin": info["origin"],
+                        "sha256": info["payload_sha256"], "path": target_path,
+                    },
+                )
 
-        wrote_file = False
-        if os.path.exists(target_path):
+        if os.path.lexists(target_path):
+            if os.path.islink(target_path):
+                raise PackageValidationError(
+                    "target_unsafe", f"Refusing symlink at installed target {target_path}"
+                )
             # No DB row yet, but a file already sits at the target path --
             # e.g. bootstrap re-run, or a tracked in-repo copy. Only proceed
             # if it's byte-identical to what we're about to register;
@@ -334,19 +589,20 @@ def import_skill_package(package_dir: str, *, skills_dir: str, db_path: str) -> 
             _atomic_write(target_path, raw_bytes)
             wrote_file = True
 
-        try:
-            conn.execute(
-                "INSERT INTO skills (name, description, path, created_at, updated_at, origin) "
-                "VALUES (?,?,?,?,?,?)",
-                (info["name"], info["description"], target_path, _now(), _now(), info["origin"]),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            if wrote_file:
-                with contextlib.suppress(OSError):
-                    os.remove(target_path)
-            raise
+        conn.execute(
+            "INSERT INTO skills "
+            "(name, description, path, created_at, updated_at, origin, content_sha256) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (info["name"], info["description"], target_path, _now(), _now(),
+             info["origin"], info["payload_sha256"]),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        if wrote_file:
+            with contextlib.suppress(OSError):
+                _remove_and_sync(target_path)
+        raise
     finally:
         conn.close()
 
@@ -361,28 +617,57 @@ def export_skill(name: str, dest_dir: str, *, skills_dir: str, db_path: str) -> 
     interface symmetry with import/bootstrap and as a future-proofing
     explicit-target hook; the row's own recorded path is what's actually
     read, since that's the skill's real installed location."""
+    skills_dir, db_path = _prepare_explicit_targets(
+        skills_dir=skills_dir, db_path=db_path
+    )
+    expected_path = os.path.join(skills_dir, _safe_filename(name))
+
     conn = db_connect(path=db_path)
     try:
         row = conn.execute(
-            "SELECT name, description, path, origin FROM skills WHERE name=?", (name,)
+            "SELECT name, description, path, origin, content_sha256 "
+            "FROM skills WHERE name=?", (name,)
         ).fetchone()
     finally:
         conn.close()
 
     if row is None:
         raise SkillTransportError(f"No installed skill named '{name}' in target.")
+    if os.path.abspath(row["path"]) != expected_path:
+        raise SkillTransportError(
+            f"Installed skill '{name}' points outside its explicit deterministic target "
+            f"(stored {row['path']}, expected {expected_path})."
+        )
+    if os.path.islink(row["path"]):
+        raise SkillTransportError(f"Installed skill '{name}' points to a symlink.")
     if not os.path.exists(row["path"]):
         raise SkillTransportError(f"Installed skill '{name}' has no backing file at {row['path']}.")
 
-    with open(row["path"], "rb") as f:
-        content = f.read()
+    content = _read_bounded_regular_file(
+        row["path"],
+        max_bytes=MAX_SKILL_PAYLOAD_BYTES,
+        label=f"installed skill {name!r}",
+        missing_code="missing_payload",
+        too_large_code="payload_too_large",
+    )
 
     payload_filename = os.path.basename(row["path"])
     sha256 = hashlib.sha256(content).hexdigest()
+    if row["content_sha256"] and sha256 != row["content_sha256"]:
+        raise SkillTransportError(
+            f"Installed skill '{name}' content disagrees with its persisted identity "
+            f"(expected {row['content_sha256']}, found {sha256})."
+        )
+    if row["origin"] == "official" and not row["content_sha256"]:
+        raise SkillTransportError(
+            f"OFFICIAL skill '{name}' has no persisted expected content hash."
+        )
 
+    dest_dir = os.path.abspath(dest_dir)
     if os.path.exists(dest_dir) and os.listdir(dest_dir):
         raise SkillTransportError(f"Export destination {dest_dir} already exists and is not empty.")
-    os.makedirs(dest_dir, exist_ok=True)
+    parent = os.path.dirname(dest_dir)
+    os.makedirs(parent, exist_ok=True)
 
     manifest = {
         "schema_version": 1,
@@ -394,10 +679,22 @@ def export_skill(name: str, dest_dir: str, *, skills_dir: str, db_path: str) -> 
         "payload_sha256": sha256,
     }
 
-    _atomic_write(os.path.join(dest_dir, payload_filename), content)
-    with open(os.path.join(dest_dir, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-        f.write("\n")
+    staging = tempfile.mkdtemp(dir=parent, prefix=".skill-export-")
+    try:
+        _atomic_write(os.path.join(staging, payload_filename), content)
+        manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        _atomic_write(os.path.join(staging, "manifest.json"), manifest_bytes)
+        if os.path.exists(dest_dir):
+            os.rmdir(dest_dir)
+            _fsync_dir(parent)
+        os.replace(staging, dest_dir)
+        _fsync_dir(parent)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            for entry in os.listdir(staging):
+                os.remove(os.path.join(staging, entry))
+            os.rmdir(staging)
+        raise
 
     return manifest
 
@@ -431,7 +728,7 @@ def bootstrap_official_skills(*, skills_dir: str, db_path: str) -> list:
     return results
 
 
-def ensure_official_skills_bootstrapped() -> list:
+def ensure_official_skills_bootstrapped(*, data_dir: str, db_path: str) -> list:
     """The real-process-startup entry point. Wired into main.py's
     run_cli()/run_gui() and core/headless.py's get_headless_agent() -- each
     an explicit, auditable call site, never LuminaAgent.__init__ itself,
@@ -442,8 +739,8 @@ def ensure_official_skills_bootstrapped() -> list:
     out of that shared constructor path means no test's Agent construction
     can ever pick up two unexpected OFFICIAL skill rows as a side effect.
 
-    Installs into config.DATA_DIR-relative storage
-    (<DATA_DIR>/skills/official/), NOT config.BASE_DIR's repo-tracked
+    Installs into explicit data_dir-relative storage
+    (<data_dir>/skills/official/), NOT config.BASE_DIR's repo-tracked
     skills/ directory -- so ordinary startup never mutates the source
     checkout, and (same as the DB already does) this target is already
     isolated by LUMINA_DATA_DIR for every test in the suite, individually
@@ -462,11 +759,9 @@ def ensure_official_skills_bootstrapped() -> list:
     unmissable, and swallowing it here would quietly defeat its own purpose;
     it is a no-op in real (non-LUMINA_TESTING) use in any case.
     """
-    import config
-
-    skills_dir = os.path.join(config.DATA_DIR, "skills", "official")
+    skills_dir = os.path.join(data_dir, "skills", "official")
     try:
-        return bootstrap_official_skills(skills_dir=skills_dir, db_path=config.DB_PATH)
+        return bootstrap_official_skills(skills_dir=skills_dir, db_path=db_path)
     except SkillTransportError as e:
         print(f"[skills] OFFICIAL skill bootstrap failed, continuing without it: {e}",
               file=sys.stderr)

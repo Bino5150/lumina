@@ -166,7 +166,9 @@ def run_cli(persona_name: str = None, tools_override: str = None):
         # registry, which searches/recalls skills) exists. Never blocks
         # startup on failure; see ensure_official_skills_bootstrapped().
         from core.skill_transport import ensure_official_skills_bootstrapped
-        ensure_official_skills_bootstrapped()
+        ensure_official_skills_bootstrapped(
+            data_dir=config.DATA_DIR, db_path=config.DB_PATH
+        )
 
         # MB-22: CLI is a trusted local session, same footing as the desktop app --
         # owner=True is already LuminaAgent's default, unchanged here. channel_id
@@ -251,7 +253,9 @@ def run_gui():
     # registry, which searches/recalls skills) exists. Never blocks
     # startup on failure; see ensure_official_skills_bootstrapped().
     from core.skill_transport import ensure_official_skills_bootstrapped
-    ensure_official_skills_bootstrapped()
+    ensure_official_skills_bootstrapped(
+        data_dir=config.DATA_DIR, db_path=config.DB_PATH
+    )
 
     # Set default font — prefer monospace
     for font_name in ["JetBrains Mono", "Fira Code", "Cascadia Code", "Monospace"]:

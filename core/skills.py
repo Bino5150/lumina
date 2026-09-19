@@ -16,6 +16,7 @@ Directory layout:
     └── *.md  (full skill documents)
 """
 
+import hashlib
 import os
 import re
 import sqlite3
@@ -69,7 +70,8 @@ def init_skills_db(db_path: str = None):
             description TEXT NOT NULL,
             path        TEXT NOT NULL,
             created_at  TEXT NOT NULL,
-            updated_at  TEXT NOT NULL
+            updated_at  TEXT NOT NULL,
+            content_sha256 TEXT
         )
     """)
 
@@ -80,6 +82,15 @@ def init_skills_db(db_path: str = None):
     # via save_skill) default to 'user', which is exactly correct, not a guess.
     try:
         conn.execute("ALTER TABLE skills ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
+
+    # Persist the content identity the registry claims to serve. Existing
+    # user-authored rows remain nullable; OFFICIAL imports always bind this
+    # field and load/export paths fail closed if it is absent or disagrees.
+    try:
+        conn.execute("ALTER TABLE skills ADD COLUMN content_sha256 TEXT")
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e):
             raise
@@ -115,6 +126,18 @@ def init_skills_db(db_path: str = None):
         END
     """)
 
+    # An external-content FTS table can be internally valid while no longer
+    # matching its authoritative skills rows (for example after an interrupted
+    # manual restore). Ask FTS5 to compare against the content table; rebuild
+    # only when that check proves split brain. The rebuild remains in this same
+    # SQLite transaction, so callers never observe a half-rebuilt index.
+    try:
+        conn.execute(
+            "INSERT INTO skills_fts(skills_fts, rank) VALUES ('integrity-check', 1)"
+        )
+    except sqlite3.DatabaseError:
+        conn.execute("INSERT INTO skills_fts(skills_fts) VALUES ('rebuild')")
+
     conn.commit()
     conn.close()
 
@@ -128,6 +151,15 @@ class OfficialSkillOverwriteError(Exception):
     upgrade/migration mechanism, never silently by this path."""
 
 
+class OfficialSkillIntegrityError(Exception):
+    """Raised when an OFFICIAL registry row cannot prove the exact bytes it
+    is about to serve. Runtime drift must be loud, never silently injected."""
+
+
+class SkillPayloadPolicyError(Exception):
+    """Raised when a USER or OFFICIAL skill violates the bounded payload law."""
+
+
 def write_skill(name: str, description: str, content: str) -> dict:
     """
     Write a skill document to disk and index it in SQLite.
@@ -136,48 +168,65 @@ def write_skill(name: str, description: str, content: str) -> dict:
     raises OfficialSkillOverwriteError rather than silently replacing it.
     Returns {'path': ..., 'name': ..., 'updated': bool}
     """
+    # Ensure content has the standard header
+    if not content.strip().startswith("# Skill:"):
+        content = f"# Skill: {name}\n**Description:** {description}\n\n{content.strip()}"
+    content_bytes = content.encode("utf-8")
+    from core.skill_transport import MAX_SKILL_PAYLOAD_BYTES
+    if len(content_bytes) > MAX_SKILL_PAYLOAD_BYTES:
+        raise SkillPayloadPolicyError(
+            f"Skill payload is {len(content_bytes)} bytes; maximum is "
+            f"{MAX_SKILL_PAYLOAD_BYTES}."
+        )
+
     skills_dir = _skills_dir()
     filename = _safe_filename(name)
     path = os.path.join(skills_dir, filename)
     now = datetime.now().isoformat()
+    content_sha256 = hashlib.sha256(content_bytes).hexdigest()
 
-    # Ensure content has the standard header
-    if not content.strip().startswith("# Skill:"):
-        content = f"# Skill: {name}\n**Description:** {description}\n\n{content.strip()}"
-
-    # Upsert in DB
+    # Serialize the identity check with transporter imports. Without an
+    # immediate transaction, an OFFICIAL import can commit after this SELECT
+    # but before this INSERT, producing a raw UNIQUE error and an orphan user
+    # file even though the OFFICIAL row correctly wins.
     conn = get_db()
-    existing = conn.execute(
-        "SELECT id, origin FROM skills WHERE name=?", (name,)
-    ).fetchone()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT id, origin FROM skills WHERE name=?", (name,)
+        ).fetchone()
 
-    if existing and existing["origin"] == "official":
+        if existing and existing["origin"] == "official":
+            raise OfficialSkillOverwriteError(
+                f"'{name}' is an OFFICIAL skill and cannot be overwritten via save_skill."
+            )
+
+        # Write to disk only after the serialized OFFICIAL guard.
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        if existing:
+            conn.execute(
+                "UPDATE skills SET description=?, path=?, updated_at=?, content_sha256=? "
+                "WHERE name=?",
+                (description, path, now, content_sha256, name)
+            )
+            updated = True
+        else:
+            conn.execute(
+                "INSERT INTO skills "
+                "(name, description, path, created_at, updated_at, origin, content_sha256) "
+                "VALUES (?,?,?,?,?,'user',?)",
+                (name, description, path, now, now, content_sha256)
+            )
+            updated = False
+
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        raise OfficialSkillOverwriteError(
-            f"'{name}' is an OFFICIAL skill and cannot be overwritten via save_skill."
-        )
-
-    # Write to disk (after the OFFICIAL guard -- never touch the file if the
-    # DB write is about to be refused).
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    if existing:
-        conn.execute(
-            "UPDATE skills SET description=?, path=?, updated_at=? WHERE name=?",
-            (description, path, now, name)
-        )
-        updated = True
-    else:
-        conn.execute(
-            "INSERT INTO skills (name, description, path, created_at, updated_at, origin) "
-            "VALUES (?,?,?,?,?,'user')",
-            (name, description, path, now, now)
-        )
-        updated = False
-
-    conn.commit()
-    conn.close()
 
     return {"path": path, "name": name, "updated": updated}
 
@@ -233,7 +282,9 @@ def search_skills(query: str, limit: int = None) -> list[dict]:
 def load_skill(name: str) -> str | None:
     """Load the full content of a skill doc from disk by name."""
     conn = get_db()
-    row = conn.execute("SELECT path FROM skills WHERE name=?", (name,)).fetchone()
+    row = conn.execute(
+        "SELECT path, origin, content_sha256 FROM skills WHERE name=?", (name,)
+    ).fetchone()
     conn.close()
 
     if not row:
@@ -241,10 +292,53 @@ def load_skill(name: str) -> str | None:
 
     path = row["path"]
     if not os.path.exists(path):
+        if row["origin"] == "official":
+            raise OfficialSkillIntegrityError(
+                f"OFFICIAL skill '{name}' has no backing file at {path}."
+            )
         return None
 
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+    if row["origin"] == "official" and os.path.islink(path):
+        raise OfficialSkillIntegrityError(
+            f"OFFICIAL skill '{name}' points to a symlink, refusing runtime recall."
+        )
+
+    from core.skill_transport import (
+        MAX_SKILL_PAYLOAD_BYTES,
+        PackageValidationError,
+        _read_bounded_regular_file,
+    )
+    try:
+        content = _read_bounded_regular_file(
+            path,
+            max_bytes=MAX_SKILL_PAYLOAD_BYTES,
+            label=f"installed skill {name!r}",
+            missing_code="missing_payload",
+            too_large_code="payload_too_large",
+        )
+    except PackageValidationError as e:
+        if row["origin"] == "official":
+            raise OfficialSkillIntegrityError(
+                f"OFFICIAL skill '{name}' failed runtime payload policy: {e}"
+            ) from e
+        raise SkillPayloadPolicyError(
+            f"Skill '{name}' failed runtime payload policy: {e}"
+        ) from e
+
+    if row["origin"] == "official":
+        expected = row["content_sha256"]
+        actual = hashlib.sha256(content).hexdigest()
+        if not expected:
+            raise OfficialSkillIntegrityError(
+                f"OFFICIAL skill '{name}' has no persisted expected content hash."
+            )
+        if actual != expected:
+            raise OfficialSkillIntegrityError(
+                f"OFFICIAL skill '{name}' failed runtime integrity verification "
+                f"(expected {expected}, found {actual})."
+            )
+
+    return content.decode("utf-8")
 
 
 def list_skills() -> list[dict]:

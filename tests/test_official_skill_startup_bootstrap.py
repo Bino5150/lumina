@@ -37,6 +37,12 @@ FROZEN = {
 }
 
 
+def _bootstrap_runtime():
+    return ensure_official_skills_bootstrapped(
+        data_dir=config.DATA_DIR, db_path=config.DB_PATH
+    )
+
+
 @pytest.fixture
 def fresh_release_root(tmp_path, monkeypatch):
     """'Fresh release code + a fresh empty release-local LUMINA_DATA_DIR':
@@ -54,7 +60,7 @@ def fresh_release_root(tmp_path, monkeypatch):
 # ── Ordinary startup -> both OFFICIAL skills available ──────────────────────
 
 def test_ordinary_startup_bootstraps_both_official_skills(fresh_release_root):
-    results = ensure_official_skills_bootstrapped()
+    results = _bootstrap_runtime()
     by_name = {r["name"]: r for r in results}
     assert set(by_name) == {"media-generation", "generated-artifact-manifest"}
     for name, frozen in FROZEN.items():
@@ -75,7 +81,7 @@ def test_bootstrap_never_writes_into_the_source_checkout(fresh_release_root):
     tracked_skills_dir = os.path.join(REPO_ROOT, "skills")
     before = set(os.listdir(tracked_skills_dir))
 
-    ensure_official_skills_bootstrapped()
+    _bootstrap_runtime()
 
     after = set(os.listdir(tracked_skills_dir))
     assert before == after, "ordinary startup must never write into the tracked skills/ directory"
@@ -87,8 +93,8 @@ def test_bootstrap_never_writes_into_the_source_checkout(fresh_release_root):
 
 
 def test_startup_bootstrap_is_idempotent(fresh_release_root):
-    first = ensure_official_skills_bootstrapped()
-    second = ensure_official_skills_bootstrapped()
+    first = _bootstrap_runtime()
+    second = _bootstrap_runtime()
     assert {r["name"]: r["status"] for r in first} == {
         "media-generation": "installed", "generated-artifact-manifest": "installed",
     }
@@ -108,7 +114,7 @@ def test_startup_bootstrap_is_idempotent(fresh_release_root):
 
 
 def test_fresh_release_discovery_through_real_native_api(fresh_release_root):
-    ensure_official_skills_bootstrapped()
+    _bootstrap_runtime()
 
     import core.skills as skills_mod
     hits = skills_mod.search_skills("image generation")
@@ -127,7 +133,7 @@ def test_fresh_release_discovery_through_real_native_api(fresh_release_root):
 # ── Restart in a NEW PROCESS against the same isolated target ───────────────
 
 def test_new_process_restart_no_duplicate_no_rewrite_discovery_survives(fresh_release_root):
-    first = ensure_official_skills_bootstrapped()
+    first = _bootstrap_runtime()
     by_name = {r["name"]: r for r in first}
     with open(by_name["media-generation"]["path"], "rb") as f:
         expected_media_gen = f.read()
@@ -145,7 +151,9 @@ def test_new_process_restart_no_duplicate_no_rewrite_discovery_survives(fresh_re
             from core.skill_transport import ensure_official_skills_bootstrapped
             import core.skills as skills_mod
 
-            results = ensure_official_skills_bootstrapped()
+            results = ensure_official_skills_bootstrapped(
+                data_dir=config.DATA_DIR, db_path=config.DB_PATH
+            )
             by_name = {{r["name"]: r for r in results}}
             assert by_name["media-generation"]["status"] == "already_installed", by_name
             assert by_name["generated-artifact-manifest"]["status"] == "already_installed", by_name
@@ -176,18 +184,34 @@ def test_new_process_restart_no_duplicate_no_rewrite_discovery_survives(fresh_re
 # ── Production-path refusal under LUMINA_TESTING ─────────────────────────────
 
 def test_startup_under_lumina_testing_cannot_target_production_paths(monkeypatch):
-    """The test-isolation guard (core/test_isolation.py) is reached through
-    core.db.connect() -> deliberately NOT swallowed by
-    ensure_official_skills_bootstrapped()'s fail-safe except clauses (it
-    only catches SkillTransportError/OSError) -- a real safety-guard
-    violation must stay loud, not be quietly absorbed into "continuing
-    without it"."""
+    """The test-isolation guard runs before target directory preparation and
+    is deliberately NOT swallowed by ensure_official_skills_bootstrapped()'s
+    fail-safe exceptions. A real safety-guard violation must stay loud, not
+    be absorbed into "continuing without it"."""
     from platformdirs import user_data_dir
     real_data_dir = user_data_dir("lumina", appauthor=False)
     monkeypatch.setattr(config, "DATA_DIR", real_data_dir)
     monkeypatch.setattr(config, "DB_PATH", os.path.join(real_data_dir, "memory", "lumina.db"))
+    import core.skill_transport as transport
+    monkeypatch.setattr(
+        transport.os, "makedirs",
+        lambda *args, **kwargs: pytest.fail("Prime target reached filesystem preparation"),
+    )
 
     with pytest.raises(RuntimeError, match="TEST-ISOLATION"):
+        _bootstrap_runtime()
+
+
+def test_naked_startup_harness_cannot_resolve_an_ambient_transport_target():
+    """Regression for the 2026-09-19 release-audit harness incident.
+
+    A manually launched startup probe omitted LUMINA_DATA_DIR and called this
+    wrapper with no target, so two correct OFFICIAL payloads were installed in
+    Prime. Owner-authorized cleanup removed those two rows/files and retained
+    the additive nullable content_sha256 column. Requiring both targets makes
+    that exact naked call shape fail before transport or filesystem setup.
+    """
+    with pytest.raises(TypeError, match="data_dir.*db_path|db_path.*data_dir"):
         ensure_official_skills_bootstrapped()
 
 

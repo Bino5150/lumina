@@ -10,17 +10,23 @@ that; one test in this file (test_release_target_cannot_resolve_prime_db_by_acci
 exercises that backstop directly.
 """
 
+import contextlib
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import textwrap
+import tempfile
+import threading
 
 import pytest
 
 import config
 from core.skill_transport import (
+    MAX_PACKAGE_MANIFEST_BYTES,
+    MAX_SKILL_PAYLOAD_BYTES,
     PackageValidationError,
     SkillCollisionError,
     SkillTransportError,
@@ -30,7 +36,12 @@ from core.skill_transport import (
     inspect_package,
     validate_package,
 )
-from core.skills import OfficialSkillOverwriteError, write_skill
+from core.skills import (
+    OfficialSkillIntegrityError,
+    OfficialSkillOverwriteError,
+    SkillPayloadPolicyError,
+    write_skill,
+)
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -85,6 +96,17 @@ def _make_package(pkg_dir, *, name="demo-skill", description="A demo skill for t
     with open(os.path.join(pkg_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f)
     return pkg_dir
+
+
+def _pad_manifest_to_exact_size(pkg_dir: str, exact_bytes: int) -> None:
+    manifest_path = os.path.join(pkg_dir, "manifest.json")
+    manifest = json.loads(open(manifest_path, "r", encoding="utf-8").read())
+    encoded = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= exact_bytes
+    with open(manifest_path, "wb") as handle:
+        handle.write(encoded)
+        handle.write(b" " * (exact_bytes - len(encoded)))
+    assert os.path.getsize(manifest_path) == exact_bytes
 
 
 # ── Validation: happy path ───────────────────────────────────────────────────
@@ -209,6 +231,29 @@ def test_import_installs_file_db_and_verifies_coherence(tmp_path, target_a):
     assert os.path.exists(result["path"])
     with open(result["path"], "rb") as f:
         assert hashlib.sha256(f.read()).hexdigest() == result["sha256"]
+
+
+def test_source_swap_after_validation_cannot_change_published_bytes(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    original = b"# Skill: demo-skill\n\nValidated bytes.\n"
+    replacement = b"# Skill: demo-skill\n\nAttacker! bytes.\n"
+    assert len(original) == len(replacement)
+    pkg = _make_package(str(tmp_path / "pkg"), content=original)
+    real_validate = st.validate_package
+
+    def validate_then_swap(package_dir):
+        info = real_validate(package_dir)
+        with open(os.path.join(package_dir, "demo-skill.md"), "wb") as handle:
+            handle.write(replacement)
+        return info
+
+    monkeypatch.setattr(st, "validate_package", validate_then_swap)
+    installed = st.import_skill_package(pkg, **target_a)
+    with open(installed["path"], "rb") as handle:
+        published = handle.read()
+    assert published == original
+    assert hashlib.sha256(published).hexdigest() == installed["sha256"]
 
 
 def test_import_is_idempotent_on_identical_reimport(tmp_path, target_a):
@@ -433,6 +478,33 @@ def test_fts_discovery_and_recall_through_native_api(tmp_path, target_a, monkeyp
     assert content == "# Skill: native-lookup-skill\n\nZebra procedure.\n"
 
 
+def test_init_repairs_db_fts_split_brain(tmp_path, target_a, monkeypatch):
+    bootstrap_official_skills(**target_a)
+    import core.db as db_mod
+    conn = db_mod.connect(path=target_a["db_path"])
+    row = conn.execute(
+        "SELECT id, name, description FROM skills WHERE name='media-generation'"
+    ).fetchone()
+    conn.execute(
+        "INSERT INTO skills_fts(skills_fts, rowid, name, description) "
+        "VALUES ('delete', ?, ?, ?)",
+        (row["id"], row["name"], row["description"]),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(config, "DB_PATH", target_a["db_path"])
+    import core.skills as skills_mod
+    assert "media-generation" not in {
+        item["name"] for item in skills_mod.search_skills("image generation", limit=10)
+    }
+
+    skills_mod.init_skills_db(db_path=target_a["db_path"])
+    assert "media-generation" in {
+        item["name"] for item in skills_mod.search_skills("image generation", limit=10)
+    }
+
+
 # ── Restart / new-process discovery ───────────────────────────────────────────
 
 def test_discovery_survives_a_fresh_process(tmp_path, target_a):
@@ -578,3 +650,730 @@ def test_war_room_specimen_export_round_trip(tmp_path, target_a, target_b):
     names = {r["name"] for r in conn.execute("SELECT name FROM skills").fetchall()}
     conn.close()
     assert names == {"media-generation", "generated-artifact-manifest"}
+
+
+# ── Final combined-tree adversarial regressions ─────────────────────────────
+
+@pytest.mark.parametrize("bad_schema", [0, 2, 999, True, "1"])
+def test_manifest_rejects_unsupported_or_ambiguous_schema(tmp_path, bad_schema):
+    pkg = _make_package(
+        str(tmp_path / "pkg"), manifest_overrides={"schema_version": bad_schema}
+    )
+    with pytest.raises(PackageValidationError) as ei:
+        validate_package(pkg)
+    assert ei.value.code == "unsupported_schema"
+
+
+def test_manifest_rejects_unknown_fields(tmp_path):
+    pkg = _make_package(
+        str(tmp_path / "pkg"), manifest_overrides={"shadow_identity": "ignored"}
+    )
+    with pytest.raises(PackageValidationError) as ei:
+        validate_package(pkg)
+    assert ei.value.code == "extra_metadata"
+
+
+def test_manifest_rejects_duplicate_json_keys(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    payload = b"# Skill: duplicate\n"
+    (pkg / "payload.md").write_bytes(payload)
+    (pkg / "manifest.json").write_text(
+        '{"schema_version":1,"name":"first","name":"second",'
+        '"description":"duplicate","origin":"user",'
+        '"payload_filename":"payload.md",'
+        f'"payload_bytes":{len(payload)},'
+        f'"payload_sha256":"{hashlib.sha256(payload).hexdigest()}"}}'
+    )
+    with pytest.raises(PackageValidationError) as ei:
+        validate_package(str(pkg))
+    assert ei.value.code == "duplicate_metadata"
+
+
+def test_manifest_rejects_nul_payload_filename(tmp_path):
+    pkg = _make_package(
+        str(tmp_path / "pkg"),
+        manifest_overrides={"payload_filename": "payload.md\x00shadow"},
+    )
+    with pytest.raises(PackageValidationError) as ei:
+        validate_package(pkg)
+    assert ei.value.code == "path_unsafe"
+
+
+def test_runtime_official_drift_is_rejected_by_recall_and_export(
+        tmp_path, target_a, monkeypatch):
+    results = bootstrap_official_skills(**target_a)
+    installed = {item["name"]: item for item in results}["media-generation"]
+    original = open(installed["path"], "rb").read()
+    tampered = original.replace(b"# Skill:", b"# SkilL:", 1)
+    assert len(tampered) == len(original)
+    assert hashlib.sha256(tampered).hexdigest() != FROZEN["media-generation"]["sha256"]
+    with open(installed["path"], "wb") as handle:
+        handle.write(tampered)
+
+    monkeypatch.setattr(config, "DB_PATH", target_a["db_path"])
+    import core.skills as skills_mod
+    with pytest.raises(OfficialSkillIntegrityError, match="runtime integrity"):
+        skills_mod.load_skill("media-generation")
+    with pytest.raises(SkillTransportError, match="persisted identity"):
+        export_skill(
+            "media-generation", str(tmp_path / "exported"), **target_a
+        )
+
+
+@pytest.mark.parametrize("mutation", ["newline", "truncate", "replace", "delete", "symlink"])
+def test_runtime_official_mutation_variants_fail_loud(
+        tmp_path, target_a, monkeypatch, mutation):
+    results = bootstrap_official_skills(**target_a)
+    installed = {item["name"]: item for item in results}["media-generation"]
+    path = installed["path"]
+    original = open(path, "rb").read()
+
+    if mutation == "newline":
+        with open(path, "ab") as handle:
+            handle.write(b"\n")
+    elif mutation == "truncate":
+        with open(path, "wb") as handle:
+            handle.write(original[:100])
+    elif mutation == "replace":
+        replacement = tmp_path / "replacement.md"
+        replacement.write_bytes(original.replace(b"# Skill:", b"# SkilL:", 1))
+        os.replace(replacement, path)
+    elif mutation == "delete":
+        os.remove(path)
+    else:
+        outside = tmp_path / "outside.md"
+        outside.write_bytes(original)
+        os.remove(path)
+        os.symlink(outside, path)
+
+    monkeypatch.setattr(config, "DB_PATH", target_a["db_path"])
+    import core.skills as skills_mod
+    with pytest.raises(OfficialSkillIntegrityError):
+        skills_mod.load_skill("media-generation")
+
+
+def test_official_import_persists_expected_content_hash(tmp_path, target_a):
+    bootstrap_official_skills(**target_a)
+    import core.db as db_mod
+    conn = db_mod.connect(path=target_a["db_path"])
+    rows = {
+        row["name"]: row["content_sha256"]
+        for row in conn.execute(
+            "SELECT name, content_sha256 FROM skills WHERE origin='official'"
+        ).fetchall()
+    }
+    conn.close()
+    assert rows == {name: frozen["sha256"] for name, frozen in FROZEN.items()}
+
+
+def test_legacy_unbound_official_row_is_bound_only_after_byte_match(tmp_path, target_a):
+    pkg = os.path.join(OFFICIAL_PACKAGES_ROOT, "media-generation")
+    os.makedirs(target_a["skills_dir"])
+    target_path = os.path.join(target_a["skills_dir"], "media-generation.md")
+    with open(os.path.join(pkg, "media-generation.md"), "rb") as source:
+        with open(target_path, "wb") as target:
+            target.write(source.read())
+
+    from core.skills import init_skills_db
+    init_skills_db(db_path=target_a["db_path"])
+    import core.db as db_mod
+    conn = db_mod.connect(path=target_a["db_path"])
+    conn.execute(
+        "INSERT INTO skills "
+        "(name, description, path, created_at, updated_at, origin, content_sha256) "
+        "VALUES (?,?,?,?,?,'official',NULL)",
+        ("media-generation", "legacy row", target_path, "now", "now"),
+    )
+    conn.commit()
+    conn.close()
+
+    result = import_skill_package(pkg, **target_a)
+    assert result["status"] == "already_installed"
+    conn = db_mod.connect(path=target_a["db_path"])
+    stored = conn.execute(
+        "SELECT content_sha256 FROM skills WHERE name='media-generation'"
+    ).fetchone()["content_sha256"]
+    conn.close()
+    assert stored == FROZEN["media-generation"]["sha256"]
+
+
+def test_existing_registry_path_outside_explicit_target_is_rejected(tmp_path, target_a):
+    pkg = os.path.join(OFFICIAL_PACKAGES_ROOT, "media-generation")
+    outside = tmp_path / "prime-like" / "media-generation.md"
+    outside.parent.mkdir()
+    with open(os.path.join(pkg, "media-generation.md"), "rb") as source:
+        outside.write_bytes(source.read())
+
+    from core.skills import init_skills_db
+    init_skills_db(db_path=target_a["db_path"])
+    import core.db as db_mod
+    conn = db_mod.connect(path=target_a["db_path"])
+    conn.execute(
+        "INSERT INTO skills "
+        "(name, description, path, created_at, updated_at, origin, content_sha256) "
+        "VALUES (?,?,?,?,?,'official',?)",
+        ("media-generation", "outside", str(outside), "now", "now",
+         FROZEN["media-generation"]["sha256"]),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SkillTransportError, match="outside its explicit"):
+        import_skill_package(pkg, **target_a)
+    with pytest.raises(SkillTransportError, match="outside its explicit"):
+        export_skill("media-generation", str(tmp_path / "exported"), **target_a)
+
+
+def test_symlink_at_installed_target_is_rejected(tmp_path, target_a):
+    pkg = os.path.join(OFFICIAL_PACKAGES_ROOT, "media-generation")
+    outside = tmp_path / "outside.md"
+    with open(os.path.join(pkg, "media-generation.md"), "rb") as source:
+        outside.write_bytes(source.read())
+    os.makedirs(target_a["skills_dir"])
+    os.symlink(outside, os.path.join(target_a["skills_dir"], "media-generation.md"))
+    with pytest.raises(PackageValidationError) as ei:
+        import_skill_package(pkg, **target_a)
+    assert ei.value.code == "target_unsafe"
+
+
+def test_distinct_names_with_same_slug_fail_closed(tmp_path, target_a):
+    content = b"# Skill: slug collision\n\nSame bytes.\n"
+    first = _make_package(
+        str(tmp_path / "first"), name="Case Skill", origin="official", content=content
+    )
+    second = _make_package(
+        str(tmp_path / "second"), name="case-skill", origin="official", content=content
+    )
+    import_skill_package(first, **target_a)
+    with pytest.raises(SkillCollisionError) as ei:
+        import_skill_package(second, **target_a)
+    assert ei.value.existing["name"] == "Case Skill"
+    assert ei.value.incoming["name"] == "case-skill"
+
+
+def test_atomic_write_fsyncs_file_then_publishes_then_fsyncs_directory(
+        tmp_path, monkeypatch):
+    import core.skill_transport as st
+    events = []
+    real_fsync = st.os.fsync
+    real_replace = st.os.replace
+
+    def traced_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        events.append("fsync_dir" if stat.S_ISDIR(mode) else "fsync_file")
+        return real_fsync(fd)
+
+    def traced_replace(source, target):
+        events.append("replace")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(st.os, "fsync", traced_fsync)
+    monkeypatch.setattr(st.os, "replace", traced_replace)
+    st._atomic_write(str(tmp_path / "published.md"), b"durable bytes")
+    assert events == ["fsync_file", "replace", "fsync_dir"]
+
+
+def test_next_import_removes_only_stale_transporter_temp_residue(tmp_path, target_a):
+    os.makedirs(target_a["skills_dir"])
+    stale = os.path.join(target_a["skills_dir"], ".skill-import-crashed.tmp")
+    unrelated = os.path.join(target_a["skills_dir"], ".unrelated.tmp")
+    with open(stale, "wb") as handle:
+        handle.write(b"partial untrusted bytes")
+    with open(unrelated, "wb") as handle:
+        handle.write(b"preserve me")
+
+    pkg = _make_package(str(tmp_path / "pkg"), name="cleanup-specimen")
+    import_skill_package(pkg, **target_a)
+
+    assert not os.path.exists(stale)
+    assert os.path.exists(unrelated)
+
+
+def test_export_failure_before_manifest_publication_leaves_no_partial_package(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    pkg = _make_package(str(tmp_path / "pkg"), name="export-crash")
+    import_skill_package(pkg, **target_a)
+    destination = tmp_path / "published-package"
+    real_atomic_write = st._atomic_write
+    calls = 0
+
+    def fail_second_staged_write(path, data):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated death before manifest publication")
+        return real_atomic_write(path, data)
+
+    monkeypatch.setattr(st, "_atomic_write", fail_second_staged_write)
+    with pytest.raises(OSError, match="before manifest"):
+        export_skill("export-crash", str(destination), **target_a)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".skill-export-*"))
+
+
+def test_two_simultaneous_imports_leave_one_coherent_identity(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    pkg = _make_package(
+        str(tmp_path / "pkg"), name="race-skill", origin="official",
+        content=b"# Skill: race-skill\n\nApproved bytes.\n",
+    )
+    from core.skills import init_skills_db
+    init_skills_db(db_path=target_a["db_path"])
+    os.makedirs(target_a["skills_dir"])
+
+    gate = threading.Barrier(2)
+
+    def gated_atomic_write(path, data):
+        directory = os.path.dirname(path)
+        fd, temporary = tempfile.mkstemp(dir=directory, prefix=".race-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                gate.wait(timeout=0.25)
+            except threading.BrokenBarrierError:
+                pass
+            os.replace(temporary, path)
+            dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(temporary)
+            raise
+
+    monkeypatch.setattr(st, "_atomic_write", gated_atomic_write)
+    outcomes = []
+    outcome_lock = threading.Lock()
+
+    def worker():
+        try:
+            result = import_skill_package(pkg, **target_a)
+            outcome = ("ok", result["status"])
+        except BaseException as exc:
+            outcome = ("error", type(exc).__name__)
+        with outcome_lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert sorted(outcomes) == [("ok", "already_installed"), ("ok", "installed")]
+    target_path = os.path.join(target_a["skills_dir"], "race-skill.md")
+    assert os.path.exists(target_path)
+
+    import core.db as db_mod
+    conn = db_mod.connect(path=target_a["db_path"])
+    count = conn.execute(
+        "SELECT COUNT(*) AS c FROM skills WHERE name='race-skill'"
+    ).fetchone()["c"]
+    fts_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM skills_fts WHERE skills_fts MATCH 'race'"
+    ).fetchone()["c"]
+    conn.close()
+    assert count == 1
+    assert fts_count == 1
+
+
+def test_official_import_racing_write_skill_fails_before_user_file_write(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    package = os.path.join(OFFICIAL_PACKAGES_ROOT, "media-generation")
+    monkeypatch.setattr(config, "DB_PATH", target_a["db_path"])
+    monkeypatch.setattr(config, "BASE_DIR", str(tmp_path / "user-runtime"))
+    from core.skills import init_skills_db
+    init_skills_db(db_path=target_a["db_path"])
+
+    official_written = threading.Event()
+    release_import = threading.Event()
+    real_atomic_write = st._atomic_write
+
+    def paused_atomic_write(path, content):
+        real_atomic_write(path, content)
+        official_written.set()
+        assert release_import.wait(timeout=10)
+
+    monkeypatch.setattr(st, "_atomic_write", paused_atomic_write)
+    outcomes = {}
+
+    def importer():
+        try:
+            outcomes["import"] = import_skill_package(package, **target_a)["status"]
+        except BaseException as exc:
+            outcomes["import"] = type(exc).__name__
+
+    def saver():
+        try:
+            write_skill("media-generation", "racing user", "attacker content")
+            outcomes["save"] = "saved"
+        except BaseException as exc:
+            outcomes["save"] = type(exc).__name__
+
+    import_thread = threading.Thread(target=importer)
+    save_thread = threading.Thread(target=saver)
+    import_thread.start()
+    assert official_written.wait(timeout=10)
+    save_thread.start()
+
+    user_path = tmp_path / "user-runtime" / "skills" / "media-generation.md"
+    assert not user_path.exists()
+    release_import.set()
+    import_thread.join(timeout=10)
+    save_thread.join(timeout=10)
+
+    assert not import_thread.is_alive()
+    assert not save_thread.is_alive()
+    assert outcomes == {
+        "import": "installed",
+        "save": "OfficialSkillOverwriteError",
+    }
+    assert not user_path.exists()
+
+
+# ── ST-09 bounded payload / manifest law ────────────────────────────────────
+
+@pytest.mark.parametrize("manifest_size", [65535, 65536])
+def test_manifest_boundary_sizes_are_accepted(tmp_path, manifest_size):
+    pkg = _make_package(str(tmp_path / "pkg"), content=b"bounded payload")
+    _pad_manifest_to_exact_size(pkg, manifest_size)
+    info = inspect_package(pkg)
+    assert info["payload_bytes"] == len(b"bounded payload")
+
+
+def test_manifest_one_byte_over_limit_is_rejected_before_read_or_parse(
+        tmp_path, monkeypatch):
+    import core.skill_transport as st
+    pkg = _make_package(str(tmp_path / "pkg"), content=b"bounded payload")
+    _pad_manifest_to_exact_size(pkg, MAX_PACKAGE_MANIFEST_BYTES + 1)
+    read_calls = []
+    real_read = st.os.read
+
+    def traced_read(fd, size):
+        read_calls.append((fd, size))
+        return real_read(fd, size)
+
+    monkeypatch.setattr(st.os, "read", traced_read)
+    monkeypatch.setattr(
+        st.json, "loads",
+        lambda *args, **kwargs: pytest.fail("oversized manifest reached JSON parsing"),
+    )
+    with pytest.raises(PackageValidationError) as ei:
+        validate_package(pkg)
+    assert ei.value.code == "manifest_too_large"
+    assert read_calls == []
+
+
+@pytest.mark.parametrize("payload_size", [262143, 262144])
+def test_payload_boundary_sizes_are_accepted_and_published(
+        tmp_path, target_a, payload_size):
+    content = b"P" * payload_size
+    pkg = _make_package(
+        str(tmp_path / "pkg"), name=f"boundary-{payload_size}", content=content
+    )
+    installed = import_skill_package(pkg, **target_a)
+    assert installed["bytes"] == payload_size
+    assert os.path.getsize(installed["path"]) == payload_size
+
+
+def test_actual_payload_one_byte_over_limit_refuses_before_read_hash_or_mutation(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    content = b"X" * (MAX_SKILL_PAYLOAD_BYTES + 1)
+    pkg = _make_package(
+        str(tmp_path / "pkg"), origin="official", content=content,
+        manifest_overrides={"payload_bytes": 1},
+    )
+    payload_path = os.path.realpath(os.path.join(pkg, "demo-skill.md"))
+    payload_reads = []
+    real_read = st.os.read
+
+    def traced_read(fd, size):
+        if os.path.realpath(f"/proc/self/fd/{fd}") == payload_path:
+            payload_reads.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(st.os, "read", traced_read)
+    monkeypatch.setattr(
+        st.hashlib, "sha256",
+        lambda *args, **kwargs: pytest.fail("oversized payload reached hashing"),
+    )
+    with pytest.raises(PackageValidationError) as ei:
+        import_skill_package(pkg, **target_a)
+    assert ei.value.code == "payload_too_large"
+    assert payload_reads == []
+    assert not os.path.exists(target_a["skills_dir"])
+    assert not os.path.exists(target_a["db_path"])
+
+
+def test_declared_oversize_actual_small_refuses_before_payload_read(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    pkg = _make_package(
+        str(tmp_path / "pkg"), content=b"small",
+        manifest_overrides={"payload_bytes": MAX_SKILL_PAYLOAD_BYTES + 1},
+    )
+    payload_path = os.path.realpath(os.path.join(pkg, "demo-skill.md"))
+    payload_reads = []
+    real_read = st.os.read
+
+    def traced_read(fd, size):
+        if os.path.realpath(f"/proc/self/fd/{fd}") == payload_path:
+            payload_reads.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(st.os, "read", traced_read)
+    with pytest.raises(PackageValidationError) as ei:
+        import_skill_package(pkg, **target_a)
+    assert ei.value.code == "declared_payload_too_large"
+    assert payload_reads == []
+    assert not os.path.exists(target_a["skills_dir"])
+    assert not os.path.exists(target_a["db_path"])
+
+
+def test_payload_growth_after_fstat_is_caught_by_bounded_read(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    content = b"G" * MAX_SKILL_PAYLOAD_BYTES
+    pkg = _make_package(str(tmp_path / "pkg"), content=content)
+    payload_path = os.path.realpath(os.path.join(pkg, "demo-skill.md"))
+    real_fstat = st.os.fstat
+    grew = False
+
+    def grow_after_fstat(fd):
+        nonlocal grew
+        observed = real_fstat(fd)
+        if not grew and os.path.realpath(f"/proc/self/fd/{fd}") == payload_path:
+            with open(payload_path, "ab") as handle:
+                handle.write(b"!")
+            grew = True
+        return observed
+
+    monkeypatch.setattr(st.os, "fstat", grow_after_fstat)
+    with pytest.raises(PackageValidationError) as ei:
+        import_skill_package(pkg, **target_a)
+    assert ei.value.code == "payload_too_large"
+    assert grew
+    assert not os.path.exists(target_a["skills_dir"])
+    assert not os.path.exists(target_a["db_path"])
+
+
+def test_payload_shrink_after_fstat_fails_byte_count_without_mutation(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    content = b"S" * 100
+    pkg = _make_package(str(tmp_path / "pkg"), content=content)
+    payload_path = os.path.realpath(os.path.join(pkg, "demo-skill.md"))
+    real_fstat = st.os.fstat
+    shrank = False
+
+    def shrink_after_fstat(fd):
+        nonlocal shrank
+        observed = real_fstat(fd)
+        if not shrank and os.path.realpath(f"/proc/self/fd/{fd}") == payload_path:
+            os.truncate(payload_path, 99)
+            shrank = True
+        return observed
+
+    monkeypatch.setattr(st.os, "fstat", shrink_after_fstat)
+    with pytest.raises(PackageValidationError) as ei:
+        import_skill_package(pkg, **target_a)
+    assert ei.value.code == "byte_count_mismatch"
+    assert shrank
+    assert not os.path.exists(target_a["skills_dir"])
+    assert not os.path.exists(target_a["db_path"])
+
+
+def test_oversize_pre_policy_user_export_refuses_without_partial_package(
+        tmp_path, target_a):
+    from core.skills import init_skills_db
+    import core.db as db_mod
+
+    os.makedirs(target_a["skills_dir"])
+    path = os.path.join(target_a["skills_dir"], "legacy-large.md")
+    with open(path, "wb") as handle:
+        handle.truncate(MAX_SKILL_PAYLOAD_BYTES + 1)
+    init_skills_db(db_path=target_a["db_path"])
+    conn = db_mod.connect(path=target_a["db_path"])
+    conn.execute(
+        "INSERT INTO skills "
+        "(name, description, path, created_at, updated_at, origin, content_sha256) "
+        "VALUES (?,?,?,?,?,'user',NULL)",
+        ("legacy-large", "pre-policy oversized user skill", path, "now", "now"),
+    )
+    conn.commit()
+    conn.close()
+
+    destination = tmp_path / "exported"
+    with pytest.raises(PackageValidationError) as ei:
+        export_skill("legacy-large", str(destination), **target_a)
+    assert ei.value.code == "payload_too_large"
+    assert not destination.exists()
+
+
+def test_64_mib_payload_attack_performs_zero_payload_reads_and_zero_hashes(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    pkg_dir = tmp_path / "huge-package"
+    pkg_dir.mkdir()
+    payload_path = pkg_dir / "huge.md"
+    with open(payload_path, "wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+    manifest = {
+        "schema_version": 1,
+        "name": "huge-skill",
+        "description": "64 MiB bounded-read attack",
+        "origin": "official",
+        "payload_filename": "huge.md",
+        "payload_bytes": 1,
+        "payload_sha256": "0" * 64,
+    }
+    (pkg_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    payload_realpath = os.path.realpath(payload_path)
+    payload_reads = []
+    real_read = st.os.read
+
+    def traced_read(fd, size):
+        if os.path.realpath(f"/proc/self/fd/{fd}") == payload_realpath:
+            payload_reads.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(st.os, "read", traced_read)
+    monkeypatch.setattr(
+        st.hashlib, "sha256",
+        lambda *args, **kwargs: pytest.fail("64 MiB payload reached hashing"),
+    )
+
+    with pytest.raises(PackageValidationError) as ei:
+        import_skill_package(str(pkg_dir), **target_a)
+    assert ei.value.code == "payload_too_large"
+    assert payload_reads == []
+    assert not os.path.exists(target_a["skills_dir"])
+    assert not os.path.exists(target_a["db_path"])
+
+
+def test_package_rejects_hidden_or_duplicate_payload_entries(tmp_path):
+    pkg = _make_package(str(tmp_path / "pkg"), content=b"one admitted payload")
+    with open(os.path.join(pkg, ".hidden-replacement.md"), "wb") as handle:
+        handle.write(b"second payload")
+    with pytest.raises(PackageValidationError) as ei:
+        validate_package(pkg)
+    assert ei.value.code == "package_shape"
+
+
+def test_write_skill_rejects_oversize_before_filesystem_or_db_mutation(
+        tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    db_path = tmp_path / "state" / "lumina.db"
+    monkeypatch.setattr(config, "BASE_DIR", str(runtime_root))
+    monkeypatch.setattr(config, "DB_PATH", str(db_path))
+    content = "# Skill: too-large\n" + ("W" * MAX_SKILL_PAYLOAD_BYTES)
+
+    with pytest.raises(SkillPayloadPolicyError, match="maximum"):
+        write_skill("too-large", "must not publish", content)
+
+    assert not runtime_root.exists()
+    assert not db_path.exists()
+
+
+def test_runtime_user_recall_refuses_64_mib_before_payload_read(
+        tmp_path, target_a, monkeypatch):
+    import core.db as db_mod
+    import core.skill_transport as st
+    import core.skills as skills_mod
+    from core.skills import init_skills_db
+
+    os.makedirs(target_a["skills_dir"])
+    path = os.path.join(target_a["skills_dir"], "legacy-huge.md")
+    with open(path, "wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+    init_skills_db(db_path=target_a["db_path"])
+    conn = db_mod.connect(path=target_a["db_path"])
+    conn.execute(
+        "INSERT INTO skills "
+        "(name, description, path, created_at, updated_at, origin, content_sha256) "
+        "VALUES (?,?,?,?,?,'user',NULL)",
+        ("legacy-huge", "pre-policy huge user skill", path, "now", "now"),
+    )
+    conn.commit()
+    conn.close()
+
+    payload_reads = []
+    real_read = st.os.read
+
+    def traced_read(fd, size):
+        if os.path.realpath(f"/proc/self/fd/{fd}") == os.path.realpath(path):
+            payload_reads.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(config, "DB_PATH", target_a["db_path"])
+    monkeypatch.setattr(st.os, "read", traced_read)
+    with pytest.raises(SkillPayloadPolicyError, match="maximum is 262144"):
+        skills_mod.load_skill("legacy-huge")
+    assert payload_reads == []
+
+
+def test_runtime_official_recall_refuses_64_mib_before_read_or_hash(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+    import core.skills as skills_mod
+
+    installed = {
+        item["name"]: item for item in bootstrap_official_skills(**target_a)
+    }["media-generation"]
+    with open(installed["path"], "wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+
+    payload_reads = []
+    real_read = st.os.read
+
+    def traced_read(fd, size):
+        if os.path.realpath(f"/proc/self/fd/{fd}") == os.path.realpath(installed["path"]):
+            payload_reads.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(config, "DB_PATH", target_a["db_path"])
+    monkeypatch.setattr(st.os, "read", traced_read)
+    monkeypatch.setattr(
+        skills_mod.hashlib, "sha256",
+        lambda *args, **kwargs: pytest.fail("oversized runtime payload reached hashing"),
+    )
+    with pytest.raises(OfficialSkillIntegrityError, match="maximum is 262144"):
+        skills_mod.load_skill("media-generation")
+    assert payload_reads == []
+
+
+def test_idempotent_restart_refuses_64_mib_installed_drift_before_read(
+        tmp_path, target_a, monkeypatch):
+    import core.skill_transport as st
+
+    package = os.path.join(OFFICIAL_PACKAGES_ROOT, "media-generation")
+    installed = import_skill_package(package, **target_a)
+    with open(installed["path"], "wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+
+    payload_reads = []
+    real_read = st.os.read
+
+    def traced_read(fd, size):
+        if os.path.realpath(f"/proc/self/fd/{fd}") == os.path.realpath(installed["path"]):
+            payload_reads.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(st.os, "read", traced_read)
+    with pytest.raises(PackageValidationError) as ei:
+        import_skill_package(package, **target_a)
+    assert ei.value.code == "payload_too_large"
+    assert payload_reads == []

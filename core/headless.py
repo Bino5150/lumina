@@ -148,8 +148,11 @@ def get_headless_agent(channel_id: str, owner: bool,
             # (which searches/recalls skills) starts serving turns. Only on
             # a genuine cache miss, not every inbound message -- this lock is
             # taken per message (see _reap_idle()'s own comment above).
+            import config
             from core.skill_transport import ensure_official_skills_bootstrapped
-            ensure_official_skills_bootstrapped()
+            ensure_official_skills_bootstrapped(
+                data_dir=config.DATA_DIR, db_path=config.DB_PATH
+            )
 
             agent = LuminaAgent(owner=owner, channel_id=channel_id,
                                 on_tool_call=_log_tool_call(channel_id),
