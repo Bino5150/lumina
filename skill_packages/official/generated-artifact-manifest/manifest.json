@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "name": "generated-artifact-manifest",
+  "description": "Govern and inspect Lumina's durable generated-artifact provenance — canonical 17-field manifest law (L1–L10), ingestion/review truthfulness, provider_output_index semantics, no-secret rule. Provider-neutral governance; never a generation engine.",
+  "origin": "official",
+  "payload_filename": "generated-artifact-manifest.md",
+  "payload_bytes": 8130,
+  "payload_sha256": "cf35a207d5c75c66f8672d26b37724c42381ea7d76efef13e618e235d4e7cbd2"
+}

@@ -48,9 +48,18 @@ def _safe_filename(name: str) -> str:
 
 # ── DB Init ────────────────────────────────────────────────────────────────────
 
-def init_skills_db():
-    """Create skills tables if they don't exist. Safe to call on every startup."""
-    conn = get_db()
+def init_skills_db(db_path: str = None):
+    """Create skills tables if they don't exist. Safe to call on every startup.
+
+    db_path: explicit target DB file (SKILLS-IMPORT-EXPORT-PORTABILITY-01 --
+    lets the transporter operate against an isolated release/test DB without
+    touching ambient config.DB_PATH). None (default) preserves every existing
+    caller's behavior exactly via get_db()."""
+    if db_path is None:
+        conn = get_db()
+    else:
+        from core.db import connect
+        conn = connect(path=db_path)
 
     # Main skills table — metadata + path only (content lives on disk)
     conn.execute("""
@@ -63,6 +72,17 @@ def init_skills_db():
             updated_at  TEXT NOT NULL
         )
     """)
+
+    # SKILLS-IMPORT-EXPORT-PORTABILITY-01: ownership/origin ('official' |
+    # 'user'), needed to keep a normal save_skill/import from silently
+    # overwriting a War Room-approved OFFICIAL skill. Idempotent in-place
+    # migration -- existing rows (all pre-campaign skills were user-authored
+    # via save_skill) default to 'user', which is exactly correct, not a guess.
+    try:
+        conn.execute("ALTER TABLE skills ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
 
     # FTS5 virtual table — indexes name + description for fast keyword search.
     # content='' means external content (we manage sync manually via triggers).
@@ -101,10 +121,19 @@ def init_skills_db():
 
 # ── Write API ──────────────────────────────────────────────────────────────────
 
+class OfficialSkillOverwriteError(Exception):
+    """Raised when a normal (save_skill / write_skill) write would overwrite
+    a War Room-approved OFFICIAL skill. See SKILLS-IMPORT-EXPORT-PORTABILITY-01
+    T9 -- OFFICIAL skills are only ever replaced through a deliberate future
+    upgrade/migration mechanism, never silently by this path."""
+
+
 def write_skill(name: str, description: str, content: str) -> dict:
     """
     Write a skill document to disk and index it in SQLite.
-    If a skill with this name already exists, it is updated.
+    If a skill with this name already exists, it is updated -- unless that
+    existing skill is OFFICIAL (origin='official'), in which case this
+    raises OfficialSkillOverwriteError rather than silently replacing it.
     Returns {'path': ..., 'name': ..., 'updated': bool}
     """
     skills_dir = _skills_dir()
@@ -116,15 +145,22 @@ def write_skill(name: str, description: str, content: str) -> dict:
     if not content.strip().startswith("# Skill:"):
         content = f"# Skill: {name}\n**Description:** {description}\n\n{content.strip()}"
 
-    # Write to disk
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
     # Upsert in DB
     conn = get_db()
     existing = conn.execute(
-        "SELECT id FROM skills WHERE name=?", (name,)
+        "SELECT id, origin FROM skills WHERE name=?", (name,)
     ).fetchone()
+
+    if existing and existing["origin"] == "official":
+        conn.close()
+        raise OfficialSkillOverwriteError(
+            f"'{name}' is an OFFICIAL skill and cannot be overwritten via save_skill."
+        )
+
+    # Write to disk (after the OFFICIAL guard -- never touch the file if the
+    # DB write is about to be refused).
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
 
     if existing:
         conn.execute(
@@ -134,7 +170,8 @@ def write_skill(name: str, description: str, content: str) -> dict:
         updated = True
     else:
         conn.execute(
-            "INSERT INTO skills (name, description, path, created_at, updated_at) VALUES (?,?,?,?,?)",
+            "INSERT INTO skills (name, description, path, created_at, updated_at, origin) "
+            "VALUES (?,?,?,?,?,'user')",
             (name, description, path, now, now)
         )
         updated = False
@@ -211,10 +248,10 @@ def load_skill(name: str) -> str | None:
 
 
 def list_skills() -> list[dict]:
-    """Return all indexed skills as {'name', 'description', 'path'}."""
+    """Return all indexed skills as {'name', 'description', 'path', 'origin'}."""
     conn = get_db()
     rows = conn.execute(
-        "SELECT name, description, path, created_at, updated_at FROM skills ORDER BY name"
+        "SELECT name, description, path, created_at, updated_at, origin FROM skills ORDER BY name"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

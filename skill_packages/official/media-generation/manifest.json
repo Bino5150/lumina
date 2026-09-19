@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "name": "media-generation",
+  "description": "Generate images through Lumina's native image_generation lane — persisted Multimodal route, spending-policy gate, provider adapter, durable artifact ingestion, canonical manifest. Image-generation subset only; video/audio/3D/reference workflows unsupported.",
+  "origin": "official",
+  "payload_filename": "media-generation.md",
+  "payload_bytes": 10188,
+  "payload_sha256": "4eac5c81840715c3bf2a631734733afdf6105557195ac53c20320c7ae12cb9b9"
+}
