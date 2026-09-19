@@ -65,10 +65,25 @@ other law can be exercised without depending on production registration; a
 small group opts out via the `real_provider_vocabulary` fixture to prove
 the real production vocabulary directly -- both that Higgsfield is
 registered and that every other identity still fails closed.
+
+Amendment (MULTIMODAL-M4-GENERATION-MANIFEST-PERSISTENCE-01, 2026-09-19):
+validate_manifest()/build_manifest()/serialize_manifest() remain exactly as
+frozen above -- pure, stdlib-only, zero-I/O. persist_manifest() (below) is
+the one deliberate exception: it performs real filesystem I/O to make an
+already-validated manifest durable under Lumina's DATA_DIR, mirroring
+core.generation_artifact.ingest_artifact()'s own "validate/hash first,
+write via the same temp-file+fsync+os.replace() idiom, never leave a
+partial file behind" discipline. It is additive only -- the manifest
+schema, every one of the ten frozen laws, and every existing function's
+behavior are unchanged. See persist_manifest()'s own docstring for the
+storage design and ManifestPersistenceError for why a durability failure
+is deliberately never conflated with a lawfulness (ManifestValidationError)
+failure.
 """
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping, Optional
@@ -81,6 +96,7 @@ from core.generation_job import (
     INGESTION_PENDING,
 )
 from core.redaction import is_secret_key, redact_secret_shapes
+from core.test_isolation import refuse_if_production_path
 
 __all__ = [
     "CANONICAL_PROVIDERS",
@@ -95,9 +111,11 @@ __all__ = [
     "UnknownManifestCapability",
     "MissingAuthorizationRef",
     "SecretMaterialInManifest",
+    "ManifestPersistenceError",
     "validate_manifest",
     "build_manifest",
     "serialize_manifest",
+    "persist_manifest",
 ]
 
 # ---------------------------------------------------------------------------
@@ -186,6 +204,23 @@ class SecretMaterialInManifest(ManifestValidationError):
     than silently redacted (a silent redaction would hide how the secret got
     there). Best-effort known-shape detection, same posture as
     core.redaction itself -- defense in depth, not a guarantee."""
+
+
+class ManifestPersistenceError(ManifestError):
+    """The manifest was LAWFUL -- it passed validate_manifest() in full --
+    but could not be made durable (a filesystem failure: permission denied,
+    disk full, an unwritable path). Deliberately NOT a ManifestValidationError
+    subclass: a caller must be able to tell "this manifest is unlawful" apart
+    from "this manifest is lawful but durability failed," since the correct
+    response to each is different (the former is a caller/config bug that
+    should never be retried as-is; the latter is an operational condition a
+    caller may legitimately retry). Never raised for a lawfulness problem --
+    persist_manifest() lets validate_manifest()'s own exceptions propagate
+    unwrapped for that case."""
+
+    def __init__(self, errors):
+        self.errors = tuple(errors)
+        super().__init__("; ".join(self.errors))
 
 
 # ---------------------------------------------------------------------------
@@ -490,3 +525,68 @@ def serialize_manifest(manifest: Mapping[str, Any]) -> str:
     refuses -- serialize IS validate."""
     validated = validate_manifest(manifest)
     return json.dumps(validated, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _atomic_write_manifest_text(path: str, text: str) -> None:
+    """Same temp-file + fsync + os.replace() idiom as core.generation_
+    artifact._write_atomic()/core.secrets._save() -- a crash or exception
+    mid-write can never leave a half-written manifest at `path`, and an
+    existing manifest at `path` is left byte-for-byte untouched unless the
+    full write+fsync succeeds. `refuse_if_production_path()` is the same
+    TEST-ISOLATION backstop every other durable-write path in this repo
+    already calls, and is left to raise its own RuntimeError uncaught (it
+    is a test-safety guard, not a durability failure)."""
+    refuse_if_production_path(path)
+    tmp_path = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        # Filesystem error text (a path, an errno string) is not secret-
+        # shaped, but redact_secret_shapes() is run anyway as the same
+        # defense-in-depth every other diagnostic path in this codebase
+        # already applies -- never trust an OS-supplied string by default.
+        detail = redact_secret_shapes(f"{type(exc).__name__}: {exc}")
+        raise ManifestPersistenceError([
+            f"failed to persist manifest durably: {detail}"
+        ]) from exc
+
+
+def persist_manifest(manifest: Mapping[str, Any]) -> str:
+    """Validate, then atomically persist ONE manifest as the durable JSON
+    sibling of its GeneratedArtifact's own bytes -- the production answer
+    to the gap MULTIMODAL-M4-HIGGSFIELD-LIVE-SMOKE-02 exposed: build_
+    manifest() alone leaves a validated manifest sitting only in memory.
+
+    Storage design (MULTIMODAL-M4-GENERATION-MANIFEST-PERSISTENCE-01):
+    core.generation_artifact.artifact_manifest_path(artifact_id) -- a
+    sibling of the artifact's own bytes, under the exact same DATA_DIR/
+    sharding convention (see that function's docstring). No second storage
+    root, no database table or column: the manifest's own artifact_id
+    field (already required and validated) is the only identity needed to
+    both write and later rediscover this file, restart-independent.
+
+    Routes through validate_manifest() on every call, regardless of
+    whether `manifest` already came from build_manifest() -- "never
+    persist an unvalidated pre-manifest object" is enforced here too, not
+    just trusted from an earlier call. Returns the absolute local path
+    written. Raises validate_manifest()'s own ManifestValidationError
+    subclasses UNCHANGED for a lawfulness refusal (never caught or
+    reinterpreted here); raises ManifestPersistenceError -- a distinct,
+    non-validation exception -- for a filesystem failure on an otherwise
+    lawful manifest. Never silently swallows either."""
+    from core.generation_artifact import artifact_manifest_path
+
+    validated = validate_manifest(manifest)
+    encoded = json.dumps(validated, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    path = artifact_manifest_path(validated["artifact_id"])
+    _atomic_write_manifest_text(path, encoded)
+    return path

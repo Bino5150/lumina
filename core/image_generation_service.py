@@ -13,13 +13,19 @@ landed M1/M4 substrate into one truthful image_generation workflow:
         -> bounded, cooperatively-cancellable polling
         -> 0..N output discovery + retrieval
         -> Lumina-owned durable ingestion (core.generation_artifact)
-        -> one core.generation_manifest per ingested artifact
+        -> one core.generation_manifest built + durably persisted per
+           ingested artifact (core.generation_manifest.build_manifest()
+           + .persist_manifest(), MULTIMODAL-M4-GENERATION-MANIFEST-
+           PERSISTENCE-01)
         -> a truthful, closed-vocabulary aggregate result
 
 This module is orchestration only. It owns no new persistence, no new
 vocabulary, and no provider-specific behavior -- every law it touches is
 already frozen in the module that owns it, and this module's only job is
-to call those modules in the right order with the right data. It performs
+to call those modules in the right order with the right data (manifest
+durability included: core.generation_manifest.persist_manifest() owns HOW
+and WHERE a manifest becomes durable; this module only calls it, once per
+ingested artifact, and records whether that call succeeded). It performs
 real I/O (DB, network via the adapter) and is therefore NOT import-pure
 like core.capability_router/core.generation_spending_policy, but nothing
 executes at import time and no provider SDK is imported here.
@@ -80,6 +86,21 @@ fail-closed preflight checks (manifest_provider registration, and an
 authorization_ref for a cost-bearing request) purely so a misconfigured
 call fails BEFORE any spend or submission rather than after -- it never
 relaxes what generation_manifest.py itself requires.
+
+MANIFEST DURABILITY, ADDED NOT WEAKENED (MULTIMODAL-M4-GENERATION-MANIFEST-
+PERSISTENCE-01): a manifest that only passed build_manifest() is still
+sitting in memory -- this module additionally calls core.generation_
+manifest.persist_manifest() exactly once per successfully-built manifest,
+so a manifest a caller receives back in ImageGenerationResult.manifests is
+also, by construction, already durable on disk at the matching
+ImageGenerationResult.manifest_paths entry. A manifest LAWFULNESS refusal
+(ManifestValidationError) is untouched by this amendment -- it still
+propagates as a raised exception exactly as before. A manifest DURABILITY
+failure (ManifestPersistenceError -- valid manifest, disk I/O failed) is
+new: it is recorded per-artifact in failed_manifest_indices, never raised,
+never allowed to invalidate a sibling artifact's already-persisted
+manifest, and never a reason to delete or roll back the artifact's own
+already-durable bytes.
 """
 from __future__ import annotations
 
@@ -123,6 +144,7 @@ __all__ = [
     "OUTCOME_SPEND_REQUIRES_APPROVAL",
     "OUTCOME_SUBMISSION_FAILED",
     "OUTCOME_AMBIGUOUS_DUPLICATE",
+    "OUTCOME_MANIFEST_FAILED",
 ]
 
 _DIAGNOSTIC_MAX_CHARS = 300
@@ -153,6 +175,7 @@ OUTCOME_SPEND_DENIED = "spend_denied"                     # spending policy: den
 OUTCOME_SPEND_REQUIRES_APPROVAL = "spend_requires_approval"  # spending policy: requires_approval
 OUTCOME_SUBMISSION_FAILED = "submission_failed"           # adapter.submit() raised; never assumed to have reached the provider
 OUTCOME_AMBIGUOUS_DUPLICATE = "ambiguous_duplicate"       # an unresolved twin already exists for this exact request
+OUTCOME_MANIFEST_FAILED = "manifest_failed"               # every output ingested, but >=1 manifest failed to persist durably
 
 
 class ImageGenerationServiceError(Exception):
@@ -176,13 +199,33 @@ class ImageGenerationResult:
         creation, e.g. OUTCOME_NOT_ROUTED).
     cost_estimate: the adapter's own pre-submission estimate, whenever one
         was obtained (None when never reached or genuinely unavailable).
-    artifacts / manifests: only the artifacts that actually became
-        Lumina-owned durable bytes, and the one validated manifest built
-        for each of them, in the same order. An output that failed to
-        fetch or ingest contributes to NEITHER tuple -- there is no
-        manifest for an artifact that never became durable.
+    artifacts: every artifact that actually became Lumina-owned durable
+        bytes, regardless of what happened to its manifest afterward. An
+        output that failed to fetch or ingest contributes to this tuple
+        NOT AT ALL -- there is no artifact entry for bytes that never
+        became durable.
+    manifests / manifest_paths: MULTIMODAL-M4-GENERATION-MANIFEST-
+        PERSISTENCE-01 -- mutually parallel, same order, same length: one
+        validated manifest dict and the durable local path it was actually
+        persisted to, for each artifact whose manifest ALSO successfully
+        persisted. These two are no longer guaranteed the same length as
+        `artifacts` (see failed_manifest_indices below) -- match a manifest
+        back to its artifact via manifest["artifact_id"], never by shared
+        tuple position with `artifacts`.
     failed_output_indices: provider_output_index values whose fetch or
         ingestion attempt failed, for a partial/ingestion_failed outcome.
+        Unrelated to manifest persistence -- see failed_manifest_indices.
+    failed_manifest_indices: provider_output_index values of artifacts that
+        WERE successfully ingested (durable bytes exist, and are still in
+        `artifacts`) but whose manifest failed to persist durably --
+        core.generation_manifest.persist_manifest() raised
+        ManifestPersistenceError. Distinct from failed_output_indices on
+        purpose: an ingestion failure and a manifest-durability failure are
+        different events with different causes, and conflating them would
+        make outcome=partial ambiguous about which one actually happened.
+        A manifest LAWFULNESS failure (ManifestValidationError) is never
+        recorded here -- it still propagates as a raised exception,
+        unchanged from before this amendment (see this module's docstring).
     diagnostic: sanitized (redact_secret_shapes'd), truncated, human
         explanation -- "" on a clean success.
     """
@@ -194,7 +237,9 @@ class ImageGenerationResult:
     cost_estimate: Optional[float] = None
     artifacts: Tuple[GeneratedArtifact, ...] = ()
     manifests: Tuple[Mapping[str, object], ...] = ()
+    manifest_paths: Tuple[str, ...] = ()
     failed_output_indices: Tuple[int, ...] = ()
+    failed_manifest_indices: Tuple[int, ...] = ()
     diagnostic: str = ""
 
 
@@ -543,24 +588,42 @@ def generate_image(
     # job_ingestion_state="partial" rather than a stale "ingested" snapshot
     # taken before a later sibling's failure was known (L7/L8: the
     # aggregate is truthful for every manifest built from it).
-    try:
-        manifests = tuple(
-            gm.build_manifest(
+    #
+    # MULTIMODAL-M4-GENERATION-MANIFEST-PERSISTENCE-01: build+validate and
+    # persist are now two distinct steps per artifact, not one. A manifest
+    # LAWFULNESS refusal (ManifestValidationError) is UNCHANGED from
+    # before this amendment -- it still stays loud and propagates,
+    # re-raised with the job id folded in, exactly as it always has (the
+    # artifacts ARE already durable at this point; the refusal just
+    # shouldn't also strand the caller without a way to find what was
+    # already made durable). A manifest DURABILITY failure
+    # (ManifestPersistenceError -- the manifest was lawful, disk I/O
+    # wasn't) is a different, sibling-independent event: recorded in
+    # failed_manifest_indices, never allowed to invalidate another
+    # artifact's already-persisted manifest, and never a reason to delete
+    # this artifact's own already-durable bytes (Truthfulness Law -- no
+    # transactional rollback is required or performed here).
+    manifests = []
+    manifest_paths = []
+    failed_manifest_indices = []
+    for artifact in ingested:
+        try:
+            manifest = gm.build_manifest(
                 final_job, artifact, provider=manifest_provider, review_state=review_state,
                 params=dict(settings), authorization_ref=authorization_ref,
             )
-            for artifact in ingested
-        )
-    except gm.ManifestValidationError as exc:
-        # Re-raised with the job id folded in (the artifacts ARE already
-        # durable at this point) -- never laundered into a soft outcome:
-        # the manifest law's refusal must stay loud (see this module's
-        # docstring), it just shouldn't also strand the caller without a
-        # way to find what was already made durable.
-        raise type(exc)([f"job {final_job.lumina_job_id}: {msg}" for msg in exc.errors]) from exc
+        except gm.ManifestValidationError as exc:
+            raise type(exc)([f"job {final_job.lumina_job_id}: {msg}" for msg in exc.errors]) from exc
+        try:
+            manifest_path = gm.persist_manifest(manifest)
+        except gm.ManifestPersistenceError:
+            failed_manifest_indices.append(artifact.provider_output_index)
+            continue
+        manifests.append(manifest)
+        manifest_paths.append(manifest_path)
 
     if final_job.ingestion_state == gj.INGESTION_INGESTED:
-        outcome = OUTCOME_SUCCESS
+        outcome = OUTCOME_MANIFEST_FAILED if failed_manifest_indices else OUTCOME_SUCCESS
     elif final_job.ingestion_state == gj.INGESTION_PARTIAL:
         outcome = OUTCOME_PARTIAL
     elif final_job.ingestion_state == gj.INGESTION_FAILED:
@@ -571,8 +634,9 @@ def generate_image(
     return ImageGenerationResult(
         outcome=outcome, lumina_job_id=job.lumina_job_id, provider_job_id=job.provider_job_id,
         job_status=final_job.status, cost_estimate=estimate,
-        artifacts=tuple(ingested), manifests=manifests,
+        artifacts=tuple(ingested), manifests=tuple(manifests), manifest_paths=tuple(manifest_paths),
         failed_output_indices=tuple(failed_indices),
+        failed_manifest_indices=tuple(failed_manifest_indices),
     )
 
 

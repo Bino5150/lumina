@@ -17,6 +17,7 @@ depend on, or pollute, the real production provider vocabulary.
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 import pytest
@@ -294,6 +295,14 @@ def test_successful_single_output_generation():
     final = gj.get_generation_job(result.lumina_job_id)
     assert final.status == gj.STATUS_SUCCEEDED
     assert final.ingestion_state == gj.INGESTION_INGESTED
+    # MULTIMODAL-M4-GENERATION-MANIFEST-PERSISTENCE-01: the manifest built
+    # above is also, by construction, already durable on disk.
+    assert len(result.manifest_paths) == 1
+    assert result.failed_manifest_indices == ()
+    manifest_path = result.manifest_paths[0]
+    assert os.path.isfile(manifest_path)
+    with open(manifest_path) as f:
+        assert json.load(f) == manifest
 
 
 def test_successful_multi_output_generation():
@@ -308,6 +317,16 @@ def test_successful_multi_output_generation():
     assert len(result.manifests) == 3
     assert sorted(a.provider_output_index for a in result.artifacts) == [0, 1, 2]
     assert {ga.get_artifact_bytes(a.artifact_id) for a in result.artifacts} == {b"img-0", b"img-1", b"img-2"}
+    # One durable manifest file per successful artifact -- each discoverable
+    # from its own artifact_id, matched by content, not by tuple position.
+    assert len(result.manifest_paths) == 3
+    assert result.failed_manifest_indices == ()
+    manifests_by_artifact_id = {m["artifact_id"]: m for m in result.manifests}
+    for path in result.manifest_paths:
+        assert os.path.isfile(path)
+        with open(path) as f:
+            on_disk = json.load(f)
+        assert on_disk == manifests_by_artifact_id[on_disk["artifact_id"]]
 
 
 def test_zero_output_provider_success():
@@ -321,6 +340,108 @@ def test_zero_output_provider_success():
     final = gj.get_generation_job(result.lumina_job_id)
     assert final.status == gj.STATUS_SUCCEEDED
     assert final.ingestion_state is None  # honestly: no ingestion attempt was ever made
+
+
+# ---------------------------------------------------------------------------
+# Manifest persistence (MULTIMODAL-M4-GENERATION-MANIFEST-PERSISTENCE-01)
+# -- a manifest DURABILITY failure is distinct from, and never allowed to
+# masquerade as, either an ingestion failure or a manifest LAWFULNESS
+# failure.
+# ---------------------------------------------------------------------------
+
+def test_manifest_persistence_failure_reported_truthfully_single_output(monkeypatch):
+    """Provider succeeds, ingestion succeeds, but persist_manifest() fails:
+    the artifact's bytes stay durable and DO appear in result.artifacts
+    (ingestion truly succeeded), while the outcome truthfully reflects that
+    the deliverable is not yet fully materialized -- provider success does
+    NOT imply manifest persistence success."""
+    adapter = FakeAdapter()
+
+    def _boom(manifest):
+        raise gm.ManifestPersistenceError(["simulated disk failure"])
+
+    monkeypatch.setattr(svc.gm, "persist_manifest", _boom)
+    result = _call(adapter)
+
+    assert result.outcome == svc.OUTCOME_MANIFEST_FAILED
+    assert len(result.artifacts) == 1  # bytes are still durable -- never rolled back
+    assert ga.get_artifact_bytes(result.artifacts[0].artifact_id) == b"fake-image-bytes"
+    assert result.manifests == ()
+    assert result.manifest_paths == ()
+    assert result.failed_manifest_indices == (0,)
+    assert result.failed_output_indices == ()  # this was NOT an ingestion failure
+    # The job's own ingestion-state axis is untouched by a manifest failure
+    # -- it stays exactly what it already meant before this amendment.
+    final = gj.get_generation_job(result.lumina_job_id)
+    assert final.ingestion_state == gj.INGESTION_INGESTED
+
+
+def test_manifest_persistence_failure_never_invalidates_a_sibling_success(monkeypatch):
+    """Multi-output: one artifact's manifest fails to persist, the other's
+    succeeds. Sibling success stays truthful -- the surviving manifest is
+    unaffected, and the failure is attributed to exactly the right index."""
+    adapter = MultiOutputFakeAdapter()
+    pid = adapter.next_provider_job_id()
+    adapter.set_outputs(pid, [(b"img-0", "image/png"), (b"img-1", "image/png")])
+
+    real_persist_manifest = gm.persist_manifest
+
+    def _fail_index_zero(manifest):
+        if manifest["provider_output_index"] == 0:
+            raise gm.ManifestPersistenceError(["simulated disk failure for output 0"])
+        return real_persist_manifest(manifest)
+
+    monkeypatch.setattr(svc.gm, "persist_manifest", _fail_index_zero)
+    result = _call(adapter)
+
+    assert result.outcome == svc.OUTCOME_MANIFEST_FAILED
+    assert len(result.artifacts) == 2  # both artifacts' bytes are durable
+    assert result.failed_manifest_indices == (0,)
+    assert len(result.manifests) == 1
+    assert len(result.manifest_paths) == 1
+    assert result.manifests[0]["provider_output_index"] == 1
+    assert os.path.isfile(result.manifest_paths[0])
+
+
+def test_failed_ingestion_output_never_receives_a_false_successful_manifest():
+    """An output whose fetch/ingestion failed never reaches manifest
+    build/persist at all -- it can never end up with a manifest, durable or
+    otherwise, since ga.ingest_artifact() never even ran for it."""
+    adapter = MultiOutputFakeAdapter()
+    pid = adapter.next_provider_job_id()
+    adapter.set_outputs(pid, [(b"img-0", "image/png"), _FETCH_FAILS])
+    result = _call(adapter)
+
+    assert result.outcome == svc.OUTCOME_PARTIAL
+    assert len(result.artifacts) == 1
+    assert result.failed_output_indices == (1,)
+    assert result.failed_manifest_indices == ()  # never attributed to the manifest axis
+    assert len(result.manifests) == 1
+    assert len(result.manifest_paths) == 1
+    assert os.path.isfile(result.manifest_paths[0])
+
+
+def test_manifest_persistence_failure_outcome_yields_to_partial_ingestion_outcome(monkeypatch):
+    """When ingestion itself was already partial, that remains the
+    reported outcome even if the one output that DID ingest also fails to
+    get a durable manifest -- ingestion failure is the dominant truthful
+    signal; failed_manifest_indices still carries the manifest-specific
+    detail rather than it being silently dropped."""
+    adapter = MultiOutputFakeAdapter()
+    pid = adapter.next_provider_job_id()
+    adapter.set_outputs(pid, [(b"img-0", "image/png"), _FETCH_FAILS])
+
+    def _boom(manifest):
+        raise gm.ManifestPersistenceError(["simulated disk failure"])
+
+    monkeypatch.setattr(svc.gm, "persist_manifest", _boom)
+    result = _call(adapter)
+
+    assert result.outcome == svc.OUTCOME_PARTIAL
+    assert result.failed_output_indices == (1,)
+    assert result.failed_manifest_indices == (0,)
+    assert result.manifests == ()
+    assert result.manifest_paths == ()
 
 
 # ---------------------------------------------------------------------------
@@ -659,3 +780,20 @@ def test_higgsfield_adapter_contract_compatibility_offline(monkeypatch):
     # every response that WAS made came from the fake transport's fixed table.
     assert all(method in ("POST", "GET", "GET_RAW") for method, _, _ in transport.calls)
     assert not any(path.startswith("/estimate") for method, path, _ in transport.calls)
+
+    # Required case 17: the fake-Higgsfield end-to-end path also reaches
+    # manifest PERSISTENCE, not just build -- the exact production gap
+    # MULTIMODAL-M4-HIGGSFIELD-LIVE-SMOKE-02 exposed (the harness there had
+    # to write an evidence copy manually; this proves that's no longer
+    # necessary). No live provider call is needed to prove this -- the fake
+    # transport already exercises the real adapter/service code in full.
+    assert len(result.manifest_paths) == 1
+    assert result.failed_manifest_indices == ()
+    manifest_path = result.manifest_paths[0]
+    assert os.path.isfile(manifest_path)
+    with open(manifest_path) as f:
+        on_disk = json.load(f)
+    assert on_disk == manifest
+    # Restart-independent rediscovery: the same path is recomputable from
+    # nothing but the artifact_id, with no database lookup.
+    assert manifest_path == ga.artifact_manifest_path(result.artifacts[0].artifact_id)

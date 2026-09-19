@@ -84,6 +84,7 @@ __all__ = [
     "get_generation_artifact",
     "get_artifact_bytes",
     "list_artifacts_for_job",
+    "artifact_manifest_path",
 ]
 
 _MAX_METADATA_BYTES = 8 * 1024
@@ -200,6 +201,19 @@ def _artifact_path(artifact_id: str) -> str:
     # DB row's mime_type is the authoritative type; this substrate slice
     # has no UI that needs a file-manager-friendly name.
     return os.path.join(_artifact_storage_root(), artifact_id[:2], artifact_id)
+
+
+def artifact_manifest_path(artifact_id: str) -> str:
+    """MULTIMODAL-M4-GENERATION-MANIFEST-PERSISTENCE-01: the deterministic,
+    restart-independent local path for the durable manifest JSON belonging
+    to exactly one GeneratedArtifact. A sibling of that artifact's own
+    bytes (same DATA_DIR root, same sharding), never a second storage root
+    and never a database linkage -- given only an artifact_id (already the
+    durable identity every GeneratedArtifact and manifest carries), any
+    caller, including one running after a restart, can recompute this path
+    without consulting anything else. Pure path derivation: no I/O, no
+    existence check, no directory creation."""
+    return _artifact_path(artifact_id) + ".manifest.json"
 
 
 def _row_to_record(row) -> GeneratedArtifact:
