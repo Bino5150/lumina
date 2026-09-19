@@ -29,6 +29,14 @@ write_skill()'s UNIQUE(name) constraint already uses for identity, extended
 with content+ownership so a same-name-different-payload package (or a
 same-name-different-origin package) fails closed instead of silently
 replacing what's installed (T7/T8/T9).
+
+One function here breaks the "never ambient config" rule on purpose:
+ensure_official_skills_bootstrapped() is the real-process-startup entry
+point (wired into main.py's run_cli()/run_gui() and core/headless.py's
+get_headless_agent(), never into LuminaAgent.__init__ itself -- see that
+function's own docstring for why). It resolves config.DATA_DIR/config.DB_PATH
+the same way write_skill()/list_skills() already legitimately do for
+interactive, single-machine use.
 """
 
 import contextlib
@@ -36,6 +44,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 from datetime import datetime
 
@@ -405,11 +414,11 @@ def _official_packages_root() -> str:
 
 def bootstrap_official_skills(*, skills_dir: str, db_path: str) -> list:
     """Idempotently install every tracked OFFICIAL package shipped with this
-    checkout under skill_packages/official/<name>/. Deterministic, offline,
-    no ambient config -- a fresh clone + a fresh empty db_path reproduces
-    the same OFFICIAL skill availability every time. Not wired into any
-    live startup path in this campaign (see SKILLS-IMPORT-EXPORT-PORTABILITY-01
-    deliverable notes) -- this is the primitive a startup sequence would call.
+    checkout under skill_packages/official/<name>/ into an explicit target.
+    Deterministic, offline, no ambient config -- a fresh clone + a fresh
+    empty db_path reproduces the same OFFICIAL skill availability every
+    time. See ensure_official_skills_bootstrapped() for the real-startup
+    entry point that calls this against the ambient runtime.
     """
     packages_root = _official_packages_root()
     results = []
@@ -420,3 +429,49 @@ def bootstrap_official_skills(*, skills_dir: str, db_path: str) -> list:
         if os.path.isdir(pkg_dir):
             results.append(import_skill_package(pkg_dir, skills_dir=skills_dir, db_path=db_path))
     return results
+
+
+def ensure_official_skills_bootstrapped() -> list:
+    """The real-process-startup entry point. Wired into main.py's
+    run_cli()/run_gui() and core/headless.py's get_headless_agent() -- each
+    an explicit, auditable call site, never LuminaAgent.__init__ itself,
+    which every test that constructs an Agent (including tests with their
+    own freshly isolated config.DB_PATH and strict skill-count assertions,
+    e.g. tests/test_settings_skills_tab.py's env fixture reaching
+    core.skills.init_skills_db() directly) also goes through. Keeping this
+    out of that shared constructor path means no test's Agent construction
+    can ever pick up two unexpected OFFICIAL skill rows as a side effect.
+
+    Installs into config.DATA_DIR-relative storage
+    (<DATA_DIR>/skills/official/), NOT config.BASE_DIR's repo-tracked
+    skills/ directory -- so ordinary startup never mutates the source
+    checkout, and (same as the DB already does) this target is already
+    isolated by LUMINA_DATA_DIR for every test in the suite, individually
+    isolated or not, since conftest.py resolves DATA_DIR once, session-wide,
+    before any test or fixture runs. user-authored skills (save_skill())
+    are unaffected and keep living under BASE_DIR/skills as before -- this
+    only changes where OFFICIAL bootstrap installs, nothing about the
+    general skill-storage architecture.
+
+    Never blocks startup on an ordinary/expected failure (missing tracked
+    packages, a filesystem error) -- mirrors main.py's own fail-safe
+    posture for non-critical startup side effects (_record_runtime_startup).
+    Deliberately does NOT catch the test-isolation guard's RuntimeError
+    (core/test_isolation.py's refuse_if_production_path, reached via
+    core.db.connect()) -- that guard exists specifically to be loud and
+    unmissable, and swallowing it here would quietly defeat its own purpose;
+    it is a no-op in real (non-LUMINA_TESTING) use in any case.
+    """
+    import config
+
+    skills_dir = os.path.join(config.DATA_DIR, "skills", "official")
+    try:
+        return bootstrap_official_skills(skills_dir=skills_dir, db_path=config.DB_PATH)
+    except SkillTransportError as e:
+        print(f"[skills] OFFICIAL skill bootstrap failed, continuing without it: {e}",
+              file=sys.stderr)
+        return []
+    except OSError as e:
+        print(f"[skills] OFFICIAL skill bootstrap failed (filesystem), continuing without it: {e}",
+              file=sys.stderr)
+        return []

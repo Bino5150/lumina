@@ -161,6 +161,13 @@ def run_cli(persona_name: str = None, tools_override: str = None):
 
     _record_runtime_startup("cli", channel_id="cli-local")
     try:
+        # SKILLS-IMPORT-EXPORT-PORTABILITY-01: deterministic OFFICIAL skill
+        # availability on ordinary startup -- before any Agent (and its tool
+        # registry, which searches/recalls skills) exists. Never blocks
+        # startup on failure; see ensure_official_skills_bootstrapped().
+        from core.skill_transport import ensure_official_skills_bootstrapped
+        ensure_official_skills_bootstrapped()
+
         # MB-22: CLI is a trusted local session, same footing as the desktop app --
         # owner=True is already LuminaAgent's default, unchanged here. channel_id
         # is now explicit ("cli-local" instead of the generic "default") so PIN
@@ -238,6 +245,13 @@ def run_gui():
     app.setApplicationName("Lumina")
     app.setApplicationVersion("0.2.7-beta.2")
     _record_runtime_startup("gui")
+
+    # SKILLS-IMPORT-EXPORT-PORTABILITY-01: deterministic OFFICIAL skill
+    # availability on ordinary startup -- before any Agent (and its tool
+    # registry, which searches/recalls skills) exists. Never blocks
+    # startup on failure; see ensure_official_skills_bootstrapped().
+    from core.skill_transport import ensure_official_skills_bootstrapped
+    ensure_official_skills_bootstrapped()
 
     # Set default font — prefer monospace
     for font_name in ["JetBrains Mono", "Fira Code", "Cascadia Code", "Monospace"]:

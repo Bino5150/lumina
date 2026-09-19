@@ -143,6 +143,14 @@ def get_headless_agent(channel_id: str, owner: bool,
         _reap_idle()
 
         if channel_id not in _agents:
+            # SKILLS-IMPORT-EXPORT-PORTABILITY-01: deterministic OFFICIAL
+            # skill availability before this brand-new agent's tool registry
+            # (which searches/recalls skills) starts serving turns. Only on
+            # a genuine cache miss, not every inbound message -- this lock is
+            # taken per message (see _reap_idle()'s own comment above).
+            from core.skill_transport import ensure_official_skills_bootstrapped
+            ensure_official_skills_bootstrapped()
+
             agent = LuminaAgent(owner=owner, channel_id=channel_id,
                                 on_tool_call=_log_tool_call(channel_id),
                                 on_tool_result=_log_tool_result(channel_id))
