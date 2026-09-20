@@ -73,3 +73,52 @@ def record(request_id: str, result: str):
     )
     conn.commit()
     conn.close()
+
+
+def claim(request_id: str, ttl_hours: float = 24) -> bool:
+    """CASTLE-WALLS-REPAIR-04 -- atomic exactly-once gate, distinct from the
+    check()/record() pair above. check()-then-record() is two round trips:
+    under concurrent callers with the same request_id, both can observe
+    check() -> None before either calls record(), and both proceed. This
+    does the test-and-set in one statement (INSERT OR IGNORE, keyed on the
+    request_id PRIMARY KEY) so SQLite's own single-writer serialization
+    (WAL + busy_timeout, see core/db.py) makes exactly one caller's
+    cur.rowcount come back 1, across threads, processes, or a restart in
+    between -- never a cached result payload, just "did I win."
+
+    A stale row from a previous claim() call under a shorter ttl_hours is
+    pruned first, so it can never block a legitimate new claim under a
+    longer one."""
+    from core.db import connect
+    from datetime import datetime, timedelta, timezone
+    _init_db()
+    conn = connect(path=LEDGER_PATH, row_factory=False, foreign_keys=False)
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        conn.execute(
+            "DELETE FROM ledger WHERE request_id = ? AND created_at <= ?",
+            (request_id, cutoff),
+        )
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO ledger (request_id, result) VALUES (?, ?)",
+            (request_id, "claimed"),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def release(request_id: str) -> None:
+    """Undo a claim() that turned out not to correspond to a real side
+    effect, so request_id's authority survives for a genuinely later,
+    distinct attempt instead of being permanently and wrongly spent. Safe
+    to call whether or not request_id was ever actually claimed."""
+    from core.db import connect
+    _init_db()
+    conn = connect(path=LEDGER_PATH, row_factory=False, foreign_keys=False)
+    conn.execute("DELETE FROM ledger WHERE request_id = ?", (request_id,))
+    conn.commit()
+    conn.close()

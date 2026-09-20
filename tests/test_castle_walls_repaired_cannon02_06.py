@@ -544,7 +544,7 @@ def test_owner_authorized_action_still_works_end_to_end(monkeypatch):
     )
     draft_store.mark_draft_presented(draft.draft_id, channel_id="c", chat_id=1)
     from core.agent import _maybe_approve_pending_draft
-    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", "c", 1)
+    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", "c", 1, "test-event-owner-authorized")
 
     result = image_tool.generate_image(draft.draft_id, channel_id="c", chat_id=1, current_turn_seq=1)
 

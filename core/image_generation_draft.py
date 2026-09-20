@@ -51,9 +51,23 @@ __all__ = [
     "approve_draft",
     "is_approved",
     "find_pending_draft_id",
+    "try_claim_approval_event",
+    "release_approval_event",
 ]
 
 DEFAULT_TTL_SECONDS = 600.0  # 10 minutes
+
+# CASTLE-WALLS-REPAIR-04 / CANNON-11 -- namespace prefix for the durable
+# exactly-once ledger entries below (core.idempotency.claim()/release()),
+# so this event-identity space can never collide with any other
+# core.idempotency caller's own request_ids (e.g. tools/telegram_send.py's
+# send-dedup) even if the raw approval_event_id string were ever reused
+# for an unrelated purpose. 24h matches telegram_origin_routing.
+# ROUTE_TTL_SECONDS' own scale and core.idempotency.check()'s own default
+# ttl_hours -- comfortably longer than any realistic transport-retry
+# window, bounded so the ledger never grows without a lifecycle policy.
+_APPROVAL_EVENT_NAMESPACE = "image_generation_draft_approval"
+APPROVAL_EVENT_TTL_HOURS = 24.0
 
 
 @dataclass(frozen=True)
@@ -279,3 +293,37 @@ def find_pending_draft_id(*, channel_id: Optional[str], chat_id: Optional[int]) 
         if len(candidates) != 1:
             return None
         return candidates[0].draft_id
+
+
+def try_claim_approval_event(approval_event_id: str) -> bool:
+    """CASTLE-WALLS-REPAIR-04 / CANNON-11 -- exactly-once admission gate for
+    a unique owner authorization event (see core.agent._maybe_approve_
+    pending_draft(), the word-match turn-admission hook that calls this
+    before ever resolving a candidate draft). Durable across threads,
+    processes, and restarts -- backed by core.idempotency's own SQLite
+    ledger.db, not an in-memory set, because the same authenticated
+    external event (e.g. a Telegram update redelivered by transport-level
+    retry) can legitimately reach this process again after either.
+
+    Returns True for exactly the one admission that wins the claim across
+    every replay of the same approval_event_id within
+    APPROVAL_EVENT_TTL_HOURS; False for every other one. Callers must
+    release_approval_event() the claim if it turns out not to correspond
+    to a real approval -- see that function's own docstring."""
+    from core import idempotency
+    request_id = idempotency.make_request_id(_APPROVAL_EVENT_NAMESPACE, approval_event_id)
+    return idempotency.claim(request_id, ttl_hours=APPROVAL_EVENT_TTL_HOURS)
+
+
+def release_approval_event(approval_event_id: str) -> None:
+    """Undo try_claim_approval_event() when the claimed event turned out
+    not to correspond to a real approval -- no eligible draft was found,
+    or approve_draft() itself declined (e.g. the draft expired in the
+    interim). An event that authorized nothing must remain available to a
+    genuinely later admission rather than becoming a permanently spent
+    bearer token for nothing (CASTLE-WALLS-REPAIR-04, section 9's closing
+    invariant: an event that failed to authorize must never become a
+    stored bearer token for unrelated future work)."""
+    from core import idempotency
+    request_id = idempotency.make_request_id(_APPROVAL_EVENT_NAMESPACE, approval_event_id)
+    idempotency.release(request_id)

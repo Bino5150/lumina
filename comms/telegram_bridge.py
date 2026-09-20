@@ -77,6 +77,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    # CASTLE-WALLS-REPAIR-04 / CANNON-11 -- a stable identity for THIS
+    # exact inbound Telegram event: Telegram's own server-assigned
+    # message_id, unique per chat and unchanged across a transport-level
+    # redelivery of the same update (see this function's own to_thread
+    # comment below about observed live redelivery). Built only from
+    # already-authenticated update/chat metadata above -- never from
+    # `text` -- so nothing in the message body, including a spoofed or
+    # quoted/forwarded "event id", can influence it. chat_id is folded in
+    # too, even though this bridge only ever has one valid owner chat, so
+    # the identity space can never migrate across a future multi-chat
+    # change. Threaded through both the routed-dispatch and headless-
+    # fallback branches below -- whichever one this delivery actually
+    # takes -- all the way to core.agent's approval word-match hook.
+    approval_event_id = f"telegram:{chat_id}:{update.message.message_id}"
+
     reply_to = getattr(update.message, "reply_to_message", None)
     reply_to_message_id = getattr(reply_to, "message_id", None)
     resolution = origin_routing.resolve(
@@ -89,7 +104,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif resolution.reason == "expired":
         fallback_note = "[Telegram origin route expired; telegram-owner fallback.]"
     if resolution.route is not None:
-        routed = origin_routing.dispatch(resolution.route, text)
+        routed = origin_routing.dispatch(resolution.route, text, approval_event_id=approval_event_id)
         if routed is not None:
             try:
                 reply = await asyncio.wrap_future(routed)
@@ -120,7 +135,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # separate agent turns). Same fix already applied to Discord in S36b.
     if emergency_stop.is_latched():
         return
-    result = await asyncio.to_thread(run_headless_turn, task=text, channel_id=CHANNEL_ID, owner=True)
+    result = await asyncio.to_thread(
+        run_headless_turn, task=text, channel_id=CHANNEL_ID, owner=True,
+        approval_event_id=approval_event_id,
+    )
     reply = result["response"] if result["success"] else f"[Lumina error: {result['error']}]"
     reply = headless_result_delivery_text(result, reply)
     if fallback_note:

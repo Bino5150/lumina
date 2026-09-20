@@ -163,7 +163,8 @@ def test_real_word_match_approval_then_later_turn_confirms_exactly_once(monkeypa
     _arm_mock_submission(monkeypatch, submissions)
     draft = _stage(staged_at_turn_seq=0)
 
-    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", CHANNEL, CHAT_ID)
+    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", CHANNEL, CHAT_ID,
+                                  "test-event-real-word-match-approval")
     assert draft_store.is_approved(draft.draft_id) is True
 
     result = image_tool.generate_image(draft.draft_id, channel_id=CHANNEL, chat_id=CHAT_ID,

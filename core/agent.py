@@ -9,6 +9,7 @@ import re
 import sys
 import os
 import time
+import uuid
 from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -363,7 +364,8 @@ def _normalize_for_approval_match(text: str) -> str:
     return normalized.strip().lower()
 
 
-def _maybe_approve_pending_draft(user_input, source: str, channel_id, chat_id) -> None:
+def _maybe_approve_pending_draft(user_input, source: str, channel_id, chat_id,
+                                  approval_event_id: Optional[str] = None) -> None:
     """CASTLE-WALLS-REPAIR-01 R2, Gate 2 (word-match path) -- runs from
     inside _chat_impl() immediately after the real ctx.add_user() call,
     BEFORE any model inference for this turn. Pure deterministic runtime
@@ -378,17 +380,52 @@ def _maybe_approve_pending_draft(user_input, source: str, channel_id, chat_id) -
     approve_draft() itself is not registered as an agent tool, so the
     model cannot call it directly either way.
 
+    approval_event_id (CASTLE-WALLS-REPAIR-04 / CANNON-11): identifies the
+    unique owner authorization event admitting THIS turn -- never derived
+    from user_input, always supplied by trusted runtime code. chat()
+    mints a fresh one whenever a caller doesn't supply one (ordinary GUI/
+    CLI turns: each physical submission IS a distinct, already-trusted
+    event). comms/telegram_bridge.py supplies a real one instead, derived
+    from Telegram's own server-assigned message_id, which stays IDENTICAL
+    across a transport-level redelivery of the same inbound update (see
+    that module's own to_thread comment about observed live redelivery) --
+    exactly the case a freshly-minted-per-call id could never catch.
+    try_claim_approval_event() below is the exactly-once boundary: at most
+    one admission of a given event identity may ever proceed past it, no
+    matter how many times find_pending_draft_id() would otherwise resolve
+    a DIFFERENT draft on a later replay. A claim that turns out not to
+    correspond to a real approval (no eligible draft, or approve_draft()
+    itself declines) is released so the event's authority survives for a
+    genuinely later, distinct admission -- see release_approval_event()'s
+    own docstring for why an event that granted nothing must never become
+    a stored bearer token. No trustworthy approval_event_id at all fails
+    closed rather than falling back to the old text-only match.
+
     Never raises -- an approval-detection failure must not break an
     ordinary chat turn that has nothing to do with image generation."""
     if source != "OWNER_DIRECT" or not isinstance(user_input, str):
         return
     if _normalize_for_approval_match(user_input) not in _APPROVAL_AFFIRMATIONS:
         return
+    if not approval_event_id:
+        print("[IMAGE_GEN] approval word-match check: no approval_event_id, failing closed",
+              flush=True)
+        return
     try:
-        from core.image_generation_draft import approve_draft, find_pending_draft_id
-        draft_id = find_pending_draft_id(channel_id=channel_id, chat_id=chat_id)
-        if draft_id is not None:
-            approve_draft(draft_id, channel_id=channel_id, chat_id=chat_id)
+        from core.image_generation_draft import (
+            approve_draft, find_pending_draft_id,
+            release_approval_event, try_claim_approval_event,
+        )
+        if not try_claim_approval_event(approval_event_id):
+            return  # already spent by an earlier admission of this same event
+        approved = False
+        try:
+            draft_id = find_pending_draft_id(channel_id=channel_id, chat_id=chat_id)
+            if draft_id is not None:
+                approved = approve_draft(draft_id, channel_id=channel_id, chat_id=chat_id)
+        finally:
+            if not approved:
+                release_approval_event(approval_event_id)
     except Exception as e:
         print(f"[IMAGE_GEN] approval word-match check failed: {e}", flush=True)
 
@@ -1833,7 +1870,7 @@ class LuminaAgent:
 
     def chat(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
              cancel_event=None, reasoning_effort: Optional[str] = None,
-             attachments=None) -> str:
+             attachments=None, approval_event_id: Optional[str] = None) -> str:
         """
         Main entry point. Runs tool loop with non-streaming,
         then streams the final response. Returns full response string.
@@ -1848,6 +1885,19 @@ class LuminaAgent:
         _build_system_prompt() docstring. None (default) preserves current
         behavior for every caller that doesn't track a chat_id (CLI, headless,
         subagents).
+        approval_event_id (CASTLE-WALLS-REPAIR-04 / CANNON-11): the unique
+        owner authorization event admitting this turn, threaded down to
+        _maybe_approve_pending_draft()'s exactly-once replay gate. None
+        (default) means the caller has no external event to preserve (an
+        ordinary GUI click or a CLI input() line IS the trusted event, with
+        nothing upstream that could ever redeliver it) -- this mints a
+        fresh one below rather than leaving the word-match hook without any
+        identity at all, so every caller that predates this parameter keeps
+        working with zero changes. comms/telegram_bridge.py is the one real
+        caller that supplies a genuine, transport-stable value instead (via
+        ui/main_window.py's routed-dispatch queue or core/headless.py's
+        run_headless_turn()), because only there can the exact same
+        external event legitimately reach this method more than once.
         cancel_event: optional threading.Event owned by the desktop foreground
         worker. Cancellation is cooperative: already-blocked provider/tool calls
         are allowed to return, then chat() exits at the next safe boundary.
@@ -1909,6 +1959,13 @@ class LuminaAgent:
             turn_cancellation._set(cancel_event)
         turn_id = flight_recorder.new_turn_id()
         turn_telemetry = _new_turn_telemetry()
+        # CASTLE-WALLS-REPAIR-04 / CANNON-11 -- mint a fresh event identity
+        # for this specific chat() call whenever the caller didn't supply
+        # one of its own; see this method's own approval_event_id docstring
+        # above for why that's the correct default rather than leaving the
+        # word-match hook with nothing. Never derived from user_input --
+        # the model has no path to this parameter either way.
+        approval_event_id = approval_event_id or uuid.uuid4().hex
         # CASTLE-WALLS-REPAIR-01 R2 -- set as early as possible, before any
         # of chat()'s three add_user()-reaching branches, so a per-agent-
         # bound tool closure reading self._current_chat_id mid-turn always
@@ -1977,6 +2034,7 @@ class LuminaAgent:
                         turn_telemetry=turn_telemetry,
                         vision_route_ctx=vision_route_ctx,
                         attachments=attachments,
+                        approval_event_id=approval_event_id,
                     )
                     duration_s = time.monotonic() - turn_started_at
                     if is_error_response(result):
@@ -2023,7 +2081,8 @@ class LuminaAgent:
                     turn_started_at: Optional[float] = None,
                     turn_telemetry: Optional[dict] = None,
                     vision_route_ctx: Optional[object] = None,
-                    attachments=None) -> str:
+                    attachments=None,
+                    approval_event_id: Optional[str] = None) -> str:
         if turn_telemetry is None:
             turn_telemetry = _new_turn_telemetry()
         tools_used_this_turn = set()
@@ -2202,7 +2261,8 @@ class LuminaAgent:
         # own docstring for why this is safe against every FILE/TOOL/
         # SPECIALIST/PEER/USER_SKILL forgery angle.
         _maybe_approve_pending_draft(
-            user_input, source, getattr(self, "channel_id", None), chat_id
+            user_input, source, getattr(self, "channel_id", None), chat_id,
+            approval_event_id,
         )
 
         # MULTIMODAL-M2-BOUNDED-VISION-LANE-01 -- execute the bounded vision

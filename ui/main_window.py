@@ -196,7 +196,7 @@ class AgentWorker(QThread):
     BATCH_CHARS = 12  # flush every N characters
 
     def __init__(self, agent, user_input, signals: StreamSignals, chat_id: int = None,
-                 attachments=None):
+                 attachments=None, approval_event_id: str = None):
         super().__init__()
         self.agent = agent
         self.user_input = user_input
@@ -205,6 +205,13 @@ class AgentWorker(QThread):
         # CASTLE-WALLS-REPAIR-01 R1A -- optional list of (label, text)
         # pairs, forwarded to agent.chat()'s own attachments= kwarg.
         self.attachments = attachments
+        # CASTLE-WALLS-REPAIR-04 / CANNON-11 -- real Telegram-derived
+        # identity for a routed reply, forwarded to agent.chat()'s own
+        # approval_event_id= kwarg. None (default, every ordinary local
+        # GUI turn) leaves it out of chat()'s call entirely -- see
+        # _agent_accepts_approval_event_id() below for why -- so chat()
+        # mints its own fresh one instead.
+        self.approval_event_id = approval_event_id
         self._think_buf = ""
         self._resp_buf = ""
         self._cancel_event = threading.Event()
@@ -253,6 +260,19 @@ class AgentWorker(QThread):
         except (TypeError, ValueError):
             return True
         return any(p.name == "attachments" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+    def _agent_accepts_approval_event_id(self) -> bool:
+        """CASTLE-WALLS-REPAIR-04 -- same compatibility shape as
+        _agent_accepts_attachments() above, for the same reason: lightweight
+        GUI-test agent stubs predate this parameter and define chat() with
+        neither an approval_event_id param nor **kwargs."""
+        import inspect
+        try:
+            params = inspect.signature(self.agent.chat).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(p.name == "approval_event_id" or p.kind == inspect.Parameter.VAR_KEYWORD
+                   for p in params)
 
     def _flush_think(self):
         if self._think_buf:
@@ -347,6 +367,8 @@ class AgentWorker(QThread):
                     kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
             if self.attachments and self._agent_accepts_attachments():
                 kwargs["attachments"] = self.attachments
+            if self.approval_event_id and self._agent_accepts_approval_event_id():
+                kwargs["approval_event_id"] = self.approval_event_id
             runtime_token = getattr(
                 self.agent, "_telegram_origin_runtime_token", None,
             )
@@ -2261,7 +2283,7 @@ class LuminaWindow(QMainWindow):
 
         self._telegram_active_dispatch = request
         try:
-            self._on_user_message(request.text)
+            self._on_user_message(request.text, approval_event_id=request.approval_event_id)
         except Exception:
             self._telegram_active_dispatch = None
             if not request.future.done():
@@ -2290,7 +2312,7 @@ class LuminaWindow(QMainWindow):
             request.future.set_result(response)
         QTimer.singleShot(0, self._drain_telegram_origin_queue)
 
-    def _on_user_message(self, text: str):
+    def _on_user_message(self, text: str, approval_event_id: str = None):
         if not text.strip():
             return
 
@@ -2428,7 +2450,8 @@ class LuminaWindow(QMainWindow):
         # in-flight deliberate_reconstruct() preparation for this chat.
         self._context_generation.bump()
         self.worker = AgentWorker(self.agent, content, self.signals, chat_id=self._current_chat_id,
-                                   attachments=attachments_for_chat)
+                                   attachments=attachments_for_chat,
+                                   approval_event_id=approval_event_id)
         self.worker.start()
         
 

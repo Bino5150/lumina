@@ -214,11 +214,26 @@ def _agent_accepts_reasoning_effort(agent) -> bool:
                for p in params)
 
 
+def _agent_accepts_approval_event_id(agent) -> bool:
+    """CASTLE-WALLS-REPAIR-04 -- same compatibility shape as
+    _agent_accepts_reasoning_effort() above, for the same reason: fake
+    agents in tests predating this parameter define chat() with neither an
+    approval_event_id param nor **kwargs."""
+    import inspect
+    try:
+        params = inspect.signature(agent.chat).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(p.name == "approval_event_id" or p.kind == inspect.Parameter.VAR_KEYWORD
+               for p in params)
+
+
 def run_headless_turn(task: str, channel_id: str, owner: bool,
                        persona: dict = None, tools_profile: str = None,
                        tools_enabled: list = None,
                        force_tools_profile: str = None,
-                       trace: bool = False) -> dict:
+                       trace: bool = False,
+                       approval_event_id: str = None) -> dict:
     """Never raises — a bot listener should always get something to relay
     back, even on failure.
 
@@ -285,6 +300,15 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
                     llm = getattr(agent, "llm", None)
                     if llm is not None:
                         chat_kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
+                # CASTLE-WALLS-REPAIR-04 / CANNON-11 -- threads a caller-
+                # supplied real ingress identity (comms/telegram_bridge.py's
+                # Telegram-derived one) down to core.agent's approval word-
+                # match hook. None (default, every pre-existing caller)
+                # leaves this out of chat_kwargs entirely, so chat() mints
+                # its own fresh one exactly as it does for any other caller
+                # with no external event to preserve.
+                if approval_event_id is not None and _agent_accepts_approval_event_id(agent):
+                    chat_kwargs["approval_event_id"] = approval_event_id
                 response = agent.chat(task, **chat_kwargs)
                 response = _sanitize_response(response, owner)
             finally:

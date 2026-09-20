@@ -409,6 +409,7 @@ def test_cannon10_telegram_marks_presented_only_after_successful_send(monkeypatc
 
     class Message:
         text = "make an image"
+        message_id = 8001
         reply_to_message = None
 
         async def reply_text(self, reply):
@@ -446,6 +447,7 @@ def test_cannon10_failed_telegram_send_never_marks_presented(monkeypatch):
 
     class Message:
         text = "make an image"
+        message_id = 8002
         reply_to_message = None
 
         async def reply_text(self, reply):

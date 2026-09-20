@@ -43,6 +43,12 @@ class OriginDispatch:
     """Transient delivery envelope, deliberately separate from route metadata."""
     route: OriginRoute
     text: str
+    # CASTLE-WALLS-REPAIR-04 / CANNON-11 -- the stable identity of the
+    # specific inbound Telegram event being routed, carried alongside
+    # `text` all the way to core.agent's approval word-match hook. Never
+    # derived from `text` itself. None only for callers that predate this
+    # field (kept optional so nothing upstream is forced to change).
+    approval_event_id: Optional[str] = None
     future: Future = field(default_factory=Future)
 
 
@@ -184,13 +190,14 @@ def resolve(*, destination_chat_id, reply_to_message_id=None,
         return RouteResolution(max(active, key=lambda r: r.created_at), "sole_recent")
 
 
-def dispatch(route: OriginRoute, text: str) -> Future | None:
+def dispatch(route: OriginRoute, text: str, *,
+             approval_event_id: Optional[str] = None) -> Future | None:
     with _lock:
         dispatcher = _live_dispatcher_locked(route.runtime_token)
     if dispatcher is None:
         return None
 
-    request = OriginDispatch(route=route, text=text)
+    request = OriginDispatch(route=route, text=text, approval_event_id=approval_event_id)
     try:
         accepted = dispatcher(request)
     except Exception:

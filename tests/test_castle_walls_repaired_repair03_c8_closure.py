@@ -91,7 +91,7 @@ def test_bare_yes_with_multiple_eligible_drafts_produces_zero_submissions(monkey
     a = _stage_and_present(cost=0.10)
     b = _stage_and_present(cost=5.00)
 
-    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", CHANNEL, CHAT_ID)
+    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", CHANNEL, CHAT_ID, "test-event-1")
 
     assert draft_store.is_approved(a.draft_id) is False
     assert draft_store.is_approved(b.draft_id) is False
@@ -176,7 +176,12 @@ def test_after_ambiguous_drafts_resolve_a_later_single_draft_is_approvable(monke
     a = _stage_and_present(cost=0.10)
     b = _stage_and_present(cost=5.00)
 
-    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", CHANNEL, CHAT_ID)
+    # Two separate owner "yes" messages -- distinct events, exactly like
+    # two separate GUI submissions (see CASTLE-WALLS-REPAIR-04's own "no
+    # dedup by content" requirement), not a transport replay of the same
+    # one. See test_castle_walls_adversarial_c9.py's own frozen scenario
+    # for the SAME-event-replayed-after-ambiguity-resolves case instead.
+    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", CHANNEL, CHAT_ID, "test-event-1")
     assert draft_store.is_approved(a.draft_id) is False
     assert draft_store.is_approved(b.draft_id) is False
 
@@ -184,7 +189,7 @@ def test_after_ambiguous_drafts_resolve_a_later_single_draft_is_approvable(monke
     # A is eligible.
     draft_store.discard_draft(b.draft_id)
 
-    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", CHANNEL, CHAT_ID)
+    _maybe_approve_pending_draft("yes", "OWNER_DIRECT", CHANNEL, CHAT_ID, "test-event-2")
     assert draft_store.is_approved(a.draft_id) is True
 
 

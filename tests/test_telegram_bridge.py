@@ -62,7 +62,7 @@ def _fake_update(chat_id, text):
     async def _reply(text):
         replies.append(text)
 
-    message = types.SimpleNamespace(text=text, reply_text=_reply)
+    message = types.SimpleNamespace(text=text, message_id=1001, reply_text=_reply)
     chat = types.SimpleNamespace(id=chat_id)
     update = types.SimpleNamespace(effective_chat=chat, message=message)
     return update, replies

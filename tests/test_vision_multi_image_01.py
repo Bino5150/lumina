@@ -133,12 +133,14 @@ class _FakeAgentWorker:
     not just intermediate UI state."""
     instances = []
 
-    def __init__(self, agent, content, signals, chat_id=None, attachments=None):
+    def __init__(self, agent, content, signals, chat_id=None, attachments=None,
+                 approval_event_id=None):
         self.agent = agent
         self.content = content
         self.signals = signals
         self.chat_id = chat_id
         self.attachments = attachments
+        self.approval_event_id = approval_event_id
         self.started = False
         _FakeAgentWorker.instances.append(self)
 
