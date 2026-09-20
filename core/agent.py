@@ -365,7 +365,8 @@ def _normalize_for_approval_match(text: str) -> str:
 
 
 def _maybe_approve_pending_draft(user_input, source: str, channel_id, chat_id,
-                                  approval_event_id: Optional[str] = None) -> None:
+                                  approval_event_id: Optional[str] = None,
+                                  current_turn_seq: Optional[int] = None) -> None:
     """CASTLE-WALLS-REPAIR-01 R2, Gate 2 (word-match path) -- runs from
     inside _chat_impl() immediately after the real ctx.add_user() call,
     BEFORE any model inference for this turn. Pure deterministic runtime
@@ -392,14 +393,25 @@ def _maybe_approve_pending_draft(user_input, source: str, channel_id, chat_id,
     exactly the case a freshly-minted-per-call id could never catch.
     try_claim_approval_event() below is the exactly-once boundary: at most
     one admission of a given event identity may ever proceed past it, no
-    matter how many times find_pending_draft_id() would otherwise resolve
-    a DIFFERENT draft on a later replay. A claim that turns out not to
-    correspond to a real approval (no eligible draft, or approve_draft()
-    itself declines) is released so the event's authority survives for a
-    genuinely later, distinct admission -- see release_approval_event()'s
-    own docstring for why an event that granted nothing must never become
-    a stored bearer token. No trustworthy approval_event_id at all fails
-    closed rather than falling back to the old text-only match.
+    matter how many times resolve_causal_draft_id() would otherwise
+    resolve a DIFFERENT draft on a later replay. A claim that turns out
+    not to correspond to a real approval (no eligible draft, or
+    approve_draft() itself declines) is released so the event's authority
+    survives for a genuinely later, distinct admission -- see
+    release_approval_event()'s own docstring for why an event that
+    granted nothing must never become a stored bearer token. No
+    trustworthy approval_event_id at all fails closed rather than falling
+    back to the old text-only match.
+
+    current_turn_seq (CASTLE-WALLS-CLOSURE-01): self.ctx.turn_seq at this
+    exact admission, read by the one real call site immediately after the
+    ctx.add_user() call above it in _chat_impl(). Threaded through to
+    resolve_causal_draft_id() -- see that function's own docstring for
+    the causal-intent-binding this enables (an event can only ever
+    authorize a draft that already existed at its FIRST admission, pinned
+    durably across any later release+reclaim or restart, closing C10's
+    S5/S6/S7-dir2 residual). None falls back to that function's own
+    pre-closure fallback unchanged.
 
     Never raises -- an approval-detection failure must not break an
     ordinary chat turn that has nothing to do with image generation."""
@@ -413,18 +425,38 @@ def _maybe_approve_pending_draft(user_input, source: str, channel_id, chat_id,
         return
     try:
         from core.image_generation_draft import (
-            approve_draft, find_pending_draft_id,
-            release_approval_event, try_claim_approval_event,
+            approve_draft, is_approved, release_approval_event,
+            resolve_causal_draft_id, try_claim_approval_event,
         )
         if not try_claim_approval_event(approval_event_id):
             return  # already spent by an earlier admission of this same event
         approved = False
+        draft_id = None
         try:
-            draft_id = find_pending_draft_id(channel_id=channel_id, chat_id=chat_id)
+            draft_id = resolve_causal_draft_id(
+                channel_id=channel_id, chat_id=chat_id,
+                approval_event_id=approval_event_id,
+                current_turn_seq=current_turn_seq,
+            )
             if draft_id is not None:
                 approved = approve_draft(draft_id, channel_id=channel_id, chat_id=chat_id)
         finally:
-            if not approved:
+            # CASTLE-WALLS-CLOSURE-01 / C10 S14 -- release only if the
+            # draft store's OWN state agrees nothing was actually
+            # approved, not merely if this call's local `approved` flag
+            # says so. approve_draft() performs its one state mutation as
+            # its last statement under lock and cannot raise after it
+            # today (see that function's own docstring), so `approved`
+            # and is_approved(draft_id) can never disagree right now --
+            # but this makes that a checked, auditable invariant rather
+            # than an implicit one: if a future refactor ever added a
+            # step after the mutation that could raise, trusting
+            # `approved` alone here would release a claim whose authority
+            # the draft store already spent, letting a replay burn a
+            # SECOND draft under the same event. is_approved() reads the
+            # exact same source of truth approve_draft() writes, so this
+            # holds even if that assumption is ever accidentally broken.
+            if not approved and not (draft_id is not None and is_approved(draft_id)):
                 release_approval_event(approval_event_id)
     except Exception as e:
         print(f"[IMAGE_GEN] approval word-match check failed: {e}", flush=True)
@@ -2262,7 +2294,7 @@ class LuminaAgent:
         # SPECIALIST/PEER/USER_SKILL forgery angle.
         _maybe_approve_pending_draft(
             user_input, source, getattr(self, "channel_id", None), chat_id,
-            approval_event_id,
+            approval_event_id, current_turn_seq=getattr(self.ctx, "turn_seq", None),
         )
 
         # MULTIMODAL-M2-BOUNDED-VISION-LANE-01 -- execute the bounded vision

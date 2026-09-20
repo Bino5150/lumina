@@ -180,9 +180,11 @@ def test_chat_mints_a_fresh_approval_event_id_per_call(monkeypatch):
     seen = []
     real_hook = agent_module._maybe_approve_pending_draft
 
-    def _spy(user_input, source, channel_id, chat_id, approval_event_id=None):
+    def _spy(user_input, source, channel_id, chat_id, approval_event_id=None,
+             current_turn_seq=None):
         seen.append(approval_event_id)
-        return real_hook(user_input, source, channel_id, chat_id, approval_event_id)
+        return real_hook(user_input, source, channel_id, chat_id, approval_event_id,
+                          current_turn_seq=current_turn_seq)
 
     monkeypatch.setattr(agent_module, "_maybe_approve_pending_draft", _spy)
 

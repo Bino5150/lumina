@@ -33,6 +33,7 @@ crossed a process restart) must never be resumable later.
 """
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ __all__ = [
     "find_pending_draft_id",
     "try_claim_approval_event",
     "release_approval_event",
+    "resolve_causal_draft_id",
 ]
 
 DEFAULT_TTL_SECONDS = 600.0  # 10 minutes
@@ -68,6 +70,28 @@ DEFAULT_TTL_SECONDS = 600.0  # 10 minutes
 # window, bounded so the ledger never grows without a lifecycle policy.
 _APPROVAL_EVENT_NAMESPACE = "image_generation_draft_approval"
 APPROVAL_EVENT_TTL_HOURS = 24.0
+
+# CASTLE-WALLS-CLOSURE-01 -- separate namespace for the causal-intent-
+# binding pin recorded by resolve_causal_draft_id() below. Deliberately a
+# DIFFERENT idempotency request_id than the claim row above (same
+# approval_event_id, different namespace): release_approval_event() only
+# ever deletes the claim row, never this one, so the pin recorded at an
+# event's first admission survives every later release+reclaim of that
+# same event -- including across a process restart, since both live in
+# core.idempotency's durable ledger. Same TTL as the claim itself: a pin
+# has no reason to outlive the event identity it is pinned to.
+_APPROVAL_PIN_NAMESPACE = "image_generation_draft_approval_pin"
+
+# CASTLE-WALLS-CLOSURE-01 -- durable, best-effort "this draft_id was
+# approved at some point" marker, keyed by draft_id (globally unique,
+# uuid4-derived -- no collision risk across channel/chat/restart). Exists
+# because consume_draft() pops _approvals for a spent draft_id, so the
+# in-memory dict alone can't tell resolve_causal_draft_id() "a sibling in
+# my pinned candidate set was separately approved and already spent" --
+# only "was approved and NOT YET spent". Written by _record_ever_
+# approved() below, never itself raised on failure (see that function's
+# own docstring).
+_DRAFT_EVER_APPROVED_NAMESPACE = "image_generation_draft_ever_approved"
 
 
 @dataclass(frozen=True)
@@ -231,7 +255,18 @@ def approve_draft(draft_id: str, *, channel_id: Optional[str], chat_id: Optional
     belongs to this EXACT (channel_id, chat_id)
     authorization context -- an approval typed/clicked in one chat can
     never authorize a draft staged in another. Returns whether approval
-    was recorded."""
+    was recorded.
+
+    The _approvals mutation above remains the one and only in-memory
+    state change, still the final statement under _lock exactly as
+    before CASTLE-WALLS-CLOSURE-01 (see C10 S14 and core/agent.py's
+    _maybe_approve_pending_draft finally-block comment for why that
+    matters). _record_ever_approved() below runs AFTER the lock releases,
+    as a clearly separate, best-effort durability step -- by the time it
+    runs (or fails to), the real in-memory approval this function's
+    return value is about has already unconditionally happened, so a
+    ledger hiccup here can never make this function's own return value
+    or the caller's is_approved()-based S14 guard lie."""
     with _lock:
         now = time.time()
         _prune_expired_locked(now)
@@ -243,7 +278,8 @@ def approve_draft(draft_id: str, *, channel_id: Optional[str], chat_id: Optional
         if draft_id not in _presented:
             return False
         _approvals[draft_id] = now
-        return True
+    _record_ever_approved(draft_id)
+    return True
 
 
 def is_approved(draft_id: str) -> bool:
@@ -293,6 +329,135 @@ def find_pending_draft_id(*, channel_id: Optional[str], chat_id: Optional[int]) 
         if len(candidates) != 1:
             return None
         return candidates[0].draft_id
+
+
+def _record_ever_approved(draft_id: str) -> None:
+    """CASTLE-WALLS-CLOSURE-01 -- durable, best-effort marker that
+    draft_id was approved at some point, independent of whether it is
+    later consumed (consume_draft() clears _approvals/_presented for a
+    spent draft_id -- this durable record is the only trace left once
+    that happens). Consulted by resolve_causal_draft_id()'s ambiguity-
+    poisoning check. Never raises: this is a secondary signal for a
+    later replay's ambiguity check, never itself the approval -- the
+    real, load-bearing in-memory approval already unconditionally
+    happened in approve_draft() before this is ever called, and a ledger
+    hiccup here must not surface as a broken button click or a broken
+    chat turn."""
+    try:
+        from core import idempotency
+        request_id = idempotency.make_request_id(_DRAFT_EVER_APPROVED_NAMESPACE, draft_id)
+        idempotency.record(request_id, "approved")
+    except Exception:
+        pass
+
+
+def _any_ever_approved(draft_ids) -> bool:
+    from core import idempotency
+    for draft_id in draft_ids:
+        request_id = idempotency.make_request_id(_DRAFT_EVER_APPROVED_NAMESPACE, draft_id)
+        if idempotency.check(request_id, ttl_hours=APPROVAL_EVENT_TTL_HOURS) is not None:
+            return True
+    return False
+
+
+def resolve_causal_draft_id(
+    *,
+    channel_id: Optional[str],
+    chat_id: Optional[int],
+    approval_event_id: str,
+    current_turn_seq: Optional[int],
+) -> Optional[str]:
+    """CASTLE-WALLS-CLOSURE-01 -- causal intent binding on top of
+    find_pending_draft_id()'s existing (channel_id, chat_id)/presented/
+    unambiguous resolution. Closes the C10 S5/S6/S7-dir2 residual: an
+    owner authorization event may resolve, via the implicit word-match
+    path, ONLY to an operation that already causally existed at the
+    event's FIRST admission -- never to a draft staged afterward. The
+    exact-draft approve_draft() button path is untouched by any of this
+    and remains valid regardless.
+
+    current_turn_seq is the caller's ctx.turn_seq at the moment of THIS
+    admission (core/agent.py's _maybe_approve_pending_draft, called
+    immediately after the real ctx.add_user() turn admission -- so it is
+    always strictly greater than any draft.staged_at_turn_seq a model
+    tool call could have recorded before this turn even began). None
+    (no turn-sequence context supplied) falls back to
+    find_pending_draft_id()'s pre-closure resolution unchanged -- the
+    one production call site always supplies a real value; only a
+    caller with no ctx to read from (frozen pre-closure test evidence)
+    omits it.
+
+    THE PIN (recorded exactly once per approval_event_id, in
+    core.idempotency's durable ledger under _APPROVAL_PIN_NAMESPACE, so
+    it survives try_claim_approval_event()/release_approval_event()
+    cycles AND a process restart): at first resolution for a given
+    event, freeze the SET of every draft_id in this exact (channel_id,
+    chat_id) context with staged_at_turn_seq <= current_turn_seq -- i.e.
+    every operation that causally existed no later than the turn this
+    owner event was admitted on AND was not already approved at that
+    exact moment (an already-approved draft is already spoken for by
+    whatever approved it -- never a real candidate for a DIFFERENT,
+    brand-new event, exactly like find_pending_draft_id()'s own
+    pre-closure candidate filter), regardless of whether it had been
+    marked presented yet (a presentation-timing race must not burn a
+    pre-existing operation's legitimate authority). This set can never
+    grow or change identity afterward; a draft staged later is causally
+    new and can never join it, no matter how many times this event is
+    later reclaimed.
+
+    Every subsequent resolution for the same approval_event_id (this
+    admission or any later reclaim) re-evaluates the frozen set against
+    CURRENT state instead of recomputing candidates:
+
+    - if ANY member of the set was EVER approved (_any_ever_approved,
+      durable -- catches a sibling approved via an unrelated event or
+      the exact-draft button, whether or not it has since been spent),
+      this event is permanently poisoned and resolves to nothing, ever.
+      A genuine ambiguity the owner's own single affirmation never
+      actually disambiguated must not be laundered into an approval of
+      whichever sibling merely happens to remain once a DIFFERENT
+      authorization already spent one of them (C10 S6).
+    - otherwise, of the members still live (still in _drafts, still
+      presented -- simple discard or TTL expiry drops a member from
+      this list without poisoning anything, exactly like the pre-
+      closure ambiguity-then-attrition behavior this preserves),
+      exactly one remaining -> resolve to it; zero or two-or-more ->
+      not yet resolvable this call, but still eligible on a later
+      reclaim (e.g. the presentation-timing race, or a sibling still
+      pending discard)."""
+    if current_turn_seq is None:
+        return find_pending_draft_id(channel_id=channel_id, chat_id=chat_id)
+
+    from core import idempotency
+    pin_request_id = idempotency.make_request_id(_APPROVAL_PIN_NAMESPACE, approval_event_id)
+    cached = idempotency.check(pin_request_id, ttl_hours=APPROVAL_EVENT_TTL_HOURS)
+    if cached is None:
+        with _lock:
+            now = time.time()
+            _prune_expired_locked(now)
+            pinned_ids = [
+                d.draft_id for d in _drafts.values()
+                if d.channel_id == channel_id and d.chat_id == chat_id
+                and d.staged_at_turn_seq is not None
+                and d.staged_at_turn_seq <= current_turn_seq
+                and d.draft_id not in _approvals
+            ]
+        idempotency.record(pin_request_id, json.dumps({"draft_ids": pinned_ids}))
+    else:
+        pinned_ids = json.loads(cached).get("draft_ids", [])
+
+    if not pinned_ids:
+        return None
+    if _any_ever_approved(pinned_ids):
+        return None
+
+    with _lock:
+        now = time.time()
+        _prune_expired_locked(now)
+        remaining = [d for d in pinned_ids if d in _drafts and d in _presented]
+    if len(remaining) != 1:
+        return None
+    return remaining[0]
 
 
 def try_claim_approval_event(approval_event_id: str) -> bool:
