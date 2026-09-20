@@ -35,5 +35,23 @@ jobs:
       - name: Install test dependencies
         run: pip install pytest==9.1.1 requests==2.34.2 platformdirs pyenchant==3.3.0 python-telegram-bot==22.8
 
-      - name: Run tests
-        run: python -m pytest tests/ -v
+      - name: Run tests (the real gate)
+        run: python -m pytest tests/ -v -m "not castle_walls_evidence"
+
+      # CASTLE-WALLS-CLOSURE-01 CI-COLLECTION-REPAIR -- tests/conftest.py's
+      # pytest_collection_modifyitems has tagged tests/test_castle_walls_
+      # adversarial_c*.py's frozen historical evidence corpus with this
+      # marker since CASTLE-WALLS-REPAIR-01, and every repair commit since
+      # has reported "pytest tests/ -m 'not castle_walls_evidence'" as ITS
+      # OWN real-gate number precisely because that corpus is preserved
+      # byte-for-byte and its assertions are EXPECTED to start failing, one
+      # by one, as each underlying vulnerability gets repaired -- that flip
+      # is the proof a fix landed, not a broken build (see conftest.py's
+      # own docstring). This step never actually existed here: the step
+      # above ran unfiltered, so CI's own pass/fail status never matched
+      # the gate every commit message has been citing. Run separately,
+      # non-blocking (continue-on-error), so its expected reds are visible
+      # in the log without ever turning the required check red.
+      - name: Run frozen Castle Walls evidence corpus (reported separately, non-blocking)
+        continue-on-error: true
+        run: python -m pytest tests/ -v -m castle_walls_evidence

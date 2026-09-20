@@ -65,6 +65,44 @@ def pytest_configure(config):
     )
 
 
+_CASTLE_WALLS_PYSIDE6_GATED_EVIDENCE_FILES = frozenset({
+    "test_castle_walls_adversarial_c2.py",
+    "test_castle_walls_adversarial_c6.py",
+})
+
+
+def pytest_ignore_collect(collection_path, config):
+    """CASTLE-WALLS-CLOSURE-01 CI-COLLECTION-REPAIR -- exactly two files in
+    the frozen tests/test_castle_walls_adversarial_c*.py corpus (c2, c6)
+    import ui.main_window at module level with no pytest.importorskip
+    guard, unlike every one of the ~20 other test files in this suite
+    that do the identical import (all of which DO have that guard --
+    e.g. tests/test_chat_startup_restore_01.py). CI's own
+    .github/workflows/tests.yml deliberately never installs PySide6 (see
+    that file's own top comment), so those two files hard-crash pytest's
+    COLLECTION phase there with ModuleNotFoundError -- not a test
+    failure, a failure before any test runs at all -- while every other
+    GUI-dependent file gracefully reports "skipped".
+
+    The established, accepted-history fix for a PySide6-shaped CI gap is
+    always pytest.importorskip("PySide6") (see git history: 0bf34ce,
+    fe5c69a) -- but these two specific files are frozen historical
+    evidence, preserved byte-for-byte on purpose (see
+    pytest_collection_modifyitems below), so that guard cannot be added
+    inside them without changing their content and breaking every prior
+    SHA-256 attestation of them. This hook reproduces exactly what that
+    guard would have done -- skip collecting the file, gracefully, only
+    when PySide6 is genuinely unavailable -- from outside the frozen
+    files instead of inside them. A PySide6-having environment (e.g. a
+    developer machine with the full app installed) is completely
+    unaffected: this only ever returns True when QApplication is None."""
+    if QApplication is not None:
+        return None
+    if collection_path.name in _CASTLE_WALLS_PYSIDE6_GATED_EVIDENCE_FILES:
+        return True
+    return None
+
+
 def pytest_collection_modifyitems(config, items):
     """CASTLE-WALLS-REPAIR-01 -- the five test_castle_walls_adversarial_c*.py
     files are a deliberately frozen historical record of a confirmed-
