@@ -74,11 +74,26 @@ def init_palace_db():
             room_id    INTEGER NOT NULL,
             content    TEXT NOT NULL,               -- raw original
             tags       TEXT,                        -- JSON array of search tags
+            untrusted  INTEGER NOT NULL DEFAULT 0,  -- durable per-record provenance
             created_at TEXT NOT NULL,
             FOREIGN KEY (room_id)   REFERENCES palace_rooms(id)   ON DELETE CASCADE,
             FOREIGN KEY (closet_id) REFERENCES palace_closets(id) ON DELETE SET NULL
         )
     """)
+
+    # CANNON-08: tags were model-supplied/searchable observability text, not
+    # structural provenance, so migration MUST NOT parse them back into
+    # authority. Existing drawers have unknowable per-record trust and enter
+    # fail-closed as lower-trust. Every new write below supplies the bit
+    # explicitly, so genuine runtime owner writes remain trusted thereafter.
+    try:
+        conn.execute(
+            "ALTER TABLE palace_drawers ADD COLUMN untrusted "
+            "INTEGER NOT NULL DEFAULT 1"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
 
     # Halls: cross-cutting fact streams (events, discoveries, preferences, advice)
     conn.execute("""
@@ -378,8 +393,9 @@ def palace_store(
     if untrusted and "trust:untrusted" not in drawer_tags:
         drawer_tags.append("trust:untrusted")
     drawer_cur = conn.execute(
-        "INSERT INTO palace_drawers (room_id, content, tags, created_at) VALUES (?,?,?,?)",
-        (room_id, content, json.dumps(drawer_tags), now)
+        "INSERT INTO palace_drawers "
+        "(room_id, content, tags, untrusted, created_at) VALUES (?,?,?,?,?)",
+        (room_id, content, json.dumps(drawer_tags), 1 if untrusted else 0, now)
     )
     drawer_id = drawer_cur.lastrowid
 
@@ -702,17 +718,35 @@ def palace_undo_write(drawer_id: int) -> dict:
     conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
 
     if closet_id:
+        location = conn.execute(
+            "SELECT w.name AS wing, r.name AS room "
+            "FROM palace_closets c "
+            "JOIN palace_rooms r ON c.room_id=r.id "
+            "JOIN palace_wings w ON r.wing_id=w.id WHERE c.id=?",
+            (closet_id,),
+        ).fetchone()
         remaining = conn.execute(
-            "SELECT content FROM palace_drawers WHERE closet_id=? ORDER BY created_at",
+            "SELECT content, untrusted FROM palace_drawers "
+            "WHERE closet_id=? ORDER BY created_at, id",
             (closet_id,)
         ).fetchall()
 
         if remaining:
-            rebuilt = " | ".join(aaak_compress(r["content"]) for r in remaining)
+            from core.context import tag_untrusted
+            label = f"{location['wing']}.{location['room']}"
+            segments = []
+            for row in remaining:
+                raw = aaak_compress(row["content"], label=label)
+                segments.append(
+                    tag_untrusted(label, raw) if row["untrusted"] else raw
+                )
+            rebuilt = " | ".join(segments)
             token_est = estimate_tokens(rebuilt)
+            ever_untrusted = 1 if any(row["untrusted"] for row in remaining) else 0
             conn.execute(
-                "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=? WHERE id=?",
-                (rebuilt, token_est, datetime.now().isoformat(), closet_id)
+                "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=?, "
+                "ever_had_untrusted_merge=? WHERE id=?",
+                (rebuilt, token_est, datetime.now().isoformat(), ever_untrusted, closet_id)
             )
         else:
             conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
@@ -730,7 +764,7 @@ def register_palace_tools(registry):
         name="palace_remember",
         fn=lambda content, wing="sessions", room="general", layer=2, tags=None: (
             lambda r: f"Stored in {wing}/{room} (L{layer}). Compressed: {r['compressed']} | Saved ~{r['tokens_saved']} tokens."
-        )(palace_store(content, wing, room, layer, tags)),
+        )(palace_store(content, wing, room, layer, tags, untrusted=True)),
         description="Store a memory in the palace. Wing options: identity, projects, people, preferences, sessions.",
         parameters={
             "type": "object",
@@ -749,7 +783,7 @@ def register_palace_tools(registry):
         name="palace_hall",
         fn=lambda content, hall="facts", layer=2: (
             lambda hall_id: f"Hall entry stored: {hall}/#{hall_id}"
-        )(palace_store_hall(content, hall, layer)),
+        )(palace_store_hall(content, hall, layer, untrusted=True)),
         description="Store a cross-cutting fact in a Hall: facts|events|preferences|discoveries|advice.",
         parameters={
             "type": "object",

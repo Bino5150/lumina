@@ -472,10 +472,11 @@ class LiveResponseBubble(QFrame):
         MetricsBar (copy/replay/token-count isolation, see core/agent.py's
         on_commentary docstring)."""
         if not shiboken6.isValid(self.bubble_layout):
-            return
+            return False
         row = CommentaryRow(text, self.colors)
         idx = self.bubble_layout.indexOf(self.stream_lbl)
         self.bubble_layout.insertWidget(idx, row)
+        return True
 
     def add_approve_button(self, draft_id: str, on_click) -> None:
         """CASTLE-WALLS-REPAIR-01 R2 -- a real, non-model UI event: clicking

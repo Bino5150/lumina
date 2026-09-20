@@ -10,6 +10,7 @@ correct addition. Pure-string logic, no PySide6 dependency, matching this
 module's existing test convention (tests/test_diff_bubble_coloring.py).
 """
 import os
+import hashlib
 
 import core.generation_artifact as ga
 from core.chat_render import md_to_html
@@ -31,7 +32,12 @@ def _register_fake_artifacts(monkeypatch, tmp_path, *paths):
     from types import SimpleNamespace
 
     monkeypatch.setattr(ga, "_artifact_storage_root", lambda: str(tmp_path))
-    records = {os.path.basename(str(p)): SimpleNamespace(local_path=str(p)) for p in paths}
+    records = {
+        os.path.basename(str(p)): SimpleNamespace(
+            local_path=str(p), sha256=hashlib.sha256(p.read_bytes()).hexdigest()
+        )
+        for p in paths
+    }
 
     def _fake_get(artifact_id):
         if artifact_id not in records:

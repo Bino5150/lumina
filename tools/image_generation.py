@@ -214,6 +214,14 @@ def generate_image(draft_id: str, *, channel_id: Optional[str],
             "click on Approve) before calling this again. Nothing was spent."
         )
 
+    if not draft_store.is_presented(draft_id):
+        return (
+            "outcome: approval_required\n"
+            "This estimate has not yet been presented through an owner-facing runtime "
+            "surface. Nothing was spent. Wait for the estimate to be delivered before "
+            "accepting any approval for it."
+        )
+
     if not draft_store.is_approved(draft_id):
         return (
             "outcome: approval_required\n"

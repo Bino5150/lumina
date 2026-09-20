@@ -2638,7 +2638,23 @@ class LuminaWindow(QMainWindow):
         if name == "estimate_image_generation" and self._live_bubble:
             match = re.search(r"draft_id:\s*([0-9a-f]+)", result or "")
             if match:
-                self._live_bubble.add_approve_button(match.group(1), self._on_approve_draft_clicked)
+                draft_id = match.group(1)
+                # Present the complete authorization context first. The
+                # existing tool-call row names the operation but does not
+                # contain its returned draft/cost fields.
+                delivered = self._live_bubble.add_commentary(result)
+                if not delivered:
+                    return
+                from core.image_generation_draft import mark_draft_presented
+                presented = mark_draft_presented(
+                    draft_id,
+                    channel_id=getattr(self.agent, "channel_id", None),
+                    chat_id=self._current_chat_id,
+                )
+                if presented:
+                    self._live_bubble.add_approve_button(
+                        draft_id, self._on_approve_draft_clicked
+                    )
 
     def _on_approve_draft_clicked(self, draft_id: str):
         """Real, non-model UI event -- calls approve_draft() directly,

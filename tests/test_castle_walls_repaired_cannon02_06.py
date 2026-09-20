@@ -5,6 +5,7 @@ tests/conftest.py's castle_walls_evidence marker). Same attack
 payloads/shapes as that corpus; asserts rejection/safe-handling instead
 of success.
 """
+import hashlib
 import json
 import os
 from types import SimpleNamespace
@@ -353,7 +354,10 @@ def test_canonical_generated_artifact_renders(tmp_path, monkeypatch):
     real_path.parent.mkdir(parents=True)
     real_path.write_bytes(b"\x89PNG\r\n\x1a\n")
     monkeypatch.setattr(ga, "get_generation_artifact",
-                         lambda aid: SimpleNamespace(local_path=str(real_path)))
+                         lambda aid: SimpleNamespace(
+                             local_path=str(real_path),
+                             sha256=hashlib.sha256(b"\x89PNG\r\n\x1a\n").hexdigest(),
+                         ))
 
     html = md_to_html(f"![Generated image](file://{real_path})", _COLORS)
     assert "<img " in html
@@ -404,7 +408,10 @@ def test_non_image_with_image_extension_does_not_render(tmp_path, monkeypatch):
     fake_png.parent.mkdir(parents=True)
     fake_png.write_bytes(b"not actually a png, just text")
     monkeypatch.setattr(ga, "get_generation_artifact",
-                         lambda aid: SimpleNamespace(local_path=str(fake_png)))
+                         lambda aid: SimpleNamespace(
+                             local_path=str(fake_png),
+                             sha256=hashlib.sha256(fake_png.read_bytes()).hexdigest(),
+                         ))
 
     html = md_to_html(f"![x](file://{fake_png})", _COLORS)
     assert "<img " not in html
@@ -420,7 +427,10 @@ def test_manifest_path_substitution_after_ingestion_does_not_render(tmp_path, mo
     real_path.parent.mkdir(parents=True)
     real_path.write_bytes(b"\x89PNG\r\n\x1a\n")
     monkeypatch.setattr(ga, "get_generation_artifact",
-                         lambda aid: SimpleNamespace(local_path=str(real_path)))
+                         lambda aid: SimpleNamespace(
+                             local_path=str(real_path),
+                             sha256=hashlib.sha256(b"\x89PNG\r\n\x1a\n").hexdigest(),
+                         ))
 
     html_before = md_to_html(f"![x](file://{real_path})", _COLORS)
     assert "<img " in html_before
@@ -445,7 +455,10 @@ def test_valid_artifact_renders_after_simulated_restart(tmp_path, monkeypatch):
     def _lookup(aid):
         # Simulates a fresh DB connection/process -- no shared state with
         # whatever ingested this artifact originally.
-        return SimpleNamespace(local_path=str(real_path))
+        return SimpleNamespace(
+            local_path=str(real_path),
+            sha256=hashlib.sha256(b"\xff\xd8\xff\xdb").hexdigest(),
+        )
     monkeypatch.setattr(ga, "get_generation_artifact", _lookup)
 
     html = md_to_html(f"![x](file://{real_path})", _COLORS)
@@ -469,6 +482,7 @@ def test_tagged_untrusted_input_cannot_satisfy_sensitive_action_authorization(mo
 
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
     ctx = ContextManager(owner=True)
     draft = draft_store.stage_draft(
         specialist="higgsfield", model="m", settings={"prompt": "x"}, cost_estimate=1.0,
@@ -482,6 +496,7 @@ def test_tagged_untrusted_input_cannot_satisfy_sensitive_action_authorization(mo
     assert draft_store.is_approved(draft.draft_id) is False
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
 
 
 def test_specialist_output_cannot_satisfy_owner_authorization():
@@ -489,6 +504,7 @@ def test_specialist_output_cannot_satisfy_owner_authorization():
 
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
     draft = draft_store.stage_draft(
         specialist="higgsfield", model="m", settings={"prompt": "x"}, cost_estimate=1.0,
         cost_unit="usd", manifest_provider="higgsfield", channel_id="c", chat_id=1,
@@ -501,6 +517,7 @@ def test_specialist_output_cannot_satisfy_owner_authorization():
     assert draft_store.is_approved(draft.draft_id) is False
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
 
 
 def test_owner_authorized_action_still_works_end_to_end(monkeypatch):
@@ -509,6 +526,7 @@ def test_owner_authorized_action_still_works_end_to_end(monkeypatch):
 
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
     target = SimpleNamespace(specialist="higgsfield", model="m", registry=object(), policy=object())
     monkeypatch.setattr(image_tool.svc, "resolve_image_generation_target", lambda: target)
     monkeypatch.setattr(image_tool, "_build_adapter",
@@ -524,6 +542,7 @@ def test_owner_authorized_action_still_works_end_to_end(monkeypatch):
         cost_unit="usd", manifest_provider="higgsfield", channel_id="c", chat_id=1,
         staged_at_turn_seq=0,
     )
+    draft_store.mark_draft_presented(draft.draft_id, channel_id="c", chat_id=1)
     from core.agent import _maybe_approve_pending_draft
     _maybe_approve_pending_draft("yes", "OWNER_DIRECT", "c", 1)
 
@@ -533,6 +552,7 @@ def test_owner_authorized_action_still_works_end_to_end(monkeypatch):
     assert len(submissions) == 1
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
 
 
 def test_ordinary_non_sensitive_tool_use_remains_functional():

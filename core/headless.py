@@ -17,6 +17,7 @@ from core.reasoning_preferences import resolve_reasoning_effort
 _agents: dict = {}
 _last_used: dict = {}   # channel_id -> unix timestamp of last access
 _is_owner: dict = {}    # channel_id -> owner bool, tracked for the reaper below
+_turn_locks: dict = {}  # channel_id -> Lock serializing one cached agent's turns
 _on_idle_callback = None  # set via set_idle_callback(), fired before a channel is reaped
 
 
@@ -98,6 +99,7 @@ def _reap_idle():
             _agents.pop(cid, None)
             _last_used.pop(cid, None)
             _is_owner.pop(cid, None)
+            _turn_locks.pop(cid, None)
 
     # FE-18: callback invocation moved OUTSIDE the lock. _on_idle_callback is
     # designed to do real work (Discord-Lite's planned summarization LLM
@@ -165,6 +167,7 @@ def get_headless_agent(channel_id: str, owner: bool,
                                     tools_enabled=tools_enabled, owner=owner)
             _agents[channel_id] = agent
             _is_owner[channel_id] = owner
+            _turn_locks[channel_id] = threading.Lock()
 
         _last_used[channel_id] = time.time()
         agent = _agents[channel_id]
@@ -178,6 +181,18 @@ def get_headless_agent(channel_id: str, owner: bool,
             apply_tool_profile(agent.registry, profile_name=force_tools_profile,
                                 tools_enabled=None, owner=agent.owner)
         return agent
+
+
+def _headless_turn_lock(channel_id: str):
+    """Return the stable per-channel execution lock.
+
+    Cache bookkeeping stays guarded by ``_lock``; slow inference uses this
+    narrower lock so different channels remain concurrent while two inbound
+    messages for the same cached agent can never mutate one ContextManager,
+    backend, or authorization state at once.
+    """
+    with _lock:
+        return _turn_locks.setdefault(channel_id, threading.Lock())
 
 
 def _agent_accepts_reasoning_effort(agent) -> bool:
@@ -222,40 +237,67 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
                                     force_tools_profile=force_tools_profile)
 
         tool_trace = []
-        if trace:
-            def _trace_call(name, args):
-                tool_trace.append({"name": name, "args": args})
-                _log_tool_call(channel_id)(name, args)  # keep existing console logging
+        presentable_drafts = []
+        turn_lock = _headless_turn_lock(channel_id)
 
-            def _trace_result(name, result):
-                if tool_trace and tool_trace[-1]["name"] == name and "result" not in tool_trace[-1]:
-                    tool_trace[-1]["result"] = result
-                _log_tool_result(channel_id)(name, result)
+        # CASTLE-WALLS-REPAIR-02 / CANNON-10: serialize only this cached
+        # agent/channel. Different channels still infer concurrently. The
+        # transport delivery itself remains outside this lock; a separate
+        # presented-state gate below binds approval to successful delivery.
+        with turn_lock:
+            previous_on_tool_call = agent.on_tool_call
+            previous_on_tool_result = agent.on_tool_result
 
-            agent.on_tool_call = _trace_call
-            agent.on_tool_result = _trace_result
+            def _capture_call(name, args):
+                if trace:
+                    tool_trace.append({"name": name, "args": args})
+                    _log_tool_call(channel_id)(name, args)
+                else:
+                    previous_on_tool_call(name, args)
 
-        # Deliberately outside _lock — agent.chat() is the slow part (LLM
-        # inference) and holding the cache lock across it would serialize
-        # every channel's conversation behind whichever one is currently
-        # generating, which defeats the point of running this in a thread
-        # at all. The cache lookup above is the only part that needed
-        # protecting.
-        source = "OWNER_DIRECT" if owner else "EXTERNAL_CHANNEL_INBOUND"
-        # Patch 3A.4 Part 4 -- resolved fresh every turn against the actual
-        # live backend in use (agent.llm), never cached/memoized. Guarded
-        # by _agent_accepts_reasoning_effort() (see above) for compatibility
-        # with pre-3A.4 fake agents used in tests/test_headless.py, which
-        # lack both a reasoning_effort chat() param and a .llm attribute.
-        chat_kwargs = {"source": source}
-        if _agent_accepts_reasoning_effort(agent):
-            llm = getattr(agent, "llm", None)
-            if llm is not None:
-                chat_kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
-        response = agent.chat(task, **chat_kwargs)
-        response = _sanitize_response(response, owner)
+            def _capture_result(name, result):
+                if trace:
+                    if (tool_trace and tool_trace[-1]["name"] == name
+                            and "result" not in tool_trace[-1]):
+                        tool_trace[-1]["result"] = result
+                    _log_tool_result(channel_id)(name, result)
+                else:
+                    previous_on_tool_result(name, result)
+                if name == "estimate_image_generation" and "outcome: estimate_ready" in str(result):
+                    match = re.search(r"draft_id:\s*([0-9a-f]+)", str(result))
+                    if match:
+                        presentable_drafts.append({
+                            "draft_id": match.group(1),
+                            "text": str(result),
+                        })
+
+            agent.on_tool_call = _capture_call
+            agent.on_tool_result = _capture_result
+            try:
+                source = "OWNER_DIRECT" if owner else "EXTERNAL_CHANNEL_INBOUND"
+                # Patch 3A.4 Part 4 -- resolved fresh every turn against the actual
+                # live backend in use (agent.llm), never cached/memoized. Guarded
+                # by _agent_accepts_reasoning_effort() (see above) for compatibility
+                # with pre-3A.4 fake agents used in tests/test_headless.py, which
+                # lack both a reasoning_effort chat() param and a .llm attribute.
+                chat_kwargs = {"source": source}
+                if _agent_accepts_reasoning_effort(agent):
+                    llm = getattr(agent, "llm", None)
+                    if llm is not None:
+                        chat_kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
+                response = agent.chat(task, **chat_kwargs)
+                response = _sanitize_response(response, owner)
+            finally:
+                agent.on_tool_call = previous_on_tool_call
+                agent.on_tool_result = previous_on_tool_result
 
         result = {"success": True, "response": response}
+        if presentable_drafts:
+            # Internal transport metadata, never interpolated into model/user
+            # text by the model. The bridge explicitly includes this exact
+            # estimate in its owner-facing payload, then marks it only after
+            # that outbound send succeeds.
+            result["_presentable_image_drafts"] = presentable_drafts
         if trace:
             result["tool_calls"] = tool_trace
             result["available_tools"] = agent.registry.all_tool_names()
@@ -264,8 +306,42 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
         return {"success": False, "error": str(e)}
 
 
+def headless_result_delivery_text(result: dict, response: str) -> str:
+    """Compose the exact trusted-runtime payload for a headless transport.
+
+    Estimate tool results are owner-visible authorization context, not hidden
+    trace data. Include each exact result before the model's final prose, while
+    avoiding a duplicate if the final already reproduced it byte-for-byte.
+    """
+    parts = []
+    for item in result.get("_presentable_image_drafts", ()):
+        estimate = item.get("text", "")
+        if estimate and estimate not in response:
+            parts.append(estimate)
+    parts.append(response)
+    return "\n\n".join(part for part in parts if part)
+
+
+def mark_headless_result_presented(result: dict, *, channel_id: str) -> int:
+    """Mark captured estimate drafts only after a headless send succeeds.
+
+    Returns the number marked. This runtime helper is intentionally separate
+    from ``run_headless_turn`` because that function ends before Telegram or
+    another transport has crossed its real owner-facing delivery boundary.
+    """
+    from core.image_generation_draft import mark_draft_presented
+
+    marked = 0
+    for item in result.get("_presentable_image_drafts", ()):
+        draft_id = item.get("draft_id")
+        if mark_draft_presented(draft_id, channel_id=channel_id, chat_id=None):
+            marked += 1
+    return marked
+
+
 def reset_headless_agent(channel_id: str):
     with _lock:
         _agents.pop(channel_id, None)
         _last_used.pop(channel_id, None)
         _is_owner.pop(channel_id, None)
+        _turn_locks.pop(channel_id, None)

@@ -40,12 +40,8 @@ _IMAGE_MAGIC_SIGNATURES = (
 )
 
 
-def _looks_like_image(path: str) -> bool:
-    try:
-        with open(path, "rb") as f:
-            header = f.read(16)
-    except OSError:
-        return False
+def _looks_like_image_bytes(data: bytes) -> bool:
+    header = data[:16]
     for offset, magic in _IMAGE_MAGIC_SIGNATURES:
         if header[offset:offset + len(magic)] == magic:
             return True
@@ -91,6 +87,7 @@ def _is_verified_generated_artifact(path: str) -> str | None:
         from core.generation_artifact import (
             ArtifactNotFound,
             _artifact_storage_root,
+            get_artifact_bytes,
             get_generation_artifact,
         )
         root = os.path.realpath(_artifact_storage_root())
@@ -107,7 +104,11 @@ def _is_verified_generated_artifact(path: str) -> str | None:
         if os.path.realpath(record.local_path) != real:
             return None
 
-        return real if _looks_like_image(real) else None
+        # CANNON-09: the canonical read re-hashes the on-disk bytes against
+        # the immutable DB record. Path identity plus magic bytes alone let
+        # an in-place regular-file replacement render as a genuine artifact.
+        verified_bytes = get_artifact_bytes(artifact_id)
+        return real if _looks_like_image_bytes(verified_bytes) else None
     except Exception:
         return None
 

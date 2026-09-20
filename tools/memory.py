@@ -23,9 +23,17 @@ def init_memory_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             label TEXT DEFAULT 'general',
             content TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            untrusted INTEGER NOT NULL DEFAULT 0
         )
     """)
+    try:
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN untrusted INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
     conn.commit()
     conn.close()
 
@@ -59,7 +67,7 @@ LABEL_TO_HALL = {
 }
 
 
-def save_memory(content: str, label: str = "general") -> str:
+def save_memory(content: str, label: str = "general", *, untrusted: bool = False) -> str:
     """Save a memory. Also writes to palace with AAAK compression."""
     if len(content) > 512:
         content = content[:512]
@@ -67,8 +75,8 @@ def save_memory(content: str, label: str = "general") -> str:
     # Write to flat memories table (preserved for compatibility)
     conn = get_db()
     conn.execute(
-        "INSERT INTO memories (label, content, created_at) VALUES (?, ?, ?)",
-        (label, content, datetime.now().isoformat())
+        "INSERT INTO memories (label, content, created_at, untrusted) VALUES (?, ?, ?, ?)",
+        (label, content, datetime.now().isoformat(), 1 if untrusted else 0)
     )
     conn.commit()
     conn.close()
@@ -78,12 +86,14 @@ def save_memory(content: str, label: str = "general") -> str:
         from tools.palace import palace_store, palace_store_hall
         wing = LABEL_TO_WING.get(label.lower(), "sessions")
         room = label.lower() if label != "general" else "general"
-        result = palace_store(content, wing=wing, room=room, layer=2)
+        result = palace_store(
+            content, wing=wing, room=room, layer=2, untrusted=untrusted
+        )
 
         # Also drop into a hall if this label maps to one
         hall = LABEL_TO_HALL.get(label.lower())
         if hall:
-            palace_store_hall(content, hall=hall, layer=2)
+            palace_store_hall(content, hall=hall, layer=2, untrusted=untrusted)
 
         compressed_preview = (result["compressed"] or "")[:80]
         return f"Memory saved [{label}]. Compressed: {compressed_preview}"
@@ -155,7 +165,9 @@ def register_memory_tools(registry):
     init_memory_db()
 
     registry.register(
-        "save_memory", save_memory,
+        "save_memory", lambda content, label="general": save_memory(
+            content, label, untrusted=True
+        ),
         "Save a memory. Label to categorize (e.g. 'people', 'projects', 'preferences', 'discovery').",
         {
             "type": "object",

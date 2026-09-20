@@ -25,18 +25,24 @@ CHAT_ID = 7
 def _clean_drafts():
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
     yield
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
 
 
 def _stage(*, channel_id=CHANNEL, chat_id=CHAT_ID, staged_at_turn_seq=0, ttl_seconds=600):
-    return draft_store.stage_draft(
+    draft = draft_store.stage_draft(
         specialist=SPECIALIST, model=MODEL, settings={"prompt": "synthetic purple deck"},
         cost_estimate=0.0938, cost_unit="usd", manifest_provider="higgsfield",
         channel_id=channel_id, chat_id=chat_id, staged_at_turn_seq=staged_at_turn_seq,
         ttl_seconds=ttl_seconds,
     )
+    draft_store.mark_draft_presented(
+        draft.draft_id, channel_id=channel_id, chat_id=chat_id
+    )
+    return draft
 
 
 def _arm_mock_submission(monkeypatch, calls, *, estimate=0.0938):
@@ -328,6 +334,7 @@ def test_fabricated_replayed_expired_and_restart_drafts_still_fail_closed():
     restarted = _stage()
     draft_store._drafts.clear()
     draft_store._approvals.clear()
+    draft_store._presented.clear()
     assert draft_store.consume_draft(restarted.draft_id) is None
 
 

@@ -151,8 +151,20 @@ def run_cli(persona_name: str = None, tools_override: str = None):
         print(f"\n  ⚙ [{name}] {args if args else ''}", flush=True)
 
     def on_tool_result(name, result):
-        preview = result[:120].replace('\n', ' ')
-        print(f"  ✓ {preview}{'...' if len(result) > 120 else ''}", flush=True)
+        if name == "estimate_image_generation":
+            # The full estimate (including exact draft ID and cost) is the
+            # approval context. A 120-character preview is not presentation.
+            print(f"  ✓ {result}", flush=True)
+            import re
+            match = re.search(r"draft_id:\s*([0-9a-f]+)", result or "")
+            if match:
+                from core.image_generation_draft import mark_draft_presented
+                mark_draft_presented(
+                    match.group(1), channel_id="cli-local", chat_id=None
+                )
+        else:
+            preview = result[:120].replace('\n', ' ')
+            print(f"  ✓ {preview}{'...' if len(result) > 120 else ''}", flush=True)
 
     print(f"\n{'='*52}")
     print(f"  LUMINA v0.2.7-beta.2 — CLI Mode")

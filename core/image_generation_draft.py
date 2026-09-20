@@ -46,6 +46,8 @@ __all__ = [
     "peek_draft",
     "consume_draft",
     "discard_draft",
+    "mark_draft_presented",
+    "is_presented",
     "approve_draft",
     "is_approved",
     "find_pending_draft_id",
@@ -84,6 +86,7 @@ class ImageGenerationDraft:
 
 _drafts: dict[str, ImageGenerationDraft] = {}
 _approvals: dict[str, float] = {}  # draft_id -> approved_at epoch
+_presented: dict[str, float] = {}  # draft_id -> owner-facing delivery epoch
 _lock = Lock()
 
 
@@ -92,6 +95,7 @@ def _prune_expired_locked(now: float) -> None:
     for draft_id in expired:
         del _drafts[draft_id]
         _approvals.pop(draft_id, None)
+        _presented.pop(draft_id, None)
 
 
 def stage_draft(
@@ -141,6 +145,7 @@ def peek_draft(draft_id: str) -> Optional[ImageGenerationDraft]:
         if draft.expires_at <= time.time():
             del _drafts[draft_id]
             _approvals.pop(draft_id, None)
+            _presented.pop(draft_id, None)
             return None
         return draft
 
@@ -157,6 +162,7 @@ def consume_draft(draft_id: str) -> Optional[ImageGenerationDraft]:
     with _lock:
         draft = _drafts.pop(draft_id, None)
         _approvals.pop(draft_id, None)
+        _presented.pop(draft_id, None)
         if draft is None:
             return None
         if draft.expires_at <= time.time():
@@ -169,6 +175,36 @@ def discard_draft(draft_id: str) -> None:
     with _lock:
         _drafts.pop(draft_id, None)
         _approvals.pop(draft_id, None)
+        _presented.pop(draft_id, None)
+
+
+def mark_draft_presented(draft_id: str, *, channel_id: Optional[str],
+                         chat_id: Optional[int]) -> bool:
+    """Record a real owner-facing delivery event for this exact draft.
+
+    CASTLE-WALLS-REPAIR-02 / CANNON-10: staging is not presentation. This
+    primitive is not registered as a model tool. GUI/CLI code calls it only
+    after updating the owner's real tool-result surface; headless transports
+    call it only after their outbound send succeeds. Approval is impossible
+    until this state exists, so an overlapping generic ``yes`` cannot approve
+    an estimate that is still hidden inside another in-flight turn.
+    """
+    with _lock:
+        now = time.time()
+        _prune_expired_locked(now)
+        draft = _drafts.get(draft_id)
+        if draft is None:
+            return False
+        if draft.channel_id != channel_id or draft.chat_id != chat_id:
+            return False
+        _presented[draft_id] = now
+        return True
+
+
+def is_presented(draft_id: str) -> bool:
+    """Read-only presentation-state observation for runtime/tests."""
+    with _lock:
+        return draft_id in _presented
 
 
 def approve_draft(draft_id: str, *, channel_id: Optional[str], chat_id: Optional[int]) -> bool:
@@ -177,7 +213,8 @@ def approve_draft(draft_id: str, *, channel_id: Optional[str], chat_id: Optional
     only from non-model runtime code (the word-match turn-admission hook
     in core/agent.py, or a real GUI button click), never from a tool call
     the model itself can make. Records approval only if the draft exists,
-    is unexpired, and belongs to this EXACT (channel_id, chat_id)
+    is unexpired, has actually been presented by trusted runtime code, and
+    belongs to this EXACT (channel_id, chat_id)
     authorization context -- an approval typed/clicked in one chat can
     never authorize a draft staged in another. Returns whether approval
     was recorded."""
@@ -188,6 +225,8 @@ def approve_draft(draft_id: str, *, channel_id: Optional[str], chat_id: Optional
         if draft is None:
             return False
         if draft.channel_id != channel_id or draft.chat_id != chat_id:
+            return False
+        if draft_id not in _presented:
             return False
         _approvals[draft_id] = now
         return True

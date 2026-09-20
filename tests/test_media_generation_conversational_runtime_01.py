@@ -61,8 +61,12 @@ def isolated_db(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _clean_draft_store():
     draft_store._drafts.clear()
+    draft_store._approvals.clear()
+    draft_store._presented.clear()
     yield
     draft_store._drafts.clear()
+    draft_store._approvals.clear()
+    draft_store._presented.clear()
 
 
 def _real_target() -> ImageGenerationTarget:
@@ -171,6 +175,9 @@ def _stage_via_tool(monkeypatch) -> str:
         staged_at_turn_seq=_TEST_STAGE_TURN,
     )
     draft_id = _extract(preview, "draft_id")
+    draft_store.mark_draft_presented(
+        draft_id, channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID
+    )
     draft_store.approve_draft(draft_id, channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID)
     return draft_id
 
@@ -249,6 +256,9 @@ def test_full_happy_path_estimate_then_confirm(monkeypatch):
     assert "outcome: estimate_ready" in preview
     assert "estimated_cost: 0.0938 usd" in preview
     draft_id = _extract(preview, "draft_id")
+    draft_store.mark_draft_presented(
+        draft_id, channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID
+    )
     draft_store.approve_draft(draft_id, channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID)
 
     result = _confirm(draft_id)

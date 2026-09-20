@@ -16,7 +16,11 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 import config
 from comms import telegram_origin_routing as origin_routing
-from core.headless import run_headless_turn
+from core.headless import (
+    headless_result_delivery_text,
+    mark_headless_result_presented,
+    run_headless_turn,
+)
 from core.secrets import get_secret
 from core.persistence import load as load_prefs
 
@@ -118,10 +122,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     result = await asyncio.to_thread(run_headless_turn, task=text, channel_id=CHANNEL_ID, owner=True)
     reply = result["response"] if result["success"] else f"[Lumina error: {result['error']}]"
+    reply = headless_result_delivery_text(result, reply)
     if fallback_note:
         reply = f"{fallback_note}\n{reply}"
     if not emergency_stop.is_latched():
         await update.message.reply_text(reply)
+        # The exact estimate becomes approvable only after Telegram confirms
+        # this real owner-facing send completed successfully.
+        mark_headless_result_presented(result, channel_id=CHANNEL_ID)
 
 
 async def _run_until_stopped(stop_event: threading.Event, token: str):

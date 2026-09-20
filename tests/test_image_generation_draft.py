@@ -19,8 +19,12 @@ def _clean_module_state():
     docstring) -- reset it around every test so tests never see each
     other's drafts."""
     draft_store._drafts.clear()
+    draft_store._approvals.clear()
+    draft_store._presented.clear()
     yield
     draft_store._drafts.clear()
+    draft_store._approvals.clear()
+    draft_store._presented.clear()
 
 
 def _stage(**overrides):
