@@ -137,8 +137,9 @@ def test_on_session_idle_writes_to_nightstand_wing_on_success(monkeypatch):
 
     stored = {}
 
-    def fake_palace_store(content, wing, room, layer, tags):
-        stored.update(content=content, wing=wing, room=room, layer=layer, tags=tags)
+    def fake_palace_store(content, wing, room, layer, tags, untrusted=False):
+        stored.update(content=content, wing=wing, room=room, layer=layer, tags=tags,
+                       untrusted=untrusted)
 
     monkeypatch.setattr(dreaming, "palace_store", fake_palace_store)
 

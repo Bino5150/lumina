@@ -26,18 +26,104 @@ import urllib.parse
 # than ever claiming an image exists when it doesn't.
 _LOCAL_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(file://([^)\s]+)\)')
 
+# CASTLE-WALLS-REPAIR-01 R3 -- os.path.isfile() alone (the only prior
+# check) follows symlinks and trusts any local path that merely exists,
+# with no containment, no identity, and no content verification. imghdr
+# is gone from the stdlib on this repo's Python 3.13 runtime and Pillow
+# isn't a dependency, so this is a small hand-rolled magic-byte sniff --
+# real signature bytes, never trusted by extension.
+_IMAGE_MAGIC_SIGNATURES = (
+    (0, b"\x89PNG\r\n\x1a\n"),  # PNG
+    (0, b"\xff\xd8\xff"),       # JPEG
+    (0, b"GIF87a"),
+    (0, b"GIF89a"),
+)
+
+
+def _looks_like_image(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+    except OSError:
+        return False
+    for offset, magic in _IMAGE_MAGIC_SIGNATURES:
+        if header[offset:offset + len(magic)] == magic:
+            return True
+    return header[0:4] == b"RIFF" and header[8:12] == b"WEBP"  # WEBP
+
+
+def _is_verified_generated_artifact(path: str) -> str | None:
+    """CASTLE-WALLS-REPAIR-01 R3 -- a local path renders as a generated
+    image only when it satisfies the actual Lumina artifact contract, not
+    merely "some file that happens to live under the right directory":
+
+      1. containment  -- realpath-resolved (symlinks followed to their
+         real destination) and contained under the real artifact storage
+         root, using the same os.path.commonpath() idiom already used
+         repo-wide (worktree_manager.py, agent_backup.py, skill_transport.py);
+      2. identity      -- the exact resolved path matches a genuinely-
+         ingested generation_artifacts row's own recorded local_path, not
+         merely a same-shaped dropped file or a symlink placed at the
+         right spot;
+      3. content       -- sniffs as a real, supported image format via
+         magic bytes, never trusted by extension alone.
+
+    Returns the verified, resolved path to render, or None. Fails CLOSED
+    on any exception -- an error here means "not a verified artifact,"
+    never "assume it's fine." Remote http(s) rendering is untouched by
+    this function entirely; _LOCAL_IMAGE_RE only ever matches file://."""
+    try:
+        # A genuine artifact file is written once by core.generation_
+        # artifact._write_atomic() (temp file + os.replace()) and is never
+        # a symlink. Rejecting a symlinked reference here, BEFORE any
+        # realpath resolution, closes a gap plain realpath-equality can't:
+        # if the file AT a previously-legitimate recorded path is later
+        # replaced by a symlink pointing elsewhere, comparing
+        # realpath(referenced_path) to realpath(recorded_local_path) finds
+        # them "equal" (both resolve through the SAME substituted symlink)
+        # even though the underlying bytes are no longer what was ingested.
+        if os.path.islink(path):
+            return None
+        real = os.path.realpath(path)
+        if not os.path.isfile(real):
+            return None
+
+        from core.generation_artifact import (
+            ArtifactNotFound,
+            _artifact_storage_root,
+            get_generation_artifact,
+        )
+        root = os.path.realpath(_artifact_storage_root())
+        if os.path.commonpath([root, real]) != root:
+            return None
+
+        artifact_id = os.path.basename(real)
+        try:
+            record = get_generation_artifact(artifact_id)
+        except ArtifactNotFound:
+            return None
+        if os.path.islink(record.local_path):
+            return None
+        if os.path.realpath(record.local_path) != real:
+            return None
+
+        return real if _looks_like_image(real) else None
+    except Exception:
+        return None
+
 
 def _convert_local_images(text: str) -> str:
     def _replace(match: re.Match) -> str:
         alt, raw_path = match.group(1), match.group(2)
         path = urllib.parse.unquote(raw_path)
-        if not os.path.isfile(path):
+        verified_path = _is_verified_generated_artifact(path)
+        if verified_path is None:
             return match.group(0)
         safe_alt = (
             alt.replace('&', '&amp;').replace('<', '&lt;')
                .replace('>', '&gt;').replace('"', '&quot;')
         )
-        src = 'file://' + urllib.parse.quote(path)
+        src = 'file://' + urllib.parse.quote(verified_path)
         return (
             f'<img src="{src}" alt="{safe_alt}" '
             'style="max-width:100%;border-radius:6px;margin:6px 0;display:block;">'

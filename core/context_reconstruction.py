@@ -25,6 +25,7 @@ implementation and exactly one fingerprint implementation.
 """
 from dataclasses import dataclass, field
 import hashlib
+import json
 
 from core.context import ContextManager
 from core.db import connect
@@ -113,6 +114,19 @@ def _durable_spine_hash(rows: list) -> str:
     return h.hexdigest()
 
 
+def _parse_row_metadata(raw_metadata: str) -> dict:
+    """CASTLE-WALLS-REPAIR-01 R1C -- fail-closed metadata parse: a
+    malformed or legacy metadata string must never crash chat load, and
+    is treated identically to no metadata at all (empty dict)."""
+    if not raw_metadata:
+        return {}
+    try:
+        parsed = json.loads(raw_metadata)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def resolve_context_skip(chat_id: int) -> int:
     """Resolve chat_id's current manual-compaction skip with the exact
     graceful-degradation _load_chat() has always used on a checkpoint
@@ -180,7 +194,33 @@ def reconstruct_chat_context(chat_id: int, context_skip: int = None) -> Reconstr
     candidate_ctx = ContextManager()
     for row in eligible:
         if row["role"] == "user":
-            candidate_ctx.add_user(row["content"])
+            # CASTLE-WALLS-REPAIR-01 R1C -- provenance now survives
+            # reconstruction instead of every durable row being
+            # unconditionally re-admitted as OWNER_DIRECT. Fallback to
+            # OWNER_DIRECT for rows with no "source" key (all rows
+            # persisted before this repair, and any row from this table's
+            # sole writer today, the always-owner-controlled GUI) is a
+            # deliberate, explicit choice -- not a silent default -- see
+            # ui/main_window.py's save_chat_message() call sites, which
+            # now stamp metadata["source"] on every new row.
+            metadata = _parse_row_metadata(row["metadata"])
+            source = metadata.get("source") or "OWNER_DIRECT"
+            content = row["content"]
+            had_attachments = metadata.get("content_format") == "parts_v1"
+            if had_attachments:
+                try:
+                    content = json.loads(content)
+                except (TypeError, ValueError):
+                    content = row["content"]
+                    had_attachments = False
+            candidate_ctx.add_user(content, source=source)
+            if had_attachments:
+                # The parts list's own items are already tag_untrusted()-
+                # wrapped from when they were first written (R1A) -- this
+                # only restores the sticky reminder flag a live turn with
+                # attachments would have set, since add_user() has no
+                # attachments= of its own to infer that from here.
+                candidate_ctx.mark_untrusted_seen()
         else:
             candidate_ctx.add_assistant(row["content"])
 

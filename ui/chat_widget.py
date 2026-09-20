@@ -477,6 +477,47 @@ class LiveResponseBubble(QFrame):
         idx = self.bubble_layout.indexOf(self.stream_lbl)
         self.bubble_layout.insertWidget(idx, row)
 
+    def add_approve_button(self, draft_id: str, on_click) -> None:
+        """CASTLE-WALLS-REPAIR-01 R2 -- a real, non-model UI event: clicking
+        this calls on_click(draft_id) directly, exactly mirroring
+        ui/settings/tools_tab.py's Pending Actions "Approve & Apply"
+        button. The model never sees this widget and cannot trigger it;
+        it exists purely so an owner who doesn't want to type a
+        confirmation word can approve a staged image-generation draft with
+        one click instead. Same insert-before-stream_lbl positioning as
+        add_tool_call()/add_commentary() above."""
+        if not shiboken6.isValid(self.bubble_layout):
+            return
+        row = QFrame()
+        row.setStyleSheet(f"""
+            QFrame{{background:{self.colors['bg_card']};
+            border:1px solid {self.colors['border_accent']};
+            border-radius:6px;padding:4px 10px;margin:4px 0;}}
+        """)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(10)
+        label = QLabel("Approve this generation?")
+        label.setStyleSheet(f"color:{self.colors['text_muted']};font-size:11px;background:transparent;")
+        layout.addWidget(label, 1)
+        approve_btn = QPushButton("✓ Approve")
+        approve_btn.setCursor(Qt.PointingHandCursor)
+        approve_btn.setStyleSheet(f"""
+            QPushButton{{background:{self.colors['accent']};color:#0b0e14;
+            border:none;border-radius:4px;padding:3px 12px;font-size:11px;font-weight:600;}}
+            QPushButton:disabled{{background:{self.colors['text_dim']};}}
+        """)
+
+        def _clicked():
+            approve_btn.setEnabled(False)
+            approve_btn.setText("Approved ✓")
+            on_click(draft_id)
+
+        approve_btn.clicked.connect(_clicked)
+        layout.addWidget(approve_btn)
+        idx = self.bubble_layout.indexOf(self.stream_lbl)
+        self.bubble_layout.insertWidget(idx, row)
+
     def append_response_token(self, token: str):
         if not shiboken6.isValid(self.stream_lbl):
             return
@@ -691,6 +732,7 @@ class ChatWidget(QWidget):
     files_dropped = Signal(list)
     audio_preview_cancelled = Signal()
     image_preview_removed = Signal(int)
+    attachment_previews_cancelled = Signal()
     attach_files_requested = Signal()
     mic_pressed = Signal()
 
@@ -1104,5 +1146,58 @@ class ChatWidget(QWidget):
         self.clear_audio_preview()
         # Signal main window to clear _pending_audio
         self.audio_preview_cancelled.emit()
+
+    def show_attachment_preview(self, fname: str):
+        """CASTLE-WALLS-REPAIR-01 R1A -- show a dropped text-file
+        attachment above the input bar, mirroring show_audio_preview()
+        above. Multiple files accumulate into one chip listing every
+        pending filename (simpler than per-item removal, matching this
+        repair's scope -- clearing removes all pending attachments at
+        once, same granularity as _pending_text_attachments itself)."""
+        self._attachment_preview_names = getattr(self, '_attachment_preview_names', [])
+        self._attachment_preview_names.append(fname)
+        if hasattr(self, '_attachment_preview_frame') and self._attachment_preview_frame is not None:
+            self._attachment_preview_frame.setParent(None)
+            self._attachment_preview_frame.deleteLater()
+            self._attachment_preview_frame = None
+        frame = QFrame()
+        frame.setStyleSheet(f"""
+            QFrame{{background:{self.colors['bg_card']};
+            border-top:1px solid {self.colors['border_accent']};
+            border-bottom:none;padding:4px 16px;}}
+        """)
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(0, 4, 0, 4)
+        row.setSpacing(10)
+        icon_lbl = QLabel("📎")
+        icon_lbl.setStyleSheet("background:transparent;font-size:18px;")
+        row.addWidget(icon_lbl)
+        name_lbl = QLabel(", ".join(self._attachment_preview_names))
+        name_lbl.setStyleSheet(f"color:{self.colors['text_muted']};font-size:11px;background:transparent;")
+        row.addWidget(name_lbl, 1)
+        clear_btn = QPushButton("✕")
+        clear_btn.setFixedSize(20, 20)
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.setStyleSheet(f"""
+            QPushButton{{background:transparent;border:none;
+            color:{self.colors['text_dim']};font-size:12px;}}
+            QPushButton:hover{{color:{self.colors['danger']};}}
+        """)
+        clear_btn.clicked.connect(self._cancel_attachments)
+        row.addWidget(clear_btn)
+        self._attachment_preview_frame = frame
+        self._main_layout.insertWidget(self._main_layout.count() - 1, frame)
+
+    def clear_attachment_previews(self):
+        self._attachment_preview_names = []
+        if hasattr(self, '_attachment_preview_frame') and self._attachment_preview_frame is not None:
+            self._attachment_preview_frame.setParent(None)
+            self._attachment_preview_frame.deleteLater()
+            self._attachment_preview_frame = None
+
+    def _cancel_attachments(self):
+        self.clear_attachment_previews()
+        # Signal main window to clear _pending_text_attachments
+        self.attachment_previews_cancelled.emit()
 
             

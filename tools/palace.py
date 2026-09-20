@@ -91,6 +91,36 @@ def init_palace_db():
         )
     """)
 
+    # CASTLE-WALLS-REPAIR-01 R1D -- ever_had_untrusted_merge is a coarse,
+    # sticky, closet-level signal used for exactly one thing: telling
+    # ContextManager whether to fold the soft "Provenance reminder" nudge
+    # into _untrusted_content_seen. It never gates or reshapes what text a
+    # closet actually renders -- that's done per-SEGMENT, inline, by
+    # tag_untrusted()-wrapping only the newly-added segment at merge time
+    # (see palace_store() below), so one lower-trust contribution can never
+    # retroactively discredit unrelated segments that already shared the
+    # same closet. Idempotent in-place migration, same idiom as
+    # core/skills.py's origin column -- existing closets default to 0
+    # (never had an untrusted merge), which is exactly correct: nothing
+    # before this repair ever recorded provenance at all.
+    try:
+        conn.execute(
+            "ALTER TABLE palace_closets ADD COLUMN ever_had_untrusted_merge "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
+
+    # Halls are never merged (palace_store_hall() always INSERTs a fresh,
+    # independent row -- each fact is already atomic), so a plain per-row
+    # flag is correct here, unlike closets.
+    try:
+        conn.execute("ALTER TABLE palace_halls ADD COLUMN untrusted INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
+
     # Seed default wings if empty
     wings = [
         ("identity",    "Who Lumina is, who Bino is, core relationship"),
@@ -303,13 +333,33 @@ def palace_store(
     layer: int = 2,
     tags: list[str] = None,
     compress: bool = True,
+    untrusted: bool = False,
 ) -> dict:
     """
     Store a memory in the palace.
     - Saves verbatim original to a Drawer
     - If compress=True, creates/updates a Closet with AAAK-compressed version
     Returns {'closet_id': ..., 'drawer_id': ..., 'compressed': ..., 'tokens_saved': ...}
+
+    untrusted (CASTLE-WALLS-REPAIR-01 R1D): True when THIS specific
+    contribution's source material was not the owner's own words (e.g.
+    summarized from an EXTERNAL_CHANNEL_INBOUND-tagged chat message).
+    Closets are rolling, pipe-separated merges (see below) -- only the
+    NEWLY-ADDED segment gets tag_untrusted()-wrapped here, never the prior
+    segments already in an existing closet, so one lower-trust
+    contribution can never retroactively discredit unrelated facts that
+    merely happen to share the same closet (the earlier, rejected design
+    made the whole closet sticky-untrusted on any merge, which would let
+    an attacker who can never gain authority instead degrade the standing
+    of legitimate owner knowledge -- a trust-destruction failure, not
+    merely an over-conservative one). Also flips the closet's
+    ever_had_untrusted_merge column (sticky, whole-closet) -- consulted
+    ONLY by build_context_block(return_meta=True) to decide whether to
+    fold ContextManager's soft "Provenance reminder" nudge on; it is never
+    consulted to decide what text actually renders -- that's the
+    per-segment tag's job alone.
     """
+    from core.context import tag_untrusted
     conn = get_db()
     now = datetime.now().isoformat()
 
@@ -321,10 +371,15 @@ def palace_store(
 
     room_id = _ensure_room(conn, wing_id, room)
 
-    # Save verbatim drawer
+    # Save verbatim drawer. "trust:untrusted" tag is observability only
+    # (palace_recall() display) -- the untrusted bool argument above, not
+    # this tag string, is what actually drives the closet/hall flags below.
+    drawer_tags = list(tags or [])
+    if untrusted and "trust:untrusted" not in drawer_tags:
+        drawer_tags.append("trust:untrusted")
     drawer_cur = conn.execute(
         "INSERT INTO palace_drawers (room_id, content, tags, created_at) VALUES (?,?,?,?)",
-        (room_id, content, json.dumps(tags or []), now)
+        (room_id, content, json.dumps(drawer_tags), now)
     )
     drawer_id = drawer_cur.lastrowid
 
@@ -334,32 +389,41 @@ def palace_store(
 
     if compress:
         label = f"{wing}.{room}"
-        compressed = aaak_compress(content, label=label)
-        token_est = estimate_tokens(compressed)
+        raw_segment = aaak_compress(content, label=label)
+        segment = tag_untrusted(label, raw_segment) if untrusted else raw_segment
+        token_est = estimate_tokens(raw_segment)
         orig_tokens = estimate_tokens(content)
         tokens_saved = max(0, orig_tokens - token_est)
 
         # Check if a closet already exists for this room+layer — update it (rolling summary)
         existing = conn.execute(
-            "SELECT id, compressed FROM palace_closets WHERE room_id=? AND layer=?",
+            "SELECT id, compressed, ever_had_untrusted_merge FROM palace_closets "
+            "WHERE room_id=? AND layer=?",
             (room_id, layer)
         ).fetchone()
 
         if existing and layer >= 2:
-            # Append to existing closet (pipe-separated AAAK facts)
-            merged = existing["compressed"] + " | " + aaak_compress(content)
-            token_est = estimate_tokens(merged)
+            # Append to existing closet (pipe-separated AAAK facts) --
+            # existing["compressed"] (every prior segment) is carried
+            # through byte-for-byte, untouched.
+            merged = existing["compressed"] + " | " + segment
+            merged_token_est = estimate_tokens(merged)
+            ever_untrusted = 1 if (existing["ever_had_untrusted_merge"] or untrusted) else 0
             conn.execute(
-                "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=? WHERE id=?",
-                (merged, token_est, now, existing["id"])
+                "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=?, "
+                "ever_had_untrusted_merge=? WHERE id=?",
+                (merged, merged_token_est, now, ever_untrusted, existing["id"])
             )
             closet_id = existing["id"]
+            compressed = merged
         else:
             closet_cur = conn.execute(
-                "INSERT INTO palace_closets (room_id, layer, compressed, token_est, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                (room_id, layer, compressed, token_est, now, now)
+                "INSERT INTO palace_closets (room_id, layer, compressed, token_est, "
+                "created_at, updated_at, ever_had_untrusted_merge) VALUES (?,?,?,?,?,?,?)",
+                (room_id, layer, segment, token_est, now, now, 1 if untrusted else 0)
             )
             closet_id = closet_cur.lastrowid
+            compressed = segment
 
         # Link drawer to closet
         conn.execute("UPDATE palace_drawers SET closet_id=? WHERE id=?", (closet_id, drawer_id))
@@ -375,13 +439,24 @@ def palace_store(
     }
 
 
-def palace_store_hall(content: str, hall: str = "facts", layer: int = 2) -> int:
-    """Store a cross-cutting fact into a Hall (events, facts, preferences, discoveries, advice)."""
+def palace_store_hall(content: str, hall: str = "facts", layer: int = 2,
+                       untrusted: bool = False) -> int:
+    """Store a cross-cutting fact into a Hall (events, facts, preferences,
+    discoveries, advice).
+
+    untrusted (CASTLE-WALLS-REPAIR-01 R1D): unlike palace_store()'s
+    closets, every call here INSERTs a fresh, independent row -- there is
+    no merge/append, so each hall fact is already atomic and a plain
+    per-row flag (no segment-tagging needed) is correct. The row's own
+    compressed text is tag_untrusted()-wrapped when true."""
+    from core.context import tag_untrusted
     conn = get_db()
-    compressed = aaak_compress(content, label=hall)
+    raw = aaak_compress(content, label=hall)
+    compressed = tag_untrusted(hall, raw) if untrusted else raw
     cur = conn.execute(
-        "INSERT INTO palace_halls (hall, compressed, layer, created_at) VALUES (?,?,?,?)",
-        (hall, compressed, layer, datetime.now().isoformat())
+        "INSERT INTO palace_halls (hall, compressed, layer, created_at, untrusted) "
+        "VALUES (?,?,?,?,?)",
+        (hall, compressed, layer, datetime.now().isoformat(), 1 if untrusted else 0)
     )
     hall_id = cur.lastrowid
     conn.commit()
@@ -394,11 +469,13 @@ def palace_store_hall(content: str, hall: str = "facts", layer: int = 2) -> int:
 def load_layer(layer: int) -> list[dict]:
     """
     Load all closets at a given layer.
-    Returns list of {'wing', 'room', 'compressed', 'token_est'}
+    Returns list of {'wing', 'room', 'compressed', 'token_est',
+    'ever_had_untrusted_merge'}
     """
     conn = get_db()
     rows = conn.execute("""
         SELECT c.id, c.compressed, c.token_est, c.updated_at,
+               c.ever_had_untrusted_merge,
                r.name as room, w.name as wing
         FROM palace_closets c
         JOIN palace_rooms r ON c.room_id = r.id
@@ -419,7 +496,8 @@ def load_halls(layer: int) -> list[dict]:
     cumulative filter silently did.)"""
     conn = get_db()
     rows = conn.execute(
-        "SELECT hall, compressed FROM palace_halls WHERE layer = ? ORDER BY created_at DESC LIMIT 30",
+        "SELECT hall, compressed, untrusted FROM palace_halls WHERE layer = ? "
+        "ORDER BY created_at DESC LIMIT 30",
         (layer,)
     ).fetchall()
     conn.close()
@@ -440,7 +518,8 @@ def _find_pinned_closet_ids(pin_tag: str) -> set[int]:
     return {r["closet_id"] for r in rows}
 
 
-def build_context_block(max_tokens: int = 400, inject_limit: int = None, pin_tag: str = None) -> str:
+def build_context_block(max_tokens: int = 400, inject_limit: int = None, pin_tag: str = None,
+                        return_meta: bool = False):
     """
     Build the memory injection block for the system prompt.
     Always loads L0 + L1 in full. Loads L2 (recent/episodic) up to two caps:
@@ -462,10 +541,22 @@ def build_context_block(max_tokens: int = 400, inject_limit: int = None, pin_tag
     like everything else here; only inject_limit is bypassed. None (default)
     reproduces prior behavior exactly.
 
+    return_meta (CASTLE-WALLS-REPAIR-01 R1D): False (default) returns the
+    block as a plain str exactly as before -- every existing caller/test
+    is untouched. True returns (str, any_untrusted) instead, where
+    any_untrusted is True iff any closet actually included in this render
+    ever had an untrusted merge, or any hall included is itself untrusted
+    -- consulted ONLY to decide whether to fold ContextManager's soft
+    "Provenance reminder" nudge on. It is never used to decide what text
+    renders; that's already correctly framed per-segment/per-row by the
+    tag_untrusted() wrapping palace_store()/palace_store_hall() applied at
+    write time (see those functions' docstrings).
+
     Returns a compact string ready to append to system prompt.
     """
     lines = ["## Memory Palace"]
     tokens_used = 4
+    any_untrusted = False
 
     for layer in [0, 1, 2]:
         closets = load_layer(layer)
@@ -492,6 +583,8 @@ def build_context_block(max_tokens: int = 400, inject_limit: int = None, pin_tag
                 break
             layer_lines.append(c["compressed"])
             tokens_used += tok
+            if c.get("ever_had_untrusted_merge"):
+                any_untrusted = True
 
         for h in halls:
             tok = estimate_tokens(h["compressed"])
@@ -499,6 +592,8 @@ def build_context_block(max_tokens: int = 400, inject_limit: int = None, pin_tag
                 break
             layer_lines.append(h["compressed"])
             tokens_used += tok
+            if h.get("untrusted"):
+                any_untrusted = True
 
         if layer_lines:
             lines.append(f"[{layer_label}]")
@@ -508,9 +603,11 @@ def build_context_block(max_tokens: int = 400, inject_limit: int = None, pin_tag
             break
 
     if len(lines) == 1:
-        return ""  # Nothing stored yet — don't inject empty block
+        block = ""  # Nothing stored yet — don't inject empty block
+    else:
+        block = "\n".join(lines)
 
-    return "\n".join(lines)
+    return (block, any_untrusted) if return_meta else block
 
 
 # ── Recall (L3 search) ─────────────────────────────────────────────────────────

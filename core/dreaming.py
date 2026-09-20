@@ -152,9 +152,23 @@ def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None) -> str:
     if not msgs:
         return DREAM_INELIGIBLE
 
-    raw_text = "\n".join(f"{m['role']}: {m['content']}" for m in msgs[-40:] if m.get("content"))
+    recent = msgs[-40:]
+    raw_text = "\n".join(f"{m['role']}: {m['content']}" for m in recent if m.get("content"))
     if estimate_tokens(raw_text) < getattr(config, "DREAM_MIN_TOKENS", 800):
         return DREAM_INELIGIBLE
+
+    # CASTLE-WALLS-REPAIR-01 R1D -- if any source message this sweep
+    # summarizes was EXTERNAL_CHANNEL_INBOUND (metadata is already loaded
+    # by load_chat_messages(), just never consulted here before), the
+    # resulting summary's Palace write is tagged untrusted -- see
+    # palace_store()'s docstring for exactly what that does and doesn't
+    # gate. A sweep can legitimately mix owner + inbound-channel content
+    # (that's still useful "what happened this session" memory); it just
+    # can no longer render as unqualified owner-trusted system content.
+    sweep_untrusted = any(
+        (m.get("metadata") or {}).get("source") == "EXTERNAL_CHANNEL_INBOUND"
+        for m in recent
+    )
 
     summary = run_summarization_call(raw_text)
     if not summary:
@@ -174,7 +188,8 @@ def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None) -> str:
             wing="nightstand",
             room=str(chat_id),
             layer=2,
-            tags=["dream-sweep", f"session:{chat_id}"]
+            tags=["dream-sweep", f"session:{chat_id}"],
+            untrusted=sweep_untrusted,
         )
     except Exception as e:
         # DREAM-LIFECYCLE-01: a failed persistence attempt is a FAILED
@@ -188,7 +203,21 @@ def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None) -> str:
         prefs = load_prefs()
         bio = prefs.get("human_bio", "")
         existing = prefs.get("human_profile_curated", "")
-        updated = curate_human_profile(raw_text, bio, existing)
+        # CASTLE-WALLS-REPAIR-01 R1D -- facts about the owner should only
+        # ever be derived from the owner's own words. My Human's curated
+        # block is rendered as explicitly "authoritative" (core/context.py),
+        # so unlike the dream-summary above (which may legitimately mix
+        # sources), this one filters EXTERNAL_CHANNEL_INBOUND messages out
+        # entirely rather than tagging the result -- there's no existing
+        # provenance mechanism on human_profile_curated to tag anyway.
+        owner_only = [
+            m for m in recent
+            if (m.get("metadata") or {}).get("source") != "EXTERNAL_CHANNEL_INBOUND"
+        ]
+        owner_only_text = "\n".join(
+            f"{m['role']}: {m['content']}" for m in owner_only if m.get("content")
+        )
+        updated = curate_human_profile(owner_only_text, bio, existing)
         if updated:
             if expected_epoch is not None:
                 from core import emergency_stop

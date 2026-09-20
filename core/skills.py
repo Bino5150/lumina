@@ -236,8 +236,15 @@ def write_skill(name: str, description: str, content: str) -> dict:
 def search_skills(query: str, limit: int = None) -> list[dict]:
     """
     Search skills by keyword against name + description (FTS5).
-    Returns list of {'name', 'description', 'path'} sorted by relevance.
-    Falls back to LIKE search if FTS returns nothing.
+    Returns list of {'name', 'description', 'path', 'origin'} sorted by
+    relevance. Falls back to LIKE search if FTS returns nothing.
+
+    'origin' ('official'|'user') was previously dropped here even though
+    it's already tracked and integrity-enforced at the storage layer
+    (see load_skill()) -- CASTLE-WALLS-REPAIR-01 R1F threads it through so
+    build_skills_block() can keep USER-authored and OFFICIAL skill content
+    authority-distinct instead of both landing identically in the trusted
+    system prompt.
     """
     if limit is None:
         limit = getattr(config, 'SKILLS_MAX_INJECT', 2)
@@ -256,7 +263,7 @@ def search_skills(query: str, limit: int = None) -> list[dict]:
     # FTS5 search
     try:
         rows = conn.execute("""
-            SELECT s.name, s.description, s.path
+            SELECT s.name, s.description, s.path, s.origin
             FROM skills_fts f
             JOIN skills s ON s.id = f.rowid
             WHERE skills_fts MATCH ?
@@ -270,7 +277,7 @@ def search_skills(query: str, limit: int = None) -> list[dict]:
     if not rows:
         pattern = f"%{query.strip()}%"
         rows = conn.execute("""
-            SELECT name, description, path FROM skills
+            SELECT name, description, path, origin FROM skills
             WHERE name LIKE ? OR description LIKE ?
             LIMIT ?
         """, (pattern, pattern, limit)).fetchall()
@@ -353,10 +360,33 @@ def list_skills() -> list[dict]:
 
 # ── Context Injection ─────────────────────────────────────────────────────────
 
-def build_skills_block(query: str) -> str:
+def _skill_content_lines(skill: dict) -> list[str]:
+    content = load_skill(skill["name"])
+    if content:
+        # Inject full doc for small skills; truncate large ones
+        if len(content) <= 2000:
+            return [content]
+        # Header + first 1500 chars
+        return [content[:1500] + "\n... (truncated — full skill on disk)"]
+    return [f"**{skill['name']}**: {skill['description']}"]
+
+
+def build_skills_block(query: str) -> tuple[str, str]:
     """
-    Search for relevant skills and return an injection block for the system prompt.
-    Returns empty string if no relevant skills found.
+    Search for relevant skills and return (official_block, user_block) --
+    two separate injection strings for the system prompt. Either or both
+    may be "" if no matching skill of that origin was found.
+
+    CASTLE-WALLS-REPAIR-01 R1F: previously returned one combined string
+    regardless of origin, so a USER-authored skill (unverified, anyone who
+    can type into this app can create one) and an OFFICIAL, integrity-
+    hash-verified skill landed identically in the trusted role="system"
+    message. Splitting by origin lets the caller route official content
+    through the normal trusted system-prompt path and user content through
+    the lower-trust push_ephemeral_assistant() channel instead (see
+    core/agent.py's call site) -- a USER skill can still usefully inform
+    the model, it just can't acquire OFFICIAL/SYSTEM authority merely by
+    matching retrieval.
     """
     if isinstance(query, list):
         # Multipart content (image turn) — search on the text portion only.
@@ -365,25 +395,20 @@ def build_skills_block(query: str) -> str:
             if isinstance(b, dict) and isinstance(b.get("text"), str)
         ).strip()
     if not query:
-        return ""
+        return "", ""
     matches = search_skills(query)
     if not matches:
-        return ""
+        return "", ""
 
-    lines = ["## Relevant Skills"]
+    official_lines = []
+    user_lines = []
     for skill in matches:
-        content = load_skill(skill["name"])
-        if content:
-            # Inject full doc for small skills; truncate large ones
-            if len(content) <= 2000:
-                lines.append(content)
-            else:
-                # Header + first 1500 chars
-                lines.append(content[:1500] + "\n... (truncated — full skill on disk)")
-        else:
-            lines.append(f"**{skill['name']}**: {skill['description']}")
+        target = official_lines if skill.get("origin") == "official" else user_lines
+        target.extend(_skill_content_lines(skill))
 
-    return "\n\n".join(lines)
+    official_block = "\n\n".join(["## Relevant Skills"] + official_lines) if official_lines else ""
+    user_block = "\n\n".join(["## Relevant Skills (user-authored)"] + user_lines) if user_lines else ""
+    return official_block, user_block
 
 
 # ── Status ────────────────────────────────────────────────────────────────────

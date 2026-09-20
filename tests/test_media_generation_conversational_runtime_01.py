@@ -143,9 +143,36 @@ def _extract(report: str, field: str) -> str:
     raise AssertionError(f"{field!r} not found in report:\n{report}")
 
 
+# CASTLE-WALLS-REPAIR-01 R2 -- generate_image() now requires a real
+# authorization context (channel_id/chat_id match + a later turn_seq than
+# staging + real approve_draft()). This suite is about the price/route/
+# credential/outcome-fidelity behavior downstream of that gate, not the
+# gate itself (see tests/test_castle_walls_adversarial_c4.py/c6.py and
+# their repaired-state counterparts for that) -- so every helper below
+# stages and approves a fully authorized draft, then confirms one turn
+# later, exactly like a real conversation would.
+_TEST_CHANNEL = "media-gen-test-channel"
+_TEST_CHAT_ID = None
+_TEST_STAGE_TURN = 0
+_TEST_CONFIRM_TURN = 1
+
+
+def _confirm(draft_id: str) -> str:
+    return tool.generate_image(
+        draft_id, channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID,
+        current_turn_seq=_TEST_CONFIRM_TURN,
+    )
+
+
 def _stage_via_tool(monkeypatch) -> str:
-    preview = tool.estimate_image_generation("a purple neon cassette deck")
-    return _extract(preview, "draft_id")
+    preview = tool.estimate_image_generation(
+        "a purple neon cassette deck",
+        channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID,
+        staged_at_turn_seq=_TEST_STAGE_TURN,
+    )
+    draft_id = _extract(preview, "draft_id")
+    draft_store.approve_draft(draft_id, channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID)
+    return draft_id
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +189,7 @@ def test_estimate_reports_not_routed_when_route_unconfigured(monkeypatch):
 
 
 def test_generate_image_never_reachable_at_all_without_a_prior_estimate():
-    result = tool.generate_image("hallucinated-draft-id")
+    result = _confirm("hallucinated-draft-id")
     assert "outcome: draft_not_found" in result
 
 
@@ -186,7 +213,7 @@ def test_generate_image_reports_credentials_unavailable_if_lost_since_staging(mo
     draft_id = _stage_via_tool(monkeypatch)
 
     _adapter_no_credentials(monkeypatch)
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: credentials_unavailable" in result
     assert draft_store.peek_draft(draft_id) is None  # single-use even on this failure
@@ -214,12 +241,17 @@ def test_full_happy_path_estimate_then_confirm(monkeypatch):
     _route_it(monkeypatch)
     fake = _adapter_ok(monkeypatch)
 
-    preview = tool.estimate_image_generation("a purple neon cassette deck")
+    preview = tool.estimate_image_generation(
+        "a purple neon cassette deck",
+        channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID,
+        staged_at_turn_seq=_TEST_STAGE_TURN,
+    )
     assert "outcome: estimate_ready" in preview
     assert "estimated_cost: 0.0938 usd" in preview
     draft_id = _extract(preview, "draft_id")
+    draft_store.approve_draft(draft_id, channel_id=_TEST_CHANNEL, chat_id=_TEST_CHAT_ID)
 
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: success" in result
     assert len(fake.submit_calls) == 1
@@ -235,7 +267,7 @@ def test_provider_failure_reported_truthfully(monkeypatch):
     _adapter_ok(monkeypatch, statuses=("failed",))
     draft_id = _stage_via_tool(monkeypatch)
 
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: provider_failed" in result
 
@@ -255,7 +287,7 @@ def test_ingestion_failure_reported_truthfully(monkeypatch):
     monkeypatch.setattr(tool, "HiggsfieldAdapter", lambda: fake)
     draft_id = _stage_via_tool(monkeypatch)
 
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: ingestion_failed" in result
 
@@ -274,7 +306,7 @@ def test_manifest_persistence_failure_reported_without_losing_the_artifact(monke
 
     monkeypatch.setattr(gm, "persist_manifest", _boom)
 
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: manifest_failed" in result
     assert "artifacts_delivered: 1" in result
@@ -299,7 +331,7 @@ def test_multiple_outputs_all_represented(monkeypatch):
     monkeypatch.setattr(tool, "HiggsfieldAdapter", lambda: fake)
     draft_id = _stage_via_tool(monkeypatch)
 
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: success" in result
     assert "artifacts_delivered: 2" in result
@@ -315,7 +347,7 @@ def test_outcome_string_is_the_services_own_unparaphrased_vocabulary(monkeypatch
     _adapter_ok(monkeypatch, statuses=("cancelled",))
     draft_id = _stage_via_tool(monkeypatch)
 
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: cancelled" in result
     assert isinstance(result, str)  # a plain report, never anything executed
@@ -330,8 +362,8 @@ def test_second_confirm_of_the_same_draft_never_resubmits(monkeypatch):
     fake = _adapter_ok(monkeypatch)
     draft_id = _stage_via_tool(monkeypatch)
 
-    first = tool.generate_image(draft_id)
-    second = tool.generate_image(draft_id)
+    first = _confirm(draft_id)
+    second = _confirm(draft_id)
 
     assert "outcome: success" in first
     assert "outcome: draft_not_found" in second
@@ -348,7 +380,7 @@ def test_draft_drift_on_price_change_refuses_and_never_submits(monkeypatch):
 
     fake._estimate = 0.50  # price moved between estimate and confirm
 
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: draft_stale" in result
     assert len(fake.submit_calls) == 0
@@ -361,7 +393,7 @@ def test_route_change_between_estimate_and_confirm_refuses(monkeypatch):
     draft_id = _stage_via_tool(monkeypatch)
 
     _not_routed(monkeypatch)
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     assert "outcome: draft_stale" in result
 
@@ -376,7 +408,7 @@ def test_artifact_path_embedded_in_result_is_a_real_local_file(monkeypatch):
     _adapter_ok(monkeypatch)
     draft_id = _stage_via_tool(monkeypatch)
 
-    result = tool.generate_image(draft_id)
+    result = _confirm(draft_id)
 
     line = next(l for l in result.splitlines() if l.startswith("![Generated image]"))
     path = line.split("file://", 1)[1].rstrip(")")
@@ -406,10 +438,16 @@ def test_official_generated_artifact_manifest_skill_hash_unchanged():
 # ---------------------------------------------------------------------------
 
 def test_registration_adds_both_tools_to_the_registry():
+    from types import SimpleNamespace
+
     from tools.registry import ToolRegistry
 
     registry = ToolRegistry()
-    tool.register_image_generation_tools(registry)
+    # CASTLE-WALLS-REPAIR-01 R2 -- register_image_generation_tools() now
+    # requires the owning agent (read at call time for channel_id/chat_id/
+    # turn_seq); a minimal stand-in is enough for a pure registration check.
+    fake_agent = SimpleNamespace(channel_id="test", ctx=SimpleNamespace(turn_seq=0))
+    tool.register_image_generation_tools(registry, fake_agent)
 
     assert "estimate_image_generation" in registry.list_tools()
     assert "generate_image" in registry.list_tools()
@@ -436,7 +474,7 @@ def test_registration_call_sits_at_the_same_indentation_as_the_toolmaker_precede
     )
     new_tool_idx = next(
         i for i, l in enumerate(lines)
-        if "register_image_generation_tools(self.registry)" in l
+        if "register_image_generation_tools(self.registry, self)" in l
     )
     assert new_tool_idx > toolmaker_idx
 

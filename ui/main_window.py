@@ -17,9 +17,10 @@ from PySide6.QtGui import QFont, QPixmap, QPainter, QBrush, QColor, QPainterPath
 import os
 import sys
 import base64
+import json
 from collections import deque
-import re 
-import threading 
+import re
+import threading
 import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -194,12 +195,16 @@ class AgentWorker(QThread):
     """
     BATCH_CHARS = 12  # flush every N characters
 
-    def __init__(self, agent, user_input, signals: StreamSignals, chat_id: int = None):
+    def __init__(self, agent, user_input, signals: StreamSignals, chat_id: int = None,
+                 attachments=None):
         super().__init__()
         self.agent = agent
         self.user_input = user_input
         self.signals = signals
         self.chat_id = chat_id
+        # CASTLE-WALLS-REPAIR-01 R1A -- optional list of (label, text)
+        # pairs, forwarded to agent.chat()'s own attachments= kwarg.
+        self.attachments = attachments
         self._think_buf = ""
         self._resp_buf = ""
         self._cancel_event = threading.Event()
@@ -235,6 +240,19 @@ class AgentWorker(QThread):
         except (TypeError, ValueError):
             return True
         return any(p.name == "reasoning_effort" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+    def _agent_accepts_attachments(self) -> bool:
+        """CASTLE-WALLS-REPAIR-01 R1A -- same compatibility shape as
+        _agent_accepts_cancel_event()/_agent_accepts_reasoning_effort()
+        above, for the same reason: lightweight GUI-test agent stubs
+        predate this parameter and define chat() with neither an
+        attachments param nor **kwargs."""
+        import inspect
+        try:
+            params = inspect.signature(self.agent.chat).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(p.name == "attachments" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
 
     def _flush_think(self):
         if self._think_buf:
@@ -327,6 +345,8 @@ class AgentWorker(QThread):
                 llm = getattr(self.agent, "llm", None)
                 if llm is not None:
                     kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
+            if self.attachments and self._agent_accepts_attachments():
+                kwargs["attachments"] = self.attachments
             runtime_token = getattr(
                 self.agent, "_telegram_origin_runtime_token", None,
             )
@@ -550,6 +570,10 @@ class LuminaWindow(QMainWindow):
         self._pending_images = []
         self._next_image_id = 1
         self._pending_audio = None
+        # CASTLE-WALLS-REPAIR-01 R1A -- dropped text-file content, staged
+        # separately exactly like _pending_images/_pending_audio above,
+        # never fused into the editable input box. list[(filename, content)].
+        self._pending_text_attachments = []
         self._current_chat_id = None
         # CONTEXT-LIFECYCLE-A5I: chat-scoped generation counter, exactly
         # parallel to ui/review_controller.py's ReviewController._generation
@@ -794,6 +818,9 @@ class LuminaWindow(QMainWindow):
         self.chat_widget.message_submitted.connect(self._on_user_message)
         self.chat_widget.files_dropped.connect(self._on_files_dropped)
         self.chat_widget.audio_preview_cancelled.connect(lambda: setattr(self, '_pending_audio', None))
+        self.chat_widget.attachment_previews_cancelled.connect(
+            lambda: setattr(self, '_pending_text_attachments', [])
+        )
         self.chat_widget.image_preview_removed.connect(self._on_image_preview_removed)
         self.chat_widget.attach_files_requested.connect(self._on_attach_files_requested)
         self.chat_widget.set_persona(
@@ -2144,9 +2171,23 @@ class LuminaWindow(QMainWindow):
                     if not emergency_stop.execution_permitted(epoch):
                         return
                     from tools.palace import palace_store
+                    # CASTLE-WALLS-REPAIR-01 R1D -- same reasoning as
+                    # core/dreaming.py's idle sweep and core/manual_
+                    # compaction.py, applied to this THIRD Palace-writing
+                    # pathway. `batch` is live in-memory ctx.history
+                    # (no per-message metadata field exists there, unlike
+                    # durable rows), so the coarser but still structural
+                    # ctx._untrusted_content_seen sticky flag is used
+                    # instead -- correct without false negatives, at the
+                    # cost of occasionally tagging a batch untrusted that
+                    # doesn't itself contain the tainting message (the
+                    # flag is session-sticky, not per-batch). See
+                    # palace_store()'s docstring for exactly what this
+                    # tag does and doesn't gate.
                     palace_store(
                         content=summary, wing="nightstand", room=str(chat_id),
                         layer=2, tags=["auto-compaction", f"session:{chat_id}"],
+                        untrusted=getattr(self.agent.ctx, "_untrusted_content_seen", False),
                     )
                     committed = True
             except emergency_stop.EmergencyStopError:
@@ -2329,6 +2370,28 @@ class LuminaWindow(QMainWindow):
         else:
             content = text
 
+        # CASTLE-WALLS-REPAIR-01 R1A -- dropped file content rides along
+        # as its own attachments= argument, never fused into `content`/
+        # `display_text` as indistinguishable owner-typed text. Additive
+        # to whichever of the three branches above just set `content`
+        # (image/audio/plain-text) -- see core/context.py's
+        # add_user(attachments=...) for how it's kept structurally
+        # separate regardless of `content`'s own shape.
+        attachments_for_chat = None
+        if self._pending_text_attachments:
+            attachments_for_chat = [
+                (f"FILE_CONTENT: {fname}", file_text)
+                for fname, file_text in self._pending_text_attachments
+            ]
+            attachment_markers = " ".join(
+                f"[📎 {fname}]" for fname, _ in self._pending_text_attachments
+            )
+            display_text = (
+                f"{display_text}  {attachment_markers}" if display_text else attachment_markers
+            )
+            self._pending_text_attachments = []
+            self.chat_widget.clear_attachment_previews()
+
         # UI-CHAT-SCROLL-01: a foreground send anchors the new turn -- the
         # submitted card's start stays visible with response space below,
         # instead of the old delayed teleport to absolute transcript bottom.
@@ -2336,12 +2399,36 @@ class LuminaWindow(QMainWindow):
         self.chat_widget.set_turn_running(True)
         self.status_lbl.setText("processing...")
         if self._current_chat_id:
-            save_chat_message(self._current_chat_id, "user", display_text)
+            # CASTLE-WALLS-REPAIR-01 R1C/R1A -- every new row is now
+            # explicitly stamped with its provenance; a turn with
+            # attachments persists the same tagged content-list shape fed
+            # to add_user() live (content_format="parts_v1"), so
+            # core/context_reconstruction.py can restore the exact same
+            # owner-text/file-content separation on chat reload instead of
+            # re-fusing everything into one OWNER_DIRECT string.
+            if attachments_for_chat and isinstance(content, str):
+                from core.context import tag_untrusted
+                persisted_parts = (
+                    [{"type": "text", "text": content}] if content else []
+                ) + [
+                    {"type": "text", "text": tag_untrusted(label, file_text)}
+                    for label, file_text in attachments_for_chat
+                ]
+                save_chat_message(
+                    self._current_chat_id, "user", json.dumps(persisted_parts),
+                    metadata={"source": "OWNER_DIRECT", "content_format": "parts_v1"},
+                )
+            else:
+                save_chat_message(
+                    self._current_chat_id, "user", display_text,
+                    metadata={"source": "OWNER_DIRECT"},
+                )
         self._live_bubble = self.chat_widget.create_live_bubble()
         # CONTEXT-LIFECYCLE-A5I: a new foreground turn invalidates any
         # in-flight deliberate_reconstruct() preparation for this chat.
         self._context_generation.bump()
-        self.worker = AgentWorker(self.agent, content, self.signals, chat_id=self._current_chat_id)
+        self.worker = AgentWorker(self.agent, content, self.signals, chat_id=self._current_chat_id,
+                                   attachments=attachments_for_chat)
         self.worker.start()
         
 
@@ -2390,21 +2477,29 @@ class LuminaWindow(QMainWindow):
                     parts.append(f"[audio:{p}] (encode error: {e})")        
 
             elif ext in text_exts:
+                # CASTLE-WALLS-REPAIR-01 R1A -- staged separately, never
+                # fused into the editable text box (was: parts.append(...)),
+                # so the owner's own typed instruction and the file's raw
+                # bytes stay structurally distinct all the way to the model
+                # (see core/context.py's add_user(attachments=...)) instead
+                # of becoming one indistinguishable string.
                 try:
                     with open(p, 'r', encoding='utf-8', errors='replace') as f:
                         contents = f.read()
                     filename = os.path.basename(p)
-                    parts.append(f"[file: {filename}]\n```\n{contents}\n```")
+                    self._pending_text_attachments.append((filename, contents))
+                    self.chat_widget.show_attachment_preview(filename)
                 except Exception as e:
                     parts.append(f"[file:{p}] (read error: {e})")
 
             else:
-                # Try reading extensionless files as text
+                # Try reading extensionless files as text -- same staging.
                 try:
                     with open(p, 'r', encoding='utf-8', errors='replace') as f:
                         contents = f.read(8192)
                     filename = os.path.basename(p)
-                    parts.append(f"[file: {filename}]\n```\n{contents}\n```")
+                    self._pending_text_attachments.append((filename, contents))
+                    self.chat_widget.show_attachment_preview(filename)
                 except Exception:
                     parts.append(f"[file:{p}]")
 
@@ -2535,6 +2630,37 @@ class LuminaWindow(QMainWindow):
     def _on_tool_result(self, name: str, result: str):
         self._mark_operator_progress("processing")
         self.status_lbl.setText("processing...")
+        # CASTLE-WALLS-REPAIR-01 R2 -- attach a real Approve button to the
+        # live bubble when a fresh image-generation estimate is staged, so
+        # the owner can approve with one click instead of typing a
+        # confirmation word (both gate the same underlying approve_draft()
+        # call; see core/image_generation_draft.py).
+        if name == "estimate_image_generation" and self._live_bubble:
+            match = re.search(r"draft_id:\s*([0-9a-f]+)", result or "")
+            if match:
+                self._live_bubble.add_approve_button(match.group(1), self._on_approve_draft_clicked)
+
+    def _on_approve_draft_clicked(self, draft_id: str):
+        """Real, non-model UI event -- calls approve_draft() directly,
+        never through the model/tool-calling surface. Mirrors
+        ui/settings/tools_tab.py's _approve_pending_action(). A short,
+        clearly-labeled synthetic follow-up turn advances ctx.turn_seq so
+        the model's next generate_image attempt can pass the turn-boundary
+        gate without requiring the owner to also type anything."""
+        from core.image_generation_draft import approve_draft
+        approved = approve_draft(
+            draft_id, channel_id=getattr(self.agent, "channel_id", None),
+            chat_id=self._current_chat_id,
+        )
+        if not approved:
+            self.chat_widget.add_operator_message(
+                "This draft could not be approved (expired, already used, or from a "
+                "different conversation)."
+            )
+            return
+        if self.worker is not None and self.worker.isRunning():
+            return  # a turn is already in flight; the owner can just wait or type
+        self._on_user_message("[Owner approved via button]")
 
     def _on_think_start(self, step: int):
         self._mark_operator_progress("thinking")

@@ -133,11 +133,12 @@ class _FakeAgentWorker:
     not just intermediate UI state."""
     instances = []
 
-    def __init__(self, agent, content, signals, chat_id=None):
+    def __init__(self, agent, content, signals, chat_id=None, attachments=None):
         self.agent = agent
         self.content = content
         self.signals = signals
         self.chat_id = chat_id
+        self.attachments = attachments
         self.started = False
         _FakeAgentWorker.instances.append(self)
 
@@ -170,6 +171,7 @@ def _make_window(chat_widget, **overrides):
         signals=types.SimpleNamespace(),
         _pending_images=[],
         _pending_audio=None,
+        _pending_text_attachments=[],
         _next_image_id=1,
     )
     base.update(overrides)
@@ -520,6 +522,11 @@ def test_text_only_turn_has_no_pending_images_and_plain_string_content(chat, mon
 
 
 def test_dropping_a_text_file_does_not_touch_pending_images(chat, tmp_path):
+    """CASTLE-WALLS-REPAIR-01 R1A -- a dropped text file no longer gets
+    fused into the editable input box (that was CANNON-02: the owner's
+    own words and a file's raw bytes became one indistinguishable
+    string). It's staged in _pending_text_attachments and shown via a
+    preview chip instead, exactly like images/audio already were."""
     fake = _make_window(chat)
     p = tmp_path / "notes.txt"
     p.write_text("hello world")
@@ -527,7 +534,8 @@ def test_dropping_a_text_file_does_not_touch_pending_images(chat, tmp_path):
     LuminaWindow._on_files_dropped(fake, [str(p)])
 
     assert fake._pending_images == []
-    assert "notes.txt" in chat.input.toPlainText()
+    assert fake._pending_text_attachments == [("notes.txt", "hello world")]
+    assert "notes.txt" not in chat.input.toPlainText()
     assert len(chat._image_preview_rows) == 0
 
 
@@ -541,6 +549,7 @@ def test_mixed_batch_image_and_text_file_admits_image_and_inlines_text_independe
     LuminaWindow._on_files_dropped(fake, [str(img), str(txt)])
 
     assert [i["filename"] for i in fake._pending_images] == ["pic.png"]
+    assert fake._pending_text_attachments == [("notes.txt", "hello world")]
     text = chat.input.toPlainText()
-    assert "notes.txt" in text
-    assert "hello world" in text
+    assert "notes.txt" not in text
+    assert "hello world" not in text

@@ -378,22 +378,29 @@ def _observation_block(result: VisionLaneResult) -> str:
     """The provenance-framed observation block appended to the primary
     user turn. Framing is descriptive, never authority-granting: this is
     machine-derived DATA in a user-role message -- structurally incapable
-    of becoming SYSTEM, owner authority, or a tool trigger."""
-    header = (
-        f"[Vision specialist observation — machine-derived data, not owner "
+    of becoming SYSTEM, owner authority, or a tool trigger.
+
+    CASTLE-WALLS-REPAIR-01 R1B: routed through the shared tag_untrusted()
+    helper (same one add_user()/palace use) instead of a hand-built
+    bracket string, so this observation is framed identically to every
+    other lower-trust content path in the codebase."""
+    from core.context import tag_untrusted
+    label = (
+        f"Vision specialist observation — machine-derived data, not owner "
         f"or system authority | capability: {VISION_CAPABILITY} | "
         f"specialist: {result.provider}"
         f"{(' / ' + result.model) if result.model else ''} | "
-        f"route: {result.route_classification} | images: {result.image_count}]"
+        f"route: {result.route_classification} | images: {result.image_count}"
     )
-    return f"{header}\n{result.observation}"
+    return tag_untrusted(label, result.observation)
 
 
 def _failure_block(result: VisionLaneResult) -> str:
+    from core.context import tag_untrusted
     reason = result.diagnostic or result.outcome
-    return (
-        f"[Vision routing failed — no specialist observation available | "
-        f"reason: {reason} | raw images not carried in this session]"
+    label = "Vision routing failed — no specialist observation available"
+    return tag_untrusted(
+        label, f"reason: {reason} | raw images not carried in this session"
     )
 
 
@@ -606,8 +613,15 @@ def _append_to_current_user_turn(agent, text: str) -> None:
     data: the durable chat row keeps the GUI's display text (established
     contract), so this append creates no durable write and no memory write.
     Defensive shape checks keep a malformed history from crashing the turn.
+
+    CASTLE-WALLS-REPAIR-01 R1B: this mutates ctx.history directly rather
+    than going through add_user()/add_tool_result(), so it must flip the
+    sticky provenance flag itself -- it never did before, which meant the
+    "Provenance reminder" system-prompt nudge never fired for a turn whose
+    only lower-trust content was a specialist observation.
     """
-    history = getattr(getattr(agent, "ctx", None), "history", None)
+    ctx = getattr(agent, "ctx", None)
+    history = getattr(ctx, "history", None)
     if not history:
         return
     message = history[-1]
@@ -618,6 +632,10 @@ def _append_to_current_user_turn(agent, text: str) -> None:
         content.append({"type": "text", "text": text})
     elif isinstance(content, str):
         message["content"] = f"{content}\n{text}" if content else text
+    else:
+        return
+    if ctx is not None and hasattr(ctx, "mark_untrusted_seen"):
+        ctx.mark_untrusted_seen()
 
 
 def _record_route_event(agent, route_ctx, result, turn_id=None, chat_id=None,

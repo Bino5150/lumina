@@ -55,6 +55,41 @@ except ImportError:
     QApplication = None
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "castle_walls_evidence: CASTLE-WALLS-ADVERSARIAL-01's frozen historical "
+        "evidence corpus (tests/test_castle_walls_adversarial_c*.py). These files "
+        "are never edited and are NOT part of the normal pass/fail gate -- see "
+        "pytest_collection_modifyitems below.",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """CASTLE-WALLS-REPAIR-01 -- the five test_castle_walls_adversarial_c*.py
+    files are a deliberately frozen historical record of a confirmed-
+    vulnerable state (CANNONFIRE), preserved byte-for-byte as evidence.
+    Repairing the underlying bugs makes several of their own assertions
+    start failing ON PURPOSE -- that failure IS the proof the fix landed,
+    exactly as those files' own docstrings say ("these tests record
+    current behavior; they deliberately do not repair any boundary").
+
+    This hook never edits those files -- it only tags their tests at
+    collection time so the distinction is structurally unmistakable rather
+    than something a future engineer has to rediscover from a comment:
+        pytest -m "not castle_walls_evidence"   -- the normal, real gate
+        pytest -m castle_walls_evidence         -- the frozen corpus alone,
+                                                    reported separately
+    Repaired-state regression coverage for every CANNON-0x finding lives in
+    separate, ordinarily-gated test files/functions -- this marker exists
+    so the frozen corpus's expected reds are never mistaken for a broken
+    build in ordinary CI output.
+    """
+    for item in items:
+        if "test_castle_walls_adversarial_c" in str(item.fspath):
+            item.add_marker(pytest.mark.castle_walls_evidence)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _cleanup_test_data_root():
     """Best-effort removal of the whole-session scratch data dir at the end
