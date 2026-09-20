@@ -67,8 +67,23 @@ LABEL_TO_HALL = {
 }
 
 
-def save_memory(content: str, label: str = "general", *, untrusted: bool = False) -> str:
-    """Save a memory. Also writes to palace with AAAK compression."""
+def save_memory(content: str, label: str = "general", *, untrusted: bool = True) -> str:
+    """Save a memory. Also writes to palace with AAAK compression.
+
+    CASTLE-WALLS-REPAIR-03 / C8 finding 2: untrusted now defaults to True
+    (fail-safe). A durable memory write is lower-trust unless a caller
+    that is actually entitled to make that determination explicitly says
+    otherwise. Before this, the default was untrusted=False -- the
+    model-callable registered tool always overrode it to True explicitly,
+    but ui/settings/memory_tab.py's _paste_import() (owner pastes/imports
+    content copied from elsewhere -- a different provenance domain, same
+    reasoning as R1A's dropped files) called this directly and silently
+    inherited the permissive default, storing copied content as fully
+    trusted system-prompt material (see
+    tests/test_castle_walls_adversarial_c8.py). Only
+    ui/settings/memory_tab.py's _add_memory() -- a single field the owner
+    is directly typing into, in Settings, GUI-only, no import/paste
+    involved -- explicitly passes untrusted=False now."""
     if len(content) > 512:
         content = content[:512]
 

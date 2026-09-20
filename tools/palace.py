@@ -348,7 +348,7 @@ def palace_store(
     layer: int = 2,
     tags: list[str] = None,
     compress: bool = True,
-    untrusted: bool = False,
+    untrusted: bool = True,
 ) -> dict:
     """
     Store a memory in the palace.
@@ -356,7 +356,10 @@ def palace_store(
     - If compress=True, creates/updates a Closet with AAAK-compressed version
     Returns {'closet_id': ..., 'drawer_id': ..., 'compressed': ..., 'tokens_saved': ...}
 
-    untrusted (CASTLE-WALLS-REPAIR-01 R1D): True when THIS specific
+    untrusted (CASTLE-WALLS-REPAIR-01 R1D, default flipped fail-safe in
+    REPAIR-03 / C8 finding 2 -- every current real caller already passes
+    this explicitly, so the flip changes no live behavior, only what a
+    future forgetful caller silently gets): True when THIS specific
     contribution's source material was not the owner's own words (e.g.
     summarized from an EXTERNAL_CHANNEL_INBOUND-tagged chat message).
     Closets are rolling, pipe-separated merges (see below) -- only the
@@ -456,11 +459,14 @@ def palace_store(
 
 
 def palace_store_hall(content: str, hall: str = "facts", layer: int = 2,
-                       untrusted: bool = False) -> int:
+                       untrusted: bool = True) -> int:
     """Store a cross-cutting fact into a Hall (events, facts, preferences,
     discoveries, advice).
 
-    untrusted (CASTLE-WALLS-REPAIR-01 R1D): unlike palace_store()'s
+    untrusted (CASTLE-WALLS-REPAIR-01 R1D, default flipped fail-safe in
+    REPAIR-03 / C8 finding 2 -- every current real caller already passes
+    this explicitly, so the flip changes no live behavior, only what a
+    future forgetful caller silently gets): unlike palace_store()'s
     closets, every call here INSERTs a fresh, independent row -- there is
     no merge/append, so each hall fact is already atomic and a plain
     per-row flag (no segment-tagging needed) is correct. The row's own

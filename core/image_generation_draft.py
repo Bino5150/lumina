@@ -241,13 +241,32 @@ def is_approved(draft_id: str) -> bool:
 
 
 def find_pending_draft_id(*, channel_id: Optional[str], chat_id: Optional[int]) -> Optional[str]:
-    """Most recently staged, unexpired, not-yet-approved draft for this
+    """The SOLE eligible (presented, unexpired, unapproved) draft for this
     exact (channel_id, chat_id) context, or None. Used only by the
     word-match turn-admission hook, which knows a context but not a
     specific draft_id -- an owner's plain "yes" approves whichever
     generation request is actually still pending in their own
     conversation, without the model needing to (or being able to) name
-    the draft_id itself."""
+    the draft_id itself.
+
+    CASTLE-WALLS-REPAIR-03 / C8 finding 1: a bare conversational
+    affirmation can only ever resolve to a draft_id when the resolution
+    is UNAMBIGUOUS. Zero eligible drafts -> None (nothing to approve).
+    Exactly one -> that draft_id. Two or more -> None, ALWAYS -- fails
+    closed rather than guessing by recency, price, or any other
+    heuristic. Previously this picked "most recently staged" among ANY
+    unapproved draft (not even requiring presentation), which let a bare
+    "yes" silently approve a different, more expensive draft than the
+    owner plausibly meant whenever two estimates were pending at once
+    (see tests/test_castle_walls_adversarial_c8.py). "Presented" is now
+    required here too -- an unpresented draft was never a candidate this
+    function should have been offering in the first place; approve_draft()
+    itself already refuses one regardless, this just stops it from ever
+    being the one silently selected over a real, presented, eligible one.
+
+    The exact-draft button path (approve_draft() called directly with a
+    known draft_id) is entirely unaffected by this function and remains
+    valid no matter how many drafts are pending."""
     with _lock:
         now = time.time()
         _prune_expired_locked(now)
@@ -255,7 +274,8 @@ def find_pending_draft_id(*, channel_id: Optional[str], chat_id: Optional[int]) 
             d for d in _drafts.values()
             if d.channel_id == channel_id and d.chat_id == chat_id
             and d.draft_id not in _approvals
+            and d.draft_id in _presented
         ]
-        if not candidates:
+        if len(candidates) != 1:
             return None
-        return max(candidates, key=lambda d: d.created_at).draft_id
+        return candidates[0].draft_id

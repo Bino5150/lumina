@@ -106,7 +106,14 @@ def test_cannon07_model_memory_tools_are_structurally_lower_trust(
 
     # A separate direct runtime API remains available for genuinely trusted
     # owner workflows; it is not the callable registered with the model.
-    memory.save_memory("CANNON07_RUNTIME_OWNER_FACT", "project")
+    # CASTLE-WALLS-REPAIR-03 / C8 finding 2: save_memory()'s own default
+    # is now untrusted=True (fail-safe) -- a caller wanting trusted
+    # storage must say so explicitly, the same discipline this test
+    # already correctly enforces on the model-facing tool two lines up.
+    # This was the exact gap C8 found: ui/settings/memory_tab.py's
+    # _paste_import() called this same bare form and silently inherited
+    # what was then a permissive default.
+    memory.save_memory("CANNON07_RUNTIME_OWNER_FACT", "project", untrusted=False)
     conn = memory.get_db()
     try:
         runtime_flat = conn.execute(

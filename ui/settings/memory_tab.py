@@ -150,7 +150,12 @@ class MemoryTab(QWidget):
         if not content:
             return
         from tools.memory import save_memory
-        save_memory(content, label)
+        # CASTLE-WALLS-REPAIR-03 / C8 finding 2: save_memory() now
+        # defaults to untrusted=True. This is the one save_memory() call
+        # site that explicitly claims trusted storage -- self.new_content
+        # is a QLineEdit the owner is directly typing into, in Settings
+        # (GUI-only, owner-authenticated), not imported/pasted material.
+        save_memory(content, label, untrusted=False)
         self.new_content.clear()
         self._load()
 
@@ -179,22 +184,29 @@ class MemoryTab(QWidget):
             return
         from tools.memory import save_memory
         count = 0
+        # CASTLE-WALLS-REPAIR-03 / C8 finding 2: explicit untrusted=True on
+        # every item here, even though it's now save_memory()'s own
+        # default too. This content is pasted/imported -- copied from
+        # some other provenance domain, not composed by the owner in this
+        # moment (see _add_memory() above for the one path that IS) --
+        # the same reasoning R1A already applied to dropped files.
         # Try JSON first
         try:
             items = json.loads(text.strip())
             for item in items:
                 if isinstance(item, dict):
-                    save_memory(item.get("content",""), item.get("label","imported"))
+                    save_memory(item.get("content",""), item.get("label","imported"),
+                                untrusted=True)
                     count += 1
                 elif isinstance(item, str):
-                    save_memory(item, "imported")
+                    save_memory(item, "imported", untrusted=True)
                     count += 1
         except Exception:
             # Plain text — one memory per line
             for line in text.strip().splitlines():
                 line = line.strip()
                 if line:
-                    save_memory(line, "imported")
+                    save_memory(line, "imported", untrusted=True)
                     count += 1
         self._load()
         QMessageBox.information(self, "Import Complete", f"Imported {count} memories.")
