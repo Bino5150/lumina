@@ -4,6 +4,7 @@ Default port: 1234
 """
 
 import json
+import time
 import requests
 from typing import Optional, Generator
 from .base import (BaseLLMBackend, BackendStreamTelemetry, ModelDiscoveryOutcome,
@@ -261,6 +262,67 @@ def _sanitize_transport_detail(e: Exception) -> str:
     return f"{type(e).__name__}: {text}"
 
 
+class _ChatCompletionsStreamTiming:
+    """PROMOTED-CANDIDATE-STREAMING-01 -- request-local observation of
+    /chat/completions stream boundaries: the Chat-Completions-delta
+    counterpart to core/backends/openai_backend.py's _ResponsesTiming,
+    deliberately reusing that class's exact measured quantities and the
+    same rule for what counts, rather than inventing a second telemetry
+    definition. A reasoning ("Think") delta never starts the Final clock
+    (it starts/extends think_started_at instead); a tool-call argument
+    delta never starts either clock; only a genuinely non-empty
+    delta["content"] token starts the Final clock. Consequence, intended:
+    a WORK round that resolves to a pure tool call (no visible answer text
+    at all) reports no Final TTFT/stream duration -- correct, since there
+    is no "final answer" in that round to time. Final TTFT/stream duration
+    only appear once a round actually produces answer text, which is
+    exactly the shape _finalize_completion_candidate() (core/agent.py)
+    already knows how to consume from a candidate's `response_telemetry`.
+    This class only ever measures a genuine provider stream already being
+    consumed for `capture_telemetry=True`'s sake -- it never causes an
+    extra request and never estimates a boundary it did not observe."""
+
+    def __init__(self, request_started_at: float):
+        self.request_started_at = request_started_at
+        self.final_started_at = None
+        self.think_started_at = None
+        self.think_duration_s = 0.0
+
+    def observe_reasoning(self, now: float) -> None:
+        if self.think_started_at is None:
+            self.think_started_at = now
+
+    def observe_content(self, now: float) -> None:
+        self._close_think(now)
+        if self.final_started_at is None:
+            self.final_started_at = now
+
+    def close(self, now: float) -> None:
+        self._close_think(now)
+
+    def _close_think(self, now: float) -> None:
+        if self.think_started_at is not None:
+            duration = now - self.think_started_at
+            if duration > 0:
+                self.think_duration_s += duration
+            self.think_started_at = None
+
+    def snapshot(self, usage: Optional[dict], terminal_at: float) -> dict:
+        telemetry = {"request_streamed": True}
+        if isinstance(usage, dict):
+            telemetry["usage"] = usage
+        if self.final_started_at is not None:
+            ttft = self.final_started_at - self.request_started_at
+            stream_duration = terminal_at - self.final_started_at
+            if ttft > 0:
+                telemetry["final_ttft_s"] = ttft
+            if stream_duration > 0:
+                telemetry["final_stream_duration_s"] = stream_duration
+        if self.think_duration_s > 0:
+            telemetry["think_duration_s"] = self.think_duration_s
+        return telemetry
+
+
 def _iter_lines_safe(resp):
     """FE-15: requests.exceptions.RequestException (e.g. ChunkedEncodingError
     from a mid-stream disconnect) raises from *inside* iter_lines(), outside
@@ -352,7 +414,8 @@ class LMStudioBackend(BaseLLMBackend):
              temperature: float = 0.7, max_tokens: int = 4096,
              disable_thinking: bool = False,
              reasoning_effort: Optional[str] = None,
-             tool_choice_mode: Optional[ToolChoiceMode] = None) -> dict:
+             tool_choice_mode: Optional[ToolChoiceMode] = None,
+             capture_telemetry: bool = False) -> dict:
         model = self.get_model()
         payload = {
             "model": model,
@@ -427,6 +490,26 @@ class LMStudioBackend(BaseLLMBackend):
         if disable_thinking:
             self._apply_disable_thinking(payload)
 
+        # PROMOTED-CANDIDATE-STREAMING-01 -- opt-in, request-local only
+        # (never a second request: this REPLACES the non-streaming POST
+        # below, it never runs alongside it). Mirrors
+        # core/backends/openai_backend.py's OpenAIBackend.chat()'s own
+        # `if capture_telemetry: return self._chat_with_stream_telemetry(...)`
+        # placement and contract exactly -- same seam, same caller
+        # (core/agent.py's _accepts_capture_telemetry() capability
+        # detection), different wire format underneath (Chat Completions
+        # SSE deltas here vs. native Responses events there). The agent-
+        # visible contract is unchanged either way: one normalized,
+        # Chat-Completions-shaped dict comes back, exactly what
+        # extract_message()/is_tool_call()/get_tool_calls()/parse_tool_call()/
+        # extract_termination()/extract_reasoning() already know how to
+        # read -- capture_telemetry only changes how that dict gets built
+        # (assembled from a live stream's deltas instead of parsed from one
+        # blocking JSON body) and adds the optional "_lumina_telemetry" key
+        # this backend's own extract_response_telemetry() override reads.
+        if capture_telemetry:
+            return self._chat_with_stream_telemetry(payload)
+
         base_url = validate_base_url(self.base_url, self.display_name)
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
@@ -468,6 +551,245 @@ class LMStudioBackend(BaseLLMBackend):
             print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
             raise RuntimeError(format_provider_error(self.display_name, resp.status_code, resp.text, str(e)))
 
+    def _chat_with_stream_telemetry(self, payload: dict) -> dict:
+        """PROMOTED-CANDIDATE-STREAMING-01 -- consume one genuine
+        /chat/completions SSE stream in the foreground and return the
+        SAME Chat-Completions-shaped dict chat()'s non-streaming branch
+        above returns (`{"choices": [{"message": ..., "finish_reason":
+        ...}], "usage": {...}}`), plus an optional "_lumina_telemetry" key
+        (see extract_response_telemetry() above) carrying the boundaries
+        this method actually observed. The externally visible contract
+        chat() has always had is unchanged: one call, one normalized
+        response, no new provider request beyond the single one this
+        method itself makes -- `capture_telemetry=True` only changes HOW
+        that one response gets built (assembled from live deltas instead
+        of parsed from one blocking JSON body), never the shape callers
+        already rely on (extract_message()/is_tool_call()/get_tool_calls()/
+        parse_tool_call()/extract_termination()/extract_reasoning() all
+        read this return value completely unmodified). Model/sibling of
+        core/backends/openai_backend.py's OpenAIBackend._chat_with_stream_
+        telemetry() -- same opt-in contract and the same _lumina_telemetry
+        seam, different wire format (this one has no single terminal event
+        carrying a complete response body the way Responses does; Chat
+        Completions tool_calls/content/reasoning all arrive as incremental
+        per-index deltas that must be reassembled here).
+
+        Tool-call delta reconstruction: the standard OpenAI-compatible
+        `choices[0].delta.tool_calls[i]` shape, accumulated by `index`
+        across every frame -- `id`/`type` set once (first frame that
+        supplies them), `function.name`/`function.arguments` concatenated
+        (arguments always arrive fragmented; name is live-observed to
+        arrive whole on the first frame for a given index, but is
+        concatenated defensively rather than assumed). Order preserved by
+        sorting on `index` at the end, matching wire order for every
+        provider this family has been live-verified against.
+
+        Reasoning: both lanes chat_stream() already established are
+        honored here too, via the SAME _first_reasoning_field() helper
+        (no second alias list) -- a provider's discrete reasoning/
+        reasoning_content/thinking delta field feeds the synthesized
+        message's "reasoning_content" (first-priority alias, so
+        extract_openai_compatible_reasoning() always finds it downstream
+        regardless of which original field name arrived on the wire), and
+        a model that instead embeds literal <think>...</think> spans
+        directly in `content` is left untouched in the reconstructed
+        `content` string -- core/agent.py's own _extract_inline_think()/
+        strip_think_blocks() already handle that shape identically for a
+        genuine non-streaming response, so no second inline-tag parser is
+        needed here.
+
+        Timing: `_ChatCompletionsStreamTiming` above measures exactly what
+        _ResponsesTiming measures for the Responses transport -- a
+        reasoning delta only starts/extends the Think clock, a tool-call
+        argument delta starts neither clock, and only a genuinely
+        non-empty content delta starts the Final clock. A round that
+        resolves to a pure tool call (no content at all) therefore
+        reports no final_ttft_s/final_stream_duration_s -- truthfully
+        unavailable, never fabricated, exactly like every other "no
+        boundary observed" case this codebase already refuses to guess
+        at (TOKS-STREAM-TIMING-01).
+
+        Usage: checked unconditionally on every frame's top level, before
+        the terminal-frame guard below -- the SAME dual-provider-
+        convention handling chat_stream() already established
+        (CHAT-TELEMETRY-REGRESSION-01): OpenCode Zen sends it on a
+        separate trailing frame with empty `choices`; OpenRouter instead
+        REPEATS the terminal frame a second time with the same
+        finish_reason, only that repeat carrying `usage`. Once a terminal
+        finish_reason has been seen, only a still-arriving usage value is
+        still processed -- content/reasoning/tool_call deltas on any later
+        frame are ignored, matching chat_stream()'s own `terminal_seen`
+        guard exactly.
+
+        A stream that ends having produced no content, no tool_calls, no
+        reasoning, and no finish_reason at all -- i.e. nothing usable came
+        back -- raises RuntimeError rather than returning a silently empty
+        "successful" response, the same posture
+        openai_backend.py's own _chat_with_stream_telemetry() takes for
+        "stream ended before a terminal response event." Any partial
+        result that DID produce at least one of those is still returned
+        (finish_reason stays None -> extract_termination() correctly
+        reports UNKNOWN, never fabricated as COMPLETE) -- the identical
+        degrade-gracefully posture a malformed/truncated non-streaming
+        response already gets elsewhere in this file.
+
+        Cancellation/interruption: identical to every other call this
+        backend family makes -- one blocking network operation with no
+        mid-flight interrupt hook (core/agent.py's cancel_event is checked
+        only before and after the whole agent.llm.chat() call, in
+        _provider_chat_or_error(), never during it; that has always been
+        true for the ordinary non-streaming branch above and stays equally
+        true here). A transport-level interruption mid-stream still
+        surfaces as ConnectionError via _iter_lines_safe() below, the same
+        conversion chat_stream() already relies on."""
+        streamed_payload = dict(payload, stream=True)
+        base_url = validate_base_url(self.base_url, self.display_name)
+        request_started_at = time.monotonic()
+        timing = _ChatCompletionsStreamTiming(request_started_at)
+        resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
+        try:
+            resp = requests.post(
+                join_endpoint(base_url, "chat/completions"),
+                headers=self.headers, json=streamed_payload,
+                timeout=config.TOOL_CALL_TIMEOUT,
+                stream=True,
+            )
+            resp.raise_for_status()
+        except requests.exceptions.ConnectionError as e:
+            raise ConnectionError(
+                f"{self.display_name} not reachable at {base_url} "
+                f"({_sanitize_transport_detail(e)})."
+            ) from e
+        except requests.exceptions.Timeout as e:
+            raise TimeoutError(
+                f"{self.display_name} request timed out "
+                f"({_sanitize_transport_detail(e)})."
+            ) from e
+        except requests.exceptions.HTTPError as e:
+            if resp is None:
+                raise RuntimeError(format_provider_error(self.display_name, None, "", str(e)))
+            print(f"[HTTP ERROR BODY] {resp.text[:500]}", flush=True)
+            raise RuntimeError(format_provider_error(self.display_name, resp.status_code, resp.text, str(e)))
+
+        role = "assistant"
+        content_parts = []
+        reasoning_parts = []
+        tool_calls_acc = {}
+        finish_reason = None
+        usage = None
+        terminal_seen = False
+        terminal_at = None
+        saw_any_frame = False
+
+        for line in _iter_lines_safe(resp):
+            if not line:
+                continue
+            line = line.decode("utf-8")
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError as e:
+                print(f"[{self.display_name} STREAM] skipped malformed "
+                      f"frame ({type(e).__name__}), len={len(data)}", flush=True)
+                continue
+
+            now = time.monotonic()
+
+            # Unconditional, every frame, before the terminal-frame guard
+            # below -- see this method's own docstring for why (the
+            # OpenCode-Zen-vs-OpenRouter trailing-usage-frame split
+            # CHAT-TELEMETRY-REGRESSION-01 already established).
+            frame_usage = chunk.get("usage")
+            if isinstance(frame_usage, dict):
+                usage = frame_usage
+                saw_any_frame = True
+
+            if terminal_seen:
+                continue
+
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            if isinstance(delta.get("role"), str) and delta["role"]:
+                role = delta["role"]
+
+            reasoning = _first_reasoning_field(delta, strip=False) or ""
+            if reasoning:
+                saw_any_frame = True
+                timing.observe_reasoning(now)
+                reasoning_parts.append(reasoning)
+
+            token = delta.get("content")
+            if isinstance(token, str) and token:
+                saw_any_frame = True
+                timing.observe_content(now)
+                content_parts.append(token)
+
+            delta_tool_calls = delta.get("tool_calls")
+            if isinstance(delta_tool_calls, list):
+                for tc_delta in delta_tool_calls:
+                    if not isinstance(tc_delta, dict):
+                        continue
+                    saw_any_frame = True
+                    idx = tc_delta.get("index", 0)
+                    entry = tool_calls_acc.setdefault(idx, {
+                        "id": None, "type": "function",
+                        "function": {"name": None, "arguments": ""},
+                    })
+                    if tc_delta.get("id"):
+                        entry["id"] = tc_delta["id"]
+                    if tc_delta.get("type"):
+                        entry["type"] = tc_delta["type"]
+                    fn_delta = tc_delta.get("function") or {}
+                    if isinstance(fn_delta.get("name"), str) and fn_delta["name"]:
+                        entry["function"]["name"] = (entry["function"]["name"] or "") + fn_delta["name"]
+                    if isinstance(fn_delta.get("arguments"), str) and fn_delta["arguments"]:
+                        entry["function"]["arguments"] += fn_delta["arguments"]
+
+            choice_finish_reason = choice.get("finish_reason")
+            if choice_finish_reason:
+                saw_any_frame = True
+                finish_reason = choice_finish_reason
+                terminal_seen = True
+                terminal_at = now
+                timing.close(now)
+                # Deliberately NOT `break` -- see docstring: a trailing
+                # usage-only frame (OpenCode Zen or OpenRouter's own
+                # terminal-repeat convention) may still follow.
+
+        if not saw_any_frame:
+            raise RuntimeError(f"{self.display_name} stream ended without a response body.")
+
+        message = {"role": role, "content": "".join(content_parts)}
+        if reasoning_parts:
+            # Live-caught 2026-09-21 (real OpenRouter/z-ai/glm-5.3-flash
+            # smoke): reasoning arrives as MANY small per-token delta
+            # fragments (chat_stream()'s own docstring already documents
+            # 74-147 of ~90-449 frames per stream carrying one), the same
+            # raw per-token shape `content_parts` gets -- NOT one fragment
+            # per logical paragraph. "\n\n".join() here inserted a spurious
+            # blank line between literally every token, corrupting the
+            # reconstructed reasoning_content. Concatenated with no
+            # separator, exactly like content_parts above and exactly like
+            # chat_stream()'s own raw yield-per-token semantics.
+            message["reasoning_content"] = "".join(reasoning_parts)
+        if tool_calls_acc:
+            message["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+
+        body = {"choices": [{"message": message, "finish_reason": finish_reason}]}
+        if isinstance(usage, dict):
+            body["usage"] = usage
+        body["_lumina_telemetry"] = timing.snapshot(
+            usage, terminal_at if terminal_at is not None else time.monotonic(),
+        )
+        return body
+
     def extract_reasoning(self, response: dict) -> Optional[str]:
         """AGENT-TOOL-THINK-TELEMETRY-01A1 -- shared across every
         LMStudioBackend descendant for free (DeepSeek/Groq/Kimi/
@@ -479,21 +801,34 @@ class LMStudioBackend(BaseLLMBackend):
         return extract_openai_compatible_reasoning(response)
 
     def extract_response_telemetry(self, response: dict) -> dict:
-        """CHAT-TELEMETRY-REGRESSION-01 -- shared across every
-        LMStudioBackend descendant that doesn't override this
-        (DeepSeek/Groq/Kimi/llama.cpp/OmniRoute/OpenRouter/Qwen/vLLM/
-        Custom; OpenAIBackend supplies its own Responses-API override
-        instead). Every OpenAI-compatible /chat/completions response
-        already carries usage (prompt_tokens/completion_tokens/
-        total_tokens) at the top level, and chat() above already hands
-        that raw body back unmodified (`return resp.json()`) -- this
-        seam only surfaces what the provider actually sent. It does
-        NOT validate or default individual fields itself: core/agent.py's
-        _accumulate_provider_telemetry() is the one place that requires
-        each field to be a genuine non-negative int before trusting it
-        (same gate every other backend's usage already goes through),
-        so a missing/malformed usage shape here safely becomes "not
-        captured" downstream rather than a fabricated zero."""
+        """CHAT-TELEMETRY-REGRESSION-01 / PROMOTED-CANDIDATE-STREAMING-01 --
+        shared across every LMStudioBackend descendant that doesn't
+        override this (DeepSeek/Groq/Kimi/llama.cpp/OmniRoute/OpenRouter/
+        Qwen/vLLM/Custom; OpenAIBackend supplies its own Responses-API
+        override instead). Every OpenAI-compatible /chat/completions
+        response already carries usage (prompt_tokens/completion_tokens/
+        total_tokens) at the top level.
+
+        `_lumina_telemetry` (present only when chat() was called with
+        capture_telemetry=True -- see _chat_with_stream_telemetry() below)
+        takes priority when present: it carries the real observed
+        final_ttft_s/final_stream_duration_s/think_duration_s boundaries
+        alongside usage, the identical contract
+        core/backends/openai_backend.py's OpenAIBackend.extract_response_
+        telemetry() already established for the Responses transport --
+        reused verbatim here, not reinvented. Absent that key (the
+        ordinary non-streaming chat() path, capture_telemetry=False),
+        this falls back to surfacing bare usage exactly as before this
+        ticket: this seam only ever surfaces what the provider actually
+        sent, never validates or defaults individual fields itself
+        (core/agent.py's _accumulate_provider_telemetry() is the one
+        place that requires each field to be a genuine non-negative int
+        before trusting it), so a missing/malformed usage shape here
+        safely becomes "not captured" downstream rather than a
+        fabricated zero."""
+        telemetry = response.get("_lumina_telemetry")
+        if isinstance(telemetry, dict):
+            return dict(telemetry)
         usage = response.get("usage")
         if isinstance(usage, dict):
             return {"usage": usage}

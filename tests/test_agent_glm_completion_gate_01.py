@@ -522,8 +522,27 @@ def test_gate_request_reaches_real_backend_wire_with_tools_and_required_choice(m
                 "content": "",
                 "tool_calls": [_tc(FINISH_TOOL_WORK_NAME)],
             }}]}
+        def iter_lines(self):
+            # PROMOTED-CANDIDATE-STREAMING-01 -- the gate request now also
+            # opts into capture_telemetry (OpenRouterBackend accepts it
+            # like every LMStudioBackend descendant), so this fake must
+            # also answer a streaming request. Synthesizes one terminal
+            # SSE frame carrying the exact same message json() already
+            # returns for the non-streaming case -- this test only
+            # inspects the REQUEST payload, never the parsed response, so
+            # a single-frame stream keeps both modes trivially in sync.
+            import json as json_module
+            body = self.json()["choices"][0]["message"]
+            tool_calls = body.get("tool_calls") or []
+            delta = {"content": body.get("content", "")}
+            if tool_calls:
+                delta["tool_calls"] = [{**tc, "index": i} for i, tc in enumerate(tool_calls)]
+            frame = {"choices": [{"delta": delta,
+                                   "finish_reason": "tool_calls" if tool_calls else "stop"}]}
+            yield f"data: {json_module.dumps(frame)}".encode("utf-8")
+            yield b"data: [DONE]"
 
-    def _fake_post(url, headers=None, json=None, timeout=None):
+    def _fake_post(url, headers=None, json=None, timeout=None, stream=False):
         captured["payload"] = json
         return _FakeResp()
 

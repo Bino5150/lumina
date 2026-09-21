@@ -868,9 +868,18 @@ def _run_tool_work_control_gate(agent, tools_used_this_turn: set, cancel_event,
     """AGENT-CONTINUATION-CONTROL-GATE-01A -- ask ONLY the two internal
     continuation-control primitives (_CONTROL_GATE_SCHEMAS — never a
     product tool) whether real tool work for this turn is complete. Only
-    ever called by _chat_impl()'s tool loop after at least one real tool
-    has already executed this turn and a WORK round returned no real tool
-    call — never on a genuine first-round answer.
+    ever called by _chat_impl()'s tool loop after a WORK round returned no
+    real tool call with a clean (non-INCOMPLETE) termination.
+
+    AGENT-PRETOOL-ACTION-INTEGRITY-01 (commit 84fce81) corrected this
+    docstring's own prior claim here: this used to fire only after at
+    least one real tool had already executed this turn, "never on a
+    genuine first-round answer" — that carve-out was the exact bug that
+    fix closed. A turn's very first WORK round, if it too returns no real
+    tool call, now reaches this same gate identically to any later round;
+    see _chat_impl()'s own candidate-creation comment for why (a zero-tool
+    response and "the model narrated an action it never actually invoked"
+    are indistinguishable from content alone, first round or not).
 
     Module-level and duck-typed against `agent`, same convention as
     _provider_chat_or_error() above -- no method binding needed on a fake.
