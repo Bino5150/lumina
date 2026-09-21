@@ -14,6 +14,7 @@ import time
 import sys
 import os
 import math
+from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import shiboken6
@@ -204,7 +205,7 @@ class MetricsBar(QFrame):
             QApplication.clipboard().setText(self._response_text)
 
     def set_metrics(self, turn_elapsed, stream_elapsed, stream_tokens,
-                     tok_in: int, tok_out: int, tool_calls: int, think_time: float,
+                     tok_in: Optional[int], tok_out: int, tool_calls: int, think_time: float,
                      ttfa=None, final_ttft=None, tok_total=None):
         """TOKS-STREAM-TIMING-01. Independent values, never conflated:
         turn_elapsed (this bubble's whole dispatch-to-finalize wall time --
@@ -228,10 +229,15 @@ class MetricsBar(QFrame):
         A held candidate only receives these values when its backend captured
         native stream boundaries; blocking-only candidates still show
         "Final TTFT n/a · stream n/a". tok_s is computed ONLY from the stream_elapsed/
-        stream_tokens pair; tok_in/tok_out below remain the pre-existing
-        approximate usage counters (chunk-count based, not a real token
-        count) -- left in place for their existing display role, never
-        relabeled as the authoritative stream token count."""
+        stream_tokens pair. tok_in (CHAT-TELEMETRY-REGRESSION-01) is
+        authoritative provider-reported usage or None -- None means this
+        turn's backend never captured usage at all (see LiveResponseBubble.
+        finalize()) and renders as "in n/a", never a fabricated 0; it is
+        NEVER the approximate local counter. tok_out falls back to the
+        pre-existing approximate local counter (chunk-count based, not a
+        real token count) only when the provider didn't report
+        completion_tokens either -- left in place for its existing display
+        role, never relabeled as the authoritative stream token count."""
         parts = ([f"{turn_elapsed:.1f}s turn"] if turn_elapsed is not None
                  else ["turn n/a"])
         parts.append(f"{ttfa:.1f}s first answer" if ttfa is not None and ttfa > 0
@@ -249,8 +255,15 @@ class MetricsBar(QFrame):
             parts.append(f"{tok_s:.1f} tok/s")
         else:
             parts.append("stream n/a")
-        total = tok_in + tok_out if tok_total is None else tok_total
-        parts.append(f"{tok_in}in / {tok_out}out / {total}total")
+        if tok_in is not None:
+            total = tok_in + tok_out if tok_total is None else tok_total
+            parts.append(f"{tok_in}in / {tok_out}out / {total}total")
+        else:
+            # No authoritative provider usage was ever captured for this
+            # turn's backend -- tok_out alone (a real local streamed-token
+            # count) is honest; in/total are not, since input tokens were
+            # never measured. Never silently equal to output-only.
+            parts.append(f"in n/a / {tok_out}out / total n/a")
         if tool_calls:
             parts.append(f"{tool_calls} tool calls")
         if think_time > 0:
@@ -620,8 +633,13 @@ class LiveResponseBubble(QFrame):
         else:
             self.stream_lbl.setText("")
 
+        # CHAT-TELEMETRY-REGRESSION-01: tok_in has no honest default -- a
+        # backend that never captured authoritative usage (self._provider_usage
+        # stays None) leaves it None here, not a fabricated 0. set_metrics()
+        # renders that as "in n/a" instead of manufacturing a zero the
+        # provider never reported.
         usage = self._provider_usage or {}
-        tok_in = usage.get("prompt_tokens", 0)
+        tok_in = usage.get("prompt_tokens")
         tok_out = usage.get("completion_tokens", self._tok_out)
         tok_total = usage.get("total_tokens")
         think_time = (self._provider_think_time if self._has_provider_think_timing

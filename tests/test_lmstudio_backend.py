@@ -21,6 +21,7 @@ from core.backends.lmstudio import (
     extract_openai_compatible_reasoning,
     LMStudioBackend,
 )
+from core.backends.base import BackendStreamTelemetry
 from core.backends.loader import CustomBackend
 
 
@@ -279,7 +280,17 @@ def _make_custom_backend():
 def test_stream_skips_empty_choices_metadata_frame_without_crashing(monkeypatch):
     """OpenCode's trailing frame: empty choices, top-level cost/usage --
     used to rely on IndexError-as-control-flow; now an explicit, cheap
-    check with no exception involved."""
+    check with no exception involved.
+
+    CHAT-TELEMETRY-REGRESSION-01: this frame's `usage` is now surfaced as a
+    BackendStreamTelemetry event (previously silently discarded) -- it does
+    not crash, and it carries only what the provider actually sent
+    (`total_tokens` alone here; no prompt_tokens/completion_tokens in this
+    fixture's frame). core/agent.py's _accumulate_provider_telemetry() is
+    the layer that requires the full triplet before trusting any of it, so
+    a partial usage dict like this one safely contributes nothing there --
+    that's out of scope for this backend-level test, which only asserts the
+    frame is surfaced, not fabricated into a crash or dropped silently."""
     backend = _make_backend()
     frames = [
         {"choices": [{"delta": {"content": "hi"}, "finish_reason": None}]},
@@ -288,8 +299,110 @@ def test_stream_skips_empty_choices_metadata_frame_without_crashing(monkeypatch)
     ]
     monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
 
+    # "hi" is only 2 chars, under chat_stream()'s 8-char safe-buffering
+    # margin (held back in case a partial "<think>" tag is still arriving),
+    # so it isn't flushed until the terminal "stop" frame -- the telemetry
+    # event, processed on the middle frame, is observed first.
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert len(out) == 2
+    assert isinstance(out[0], BackendStreamTelemetry)
+    assert out[0].fields == {"usage": {"total_tokens": 12}, "request_streamed": True}
+    assert out[1] == "hi"
+
+
+def test_stream_yields_backend_stream_telemetry_with_full_usage_triplet(monkeypatch):
+    """A hypothetical OpenCode-Zen-shaped trailing empty-choices frame
+    carrying the complete prompt_tokens/completion_tokens/total_tokens
+    triplet -- this is what actually restores truthful input/output/total
+    token counts end to end (core/agent.py's _accumulate_provider_telemetry()
+    accepts this shape without discarding it, unlike the partial-usage case
+    above). See test_stream_yields_backend_stream_telemetry_for_live_openrouter_shape
+    below for the ACTUAL live-verified OpenRouter/GLM frame shape, which is
+    different -- both are real possibilities across this backend family's
+    providers, so both are covered independently."""
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"content": "hi"}, "finish_reason": None}]},
+        {"choices": [], "usage": {"prompt_tokens": 25, "completion_tokens": 9,
+                                   "total_tokens": 34}},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+
+    # Same buffering note as the partial-usage test above: "hi" flushes on
+    # the terminal "stop" frame, after the telemetry event.
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert out == [
+        BackendStreamTelemetry({"usage": {"prompt_tokens": 25, "completion_tokens": 9,
+                                           "total_tokens": 34},
+                                 "request_streamed": True}),
+        "hi",
+    ]
+
+
+def test_stream_trailing_frame_without_usage_yields_no_telemetry(monkeypatch):
+    """A trailing empty-choices frame with no `usage` key at all (or a
+    malformed one) stays exactly as safely-skipped as before this fix --
+    never a crash, never a fabricated telemetry event."""
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"content": "hi"}, "finish_reason": None}]},
+        {"choices": [], "cost": "0"},
+        {"choices": [], "usage": "not-a-dict"},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+
     out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
     assert out == ["hi"]
+
+
+def test_stream_yields_backend_stream_telemetry_for_live_openrouter_shape(monkeypatch):
+    """The ACTUAL live-observed shape (2026-09-20, real openrouter/
+    z-ai/glm-5.3-flash route, single-turn smoke): unlike OpenCode Zen's
+    separate empty-choices trailing frame, OpenRouter REPEATS the terminal
+    frame -- same finish_reason, non-empty choices -- a second time, only
+    that repeat carrying top-level `usage`. An earlier version of this fix
+    only checked empty-choices frames and `break`d immediately on the
+    first finish_reason sighting, which would have never even read this
+    second frame -- both are exercised here so a regression to either
+    shape assumption fails loudly."""
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"content": "hi"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]},
+        {"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}],
+         "usage": {"prompt_tokens": 19, "completion_tokens": 8, "total_tokens": 27}},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    assert out == [
+        "hi",
+        BackendStreamTelemetry({"usage": {"prompt_tokens": 19, "completion_tokens": 8,
+                                           "total_tokens": 27},
+                                 "request_streamed": True}),
+    ]
+
+
+def test_stream_ignores_content_on_any_frame_after_terminal_finish_reason(monkeypatch):
+    """Defensive: once a terminal finish_reason has been seen, a later
+    frame's content/delta is never treated as new text, even if one somehow
+    arrived (e.g. a misbehaving proxy) -- only a trailing usage dict on that
+    later frame is still honored."""
+    backend = _make_backend()
+    frames = [
+        {"choices": [{"delta": {"content": "hi"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]},
+        {"choices": [{"delta": {"content": "should never appear"}, "finish_reason": "stop"},],
+         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}},
+    ]
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _FakeStreamResp(_sse_lines(*frames)))
+
+    out = list(backend.chat_stream(messages=[{"role": "user", "content": "hi"}]))
+    text_items = [item for item in out if isinstance(item, str)]
+    assert text_items == ["hi"]
+    assert "should never appear" not in "".join(text_items)
 
 
 def test_stream_reasoning_first_then_content_matches_opencode_shape(monkeypatch):
@@ -635,3 +748,72 @@ def test_first_reasoning_field_is_the_one_shared_seam(monkeypatch):
     assert out[0] == "__THINK_START__"
     assert out[1] == "SENTINEL"
     assert any(strip is False for _, strip in calls)
+
+
+# ── extract_response_telemetry(): CHAT-TELEMETRY-REGRESSION-01 ──────────────
+# Non-streaming chat()'s WORK-round response, shared for free by every
+# LMStudioBackend descendant that doesn't override this (OpenRouter, LM
+# Studio, DeepSeek, Groq, Kimi, llama.cpp, OmniRoute, Qwen, vLLM, Custom).
+# OpenAIBackend supplies its own Responses-API override instead -- see
+# tests/test_openai_responses_telemetry_01.py for that half.
+
+def test_extract_response_telemetry_passes_through_real_usage():
+    """chat()'s `return resp.json()` hands the raw OpenAI-compatible body
+    straight through with usage already at the top level -- this seam just
+    has to surface it, not reshape or re-key it (prompt_tokens/
+    completion_tokens/total_tokens are already the right names)."""
+    backend = _make_backend()
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+        "usage": {"prompt_tokens": 25, "completion_tokens": 9, "total_tokens": 34},
+    }
+    assert backend.extract_response_telemetry(response) == {
+        "usage": {"prompt_tokens": 25, "completion_tokens": 9, "total_tokens": 34},
+    }
+
+
+def test_extract_response_telemetry_empty_when_usage_absent():
+    """No `usage` key at all (a provider that never reports it) -- empty
+    dict, never a fabricated/estimated one. Matches BaseLLMBackend's own
+    opt-in-seam contract: 'a backend must positively normalize its own
+    provider schema before the agent will consume it.'"""
+    backend = _make_backend()
+    response = {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+    assert backend.extract_response_telemetry(response) == {}
+
+
+def test_extract_response_telemetry_empty_when_usage_malformed():
+    """A `usage` key that isn't a dict (some providers omit it entirely
+    rather than send this, but never trust the shape) -- still empty, never
+    a crash and never coerced."""
+    backend = _make_backend()
+    response = {"choices": [], "usage": "not-a-dict"}
+    assert backend.extract_response_telemetry(response) == {}
+
+
+def test_extract_response_telemetry_partial_usage_passed_through_unvalidated():
+    """This seam only surfaces what the provider sent -- it does not itself
+    require the full prompt/completion/total triplet. That validation is
+    core/agent.py's _accumulate_provider_telemetry() job (see
+    tests/test_toks_stream_timing_01.py), so a partial dict still comes
+    through here unmodified rather than being silently dropped at this
+    layer, where a future caller might reasonably expect the raw provider
+    value."""
+    backend = _make_backend()
+    response = {"choices": [], "usage": {"total_tokens": 12}}
+    assert backend.extract_response_telemetry(response) == {"usage": {"total_tokens": 12}}
+
+
+def test_extract_response_telemetry_shared_by_openrouter_subclass():
+    """OpenRouterBackend never overrides this -- confirms the live-observed
+    z-ai/glm-5.3-flash symptom's actual fix point is this shared method,
+    not something OpenRouterBackend-specific."""
+    from core.backends.openrouter import OpenRouterBackend
+    backend = OpenRouterBackend.__new__(OpenRouterBackend)
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+    }
+    assert backend.extract_response_telemetry(response) == {
+        "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+    }

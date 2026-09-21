@@ -6,7 +6,8 @@ Default port: 1234
 import json
 import requests
 from typing import Optional, Generator
-from .base import BaseLLMBackend, ModelDiscoveryOutcome, ModelDiscoveryResult, ToolChoiceMode
+from .base import (BaseLLMBackend, BackendStreamTelemetry, ModelDiscoveryOutcome,
+                    ModelDiscoveryResult, ToolChoiceMode)
 from core.redaction import redact_secret_shapes
 import config
 
@@ -477,9 +478,30 @@ class LMStudioBackend(BaseLLMBackend):
         live-verified field priority and shape."""
         return extract_openai_compatible_reasoning(response)
 
+    def extract_response_telemetry(self, response: dict) -> dict:
+        """CHAT-TELEMETRY-REGRESSION-01 -- shared across every
+        LMStudioBackend descendant that doesn't override this
+        (DeepSeek/Groq/Kimi/llama.cpp/OmniRoute/OpenRouter/Qwen/vLLM/
+        Custom; OpenAIBackend supplies its own Responses-API override
+        instead). Every OpenAI-compatible /chat/completions response
+        already carries usage (prompt_tokens/completion_tokens/
+        total_tokens) at the top level, and chat() above already hands
+        that raw body back unmodified (`return resp.json()`) -- this
+        seam only surfaces what the provider actually sent. It does
+        NOT validate or default individual fields itself: core/agent.py's
+        _accumulate_provider_telemetry() is the one place that requires
+        each field to be a genuine non-negative int before trusting it
+        (same gate every other backend's usage already goes through),
+        so a missing/malformed usage shape here safely becomes "not
+        captured" downstream rather than a fabricated zero."""
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            return {"usage": usage}
+        return {}
+
     def chat_stream(self, messages: list, max_tokens: int = 4096,
                     temperature: float = 0.7,
-                    reasoning_effort: Optional[str] = None) -> Generator[str, None, None]:
+                    reasoning_effort: Optional[str] = None) -> Generator[object, None, None]:
         model = self.get_model()
         payload = {
             "model": model,
@@ -523,6 +545,11 @@ class LMStudioBackend(BaseLLMBackend):
 
         buffer = ""
         in_think = False
+        # CHAT-TELEMETRY-REGRESSION-01 -- once a terminal finish_reason has
+        # been seen, only a trailing usage frame (if any) is still
+        # meaningful; every other field on a later frame is ignored rather
+        # than re-processed as new content.
+        terminal_seen = False
 
         for line in _iter_lines_safe(resp):
             if not line:
@@ -534,21 +561,51 @@ class LMStudioBackend(BaseLLMBackend):
                     break
                 try:
                     chunk = json.loads(data)
+
+                    # CHAT-TELEMETRY-REGRESSION-01 -- checked unconditionally,
+                    # on every frame, BEFORE the empty-choices/finish_reason
+                    # branches below: usage does not arrive on one single
+                    # provider-neutral frame shape. OpenCode Zen sends it on
+                    # a separate trailing frame with empty `choices`. Live-
+                    # verified 2026-09-20 against the real openrouter/
+                    # z-ai/glm-5.3-flash route: OpenRouter instead REPEATS
+                    # the terminal frame -- same finish_reason, non-empty
+                    # choices -- a second time, only that repeat carrying
+                    # `usage`. Checking every frame's top level, regardless
+                    # of `choices` shape, covers both without guessing which
+                    # convention a given provider follows.
+                    usage = chunk.get("usage")
+                    if isinstance(usage, dict):
+                        yield BackendStreamTelemetry(
+                            {"usage": usage, "request_streamed": True}
+                        )
+
+                    if terminal_seen:
+                        # Already flushed the answer and closed Think below;
+                        # a frame arriving after that is only ever here to
+                        # (maybe) carry the trailing usage handled above.
+                        continue
+
                     choices = chunk.get("choices") or []
                     if not choices:
-                        # Some providers (e.g. OpenCode Zen) send a trailing
-                        # metadata frame with empty choices and top-level
-                        # usage/cost fields — expected, not an error.
                         continue
                     delta = choices[0].get("delta", {})
                     finish_reason = choices[0].get("finish_reason")
                     if finish_reason in ("stop", "length", "eos"):
+                        terminal_seen = True
                         if buffer:
                             yield buffer
                             buffer = ""
                         if in_think:
                             yield "__THINK_END__"
-                        break
+                        # Deliberately NOT `break` (CHAT-TELEMETRY-REGRESSION-01):
+                        # OpenRouter's own trailing usage-bearing repeat frame
+                        # (see above) arrives AFTER this one -- breaking here
+                        # would exit the stream before it's ever read. The loop
+                        # still ends the same way it always did, at this
+                        # provider family's `[DONE]` sentinel above (or simply
+                        # running out of lines), never open-ended.
+                        continue
 
                     # AGENT-GLM-THINK-TOOL-TRANSITION-01 -- same
                     # reasoning_content/reasoning/thinking alias priority

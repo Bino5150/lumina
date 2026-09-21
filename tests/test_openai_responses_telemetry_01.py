@@ -375,11 +375,17 @@ def test_gui_footer_prefers_provider_usage_and_preserves_non_openai_fallback(
     assert provider._provider_usage["cached_tokens"] == 4
     assert provider._provider_usage["reasoning_tokens"] == 3
 
+    # CHAT-TELEMETRY-REGRESSION-01: a backend that never captured usage at
+    # all (set_token_usage() never called) must show input tokens as
+    # genuinely unavailable, never a fabricated "0in" -- tok_out alone (a
+    # real local streamed-token count) stays honest and visible.
     fallback = LiveResponseBubble(COLORS)
     fallback.append_response_token("one")
     fallback.append_response_token("two")
     fallback.finalize()
-    assert "0in / 2out / 2total" in fallback.metrics.lbl.text()
+    fallback_text = fallback.metrics.lbl.text()
+    assert "in n/a / 2out / total n/a" in fallback_text
+    assert "0in" not in fallback_text
 
 
 def test_agent_worker_routes_usage_and_think_timing_as_dedicated_signals(qapp):
