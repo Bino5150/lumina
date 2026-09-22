@@ -155,6 +155,13 @@ def init_palace_db():
     if existing == 0:
         _seed_l0(conn)
 
+    # REDDIT-INGRESS-AUTHORITY-01: historical Dream/compaction drawers may
+    # predate the rule that every model-authored durable summary is
+    # lower-trust.  Repair both the per-drawer authority bit and each linked
+    # rolling closet's rendered segments.  Idempotent: once every matching
+    # row is untrusted, this is a read-only no-op on later startups.
+    _migrate_synthesized_drawer_authority(conn)
+
     conn.commit()
     conn.close()
 
@@ -337,6 +344,90 @@ def _ensure_room(conn, wing_id: int, room_name: str) -> int:
 def _get_wing_id(conn, wing_name: str) -> int | None:
     row = conn.execute("SELECT id FROM palace_wings WHERE name=?", (wing_name,)).fetchone()
     return row["id"] if row else None
+
+
+_SYNTHESIZED_MEMORY_TAGS = frozenset({
+    "dream-sweep", "auto-compaction", "manual-compaction",
+})
+
+
+def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
+    """Rebuild one rolling closet from its drawers and their authority bits."""
+    location = conn.execute(
+        "SELECT w.name AS wing, r.name AS room "
+        "FROM palace_closets c "
+        "JOIN palace_rooms r ON c.room_id=r.id "
+        "JOIN palace_wings w ON r.wing_id=w.id WHERE c.id=?",
+        (closet_id,),
+    ).fetchone()
+    if location is None:
+        return
+
+    remaining = conn.execute(
+        "SELECT content, untrusted FROM palace_drawers "
+        "WHERE closet_id=? ORDER BY created_at, id",
+        (closet_id,),
+    ).fetchall()
+    if not remaining:
+        conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
+        return
+
+    from core.context import tag_untrusted
+    label = f"{location['wing']}.{location['room']}"
+    segments = []
+    for row in remaining:
+        raw = aaak_compress(row["content"], label=label)
+        segments.append(tag_untrusted(label, raw) if row["untrusted"] else raw)
+    rebuilt = " | ".join(segments)
+    conn.execute(
+        "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=?, "
+        "ever_had_untrusted_merge=? WHERE id=?",
+        (
+            rebuilt,
+            estimate_tokens(rebuilt),
+            datetime.now().isoformat(),
+            1 if any(row["untrusted"] for row in remaining) else 0,
+            closet_id,
+        ),
+    )
+
+
+def _migrate_synthesized_drawer_authority(conn) -> int:
+    """Fail closed for model-authored durable summaries created by old builds.
+
+    Returns the number of drawers changed, mainly for deterministic tests.
+    Tags identify the trusted runtime write path here; they never promote
+    authority.  This migration only moves matching rows in the safer
+    direction (trusted -> untrusted).
+    """
+    rows = conn.execute(
+        "SELECT id, closet_id, tags FROM palace_drawers WHERE untrusted=0"
+    ).fetchall()
+    changed = 0
+    affected_closets = set()
+    for row in rows:
+        try:
+            tags = json.loads(row["tags"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(tags, list):
+            continue
+        tag_set = {tag for tag in tags if isinstance(tag, str)}
+        if not (_SYNTHESIZED_MEMORY_TAGS & tag_set):
+            continue
+        if "trust:untrusted" not in tags:
+            tags.append("trust:untrusted")
+        conn.execute(
+            "UPDATE palace_drawers SET untrusted=1, tags=? WHERE id=?",
+            (json.dumps(tags), row["id"]),
+        )
+        changed += 1
+        if row["closet_id"] is not None:
+            affected_closets.add(row["closet_id"])
+
+    for closet_id in affected_closets:
+        _rebuild_closet_from_drawers(conn, closet_id)
+    return changed
 
 
 # ── Write API ──────────────────────────────────────────────────────────────────
@@ -724,38 +815,7 @@ def palace_undo_write(drawer_id: int) -> dict:
     conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
 
     if closet_id:
-        location = conn.execute(
-            "SELECT w.name AS wing, r.name AS room "
-            "FROM palace_closets c "
-            "JOIN palace_rooms r ON c.room_id=r.id "
-            "JOIN palace_wings w ON r.wing_id=w.id WHERE c.id=?",
-            (closet_id,),
-        ).fetchone()
-        remaining = conn.execute(
-            "SELECT content, untrusted FROM palace_drawers "
-            "WHERE closet_id=? ORDER BY created_at, id",
-            (closet_id,)
-        ).fetchall()
-
-        if remaining:
-            from core.context import tag_untrusted
-            label = f"{location['wing']}.{location['room']}"
-            segments = []
-            for row in remaining:
-                raw = aaak_compress(row["content"], label=label)
-                segments.append(
-                    tag_untrusted(label, raw) if row["untrusted"] else raw
-                )
-            rebuilt = " | ".join(segments)
-            token_est = estimate_tokens(rebuilt)
-            ever_untrusted = 1 if any(row["untrusted"] for row in remaining) else 0
-            conn.execute(
-                "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=?, "
-                "ever_had_untrusted_merge=? WHERE id=?",
-                (rebuilt, token_est, datetime.now().isoformat(), ever_untrusted, closet_id)
-            )
-        else:
-            conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
+        _rebuild_closet_from_drawers(conn, closet_id)
 
     conn.commit()
     conn.close()

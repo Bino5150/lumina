@@ -132,15 +132,6 @@ def run_manual_compaction(history_snapshot: list, chat_id: int, cancel_event=Non
         return {"status": "nothing_to_compact", "chat_id": chat_id}
 
     durable_prefix = conversational[previous_skip:new_skip]
-    # CASTLE-WALLS-REPAIR-01 R1D -- same reasoning as core/dreaming.py's
-    # idle sweep: if any row actually being compacted here was
-    # EXTERNAL_CHANNEL_INBOUND, the resulting summary's Palace write is
-    # tagged untrusted (see palace_store()'s docstring for exactly what
-    # that does and doesn't gate).
-    compaction_untrusted = any(
-        (m.get("metadata") or {}).get("source") == "EXTERNAL_CHANNEL_INBOUND"
-        for m in durable_prefix
-    )
     chunks = chunk_compaction_history(durable_prefix, max_chars=SUMMARY_CHUNK_CHARS)
     if not chunks:
         return {
@@ -172,7 +163,12 @@ def run_manual_compaction(history_snapshot: list, chat_id: int, cancel_event=Non
                 f"session:{chat_id}",
                 f"{CONTEXT_SKIP_TAG_PREFIX}{new_skip}",
             ],
-            untrusted=compaction_untrusted,
+            # REDDIT-INGRESS-AUTHORITY-01: every compaction summary is
+            # model-authored derived state, not an owner command.  The current
+            # incremental slice can contain a Lumina paraphrase whose original
+            # external source was compacted earlier, so scanning only this
+            # slice cannot prove owner provenance.
+            untrusted=True,
         )
     except Exception as e:
         return {

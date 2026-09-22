@@ -140,6 +140,7 @@ def test_fires_and_writes_to_nightstand_wing_tagged_correctly(monkeypatch):
     assert call["content"] == "- did a thing"
     assert "auto-compaction" in call["tags"]
     assert "session:42" in call["tags"]
+    assert call["untrusted"] is True
 
     # Reset after the run, so a later turn can trigger again.
     assert ctx._compacting is False

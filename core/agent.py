@@ -1915,8 +1915,11 @@ class LuminaAgent:
         """
         Main entry point. Runs tool loop with non-streaming,
         then streams the final response. Returns full response string.
-        source: passed straight through to ctx.add_user(). OWNER_DIRECT (default)
-        preserves current desktop behavior unchanged.
+        source: passed through to ctx.add_user(). OWNER_DIRECT (default)
+        preserves current desktop behavior unchanged, but a real
+        ``self.owner is False`` agent always clamps it to
+        EXTERNAL_CHANNEL_INBOUND before admission.  Callers may lower an
+        owner agent's turn trust; they may never raise a non-owner agent's.
         attachments (CASTLE-WALLS-REPAIR-01 R1A): optional list of
         (label, text) pairs -- e.g. dropped-file content -- passed straight
         through to ctx.add_user(), kept structurally separate from
@@ -1990,6 +1993,16 @@ class LuminaAgent:
         nothing new — every branch below still returns or raises exactly
         as it did before this instrumentation existed.
         """
+        # REDDIT-INGRESS-AUTHORITY-01: channel authority is fixed on the
+        # agent at construction.  The caller-controlled source argument may
+        # lower trust on an owner agent (e.g. a future routed external
+        # observation), but it may never stamp a turn on a non-owner agent as
+        # OWNER_DIRECT.  getattr(..., True) preserves the long-established
+        # unbound-call test fakes that predate self.owner; every real
+        # LuminaAgent always has the attribute.
+        if getattr(self, "owner", True) is False:
+            source = "EXTERNAL_CHANNEL_INBOUND"
+
         # CODING-06A2: getattr-guarded, same reason as every other fake-self
         # compatibility check in this method — lightweight test stand-ins
         # (types.SimpleNamespace) predating this patch have no

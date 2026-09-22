@@ -2193,23 +2193,15 @@ class LuminaWindow(QMainWindow):
                     if not emergency_stop.execution_permitted(epoch):
                         return
                     from tools.palace import palace_store
-                    # CASTLE-WALLS-REPAIR-01 R1D -- same reasoning as
-                    # core/dreaming.py's idle sweep and core/manual_
-                    # compaction.py, applied to this THIRD Palace-writing
-                    # pathway. `batch` is live in-memory ctx.history
-                    # (no per-message metadata field exists there, unlike
-                    # durable rows), so the coarser but still structural
-                    # ctx._untrusted_content_seen sticky flag is used
-                    # instead -- correct without false negatives, at the
-                    # cost of occasionally tagging a batch untrusted that
-                    # doesn't itself contain the tainting message (the
-                    # flag is session-sticky, not per-batch). See
-                    # palace_store()'s docstring for exactly what this
-                    # tag does and doesn't gate.
+                    # REDDIT-INGRESS-AUTHORITY-01: an automatic compaction
+                    # summary is Lumina/model-authored derived state, never an
+                    # owner command.  Always persist it lower-trust; a sticky
+                    # live-session flag cannot prove that a paraphrase's
+                    # original source still exists in this particular batch.
                     palace_store(
                         content=summary, wing="nightstand", room=str(chat_id),
                         layer=2, tags=["auto-compaction", f"session:{chat_id}"],
-                        untrusted=getattr(self.agent.ctx, "_untrusted_content_seen", False),
+                        untrusted=True,
                     )
                     committed = True
             except emergency_stop.EmergencyStopError:

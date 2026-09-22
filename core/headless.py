@@ -289,7 +289,19 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
             agent.on_tool_call = _capture_call
             agent.on_tool_result = _capture_result
             try:
-                source = "OWNER_DIRECT" if owner else "EXTERNAL_CHANNEL_INBOUND"
+                # REDDIT-INGRESS-AUTHORITY-01: the cached agent's immutable
+                # authority owns provenance, not this call's requested owner
+                # value.  A cache hit with a mismatched owner=True argument
+                # was already prevented from restoring owner-only tools in
+                # get_headless_agent(), but could still stamp the inbound turn
+                # OWNER_DIRECT here.  Keep both axes bound to the same source
+                # of truth so identity/familiarity/caller error cannot promote
+                # an established non-owner channel.
+                authoritative_owner = getattr(agent, "owner", owner)
+                source = (
+                    "OWNER_DIRECT" if authoritative_owner
+                    else "EXTERNAL_CHANNEL_INBOUND"
+                )
                 # Patch 3A.4 Part 4 -- resolved fresh every turn against the actual
                 # live backend in use (agent.llm), never cached/memoized. Guarded
                 # by _agent_accepts_reasoning_effort() (see above) for compatibility
@@ -310,7 +322,7 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
                 if approval_event_id is not None and _agent_accepts_approval_event_id(agent):
                     chat_kwargs["approval_event_id"] = approval_event_id
                 response = agent.chat(task, **chat_kwargs)
-                response = _sanitize_response(response, owner)
+                response = _sanitize_response(response, authoritative_owner)
             finally:
                 agent.on_tool_call = previous_on_tool_call
                 agent.on_tool_result = previous_on_tool_result
