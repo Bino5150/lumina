@@ -228,8 +228,12 @@ class GeminiBackend(BaseLLMBackend):
     supports_required_tool_choice = True
 
     def __init__(self, base_url: str = None, api_key: Optional[str] = None):
-        # base_url accepted for interface parity with other backends but ignored,
-        # same convention as AnthropicBackend.
+        # GH-ISSUE-03-REPAIR-01: routed through the inherited fixed-provider
+        # setter (BaseLLMBackend.base_url), same convention as
+        # AnthropicBackend -- see its __init__ for the full rationale.
+        # Every real request below still targets the hardcoded API_ROOT
+        # constant directly, never self.base_url/self._base_url.
+        self.base_url = base_url
         configured_key = getattr(config, "GEMINI_API_KEY", "") if api_key is None else api_key
         self.api_key = configured_key.strip()
         self.default_model = getattr(config, "GEMINI_DEFAULT_MODEL", "gemini-3.5-flash")

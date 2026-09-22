@@ -153,8 +153,14 @@ class AnthropicBackend(BaseLLMBackend):
     default_url = API_BASE  # not user-editable; kept for UI consistency with other backends
 
     def __init__(self, base_url: str = None, api_key: Optional[str] = None):
-        # base_url is accepted for interface parity with other backends but ignored —
-        # Anthropic's endpoint is fixed, unlike self-hosted/custom backends.
+        # GH-ISSUE-03-REPAIR-01: routed through the inherited fixed-provider
+        # setter (BaseLLMBackend.base_url) solely so an attempted override
+        # surfaces the same UserWarning every other fixed backend emits.
+        # Every real request below still targets the hardcoded API_BASE
+        # constant directly, never self.base_url/self._base_url -- this
+        # assignment has no effect on request construction, auth, or any
+        # other Anthropic-specific behavior.
+        self.base_url = base_url
         configured_key = getattr(config, "ANTHROPIC_API_KEY", "") if api_key is None else api_key
         self.api_key = configured_key.strip()
         self.default_model = getattr(config, "ANTHROPIC_DEFAULT_MODEL", "claude-sonnet-4-6")

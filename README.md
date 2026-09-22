@@ -89,6 +89,8 @@ Lumina's LLM layer is fully abstracted behind one shared interface, so swapping 
 
 All fourteen implement the same interface, and each one remembers its own context window and memory-injection limits independently — switching from a 16k local llama.cpp session to a 1M-token Gemini session doesn't drag stale settings along with it. A backend change takes effect immediately, no restart required.
 
+Endpoints are provider-owned, not caller-configurable, for every backend above except llama.cpp, LM Studio, Ollama, vLLM, OmniRoute, and Custom — those six are the intended route for a gateway, a corporate proxy, or any other custom/local endpoint. Pointing a fixed cloud provider at a different URL is refused rather than honored.
+
 
 ## Security Architecture
 

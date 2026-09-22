@@ -3,6 +3,7 @@ BaseLLMBackend — abstract interface all LLM backends must implement.
 """
 
 import re
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -170,9 +171,28 @@ class BaseLLMBackend(ABC):
             # fails before any network request is attempted.
             self._base_url = (self.default_url if value is None else value).rstrip("/")
         else:
-            # Fixed providers own their endpoint.  Silently retaining the
-            # declared endpoint preserves constructor interface parity while
-            # refusing generic/user-controlled redirection.
+            # Fixed providers own their endpoint.  Retaining the declared
+            # endpoint preserves constructor interface parity while
+            # refusing generic/user-controlled redirection -- GH-ISSUE-03:
+            # that refusal used to be indistinguishable from acceptance to
+            # a programmatic caller. Warn (never raise, to keep the parity
+            # the comment above describes) exactly when the supplied value
+            # is a genuine attempted redirect -- differs from this
+            # backend's own default once both sides are slash-normalized
+            # the same way this setter already normalizes everywhere else.
+            # Ordinary construction must stay quiet: get_llm_backend() and
+            # the Settings reasoning-probe both always supply this
+            # backend's own default_url for a fixed provider (never a
+            # mismatched value), so that path never trips this warning.
+            if value is not None and value.rstrip("/") != self.default_url.rstrip("/"):
+                warnings.warn(
+                    f"{self.display_name} has a fixed endpoint and does not accept "
+                    "a custom base_url; the requested value was ignored. Use an "
+                    "endpoint-configurable backend (Custom, LM Studio, Ollama, "
+                    "LlamaCpp, vLLM, or OmniRoute) to point at a custom endpoint.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             self._base_url = self.default_url.rstrip("/")
 
     @property

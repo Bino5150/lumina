@@ -49,6 +49,12 @@ CONFIGURABLE_ENDPOINTS = {
     "vllm": "http://vllm.example/v1",
 }
 
+# GH-ISSUE-03-REPAIR-01: every fixed provider, keyed by its BACKENDS class --
+# both structural families (the OpenAI-compatible constructors that already
+# call the shared setter, and Anthropic/Gemini, which are now routed through
+# it too). Reuses FIXED_ENDPOINTS' key set so the two dicts can never drift.
+FIXED_BACKEND_CLASSES = {name: BACKENDS[name] for name in FIXED_ENDPOINTS}
+
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
@@ -161,7 +167,8 @@ def test_lm_family_fixed_credentials_never_reach_foreign_endpoint(
 
     monkeypatch.setattr(requests, "post", fake_post)
     instance = get_llm_backend(backend, url=hostile)
-    instance.base_url = hostile  # Simulate regressed generic live-apply.
+    with pytest.warns(UserWarning, match="fixed endpoint"):
+        instance.base_url = hostile  # Simulate regressed generic live-apply.
     instance.chat([{"role": "user", "content": "intercepted"}])
 
     assert len(calls) == 1
@@ -186,7 +193,8 @@ def test_native_backends_remain_structurally_fixed(monkeypatch, backend):
 
     monkeypatch.setattr(requests, "post", fake_post)
     instance = get_llm_backend(backend, url=hostile)
-    instance.base_url = hostile
+    with pytest.warns(UserWarning, match="fixed endpoint"):
+        instance.base_url = hostile
     instance.chat([{"role": "user", "content": "intercepted"}])
 
     assert len(calls) == 1
@@ -282,6 +290,126 @@ def test_manual_cloud_model_entry_remains_editable(qapp):
     tab = _settings_tab()
     tab.backend_combo.setCurrentText("openai")
     assert tab.cloud_model.isEditable()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# GH-ISSUE-03-REPAIR-01: visibility contract for the silent-discard above.
+# A fixed provider must still refuse a caller-supplied endpoint -- the
+# tests above already prove that -- but the refusal must now be visible
+# to a programmatic caller as a UserWarning, and *only* when the supplied
+# value is a genuine attempted redirect (differs from this backend's own
+# default). Ordinary construction, including get_llm_backend()'s own
+# internal call pattern, must stay silent.
+# ──────────────────────────────────────────────────────────────────────
+
+HOSTILE_URL = "http://127.0.0.1:9/hostile"
+
+
+@pytest.mark.parametrize("backend", FIXED_BACKEND_CLASSES)
+def test_fixed_backend_constructor_warns_on_mismatched_base_url(backend):
+    cls = FIXED_BACKEND_CLASSES[backend]
+    with pytest.warns(UserWarning, match="fixed endpoint"):
+        instance = cls(base_url=HOSTILE_URL, api_key="probe")
+    assert instance.base_url == FIXED_ENDPOINTS[backend]
+
+
+@pytest.mark.parametrize("backend", FIXED_BACKEND_CLASSES)
+def test_fixed_backend_constructor_silent_with_no_override(recwarn, backend):
+    cls = FIXED_BACKEND_CLASSES[backend]
+    instance = cls(api_key="probe")
+    assert len(recwarn) == 0
+    assert instance.base_url == FIXED_ENDPOINTS[backend]
+
+
+@pytest.mark.parametrize("backend", FIXED_BACKEND_CLASSES)
+def test_fixed_backend_constructor_silent_with_own_default(recwarn, backend):
+    cls = FIXED_BACKEND_CLASSES[backend]
+    instance = cls(base_url=cls.default_url, api_key="probe")
+    assert len(recwarn) == 0
+    assert instance.base_url == FIXED_ENDPOINTS[backend]
+
+
+@pytest.mark.parametrize("backend", FIXED_BACKEND_CLASSES)
+def test_fixed_backend_constructor_silent_with_trailing_slash_default(recwarn, backend):
+    """A trailing-slash variant of the backend's own default is already
+    normalized as equivalent everywhere else in this setter -- it must not
+    become a false-positive warning."""
+    cls = FIXED_BACKEND_CLASSES[backend]
+    instance = cls(base_url=cls.default_url.rstrip("/") + "/", api_key="probe")
+    assert len(recwarn) == 0
+    assert instance.base_url == FIXED_ENDPOINTS[backend]
+
+
+@pytest.mark.parametrize("backend", FIXED_BACKEND_CLASSES)
+def test_fixed_backend_post_construction_reassignment_warns_and_is_refused(backend):
+    cls = FIXED_BACKEND_CLASSES[backend]
+    instance = cls(api_key="probe")
+    with pytest.warns(UserWarning, match="fixed endpoint"):
+        instance.base_url = HOSTILE_URL
+    assert instance.base_url == FIXED_ENDPOINTS[backend]
+
+
+@pytest.mark.parametrize("backend", FIXED_BACKEND_CLASSES)
+def test_get_llm_backend_normal_fixed_construction_never_warns(recwarn, backend):
+    """The load-bearing call-site invariant: get_llm_backend() always
+    substitutes a fixed provider's own default_url before construction
+    (core/backends/loader.py), so ordinary startup/Settings-probe
+    construction must never trip the new warning."""
+    instance = get_llm_backend(backend)
+    assert len(recwarn) == 0
+    assert instance.base_url == FIXED_ENDPOINTS[backend]
+
+
+@pytest.mark.parametrize("backend", FIXED_BACKEND_CLASSES)
+def test_get_llm_backend_stale_url_argument_never_warns(recwarn, backend):
+    """Even an explicitly mismatched ``url=`` passed to get_llm_backend()
+    for a fixed provider is gated at the loader layer -- cls.default_url is
+    substituted before the constructor ever runs, so this must stay
+    silent too (loader-level gate, not the setter, is what makes this
+    safe)."""
+    instance = get_llm_backend(backend, url=HOSTILE_URL)
+    assert len(recwarn) == 0
+    assert instance.base_url == FIXED_ENDPOINTS[backend]
+
+
+@pytest.mark.parametrize("backend, expected", CONFIGURABLE_ENDPOINTS.items())
+def test_configurable_backend_never_warns_on_custom_base_url(recwarn, backend, expected):
+    instance = get_llm_backend(backend, url=expected)
+    assert len(recwarn) == 0
+    assert instance.base_url == expected
+
+
+def test_fixed_backend_constructor_empty_string_is_absorbed_before_setter(recwarn):
+    """The pre-existing ``base_url or self.default_url`` pattern in every
+    OpenAI-compatible-family fixed constructor replaces a falsy empty
+    string with the default before it ever reaches the setter -- this
+    repair does not change that normalization, so it must stay silent (an
+    empty string here was never a real override attempt)."""
+    instance = BACKENDS["openai"](base_url="", api_key="probe")
+    assert len(recwarn) == 0
+    assert instance.base_url == FIXED_ENDPOINTS["openai"]
+
+
+@pytest.mark.parametrize("value", ["", "   ", HOSTILE_URL, "http://localhost:9/hostile"])
+def test_fixed_backend_post_construction_adversarial_values_warn_and_refuse(value):
+    """Unlike the constructor's ``or``-based normalization above, a direct
+    post-construction assignment reaches the setter literally -- every one
+    of these values is a genuine mismatch against default_url and must
+    warn, whether it's an empty string, whitespace, or a real hostile
+    URL."""
+    instance = BACKENDS["openai"](api_key="probe")
+    with pytest.warns(UserWarning, match="fixed endpoint"):
+        instance.base_url = value
+    assert instance.base_url == FIXED_ENDPOINTS["openai"]
+
+
+def test_fixed_backend_post_construction_none_is_silent(recwarn):
+    """None means 'no override requested' even post-construction -- must
+    never warn."""
+    instance = BACKENDS["openai"](api_key="probe")
+    instance.base_url = None
+    assert len(recwarn) == 0
+    assert instance.base_url == FIXED_ENDPOINTS["openai"]
 
 
 def test_save_does_not_post_mutate_reconstructed_fixed_backend(qapp, monkeypatch):
