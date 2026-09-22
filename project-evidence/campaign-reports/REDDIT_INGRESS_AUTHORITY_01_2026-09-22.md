@@ -80,7 +80,7 @@ Read-only live SQLite inspection (`PRAGMA quick_check = ok`) found:
 - No automatic- or manual-compaction drawers in the live database.
 - A non-empty curated human profile (1,602 characters); content was not printed or modified.
 
-Repair: `init_palace_db()` now performs an idempotent one-way migration for historical `dream-sweep`, `auto-compaction`, and `manual-compaction` drawers. It flips matching trusted drawers lower-trust, adds the observability tag, and rebuilds affected rolling closets from drawer authority bits so already-compressed segments are also bracketed. The migration was verified against isolated SQLite state and was not executed against the live owner database during this campaign.
+Repair: `init_palace_db()` now performs an idempotent one-way migration for historical `dream-sweep`, `auto-compaction`, and `manual-compaction` drawers. It flips matching trusted drawers lower-trust, adds the observability tag, and validates/rebuilds every synthesized rolling closet from drawer authority bits so already-untrusted legacy drawers cannot remain unframed in compressed context. The migration was verified against isolated SQLite state and a temporary SQLite backup of the live database; it was not executed against the live owner database during this campaign.
 
 ## Regression coverage
 
@@ -106,6 +106,7 @@ Repair: `init_palace_db()` now performs an idempotent one-way migration for hist
 - Before the cached-headless repair: the targeted cache-mismatch regression failed with actual `OWNER_DIRECT` vs expected `EXTERNAL_CHANNEL_INBOUND`.
 - After that repair and the direct-agent clamp: the campaign file passed.
 - The startup migration test constructs a trusted legacy Dream row, runs initialization twice, and verifies the drawer bit/tag, closet bracket, and sticky aggregate are repaired without a second-pass change.
+- Follow-up mutation proof: with the expanded startup regression but the pre-follow-up migration code, the isolated test failed because an already-untrusted synthesized drawer's stale closet aggregate remained `0`; the repaired tree passes with the aggregate restored to `1` and the compressed segment lower-trust framed.
 
 ## Verification
 
@@ -114,7 +115,7 @@ Repair: `init_palace_db()` now performs an idempotent one-way migration for hist
 - Agent/headless focused gate: `201 passed`, native exit 0.
 - Palace/migration focused gate: `98 passed`, native exit 0.
 - Final campaign file: `9 passed`, native exit 0.
-- Full release suite: `4,879 passed`, `38 deselected`, `1 warning`, native exit 0 (`525.39s`).
+- Full release suite: `4,879 passed`, `38 deselected`, `1 warning`, native exit 0 (`533.37s`).
 
 ## Remaining architectural limitation
 

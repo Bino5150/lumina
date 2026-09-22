@@ -354,7 +354,8 @@ _SYNTHESIZED_MEMORY_TAGS = frozenset({
 def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
     """Rebuild one rolling closet from its drawers and their authority bits."""
     location = conn.execute(
-        "SELECT w.name AS wing, r.name AS room "
+        "SELECT w.name AS wing, r.name AS room, c.compressed, c.token_est, "
+        "c.ever_had_untrusted_merge "
         "FROM palace_closets c "
         "JOIN palace_rooms r ON c.room_id=r.id "
         "JOIN palace_wings w ON r.wing_id=w.id WHERE c.id=?",
@@ -379,17 +380,18 @@ def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
         raw = aaak_compress(row["content"], label=label)
         segments.append(tag_untrusted(label, raw) if row["untrusted"] else raw)
     rebuilt = " | ".join(segments)
-    conn.execute(
-        "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=?, "
-        "ever_had_untrusted_merge=? WHERE id=?",
-        (
-            rebuilt,
-            estimate_tokens(rebuilt),
-            datetime.now().isoformat(),
-            1 if any(row["untrusted"] for row in remaining) else 0,
-            closet_id,
-        ),
-    )
+    token_est = estimate_tokens(rebuilt)
+    ever_untrusted = 1 if any(row["untrusted"] for row in remaining) else 0
+    if (
+        location["compressed"] != rebuilt
+        or location["token_est"] != token_est
+        or location["ever_had_untrusted_merge"] != ever_untrusted
+    ):
+        conn.execute(
+            "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=?, "
+            "ever_had_untrusted_merge=? WHERE id=?",
+            (rebuilt, token_est, datetime.now().isoformat(), ever_untrusted, closet_id),
+        )
 
 
 def _migrate_synthesized_drawer_authority(conn) -> int:
@@ -401,7 +403,7 @@ def _migrate_synthesized_drawer_authority(conn) -> int:
     direction (trusted -> untrusted).
     """
     rows = conn.execute(
-        "SELECT id, closet_id, tags FROM palace_drawers WHERE untrusted=0"
+        "SELECT id, closet_id, tags, untrusted FROM palace_drawers"
     ).fetchall()
     changed = 0
     affected_closets = set()
@@ -415,13 +417,16 @@ def _migrate_synthesized_drawer_authority(conn) -> int:
         tag_set = {tag for tag in tags if isinstance(tag, str)}
         if not (_SYNTHESIZED_MEMORY_TAGS & tag_set):
             continue
+        needs_update = not bool(row["untrusted"])
         if "trust:untrusted" not in tags:
             tags.append("trust:untrusted")
-        conn.execute(
-            "UPDATE palace_drawers SET untrusted=1, tags=? WHERE id=?",
-            (json.dumps(tags), row["id"]),
-        )
-        changed += 1
+            needs_update = True
+        if needs_update:
+            conn.execute(
+                "UPDATE palace_drawers SET untrusted=1, tags=? WHERE id=?",
+                (json.dumps(tags), row["id"]),
+            )
+            changed += 1
         if row["closet_id"] is not None:
             affected_closets.add(row["closet_id"])
 
