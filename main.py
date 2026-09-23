@@ -23,13 +23,9 @@ os.environ.setdefault("LUMINA_DATA_DIR", os.path.join(os.path.expanduser("~"), "
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# AGENT-FLIGHT-RECORDER-01A1 -- the two literal version strings below
-# (CLI banner, GUI app.setApplicationVersion) already existed independently
-# before this patch and are left untouched (fixing that duplication is out
-# of scope here) -- this constant is a THIRD, new use specifically for the
-# recorder's runtime.startup identity fields, deliberately matching their
-# current value rather than introducing a fourth drifting copy silently.
-LUMINA_VERSION = "0.2.7-beta.2"
+# AGENT-FLIGHT-RECORDER-01A1 -- runtime.startup reads this literal constant.
+# Keep it aligned with the CLI banner and GUI application version below.
+LUMINA_VERSION = "0.3.6-beta.3"
 
 
 def _record_runtime_startup(entry_point: str, channel_id=None):
@@ -167,7 +163,7 @@ def run_cli(persona_name: str = None, tools_override: str = None):
             print(f"  ✓ {preview}{'...' if len(result) > 120 else ''}", flush=True)
 
     print(f"\n{'='*52}")
-    print(f"  LUMINA v0.2.7-beta.2 — CLI Mode")
+    print(f"  LUMINA v0.3.6-beta.3 — CLI Mode")
     print(f"  Backend: {config.LLM_BACKEND} ({config.LLM_BACKEND_URL})")
     print(f"{'='*52}\n")
 
@@ -257,7 +253,7 @@ def run_gui():
 
     app = QApplication(sys.argv)
     app.setApplicationName("Lumina")
-    app.setApplicationVersion("0.2.7-beta.2")
+    app.setApplicationVersion("0.3.6-beta.3")
     _record_runtime_startup("gui")
 
     # SKILLS-IMPORT-EXPORT-PORTABILITY-01: deterministic OFFICIAL skill

@@ -28,7 +28,7 @@ class AboutTab(QWidget):
         by_label.setStyleSheet(f"color:{c['text_primary']};font-size:19px;background:transparent;")
         layout.addWidget(by_label)
 
-        ver_label = QLabel("v0.2.7-beta.2")
+        ver_label = QLabel("v0.3.6-beta.3")
         ver_label.setAlignment(Qt.AlignCenter)
         ver_label.setStyleSheet(f"color:{c['text_primary']};font-size:16px;background:transparent;")
         layout.addWidget(ver_label)

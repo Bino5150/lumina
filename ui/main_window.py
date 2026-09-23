@@ -75,6 +75,8 @@ COLORS = {
     "warning":      "#ffa502",
 }
 
+_SIDEBAR_AVATAR_SIZE = 96
+
 # Same arrow-visibility fix as ui/settings/_widgets.py's _combo() -- a pure
 # CSS border-triangle doesn't actually render as a triangle for Qt's
 # ::down-arrow subcontrol (verified via offscreen render, not assumed), so
@@ -870,7 +872,7 @@ class LuminaWindow(QMainWindow):
 
         # ── Avatar ──
         self.avatar_btn = QPushButton()
-        self.avatar_btn.setFixedSize(72, 72)
+        self.avatar_btn.setFixedSize(_SIDEBAR_AVATAR_SIZE, _SIDEBAR_AVATAR_SIZE)
         self.avatar_btn.setCursor(Qt.PointingHandCursor)
         self.avatar_btn.setToolTip("Click to set Lumina avatar")
         self._set_avatar_placeholder()
@@ -954,7 +956,7 @@ class LuminaWindow(QMainWindow):
         credit2.setStyleSheet(f"color:{COLORS['text_dim']};font-size:10px;background:transparent;")
         layout.addWidget(credit2)
 
-        ver = QLabel("v0.2.7-beta.2")
+        ver = QLabel("v0.3.6-beta.3")
         ver.setAlignment(Qt.AlignCenter)
         ver.setStyleSheet(f"color:{COLORS['text_dim']};font-size:13px;background:transparent;")
         layout.addWidget(ver)
@@ -981,18 +983,18 @@ class LuminaWindow(QMainWindow):
         self.avatar_btn.setStyleSheet(f"""
             QPushButton{{
                 background:{COLORS['accent_glow']};border:1px solid {COLORS['border_accent']};
-                border-radius:36px;color:{COLORS['accent']};font-size:26px;
+                border-radius:{_SIDEBAR_AVATAR_SIZE // 2}px;color:{COLORS['accent']};font-size:26px;
             }}
             QPushButton:hover{{background:{COLORS['bg_card']};}}
         """)
 
     def _apply_avatar(self, path: str):
-        pix = make_round_pixmap(path, 72)
+        pix = make_round_pixmap(path, _SIDEBAR_AVATAR_SIZE)
         self.avatar_btn.setIcon(QIcon(pix))
         self.avatar_btn.setIconSize(pix.size())
         self.avatar_btn.setText("")
         self.avatar_btn.setStyleSheet(f"""
-            QPushButton{{background:transparent;border:2px solid {COLORS['border_accent']};border-radius:36px;}}
+            QPushButton{{background:transparent;border:2px solid {COLORS['border_accent']};border-radius:{_SIDEBAR_AVATAR_SIZE // 2}px;}}
             QPushButton:hover{{border-color:{COLORS['accent']};}}
         """)
 
