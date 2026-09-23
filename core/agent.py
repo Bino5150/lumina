@@ -1520,6 +1520,15 @@ def _effective_tool_budgets(agent) -> dict:
 # "Suppress auto-name when the main turn fails."
 ERROR_RESPONSE_PREFIXES = ("[Lumina error:", "[Stream error:")
 
+# These two machine-authored non-success notices use the historical
+# "[Lumina: ...]" form, which is also used for ordinary capability notices.
+# Match them exactly so an unrelated notice or a real reply quoting one is
+# not misclassified as a failed turn.
+ERROR_RESPONSE_EXACT = frozenset({
+    "[Lumina: tool-work continuation ended without confirming completion.]",
+    "[Lumina: response was cut off before it could be confirmed complete.]",
+})
+
 # A third failure sentinel — a tool call succeeds, then the *next* provider
 # call in the same turn fails during continuation (Bug B / section 8.2.1's
 # observability fix, added to the tool loop's except-block last session).
@@ -1551,6 +1560,8 @@ def is_error_response(text: str) -> bool:
     real conversational content."""
     if not text:
         return False
+    if text in ERROR_RESPONSE_EXACT:
+        return True
     if text.startswith(ERROR_RESPONSE_PREFIXES):
         return True
     return any(s in text for s in ERROR_RESPONSE_SUBSTRINGS)

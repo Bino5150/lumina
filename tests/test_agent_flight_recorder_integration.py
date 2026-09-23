@@ -20,7 +20,8 @@ import threading
 
 import pytest
 
-from core.agent import LuminaAgent, TurnCancelled, FINISH_TOOL_WORK_NAME
+from core.agent import (LuminaAgent, TurnCancelled, FINISH_TOOL_WORK_NAME,
+                        CONTINUE_TOOL_WORK_NAME)
 from core.backends.base import TerminationStatus
 from core.flight_recorder import FlightRecorder
 
@@ -243,6 +244,79 @@ def test_turn_failed_recorded_on_error_sentinel_return(tmp_path):
     assert len(failed) == 1
     assert failed[0]["severity"] == "error"
     assert json.loads(failed[0]["fields_json"])["reason"] == "error_sentinel"
+
+
+def test_second_gate_continue_is_four_thinks_and_failed_turn(tmp_path):
+    llm = _ScriptedLLM([
+        {"content": "First complete candidate.", "reasoning": "Work answer one."},
+        {"tool_calls": [_tc(CONTINUE_TOOL_WORK_NAME)], "reasoning": "Gate continue one."},
+        {"content": "Second complete candidate.", "reasoning": "Work answer two."},
+        {"tool_calls": [_tc(CONTINUE_TOOL_WORK_NAME)], "reasoning": "Gate continue two."},
+    ])
+    fake = _fake_agent(llm, tmp_path)
+
+    result = LuminaAgent.chat(fake, "MB35B turn")
+
+    assert result == "[Lumina: tool-work continuation ended without confirming completion.]"
+    events = _events(fake)
+    names = [event["event_type"] for event in events]
+    assert names.count("provider.dispatch") == 4
+    assert [json.loads(event["fields_json"])["think_step"]
+            for event in events if event["event_type"] == "turn.think"] == [1, 2, 3, 4]
+    assert names.count("completion_candidate.created") == 2
+    assert names.count("completion_candidate.discarded") == 2
+    assert names.count("turn.failed") == 1
+    assert "turn.completed" not in names
+
+
+def test_successful_turn_then_independent_success_has_fresh_gate_state(tmp_path):
+    llm = _ScriptedLLM([
+        {"content": "First answer."}, {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+        {"content": "Second answer."}, {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake = _fake_agent(llm, tmp_path)
+
+    assert LuminaAgent.chat(fake, "first") == "First answer."
+    assert LuminaAgent.chat(fake, "second") == "Second answer."
+
+    events = _events(fake)
+    assert len({event["turn_id"] for event in events if event["event_type"] == "turn.started"}) == 2
+    assert sum(event["event_type"] == "turn.completed" for event in events) == 2
+    assert sum(event["event_type"] == "completion_candidate.accepted" for event in events) == 2
+
+
+@pytest.mark.parametrize("failed_request", [
+    [{"raise": ConnectionError("synthetic TLS failure")}],
+    [{"content": "Unconfirmed answer."},
+     {"raise": ConnectionError("synthetic TLS failure in completion gate")}],
+    [{"tool_calls": [_tc("search_memory")]},
+     {"raise": ConnectionError("synthetic TLS failure after tool result")}],
+])
+def test_provider_failure_does_not_carry_completion_state_to_next_turn(
+        tmp_path, failed_request):
+    llm = _ScriptedLLM(failed_request + [
+        {"content": "Recovered answer."},
+        {"tool_calls": [_tc(FINISH_TOOL_WORK_NAME)]},
+    ])
+    fake = _fake_agent(llm, tmp_path)
+
+    failed = LuminaAgent.chat(fake, "first")
+    recovered = LuminaAgent.chat(fake, "second")
+
+    assert "synthetic TLS failure" in failed
+    assert recovered == "Recovered answer."
+    events = _events(fake)
+    started = [event["turn_id"] for event in events if event["event_type"] == "turn.started"]
+    assert len(started) == 2 and started[0] != started[1]
+    first = [event for event in events if event["turn_id"] == started[0]]
+    second = [event for event in events if event["turn_id"] == started[1]]
+    assert sum(event["event_type"] == "provider.dispatch_failed" for event in first) == 1
+    assert sum(event["event_type"] == "turn.failed" for event in first) == 1
+    assert sum(event["event_type"] == "turn.completed" for event in second) == 1
+    created = [json.loads(event["fields_json"])["source_round"] for event in second
+               if event["event_type"] == "completion_candidate.created"]
+    assert created == [0]
+    assert sum(event["event_type"] == "completion_candidate.accepted" for event in second) == 1
 
 
 # ── tool.batch / tool.call / tool.result fields ──────────────────────────

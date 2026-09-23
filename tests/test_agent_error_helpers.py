@@ -66,6 +66,14 @@ def test_bracketed_continuation_failure_sentinel_is_also_flagged():
     assert is_error_response(msg) is True
 
 
+@pytest.mark.parametrize("notice", [
+    "[Lumina: tool-work continuation ended without confirming completion.]",
+    "[Lumina: response was cut off before it could be confirmed complete.]",
+])
+def test_unconfirmed_completion_notices_are_failed_turns(notice):
+    assert is_error_response(notice) is True
+
+
 # ── _stream_final()'s new ValueError handling ────────────────────────────
 
 def test_stream_final_converts_valueerror_to_stream_error_string():
