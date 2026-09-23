@@ -39,11 +39,13 @@ from core.operator_commands import (
 )
 from core.personas import list_personas, load_persona
 from core import persistence
-from core.reasoning_preferences import resolve_reasoning_effort
 from core import dreaming 
 from ui.chat_widget import ChatWidget, LiveResponseBubble
 from ui.settings import SettingsPanel
 from ui.review_panel import ReviewPanel
+from ui.owner_turn_intake import (
+    admit_dropped_text_file, owner_chat_call, package_submission,
+)
 from tools.memory import (
     init_chat_db, create_chat, list_chats, save_chat_message,
     load_chat_messages, rename_chat, delete_chat, get_chat_name
@@ -211,7 +213,7 @@ class AgentWorker(QThread):
         # identity for a routed reply, forwarded to agent.chat()'s own
         # approval_event_id= kwarg. None (default, every ordinary local
         # GUI turn) leaves it out of chat()'s call entirely -- see
-        # _agent_accepts_approval_event_id() below for why -- so chat()
+        # ui/owner_turn_intake.py's owner_chat_call() -- so chat()
         # mints its own fresh one instead.
         self.approval_event_id = approval_event_id
         self._think_buf = ""
@@ -227,54 +229,6 @@ class AgentWorker(QThread):
 
     def cancel_requested(self) -> bool:
         return self._cancel_event.is_set()
-
-    def _agent_accepts_cancel_event(self) -> bool:
-        """Compatibility for lightweight GUI-test stubs predating /stop."""
-        import inspect
-        try:
-            params = inspect.signature(self.agent.chat).parameters.values()
-        except (TypeError, ValueError):
-            return True
-        return any(p.name == "cancel_event" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
-
-    def _agent_accepts_reasoning_effort(self) -> bool:
-        """Patch 3A.4 Part 4 -- same compatibility shape as
-        _agent_accepts_cancel_event() above, for the same reason: lightweight
-        GUI-test agent stubs (tests/test_operator_stop_ui.py) predate
-        reasoning-effort persistence and define chat() with neither a
-        reasoning_effort param nor **kwargs."""
-        import inspect
-        try:
-            params = inspect.signature(self.agent.chat).parameters.values()
-        except (TypeError, ValueError):
-            return True
-        return any(p.name == "reasoning_effort" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
-
-    def _agent_accepts_attachments(self) -> bool:
-        """CASTLE-WALLS-REPAIR-01 R1A -- same compatibility shape as
-        _agent_accepts_cancel_event()/_agent_accepts_reasoning_effort()
-        above, for the same reason: lightweight GUI-test agent stubs
-        predate this parameter and define chat() with neither an
-        attachments param nor **kwargs."""
-        import inspect
-        try:
-            params = inspect.signature(self.agent.chat).parameters.values()
-        except (TypeError, ValueError):
-            return True
-        return any(p.name == "attachments" or p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
-
-    def _agent_accepts_approval_event_id(self) -> bool:
-        """CASTLE-WALLS-REPAIR-04 -- same compatibility shape as
-        _agent_accepts_attachments() above, for the same reason: lightweight
-        GUI-test agent stubs predate this parameter and define chat() with
-        neither an approval_event_id param nor **kwargs."""
-        import inspect
-        try:
-            params = inspect.signature(self.agent.chat).parameters.values()
-        except (TypeError, ValueError):
-            return True
-        return any(p.name == "approval_event_id" or p.kind == inspect.Parameter.VAR_KEYWORD
-                   for p in params)
 
     def _flush_think(self):
         if self._think_buf:
@@ -354,28 +308,22 @@ class AgentWorker(QThread):
         self.agent.on_think_timing = on_think_timing
 
         try:
-            kwargs = {"chat_id": self.chat_id}
-            if self._agent_accepts_cancel_event():
-                kwargs["cancel_event"] = self._cancel_event
-            # Patch 3A.4 Part 4 -- resolved fresh on every turn against the
-            # actual live backend in use (self.agent.llm), never cached on
-            # this worker or the agent, since Settings can swap the active
-            # backend between turns. Guarded the same way cancel_event is
-            # above, for the same pre-3A.4 GUI-test-stub compatibility
-            # reason (see _agent_accepts_reasoning_effort()).
-            if self._agent_accepts_reasoning_effort():
-                llm = getattr(self.agent, "llm", None)
-                if llm is not None:
-                    kwargs["reasoning_effort"] = resolve_reasoning_effort(llm)
-            if self.attachments and self._agent_accepts_attachments():
-                kwargs["attachments"] = self.attachments
-            if self.approval_event_id and self._agent_accepts_approval_event_id():
-                kwargs["approval_event_id"] = self.approval_event_id
+            # CASTLE-WALLS-BLOCKING-COVERAGE-01B -- the call itself is built
+            # Qt-free (ui/owner_turn_intake.py) so the blocking no-PySide6 CI
+            # gate executes it: attachments travel only as attachments=, never
+            # fused into user_input. Pass both through exactly as returned.
+            user_input, kwargs = owner_chat_call(
+                self.agent, self.user_input,
+                chat_id=self.chat_id,
+                cancel_event=self._cancel_event,
+                attachments=self.attachments,
+                approval_event_id=self.approval_event_id,
+            )
             runtime_token = getattr(
                 self.agent, "_telegram_origin_runtime_token", None,
             )
             with origin_routing.origin_scope(runtime_token, self.chat_id):
-                result = self.agent.chat(self.user_input, **kwargs)
+                result = self.agent.chat(user_input, **kwargs)
             self._flush_think()
             self._flush_resp()
             self.signals.finished.emit(result)
@@ -2393,15 +2341,14 @@ class LuminaWindow(QMainWindow):
         # (image/audio/plain-text) -- see core/context.py's
         # add_user(attachments=...) for how it's kept structurally
         # separate regardless of `content`'s own shape.
-        attachments_for_chat = None
-        if self._pending_text_attachments:
-            attachments_for_chat = [
-                (f"FILE_CONTENT: {fname}", file_text)
-                for fname, file_text in self._pending_text_attachments
-            ]
-            attachment_markers = " ".join(
-                f"[📎 {fname}]" for fname, _ in self._pending_text_attachments
-            )
+        #
+        # CASTLE-WALLS-BLOCKING-COVERAGE-01B -- packaged Qt-free
+        # (ui/owner_turn_intake.py) so the blocking no-PySide6 CI gate
+        # executes it; `content` comes back unchanged.
+        content, attachments_for_chat, attachment_markers = package_submission(
+            content, self._pending_text_attachments,
+        )
+        if attachments_for_chat:
             display_text = (
                 f"{display_text}  {attachment_markers}" if display_text else attachment_markers
             )
@@ -2456,9 +2403,6 @@ class LuminaWindow(QMainWindow):
 
         image_exts = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}
         audio_exts = {'.mp3', '.wav', '.ogg', '.flac', '.m4a'}
-        text_exts  = {'.txt', '.md', '.py', '.js', '.ts', '.json', '.csv',
-                      '.yaml', '.yml', '.toml', '.ini', '.sh', '.html',
-                      '.css', '.xml', '.log'}
 
         # Images are admitted as one atomic batch ahead of the per-file loop
         # below (VISION-MULTI-IMAGE-01) -- see _admit_images(): either every
@@ -2493,32 +2437,24 @@ class LuminaWindow(QMainWindow):
                 except Exception as e:
                     parts.append(f"[audio:{p}] (encode error: {e})")        
 
-            elif ext in text_exts:
-                # CASTLE-WALLS-REPAIR-01 R1A -- staged separately, never
-                # fused into the editable text box (was: parts.append(...)),
-                # so the owner's own typed instruction and the file's raw
-                # bytes stay structurally distinct all the way to the model
-                # (see core/context.py's add_user(attachments=...)) instead
-                # of becoming one indistinguishable string.
-                try:
-                    with open(p, 'r', encoding='utf-8', errors='replace') as f:
-                        contents = f.read()
-                    filename = os.path.basename(p)
-                    self._pending_text_attachments.append((filename, contents))
-                    self.chat_widget.show_attachment_preview(filename)
-                except Exception as e:
-                    parts.append(f"[file:{p}] (read error: {e})")
-
             else:
-                # Try reading extensionless files as text -- same staging.
-                try:
-                    with open(p, 'r', encoding='utf-8', errors='replace') as f:
-                        contents = f.read(8192)
-                    filename = os.path.basename(p)
+                # CASTLE-WALLS-REPAIR-01 R1A -- a dropped text, extensionless,
+                # dotfile or unknown-extension file is staged separately, never
+                # fused into the editable text box, so the owner's own typed
+                # instruction and the file's raw bytes stay structurally
+                # distinct all the way to the model (see core/context.py's
+                # add_user(attachments=...)). BLOCKING-COVERAGE-01B: the read and
+                # the bytes-to-staging decision live in ui/owner_turn_intake.py,
+                # which the blocking no-PySide6 CI gate executes; this closure is
+                # the only Qt-side step, and a failure inside it is reported the
+                # same way as a read failure.
+                def _stage(filename, contents):
                     self._pending_text_attachments.append((filename, contents))
                     self.chat_widget.show_attachment_preview(filename)
-                except Exception:
-                    parts.append(f"[file:{p}]")
+
+                note = admit_dropped_text_file(p, _stage)
+                if note is not None:
+                    parts.append(note)
 
         self.chat_widget.input.setPlainText("\n\n".join(parts).strip())
 

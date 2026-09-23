@@ -55,3 +55,40 @@ jobs:
       - name: Run frozen Castle Walls evidence corpus (reported separately, non-blocking)
         continue-on-error: true
         run: python -m pytest tests/ -v -m castle_walls_evidence
+
+  # CASTLE-WALLS-BLOCKING-COVERAGE-01B -- the smallest GUI tier the top comment
+  # anticipates. The `test` job above never installs PySide6, so every
+  # Qt-dependent test SKIPS there. That is fine for ordinary GUI tests but not
+  # for security guards: tests/test_castle_walls_repaired_wiring_01.py's Qt
+  # layer drives the real LuminaWindow drop/submit handlers and the real
+  # AgentWorker.run() handoff (dropped-file bytes must stay FILE_CONTENT data,
+  # never become owner-authored text), and tests/test_vision_multi_image_01.py
+  # pins the typed-extension drop half of the same R1A repair. The `test` job
+  # already runs the Qt-free layer of that guard. Only PySide6 is added (pinned
+  # as in requirements.txt), run headless. LUMINA_REQUIRE_QT=1 makes a missing
+  # PySide6 fail the guard file instead of skipping, and the preflight step
+  # fails the job if Qt cannot start.
+  qt-security-guards:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      LUMINA_REQUIRE_QT: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install system dependencies (enchant + headless Qt runtime libraries)
+        run: sudo apt-get update && sudo apt-get install -y libenchant-2-2 libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+
+      - name: Install test dependencies plus PySide6
+        run: pip install pytest==9.1.1 requests==2.34.2 platformdirs pyenchant==3.3.0 python-telegram-bot==22.8 PySide6==6.11.1
+
+      - name: Preflight -- Qt must start headless (fail, never skip)
+        run: python -c "from PySide6.QtWidgets import QApplication; app = QApplication([]); print('Qt', app.platformName())"
+
+      - name: Run Qt-bound Castle Walls guards (blocking)
+        run: python -m pytest tests/test_castle_walls_repaired_wiring_01.py tests/test_vision_multi_image_01.py -v -rs -m "not castle_walls_evidence"

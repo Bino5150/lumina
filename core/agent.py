@@ -2377,7 +2377,11 @@ class LuminaAgent:
         if isinstance(skills_result, tuple):
             official_skills_block, user_skills_block = skills_result
         else:
-            official_skills_block, user_skills_block = skills_result, ""
+            # CASTLE-WALLS-BLOCKING-COVERAGE-01B -- a bare string carries no
+            # origin, so nothing shows it is OFFICIAL: fail closed and route
+            # it as user-authored, lower-trust content. Only test stubs return
+            # a bare string today, and every one of them returns "".
+            official_skills_block, user_skills_block = "", skills_result or ""
 
         ephemeral_parts = task_summaries + ([official_skills_block] if official_skills_block else [])
         if user_skills_block:
