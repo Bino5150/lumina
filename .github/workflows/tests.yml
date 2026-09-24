@@ -92,3 +92,12 @@ jobs:
 
       - name: Run Qt-bound Castle Walls guards (blocking)
         run: python -m pytest tests/test_castle_walls_repaired_wiring_01.py tests/test_vision_multi_image_01.py -v -rs -m "not castle_walls_evidence"
+
+      # VISION-RESTORE-01 -- the vision specialist model override was silently
+      # never saved (an editable QComboBox keeps its currentIndex while the
+      # owner types) and only real Qt key events reproduce it, so the plain
+      # `test` job above can only skip these. Same job, same pinned PySide6,
+      # same LUMINA_REQUIRE_QT=1 fail-never-skip contract; its own step so the
+      # Castle Walls selection above stays exactly as it was.
+      - name: Run Qt-bound vision specialist settings guards (blocking)
+        run: python -m pytest tests/test_vision_restore_01_settings.py -v -rs -m "not castle_walls_evidence"

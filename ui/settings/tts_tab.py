@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit, QComboBox
 from PySide6.QtCore import Signal, QTimer
 
 import os, sys, threading
@@ -67,6 +67,11 @@ class MultimodalTab(QWidget):
         # stale callback is a no-op instead of stomping the new operation's
         # button text.
         self._feedback_generation = 0
+        # VISION-RESTORE-01: last successful live model discovery per
+        # specialist provider (same shape as General Settings'
+        # _discovered_models). Populated only by an explicit ⟳ click, never
+        # by passive construction.
+        self._vision_discovered_models: dict[str, tuple[str, ...]] = {}
         self._tts_test_result.connect(self._on_tts_test_result)
         self._tts_swap_done.connect(self._on_tts_swap_done)
         self._build()
@@ -323,17 +328,33 @@ class MultimodalTab(QWidget):
         model_col.addWidget(_lbl("Model", self.c))
         self.vision_model_combo = _combo(self.c)
         self.vision_model_combo.setEditable(True)
+        # VISION-RESTORE-01: Enter must not append a data-less duplicate
+        # item; the typed text itself is the override (see
+        # _vision_model_override()).
+        self.vision_model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.vision_model_combo.addItem("Provider default", "")
         configured_model_override = (route.model or "") if route is not None else ""
         if configured_model_override:
             self.vision_model_combo.addItem(configured_model_override, configured_model_override)
-        model_col.addWidget(self.vision_model_combo)
+        vision_model_row = QHBoxLayout()
+        vision_model_row.setSpacing(6)
+        vision_model_row.addWidget(self.vision_model_combo, 1)
+        self.vision_refresh_models_btn = _btn("⟳", self.c)
+        self.vision_refresh_models_btn.setFixedWidth(36)
+        self.vision_refresh_models_btn.setToolTip(
+            "Fetch this provider's models using its saved General Settings "
+            "credentials, without changing the selected model"
+        )
+        self.vision_refresh_models_btn.clicked.connect(self._refresh_vision_models)
+        vision_model_row.addWidget(self.vision_refresh_models_btn)
+        model_col.addLayout(vision_model_row)
         layout.addLayout(model_col)
 
         model_note = _lbl(
             "Provider default follows that provider's own configured model "
-            "(General Settings). Type a specific model id to override it "
-            "for vision_understanding only -- the primary conversation "
+            "(General Settings). Type a specific model id, or ⟳ to list the "
+            "provider's models, to override it for vision_understanding "
+            "only -- the primary conversation "
             "backend/model is never changed by this selection.",
             self.c,
         )
@@ -550,22 +571,78 @@ class MultimodalTab(QWidget):
         return "Not available from current provider settings"
 
     def _refresh_vision_model(self, *_args):
-        default_text = self._configured_vision_model(self.vision_provider_combo.currentText())
-        self.vision_model_combo.setItemText(0, f"Provider default — {default_text}")
+        """Re-render the model list for the selected provider: the item-0
+        provider-default label plus that provider's last successful live
+        discovery. The owner's explicit override (typed or selected) is
+        captured first and restored afterwards -- a provider change or a
+        discovery result never silently replaces it, and an override the
+        provider did not list stays selectable."""
+        provider = self.vision_provider_combo.currentText().strip()
+        override = self._vision_model_override()
+        combo = self.vision_model_combo
+        combo.blockSignals(True)
+        try:
+            while combo.count() > 1:
+                combo.removeItem(1)
+            for model_id in self._vision_discovered_models.get(provider, ()):
+                combo.addItem(model_id, model_id)
+            combo.setItemText(0, f"Provider default — {self._configured_vision_model(provider)}")
+            if override:
+                index = combo.findData(override)
+                if index < 1:
+                    combo.addItem(override, override)
+                    index = combo.count() - 1
+                combo.setCurrentIndex(index)
+            else:
+                combo.setCurrentIndex(0)
+        finally:
+            combo.blockSignals(False)
+
+    def _refresh_vision_models(self):
+        """⟳ -- live model discovery for the specialist provider through that
+        provider backend's own discover_models(), the same primitive General
+        Settings' ⟳ uses; there is no second per-provider implementation and
+        no static catalog presented as provider results. Credentials are the
+        provider's saved General Settings ones -- the same the routed
+        specialist call uses at execution. Persists nothing."""
+        from core.backends.base import ModelDiscoveryOutcome, ModelDiscoveryResult
+
+        provider = self.vision_provider_combo.currentText().strip()
+        if not provider:
+            self.status_lbl.setText("Choose a specialist provider before refreshing models.")
+            return
+        try:
+            from core.backends.loader import get_llm_backend
+            result = get_llm_backend(name=provider).discover_models()
+        except Exception as exc:
+            result = ModelDiscoveryResult(
+                ModelDiscoveryOutcome.FAILED,
+                diagnostic=f"Model discovery could not start ({type(exc).__name__}).",
+            )
+        if result.outcome is ModelDiscoveryOutcome.SUCCESS:
+            self._vision_discovered_models[provider] = tuple(result.models)
+            self._refresh_vision_model()
+        self.status_lbl.setText(result.diagnostic)
 
     def _vision_model_override(self) -> str:
         """The owner's typed/selected capability-specific model override for
         vision_understanding, or "" for "Provider default" -- never a
-        display label. Editable-combo semantics: selecting an existing
-        item (including the item-0 "Provider default" sentinel, whose
-        userData is always "") keeps currentIndex >= 0 and currentData()
-        authoritative; typing free text that matches no item's text
-        drops currentIndex to -1 (standard QComboBox behavior for an
-        editable combo), so the typed text itself is the override."""
+        display label.
+
+        VISION-RESTORE-01: the visible edit text is the authority, not
+        currentIndex()/currentData(). An editable QComboBox keeps its
+        previous currentIndex while the owner types (live-verified on
+        PySide6 6.11: typed text with or without Enter never drops the
+        index to -1), so reading currentData() persisted the PREVIOUS
+        selection -- "" (provider default) or a stale override -- and
+        silently discarded what was typed. Every non-sentinel item's text
+        is its model id, so the text alone is unambiguous; empty text or
+        the item-0 label means provider default."""
         combo = self.vision_model_combo
-        if combo.currentIndex() >= 0:
-            return (combo.currentData() or "").strip()
-        return combo.currentText().strip()
+        text = combo.currentText().strip()
+        if not text or text == combo.itemText(0).strip():
+            return ""
+        return text
 
     def _sync_vision_controls(self, *_args):
         enabled = self.vision_mode_combo.currentData() != "disabled"

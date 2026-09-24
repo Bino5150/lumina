@@ -95,17 +95,99 @@ _REASONING_MODELS = {
     "gpt-5.6-luna": _GPT_5_6_CAPS,
 }
 
+# VISION-RESTORE-01: every capability below is its own explicit, per-model
+# evidence table. None is derived from another -- knowing a model rejects
+# temperature says nothing about its reasoning-effort ladder, and neither
+# says anything about vision+tools. A new model is added only to the tables
+# its own evidence supports, never by family resemblance.
+
 # VISION-TOOL-INTEROP-01 -- OPENAI-RESPONSES-01: live-verified 2026-09-05
 # against the real API -- a single image, two images, tools, and
 # reasoning.effort="high" all combined in one /v1/responses request
 # returned HTTP 200 with a correct function_call output item, for every
 # model in this set. Scoped to exactly the models with that live evidence
-# (the same gpt-5.6 family reasoning_capabilities() already covers) --
-# every other/unknown OpenAI model keeps the safe base-class default
+# -- every other/unknown OpenAI model keeps the safe base-class default
 # (False) until it gets its own live verification, matching
 # OpenRouterBackend's existing per-model-evidence pattern for this same
-# method.
-_VISION_TOOL_CAPABLE_MODELS = frozenset(_REASONING_MODELS.keys())
+# method. (Used to be derived as frozenset(_REASONING_MODELS.keys()); same
+# members, now declared rather than inherited.)
+_VISION_TOOL_CAPABLE_MODELS = frozenset({
+    "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+})
+
+# Models that reject a caller-chosen temperature, so the field is omitted
+# from the wire (the provider then applies its own default).
+# - gpt-5.6 family: UTILITY-OPENAI-PARAMETER-CAPABILITY-01, live-verified
+#   2026-09-05 on gpt-5.6-luna (HTTP 400 "Unsupported value: 'temperature'
+#   does not support 0.3 with this model. Only the default (1) value is
+#   supported."); the rest of the family carries the omission it has had
+#   since then (previously implied by reasoning-table membership).
+# - gpt-6-luna: VISION-RESTORE-01, live-verified 2026-09-23 -- temperature
+#   0.7 -> HTTP 400 {"type": "invalid_request_error", "param":
+#   "temperature", "message": "Unsupported parameter: 'temperature' is not
+#   supported with this model."}. Deliberately NOT in _REASONING_MODELS or
+#   _VISION_TOOL_CAPABLE_MODELS: neither has been verified for it.
+# - gpt-6-sol: VISION-RESTORE-01, live-verified 2026-09-23 on its own (the
+#   identical HTTP 400 for temperature 0.3), not inferred from gpt-6-luna.
+#   Same exclusions as gpt-6-luna. gpt-6-astra is unverified and stays out.
+_TEMPERATURE_FORBIDDEN_MODELS = frozenset({
+    "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6-luna", "gpt-6-sol",
+})
+
+# Message prefixes of OpenAI's validation rejection of a request field (see
+# the two live shapes quoted above).
+_UNSUPPORTED_FIELD_PREFIXES = ("Unsupported parameter:", "Unsupported value:")
+
+
+def _is_temperature_rejection(resp) -> bool:
+    """True only for OpenAI's exact validation rejection of the optional
+    temperature field: HTTP 400, type invalid_request_error, param
+    "temperature", message naming an unsupported parameter/value. Any other
+    status, error, or unparseable body is False -- rate limits, server
+    errors, auth failures and other invalid fields are never retried."""
+    if getattr(resp, "status_code", None) != 400:
+        return False
+    try:
+        error = resp.json().get("error")
+    except Exception:
+        return False
+    if not isinstance(error, dict):
+        return False
+    message = error.get("message")
+    return (
+        error.get("param") == "temperature"
+        and error.get("type") == "invalid_request_error"
+        and isinstance(message, str)
+        and message.startswith(_UNSUPPORTED_FIELD_PREFIXES)
+    )
+
+
+def _record_capability_mismatch(model, parameter: str) -> None:
+    """Surface that _TEMPERATURE_FORBIDDEN_MODELS was stale for `model`:
+    a console line plus a warning-severity Flight Recorder machine event.
+    Telemetry failure never affects the request."""
+    print(
+        f"[OpenAI CAPABILITY MISMATCH] model={model!r} rejected optional "
+        f"'{parameter}'; retried once without it -- capability metadata is "
+        f"stale for this model.",
+        flush=True,
+    )
+    try:
+        from core.flight_recorder import record_machine_event
+        record_machine_event(
+            "backend.capability_mismatch",
+            severity="warning",
+            backend="openai",
+            model=model if isinstance(model, str) else None,
+            fields={
+                "parameter": parameter,
+                "action": "retried_once_without_parameter",
+                "capability_metadata": "stale",
+            },
+        )
+    except Exception:
+        pass
 
 
 def _translate_user_content(content):
@@ -405,12 +487,35 @@ class OpenAIBackend(LMStudioBackend):
             return False, "OPENAI_API_KEY not set in config.py"
         return True, f"Configured — {self._model}"
 
-    def _reasoning_capable(self, model: Optional[str]) -> bool:
-        """True only for a model this backend has real reasoning capability
-        data for -- reuses reasoning_capabilities() rather than a second,
-        parallel table, so this can never drift out of sync with the
-        capability data apply_reasoning() already validates against."""
-        return self.reasoning_capabilities(model) is not NO_REASONING_CONTROL
+    def _accepts_temperature(self, model: Optional[str]) -> bool:
+        """Temperature policy, decided here from its own evidence table
+        (_TEMPERATURE_FORBIDDEN_MODELS) -- never from reasoning-table
+        membership. Callers (chat turns, every complete_utility() consumer)
+        may always request a temperature; this decides whether it reaches
+        the wire."""
+        return model not in _TEMPERATURE_FORBIDDEN_MODELS
+
+    def _post_responses(self, payload: dict, *, stream: bool = False):
+        """POST one /responses request and return the raw response.
+
+        VISION-RESTORE-01 defense-in-depth: when a model missing from
+        _TEMPERATURE_FORBIDDEN_MODELS rejects the optional temperature field
+        with OpenAI's exact validation error, retry exactly once without
+        that one field and record a capability mismatch. Everything else --
+        network exceptions, any other status or error, a payload without
+        temperature -- passes through untouched to the caller's existing
+        handling. No other field is ever stripped."""
+        extra = {"stream": True} if stream else {}
+        url = join_endpoint(self.base_url, "responses")
+        resp = requests.post(url, headers=self.headers, json=payload,
+                             timeout=config.TOOL_CALL_TIMEOUT, **extra)
+        if "temperature" not in payload or not _is_temperature_rejection(resp):
+            return resp
+        resp.close()
+        _record_capability_mismatch(payload.get("model"), "temperature")
+        retry_payload = {k: v for k, v in payload.items() if k != "temperature"}
+        return requests.post(url, headers=self.headers, json=retry_payload,
+                             timeout=config.TOOL_CALL_TIMEOUT, **extra)
 
     def supports_vision_with_tools(self, model: Optional[str] = None) -> bool:
         return model in _VISION_TOOL_CAPABLE_MODELS
@@ -526,12 +631,15 @@ class OpenAIBackend(LMStudioBackend):
         # complete_utility()/complete_utility_content_only() call site
         # (auto-name, dream-sweep, My Human curation, compaction, the
         # continuity compiler) passes an explicit temperature -- this
-        # backend must never forward it for a reasoning-capable model,
-        # rather than trying to substitute a "legal" value. Non-reasoning
-        # models (gpt-4o, gpt-4o-mini, ...) keep receiving temperature
-        # unchanged -- live-verified 2026-09-05 that gpt-4o-mini accepts a
-        # non-default temperature normally via Responses.
-        if not self._reasoning_capable(model):
+        # backend must never forward it for a model known to reject it,
+        # rather than trying to substitute a "legal" value. Other models
+        # (gpt-4o, gpt-4o-mini, ...) keep receiving temperature unchanged --
+        # live-verified 2026-09-05 that gpt-4o-mini accepts a non-default
+        # temperature normally via Responses. VISION-RESTORE-01: decided by
+        # _accepts_temperature()'s own table, no longer by reasoning
+        # membership (gpt-6-luna rejects temperature yet has no verified
+        # reasoning ladder).
+        if self._accepts_temperature(model):
             payload["temperature"] = temperature
 
         effective_effort = self._effective_reasoning_effort(reasoning_effort, disable_thinking, model=model)
@@ -542,11 +650,7 @@ class OpenAIBackend(LMStudioBackend):
 
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
-            resp = requests.post(
-                join_endpoint(self.base_url, "responses"),
-                headers=self.headers, json=payload,
-                timeout=config.TOOL_CALL_TIMEOUT,
-            )
+            resp = self._post_responses(payload)
             resp.raise_for_status()
             return _normalize_responses_body(resp.json())
         except requests.exceptions.ConnectionError:
@@ -572,12 +676,7 @@ class OpenAIBackend(LMStudioBackend):
         request_started_at = time.monotonic()
         timing = _ResponsesTiming(request_started_at)
         try:
-            resp = requests.post(
-                join_endpoint(self.base_url, "responses"),
-                headers=self.headers, json=streamed_payload,
-                timeout=config.TOOL_CALL_TIMEOUT,
-                stream=True,
-            )
+            resp = self._post_responses(streamed_payload, stream=True)
             resp.raise_for_status()
         except requests.exceptions.ConnectionError:
             raise ConnectionError(f"{self.display_name} not reachable at {self.base_url}.")
@@ -638,18 +737,13 @@ class OpenAIBackend(LMStudioBackend):
             "stream": True,
         }
         self._apply_output_token_limit(payload, max_tokens, model=model)
-        if not self._reasoning_capable(model):
+        if self._accepts_temperature(model):
             payload["temperature"] = temperature
         self.apply_reasoning(payload, reasoning_effort, model=model)
 
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
-            resp = requests.post(
-                join_endpoint(self.base_url, "responses"),
-                headers=self.headers, json=payload,
-                timeout=config.TOOL_CALL_TIMEOUT,
-                stream=True,
-            )
+            resp = self._post_responses(payload, stream=True)
             resp.raise_for_status()
         except requests.exceptions.ConnectionError:
             raise ConnectionError(f"{self.display_name} not reachable at {self.base_url}.")

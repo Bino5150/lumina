@@ -167,6 +167,12 @@ class GeneralTab(QWidget):
         layout.addWidget(self.cloud_widget)
         self._refresh_cloud_row(config.LLM_BACKEND)  # set initial state
         self._refresh_endpoint_row(config.LLM_BACKEND)
+        # VISION-RESTORE-01: the Model Name row is the custom/omniroute
+        # backend's own saved model slot. backend_combo's initial value is set
+        # before _on_backend_changed() is connected, so without this the row
+        # was shown on every Settings open regardless of backend -- e.g. a
+        # saved Custom model displayed under an active OpenRouter backend.
+        self.custom_model_widget.setVisible(config.LLM_BACKEND in ("custom", "omniroute"))
 
         # ── Reasoning Effort (Patch 3A.4 Part 5) ──
         # Always visible regardless of backend -- unlike cloud_widget/
