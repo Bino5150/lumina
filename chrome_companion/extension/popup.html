@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Lumina Companion</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <h1>Lumina Companion</h1>
+
+  <section class="card" aria-live="polite">
+    <div class="row"><span id="dot" class="dot" aria-hidden="true"></span><strong id="state">Checking…</strong></div>
+    <div id="detail" class="muted"></div>
+  </section>
+
+  <section class="card">
+    <div class="label">Current tab</div>
+    <div id="tab-state">Checking…</div>
+    <div id="tab-origin" class="muted mono"></div>
+    <button id="grant" type="button" class="secondary" hidden>Allow Lumina to read this site</button>
+    <button id="revoke" type="button" class="secondary" hidden>Revoke Lumina's access to this site</button>
+    <div id="revoke-note" class="muted" role="status" aria-live="polite"></div>
+  </section>
+
+  <section class="card">
+    <div class="label">Last action</div>
+    <div id="action" class="muted">none</div>
+  </section>
+
+  <button id="pause" type="button" class="primary">PAUSE LUMINA</button>
+
+  <section class="card small">
+    <div class="label">Pairing ID for this Chrome profile</div>
+    <div class="row"><code id="instance">…</code><button id="copy" type="button" class="link">Copy</button></div>
+    <div id="pair-hint" class="muted" hidden>
+      Not paired yet. On Lumina's computer run:<br>
+      <code>python scripts/chrome_companion_setup.py --data-dir &lt;Lumina data dir&gt; pair &lt;this ID&gt;</code>
+    </div>
+  </section>
+
+  <p class="footnote">Read-only. Lumina can list tabs and read sites you allow here. Pausing disconnects her immediately; only you can resume.</p>
+
+  <script src="policy.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

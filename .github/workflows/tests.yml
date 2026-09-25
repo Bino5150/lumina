@@ -29,6 +29,16 @@ jobs:
         with:
           python-version: "3.13"
 
+      # BROWSER-COMPANION-01A -- tests/test_chrome_companion_extension.py and
+      # _e2e.py run the real Chrome Companion extension JavaScript under Node.
+      # They are security guards (pause, site access, restricted surfaces,
+      # stale-session drops), so they fail -- never skip -- when CI is set and
+      # Node is missing; pin Node here rather than relying on the runner image.
+      - name: Set up Node (Chrome Companion extension guards)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libenchant-2-2
 

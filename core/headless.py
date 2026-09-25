@@ -11,6 +11,10 @@ import threading
 import time
 from core.agent import LuminaAgent
 from core.reasoning_preferences import resolve_reasoning_effort
+from tools.chrome_companion import (
+    CHROME_TOOL_NAMES as CHROME_COMPANION_TOOL_NAMES,
+    telemetry_result_summary as chrome_companion_telemetry_summary,
+)
 
 # Process-lifetime cache, keyed by channel_id, so a channel can hold an
 # actual conversation across messages.
@@ -84,7 +88,11 @@ def _log_tool_call(channel_id):
 
 def _log_tool_result(channel_id):
         def _fn(name, result):
-            preview = str(result)[:150].replace('\n', ' ')
+            if name in CHROME_COMPANION_TOOL_NAMES:
+                # BROWSER-COMPANION-01A: never echo Lumina's page content to the console.
+                preview = chrome_companion_telemetry_summary(result)
+            else:
+                preview = str(result)[:150].replace('\n', ' ')
             print(f"[HEADLESS:{channel_id}] TOOL RESULT ← {name}: {preview}", flush=True)
         return _fn
 

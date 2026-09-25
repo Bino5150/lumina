@@ -109,6 +109,13 @@ TOOL_TIERS = {
     "list_recent_chats": "read_only", "list_custom_tools": "read_only",
     "browser_current_url": "read_only", "browser_get_links": "read_only",
     "browser_extract": "read_only", "browser_screenshot": "read_only",
+    # BROWSER-COMPANION-01A: read-only observations of Lumina's own Chrome
+    # (tabs.query/get + an isolated-world DOM read; no page mutation). Tier
+    # documents that; OWNER_ONLY_TOOLS below is what actually keeps them
+    # away from every non-owner path.
+    "chrome_status": "read_only", "chrome_list_tabs": "read_only",
+    "chrome_get_active_tab": "read_only", "chrome_get_url_title": "read_only",
+    "chrome_extract_visible_text": "read_only", "chrome_get_links": "read_only",
     "diff_texts": "read_only", "diff_files": "read_only", "submit_pin": "read_only",
     "get_active_project": "read_only",
     # TOOL-TIER-CLASSIFICATION-01: explicit read_only classification for
@@ -223,6 +230,12 @@ OWNER_ONLY_TOOLS = {
     # transitively inherit just because the owner session that spawned the
     # subagent is trusted.
     "estimate_image_generation", "generate_image",
+    # BROWSER-COMPANION-01A: Lumina's own authenticated Chrome (Gmail, GitHub,
+    # Reddit sessions). core/agent.py never registers these for a non-owner
+    # session; this second axis strips them from any subagent profile or
+    # tools_enabled grant, whatever the parent's authority.
+    "chrome_status", "chrome_list_tabs", "chrome_get_active_tab",
+    "chrome_get_url_title", "chrome_extract_visible_text", "chrome_get_links",
     # CODING-02B-A1: create_project also calls save_project_binding()
     # directly (tools/projects.py) -- it writes the exact same
     # DATA_DIR/projects/<name>/binding.json as set_project_root, so it must

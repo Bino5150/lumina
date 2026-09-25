@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Lumina Chrome Companion",
+  "version": "0.1.6",
+  "description": "Read-only companion that lets Lumina see tabs in this Chrome profile. Site access is granted per site by you; PAUSE LUMINA stops it.",
+  "minimum_chrome_version": "120",
+  "incognito": "not_allowed",
+  "permissions": ["nativeMessaging", "tabs", "scripting", "storage", "alarms", "webNavigation"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "worker.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Lumina Companion" }
+}

@@ -46,6 +46,11 @@ from core.chat_history import register_chat_history_tools
 from tools.projects import register_projects_tools, init_projects
 from tools.diff import register_diff_tools
 from tools.browser import register_browser_tools, browser_manager
+from tools.chrome_companion import (
+    CHROME_TOOL_NAMES as CHROME_COMPANION_TOOL_NAMES,
+    register_chrome_companion_tools,
+    telemetry_result_summary as chrome_companion_telemetry_summary,
+)
 from tools.telegram_send import register_telegram_tools
 from tools.updates import register_update_tools
 from tools.git_status import register_git_status_tool
@@ -1334,6 +1339,16 @@ def _fr_machine(agent, event_type: str, *, turn_id=None, chat_id=None,
         pass
 
 
+def _tool_result_summary(name: str, result) -> str:
+    """tool.result's result_summary. BROWSER-COMPANION-01A: a chrome_* result
+    can carry Lumina's authenticated page content (Gmail, Reddit drafts,
+    GitHub); it goes to the model only, and telemetry gets a content-free
+    stand-in. Every other tool keeps the established bounded_repr()."""
+    if name in CHROME_COMPANION_TOOL_NAMES:
+        return chrome_companion_telemetry_summary(result)
+    return flight_recorder.bounded_repr(result)
+
+
 def _fr_model(agent, event_type: str, text: Optional[str], *, turn_id=None,
                chat_id=None, severity: str = "info", fields: dict = None, **kwargs) -> None:
     """Fail-safe model-expression recording -- same posture as _fr_machine()
@@ -1838,6 +1853,11 @@ class LuminaAgent:
             # model-facing tool schema still only ever exposes draft_id/
             # prompt/settings, so it can never inject these itself.
             register_image_generation_tools(self.registry, self)
+            # BROWSER-COMPANION-01A -- same hard exclusion: these read Lumina's
+            # own logged-in Chrome (Gmail/GitHub/Reddit sessions), so they must
+            # never exist for a non-owner session. Registers nothing unless the
+            # owner has installed the companion for this data dir.
+            register_chrome_companion_tools(self.registry)
         register_palace_tools(self.registry)
         from tools.pin import register_pin_tools
         register_pin_tools(self.registry, channel_id)
@@ -2986,7 +3006,7 @@ class LuminaAgent:
                             fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,
                                     "tool_name": name, "success": _tool_success, "skipped": False,
                                     "duration_s": _tool_duration,
-                                    "result_summary": flight_recorder.bounded_repr(result)})
+                                    "result_summary": _tool_result_summary(name, result)})
                 self.on_tool_result(name, result)
                 tools_used_this_turn.add(name)
                 self.ctx.add_tool_result(tool_id, name, result)

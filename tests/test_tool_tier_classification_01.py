@@ -310,7 +310,10 @@ def test_owner_only_boundary_frozen():
     become) owner-only. estimate_image_generation/generate_image were
     added later, by MEDIA-GENERATION-CONVERSATIONAL-RUNTIME-01 -- a real,
     deliberate expansion (the only two real-money tools in the registry),
-    not drift; see core/tool_profiles.py's own comment on that addition."""
+    not drift; see core/tool_profiles.py's own comment on that addition.
+    The six chrome_* tools were added by BROWSER-COMPANION-01A -- likewise
+    deliberate: they read Lumina's own logged-in Chrome (Gmail, GitHub,
+    Reddit sessions), so no non-owner path may ever hold them."""
     assert OWNER_ONLY_TOOLS == {
         "create_tool", "list_custom_tools", "delete_tool",
         "list_pending_tools", "show_pending_tool_source", "reject_pending_tool",
@@ -323,6 +326,8 @@ def test_owner_only_boundary_frozen():
         "set_project_root",
         "create_project",
         "estimate_image_generation", "generate_image",
+        "chrome_status", "chrome_list_tabs", "chrome_get_active_tab",
+        "chrome_get_url_title", "chrome_extract_visible_text", "chrome_get_links",
     }
     assert NEWLY_CLASSIFIED.isdisjoint(OWNER_ONLY_TOOLS)
 

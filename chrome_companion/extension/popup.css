@@ -1,0 +1,37 @@
+:root {
+  --bg: #171821;
+  --card: #262836;
+  --text: #f4f3ee;
+  --muted: #aeadbf;
+  --accent: #d5a4ff;
+  --ok: #6fdc8c;
+  --warn: #f5c451;
+  --off: #8b8a9b;
+  --danger: #ff7b86;
+}
+body {
+  font: 13px/1.4 system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  width: 300px;
+  margin: 0;
+  padding: 14px;
+}
+h1 { font-size: 15px; margin: 0 0 10px; }
+.card { background: var(--card); border-radius: 8px; padding: 9px 10px; margin-bottom: 8px; }
+.card.small { font-size: 12px; }
+.row { display: flex; align-items: center; gap: 8px; }
+.label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 3px; }
+.muted { color: var(--muted); }
+.warn { color: var(--warn); }
+.mono, code { font-family: ui-monospace, monospace; font-size: 11px; word-break: break-all; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
+.dot.ready { background: var(--ok); }
+.dot.pending { background: var(--warn); }
+.dot.paused { background: var(--danger); }
+button { font: inherit; cursor: pointer; border: 0; border-radius: 7px; }
+button.primary { width: 100%; padding: 10px; margin: 2px 0 8px; background: var(--accent); color: var(--bg); font-weight: 700; }
+button.primary.resume { background: var(--ok); }
+button.secondary { margin-top: 7px; padding: 6px 9px; background: #3a3d52; color: var(--text); }
+button.link { background: none; color: var(--accent); padding: 0; margin-left: auto; }
+.footnote { color: var(--muted); font-size: 11px; margin: 4px 0 0; }
