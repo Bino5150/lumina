@@ -129,18 +129,33 @@ TOOL_TIERS = {
     # mutated) against allowlist-resolved repos; view_image stats a path
     # (exists/isfile/getsize, contents never read); get_weather is a pure
     # function with zero I/O; load_project/load_codebase/get_project_chats
-    # read tracked/data files. Deliberately NOT classified here:
-    # update_project, refresh_codebase_index, link_chat (tracked-file
-    # writers), spawn_subagent + run/schedule_background_subagent
-    # (dispatch/launch semantics), check_background_task (get_task_result
-    # lazy-GC deletes TTL-expired queue entries -- a hidden mutating edge
-    # inside a nominal read). See the classification test's
-    # STILL_UNCLASSIFIED accounting for the full per-tool rationale.
+    # read tracked/data files.
     "git_status": "read_only", "git_diff": "read_only",
     "git_log": "read_only", "git_branches": "read_only",
     "view_image": "read_only", "get_weather": "read_only",
     "load_project": "read_only", "load_codebase": "read_only",
     "get_project_chats": "read_only",
+    # TOOL-TIER-COMPLETENESS-01: the remainder TOOL-TIER-CLASSIFICATION-01
+    # left unclassified (its own docstring: "each would need behavioral or
+    # policy work before an honest [non-execute] tier claim"). Kept at the
+    # exact tier their unclassified fallback already produced --
+    # `TOOL_TIERS.get(name, "execute")` -- so non-owner PIN-gate behavior is
+    # unchanged for every one of them; this only makes the classification
+    # explicit instead of implicit. spawn_subagent/run_background_subagent/
+    # schedule_background_subagent are headless child-agent/task dispatch;
+    # check_background_task's get_task_result() lazy-GC deletes
+    # TTL-expired queue entries (a mutating edge inside a nominal read,
+    # too ambiguous for read_only); update_project/refresh_codebase_index/
+    # link_chat overwrite tracked project files -- behaviorally closer to
+    # write_local, but reclassifying them there would remove their current
+    # non-owner PIN gate, a real security loosening rather than a
+    # documentation fix, so they stay at "execute" here. See
+    # tests/test_tool_tier_completeness_01.py for the full per-tool record
+    # and the residual follow-up this leaves open.
+    "spawn_subagent": "execute", "run_background_subagent": "execute",
+    "schedule_background_subagent": "execute", "check_background_task": "execute",
+    "update_project": "execute", "refresh_codebase_index": "execute",
+    "link_chat": "execute",
 
     "edit_prompt": "write_local", "reset_chat": "write_local",
     # CODING-02B-A: project-context tools. activate_project/clear_active_project
@@ -153,6 +168,24 @@ TOOL_TIERS = {
     # enforces the exclusion.
     "activate_project": "write_local", "clear_active_project": "write_local",
     "set_project_root": "write_local",
+    # TOOL-TIER-COMPLETENESS-01: create_project also calls
+    # save_project_binding() -- the exact same DATA_DIR/projects/<name>/
+    # binding.json write as set_project_root above -- plus writes
+    # project.md/codebase.md/chats.json. Owner-only (OWNER_ONLY_TOOLS
+    # below) makes this tier redundant for gating purposes, but tier and
+    # owner-only are different properties (this campaign's premise) and a
+    # missing tier here would still show up as an accounting gap.
+    "create_project": "write_local",
+    # reject_pending_tool: os.remove() of a staged, never-loaded file plus
+    # a local audit-log append -- "still just file deletion" per
+    # tools/toolmaker.py's own module docstring; never touches the live
+    # registry. list_pending_tools/show_pending_tool_source are pure reads
+    # (os.listdir / open().read()) of that same staging directory.
+    "list_pending_tools": "read_only", "show_pending_tool_source": "read_only",
+    "reject_pending_tool": "write_local",
+    # palace_review_writes: SELECT-only (list_flagged_writes). palace_undo_write:
+    # DELETE FROM palace_drawers + parent-closet rebuild -- a real local write.
+    "palace_review_writes": "read_only", "palace_undo_write": "write_local",
     "save_memory": "write_local", "delete_memory": "write_local",
     "save_knowledge": "write_local", "delete_knowledge": "write_local",
     "save_person": "write_local", "write_file": "write_local",
@@ -243,10 +276,11 @@ OWNER_ONLY_TOOLS = {
     # DATA_DIR/projects/<name>/binding.json as set_project_root, so it must
     # be excluded for the identical reason. CODING-02B-A classified
     # set_project_root as owner-only but left create_project unclassified,
-    # leaving a second, un-gated path to the same privileged write. Left
-    # deliberately absent from TOOL_TIERS (not given a "write_local" entry)
-    # -- OWNER_ONLY_TOOLS is checked before tier/PIN logic ever runs for a
-    # non-owner session, so a tier entry here would be redundant at best.
+    # leaving a second, un-gated path to the same privileged write.
+    # TOOL-TIER-COMPLETENESS-01: now also carries an explicit "write_local"
+    # TOOL_TIERS entry (see above) -- redundant for non-owner gating (this
+    # exclusion already runs first) but owner-only and tier are different
+    # properties, and a tool can legitimately need both.
     "create_project",
 }
 

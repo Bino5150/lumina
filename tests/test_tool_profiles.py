@@ -142,22 +142,30 @@ def test_old_project_tools_tier_behavior_unchanged():
     sessions, same as any other tool nobody has ever explicitly
     classified). CODING-02B-A1 changes exactly one bit of that: create_project
     is now in OWNER_ONLY_TOOLS (see test_create_project_is_owner_only below)
-    -- it stays deliberately absent from TOOL_TIERS itself.
+    -- at the time, it stayed deliberately absent from TOOL_TIERS itself.
 
-    TOOL-TIER-CLASSIFICATION-01 changes exactly three more bits: the three
+    TOOL-TIER-CLASSIFICATION-01 changed exactly three more bits: the three
     pure readers of this family (load_project, load_codebase,
-    get_project_chats) now carry an explicit read_only tier -- their
-    complete production call path is proven observational (per-tool
-    evidence contract in tests/test_tool_tier_classification_01.py). The
-    three writers (update_project, refresh_codebase_index, link_chat)
-    remain deliberately unclassified, keeping their fail-closed execute
-    PIN gate for non-owner sessions."""
-    # Deliberately still unclassified: owner-only binding authority
-    # (create_project) + tracked-file writers (fail-closed execute
-    # default retained for non-owner sessions).
-    for name in ("create_project", "update_project",
-                 "refresh_codebase_index", "link_chat"):
-        assert name not in TOOL_TIERS
+    get_project_chats) got an explicit read_only tier -- their complete
+    production call path is proven observational (per-tool evidence
+    contract in tests/test_tool_tier_classification_01.py). The three
+    writers (update_project, refresh_codebase_index, link_chat) stayed
+    unclassified at that point, keeping their fail-closed execute PIN gate
+    for non-owner sessions.
+
+    TOOL-TIER-COMPLETENESS-01 later closed that remainder too: all four of
+    create_project/update_project/refresh_codebase_index/link_chat now
+    carry an explicit tier (create_project: write_local, matching its
+    save_project_binding() write; the other three: execute -- the exact
+    tier their unclassified fallback already produced, so the non-owner
+    PIN gate for all four is unchanged from what this test originally
+    proved). See tests/test_tool_tier_completeness_01.py for the full
+    per-tool record."""
+    # Explicitly classified by TOOL-TIER-COMPLETENESS-01, same effective
+    # PIN-gate behavior (still SENSITIVE_TIERS) as the fallback they replace.
+    assert TOOL_TIERS["create_project"] == "write_local"
+    for name in ("update_project", "refresh_codebase_index", "link_chat"):
+        assert TOOL_TIERS[name] == "execute"
     # Explicitly classified read_only by TOOL-TIER-CLASSIFICATION-01.
     for name in ("load_project", "load_codebase", "get_project_chats"):
         assert TOOL_TIERS[name] == "read_only"
@@ -181,9 +189,15 @@ def test_create_project_is_owner_only():
     assert "create_project" in OWNER_ONLY_TOOLS
 
 
-def test_create_project_still_not_classified_in_tool_tiers():
-    # Deliberate: OWNER_ONLY_TOOLS is checked before tier/PIN logic ever
-    # runs for a non-owner session, so adding a "write_local" tier entry
-    # here would be redundant at best -- see core/tool_profiles.py's
-    # OWNER_ONLY_TOOLS comment for the full reasoning.
-    assert "create_project" not in TOOL_TIERS
+def test_create_project_now_has_an_explicit_write_local_tier():
+    # At CODING-02B-A1, this was deliberately absent from TOOL_TIERS:
+    # OWNER_ONLY_TOOLS is checked before tier/PIN logic ever runs for a
+    # non-owner session, so a tier entry was redundant at best. TOOL-TIER-
+    # COMPLETENESS-01 added one anyway -- owner-only and tier are different
+    # properties, and a missing tier is still an accounting gap even when
+    # it's behaviorally redundant. write_local matches create_project's
+    # actual save_project_binding()/project.md/codebase.md/chats.json
+    # writes, and it stays owner-only regardless (see
+    # test_create_project_is_owner_only above).
+    assert TOOL_TIERS.get("create_project") == "write_local"
+    assert "create_project" in OWNER_ONLY_TOOLS

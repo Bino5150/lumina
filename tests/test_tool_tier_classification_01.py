@@ -31,9 +31,15 @@ Per-tool evidence (source files at the 657c185 baseline):
   load_codebase  tools/projects.py      -- reads projects/<n>/codebase.md.
   get_project_chats  tools/projects.py  -- reads DATA_DIR chats.json.
 
-Deliberately LEFT UNCLASSIFIED (non-owner-relevant, fail-closed execute
-default retained -- each would need behavioral or policy work before an
-honest tier claim):
+At the time this slice landed, 13 tools were LEFT deliberately unclassified
+(non-owner-relevant ones fail-closed to the implicit "execute" fallback;
+owner-only ones judged redundant behind OWNER_ONLY_TOOLS). TOOL-TIER-
+COMPLETENESS-01 (see tests/test_tool_tier_completeness_01.py) later closed
+that remainder -- every one of those 13 now carries an explicit TOOL_TIERS
+entry, none of them changing effective PIN-gate behavior. The historical
+record of what was left open here, and why, is preserved below and in the
+HISTORICALLY_UNCLASSIFIED_* constants for provenance; treat it as a snapshot of
+this slice's own scope, not as the current state of TOOL_TIERS.
 
   update_project          overwrites projects/<n>/project.md.
   refresh_codebase_index  overwrites projects/<n>/codebase.md.
@@ -55,10 +61,12 @@ honest tier claim):
 
 Owner-only unclassified tools (create_project, list_pending_tools,
 show_pending_tool_source, reject_pending_tool, palace_review_writes,
-palace_undo_write) are NOT non-owner-reachable: OWNER_ONLY_TOOLS is
+palace_undo_write) were NOT non-owner-reachable: OWNER_ONLY_TOOLS is
 stripped structurally in resolve_enabled_set() before tier/PIN logic ever
-runs, so a tier entry for them would be redundant at best (same reasoning
-core/tool_profiles.py already documents for create_project).
+runs, so a tier entry for them was redundant for gating purposes. TOOL-
+TIER-COMPLETENESS-01 classified them anyway, on the principle that
+owner-only membership and tier are different properties and one should
+never substitute for the other.
 """
 
 import json
@@ -89,10 +97,15 @@ NEWLY_CLASSIFIED = {
     "load_project", "load_codebase", "get_project_chats",
 }
 
-# Non-owner-relevant tools that deliberately remain unclassified (execute
-# tier fail-closed default). Exact set -- a future tool must either be
-# classified here consciously or this test breaks, which is the audit.
-STILL_UNCLASSIFIED_NON_OWNER = {
+# HISTORICAL RECORD, not current state: the 7 non-owner-relevant tools this
+# slice (TOOL-TIER-CLASSIFICATION-01) left on the implicit execute-tier
+# fallback. TOOL-TIER-COMPLETENESS-01 later gave every one of these an
+# explicit "execute" TOOL_TIERS entry (same tier the fallback already
+# produced -- see tests/test_tool_tier_completeness_01.py). Kept here so the
+# provenance of that later decision -- which tools, and why they were left
+# open at this slice's own boundary -- stays attached to the original
+# per-tool evidence above.
+HISTORICALLY_UNCLASSIFIED_NON_OWNER = {
     "update_project",
     "refresh_codebase_index",
     "link_chat",
@@ -102,9 +115,11 @@ STILL_UNCLASSIFIED_NON_OWNER = {
     "check_background_task",
 }
 
-# Owner-only unclassified tools: never non-owner-reachable, tier entry
-# deliberately omitted (redundant behind the OWNER_ONLY_TOOLS strip).
-STILL_UNCLASSIFIED_OWNER_ONLY = {
+# HISTORICAL RECORD, not current state: owner-only tools this slice left
+# without a tier entry (redundant behind the OWNER_ONLY_TOOLS strip at the
+# time). TOOL-TIER-COMPLETENESS-01 classified them anyway -- owner-only and
+# tier are different properties.
+HISTORICALLY_UNCLASSIFIED_OWNER_ONLY = {
     "create_project",
     "list_pending_tools",
     "show_pending_tool_source",
@@ -113,8 +128,8 @@ STILL_UNCLASSIFIED_OWNER_ONLY = {
     "palace_undo_write",
 }
 
-EXPECTED_UNCLASSIFIED = (
-    STILL_UNCLASSIFIED_NON_OWNER | STILL_UNCLASSIFIED_OWNER_ONLY
+HISTORICALLY_UNCLASSIFIED = (
+    HISTORICALLY_UNCLASSIFIED_NON_OWNER | HISTORICALLY_UNCLASSIFIED_OWNER_ONLY
 )
 
 # Which shipped profiles contain each newly classified tool (from the
@@ -201,40 +216,42 @@ def test_newly_classified_tools_carry_no_other_tier():
 
 
 # ── 2. Complete candidate accounting (the audit) ─────────────────────────
+#
+# TOOL-TIER-COMPLETENESS-01 replaced the "exact deliberate remainder" audit
+# that used to live here with a stronger one: the live registry universe
+# minus the tier map must be EMPTY, full stop (see
+# tests/test_tool_tier_completeness_01.py, which also covers Browser
+# Companion's conditionally-registered chrome_* tools -- this file's
+# full_registry fixture never installs the companion, so it can only ever
+# under-count the universe, never over-count it). What remains here just
+# confirms the tools THIS slice classified didn't silently get folded back
+# into that later, more complete accounting under a different tier.
 
 def test_unclassified_universe_accounting_is_exact(full_registry):
-    """THE audit: the live registry universe minus the tier map must be
-    EXACTLY the deliberate remainder. Any future tool registered without a
-    TOOL_TIERS entry lands here and breaks this test -- forcing a
-    conscious classification decision instead of a silent fall-through to
-    the execute-tier PIN gate."""
+    """Nothing in this fixture's registry construction is unclassified
+    anymore -- TOOL-TIER-COMPLETENESS-01 closed the remainder this slice
+    left open. Any future tool registered without a TOOL_TIERS entry lands
+    here and breaks this test."""
     universe = set(full_registry.all_tool_names())
     unclassified = universe - set(TOOL_TIERS)
-    assert unclassified == EXPECTED_UNCLASSIFIED, (
-        "Registry/tier accounting drifted. Newly unclassified tools: "
-        f"{sorted(unclassified - EXPECTED_UNCLASSIFIED)}; "
-        f"tier entries for tools that no longer register: "
-        f"{sorted(EXPECTED_UNCLASSIFIED - unclassified)}"
+    assert not unclassified, (
+        f"Registry/tier accounting drifted -- unclassified tools: {sorted(unclassified)}"
     )
 
 
-def test_non_owner_relevant_remainder_is_exact(full_registry):
-    universe = set(full_registry.all_tool_names())
-    unclassified = universe - set(TOOL_TIERS)
-    non_owner_relevant = unclassified - OWNER_ONLY_TOOLS
-    assert non_owner_relevant == STILL_UNCLASSIFIED_NON_OWNER
-
-
-def test_owner_only_unclassified_remainder_is_exact(full_registry):
-    universe = set(full_registry.all_tool_names())
-    unclassified = universe - set(TOOL_TIERS)
-    owner_only_unclassified = unclassified & OWNER_ONLY_TOOLS
-    assert owner_only_unclassified == STILL_UNCLASSIFIED_OWNER_ONLY
+def test_historically_unclassified_tools_are_now_all_classified():
+    """The exact remainder this slice left open (per its own module
+    docstring) now has an explicit TOOL_TIERS entry for every member --
+    proves TOOL-TIER-COMPLETENESS-01's later repair actually covered this
+    slice's specific boundary, not just some other subset of the registry."""
+    missing = HISTORICALLY_UNCLASSIFIED - set(TOOL_TIERS)
+    assert not missing, f"Still unclassified: {sorted(missing)}"
 
 
 def test_still_unclassified_non_owner_tools_are_deliberate():
-    """Documentation-in-test: every tool left unclassified has a recorded
-    reason (module docstring carries the full evidence)."""
+    """Documentation-in-test: every tool this slice left unclassified has a
+    recorded reason (module docstring carries the full evidence), and (per
+    TOOL-TIER-COMPLETENESS-01) now an explicit tier too."""
     reasons = {
         "update_project": "overwrites project.md",
         "refresh_codebase_index": "overwrites codebase.md",
@@ -244,7 +261,9 @@ def test_still_unclassified_non_owner_tools_are_deliberate():
         "schedule_background_subagent": "enqueues a future task (mutating)",
         "check_background_task": "TTL lazy-GC mutation in get_task_result",
     }
-    assert set(reasons) == STILL_UNCLASSIFIED_NON_OWNER
+    assert set(reasons) == HISTORICALLY_UNCLASSIFIED_NON_OWNER
+    for name in reasons:
+        assert name in TOOL_TIERS
 
 
 # ── 3. No accidental profile expansion ───────────────────────────────────
@@ -333,11 +352,17 @@ def test_owner_only_boundary_frozen():
     assert NEWLY_CLASSIFIED.isdisjoint(OWNER_ONLY_TOOLS)
 
 
-def test_create_project_stays_deliberately_absent_from_tier_map():
-    """CODING-02B-A1's deliberate omission must survive this slice: an
-    owner-only tool gets no tier entry (redundant behind the structural
-    strip)."""
-    assert "create_project" not in TOOL_TIERS
+def test_create_project_now_carries_an_explicit_tier():
+    """CODING-02B-A1 deliberately left create_project out of TOOL_TIERS
+    (redundant behind the OWNER_ONLY_TOOLS structural strip). TOOL-TIER-
+    COMPLETENESS-01 gave it one anyway -- write_local, matching its sibling
+    set_project_root's tier and its actual save_project_binding() write --
+    on the principle that owner-only and tier are different properties.
+    create_project stays owner-only regardless (checked separately by
+    test_owner_only_boundary_frozen below); this only confirms the tier
+    itself landed and didn't drift to something else."""
+    assert TOOL_TIERS.get("create_project") == "write_local"
+    assert "create_project" in OWNER_ONLY_TOOLS
 
 
 # ── 6. Non-owner PIN-gate behavior: the explicit authority delta ─────────
@@ -369,9 +394,11 @@ def test_newly_classified_tool_is_pin_exempt_for_granted_non_owner(
 def test_still_unclassified_tools_remain_pin_gated_for_non_owner(
     isolated_agent_data, monkeypatch
 ):
-    """The fail-closed default is preserved for everything this slice
-    deliberately left unclassified: execute-tier default means a granted
-    non-owner session still needs PIN verification."""
+    """PIN-gating is preserved for the tools this slice left unclassified.
+    TOOL-TIER-COMPLETENESS-01 later gave both of these an explicit
+    "execute" tier -- the exact tier their unclassified fallback already
+    produced -- specifically so this assertion would keep holding
+    unchanged: a granted non-owner session still needs PIN verification."""
     agent = _nonowner_agent_with_grants(
         isolated_agent_data, monkeypatch,
         ["update_project", "check_background_task"],
