@@ -165,6 +165,15 @@ def get_headless_agent(channel_id: str, owner: bool,
                 data_dir=config.DATA_DIR, db_path=config.DB_PATH
             )
 
+            # DOCS-01B: same explicit-call-site, cache-miss-only discipline
+            # as the skill bootstrap just above -- deterministic official
+            # self-knowledge availability before this brand-new agent's tool
+            # registry starts serving turns.
+            from core.knowledge_bootstrap import ensure_official_knowledge_bootstrapped
+            ensure_official_knowledge_bootstrapped(
+                data_dir=config.DATA_DIR, db_path=config.DB_PATH
+            )
+
             agent = LuminaAgent(owner=owner, channel_id=channel_id,
                                 on_tool_call=_log_tool_call(channel_id),
                                 on_tool_result=_log_tool_result(channel_id))

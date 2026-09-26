@@ -134,6 +134,18 @@ you and Lumina can save documents, notes, and datasets here
 FTS5. Permanently stored — unlike "chat with your document" in the chat
 window itself, it's there when you come back to it later.
 
+A small set of entries under the reserved category `lumina-self-knowledge`
+ships with the app and seeds itself into a fresh install automatically —
+concise, factual notes about Lumina's own architecture (MemPalace, Halls,
+Browser Companion, Reforge, and more), retrievable through the exact same
+`list_knowledge`/`search_knowledge`/`read_knowledge` tools as anything
+else stored here. There's nothing special about it structurally: it's
+ordinary information, tagged with the same tool-output provenance as any
+other tool result, never elevated to owner authority just because it
+shipped with the app. Deleting an entry is respected permanently — it
+won't be silently reinstalled on the next launch unless the entire
+category is emptied out.
+
 ## Backup
 
 **Backup Memory** in Settings is a one-click button

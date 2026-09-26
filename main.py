@@ -178,6 +178,16 @@ def run_cli(persona_name: str = None, tools_override: str = None):
             data_dir=config.DATA_DIR, db_path=config.DB_PATH
         )
 
+        # DOCS-01B: same explicit-call-site discipline as the skill bootstrap
+        # just above -- deterministic official self-knowledge availability
+        # before any Agent's tool registry (search_knowledge/list_knowledge/
+        # read_knowledge) starts serving turns. Never blocks startup on
+        # failure; see ensure_official_knowledge_bootstrapped().
+        from core.knowledge_bootstrap import ensure_official_knowledge_bootstrapped
+        ensure_official_knowledge_bootstrapped(
+            data_dir=config.DATA_DIR, db_path=config.DB_PATH
+        )
+
         # MB-22: CLI is a trusted local session, same footing as the desktop app --
         # owner=True is already LuminaAgent's default, unchanged here. channel_id
         # is now explicit ("cli-local" instead of the generic "default") so PIN
@@ -262,6 +272,16 @@ def run_gui():
     # startup on failure; see ensure_official_skills_bootstrapped().
     from core.skill_transport import ensure_official_skills_bootstrapped
     ensure_official_skills_bootstrapped(
+        data_dir=config.DATA_DIR, db_path=config.DB_PATH
+    )
+
+    # DOCS-01B: same explicit-call-site discipline as the skill bootstrap
+    # just above -- deterministic official self-knowledge availability
+    # before any Agent's tool registry (search_knowledge/list_knowledge/
+    # read_knowledge) starts serving turns. Never blocks startup on
+    # failure; see ensure_official_knowledge_bootstrapped().
+    from core.knowledge_bootstrap import ensure_official_knowledge_bootstrapped
+    ensure_official_knowledge_bootstrapped(
         data_dir=config.DATA_DIR, db_path=config.DB_PATH
     )
 
