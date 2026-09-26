@@ -67,7 +67,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 from platformdirs import user_data_dir
 from migrate_state_dir import migrate_legacy_state
 DATA_DIR = os.environ.get("LUMINA_DATA_DIR") or user_data_dir("lumina", appauthor=False)
-migrate_legacy_state(BASE_DIR, DATA_DIR)
+# TEST-DATA-ISOLATION-01: never migrate real in-repo legacy state (shutil.move,
+# not copy) into a throwaway test data dir -- tests/conftest.py sets
+# LUMINA_TESTING before this module is ever imported. A fresh test dir would
+# otherwise always look "unmigrated," relocating (and deleting from BASE_DIR)
+# any legacy file that happened to exist.
+if os.environ.get("LUMINA_TESTING") != "1":
+    migrate_legacy_state(BASE_DIR, DATA_DIR)
 
 DB_PATH = os.path.join(DATA_DIR, "memory", "lumina.db")
 PERSONAS_DIR = os.path.join(BASE_DIR, "personas")
@@ -94,6 +100,7 @@ VOICEBOX_INSTRUCT = _p.get("voicebox_instruct", "")
 CHATTERBOX_HOST      = _p.get("chatterbox_host",     "http://localhost:8004")
 CHATTERBOX_VOICE     = _p.get("chatterbox_voice",    "lumina")
 CHATTERBOX_REF_DIR   = _p.get("chatterbox_ref_dir",  os.path.join(BASE_DIR, "assets", "voices"))
+CHATTERBOX_DEVICE    = _p.get("chatterbox_device",   "cpu")
 SUPERTONIC_HOST      = _p.get("supertonic_host",     "http://localhost:7788")
 SUPERTONIC_VOICE     = _p.get("supertonic_voice",    "lumina")
 ELEVENLABS_VOICE_ID  = _p.get("elevenlabs_voice_id", "")
@@ -115,6 +122,14 @@ STT_DEVICE  = _p.get("stt_device", "cpu")
 # Cloud Model
 LLM_BACKEND     = _p.get("llm_backend", "llamacpp")
 LLM_BACKEND_URL = _p.get("llm_backend_url", "http://localhost:8080/v1")
+# BACKEND-CONTRACT-01A: user-controlled endpoints are keyed by configurable
+# backend.  The legacy generic value above remains as bounded migration/read
+# compatibility only; backend construction never treats it as universal
+# runtime authority.  The loader owns classification and performs the one-time
+# migration because config cannot import backend classes without a cycle.
+_saved_backend_endpoints = _p.get("backend_endpoints", {})
+BACKEND_ENDPOINTS = dict(_saved_backend_endpoints) if isinstance(_saved_backend_endpoints, dict) else {}
+BACKEND_ENDPOINTS_MIGRATED = bool(_p.get("backend_endpoints_migrated", False))
 CUSTOM_DEFAULT_MODEL = _p.get("custom_default_model", "")
 # OmniRoute (github.com/diegosouzapw/OmniRoute) — a separate slot from
 # "custom" on purpose: both are OpenAI-compatible endpoints under the hood,
@@ -137,25 +152,31 @@ ELEVENLABS_API_KEY = _secrets.get_secret("elevenlabs_api_key") or _p.get("eleven
 # First time a backend is used, falls back to a conservative default below
 # rather than crashing or silently reusing another backend's number.
 BACKEND_CONTEXT_DEFAULTS = {
-    "llamacpp":   {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "lmstudio":   {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "ollama":     {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "vllm":       {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "custom":     {"max_context_tokens": 16384,   "memory_inject_limit": 6},
-    "omniroute":  {"max_context_tokens": 32000,   "memory_inject_limit": 12},
-    "openrouter": {"max_context_tokens": 32000,   "memory_inject_limit": 12},
-    "deepseek":   {"max_context_tokens": 64000,   "memory_inject_limit": 16},
-    "groq":       {"max_context_tokens": 32000,   "memory_inject_limit": 12},
-    "openai":     {"max_context_tokens": 128000,  "memory_inject_limit": 24},
-    "anthropic":  {"max_context_tokens": 180000,  "memory_inject_limit": 40},
-    "gemini":     {"max_context_tokens": 1000000, "memory_inject_limit": 60},
-    "kimi":       {"max_context_tokens": 128000,  "memory_inject_limit": 24},
-    "qwen":       {"max_context_tokens": 128000,  "memory_inject_limit": 24},
+    "llamacpp":   {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "lmstudio":   {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "ollama":     {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "vllm":       {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "custom":     {"max_context_tokens": 16384,   "memory_inject_limit": 6,  "tool_result_max_chars": 9000},
+    "omniroute":  {"max_context_tokens": 32000,   "memory_inject_limit": 12, "tool_result_max_chars": 20000},
+    "openrouter": {"max_context_tokens": 32000,   "memory_inject_limit": 12, "tool_result_max_chars": 20000},
+    "deepseek":   {"max_context_tokens": 64000,   "memory_inject_limit": 16, "tool_result_max_chars": 30000},
+    "groq":       {"max_context_tokens": 32000,   "memory_inject_limit": 12, "tool_result_max_chars": 20000},
+    "openai":     {"max_context_tokens": 128000,  "memory_inject_limit": 24, "tool_result_max_chars": 40000},
+    "anthropic":  {"max_context_tokens": 180000,  "memory_inject_limit": 40, "tool_result_max_chars": 50000},
+    "gemini":     {"max_context_tokens": 1000000, "memory_inject_limit": 60, "tool_result_max_chars": 100000},
+    "kimi":       {"max_context_tokens": 128000,  "memory_inject_limit": 24, "tool_result_max_chars": 40000},
+    "qwen":       {"max_context_tokens": 128000,  "memory_inject_limit": 24, "tool_result_max_chars": 40000},
 }
 _ctx_default = BACKEND_CONTEXT_DEFAULTS.get(LLM_BACKEND, BACKEND_CONTEXT_DEFAULTS["llamacpp"])
 _backend_ctx = _p.get("backend_context", {}).get(LLM_BACKEND, {})
-MAX_CONTEXT_TOKENS  = _backend_ctx.get("max_context_tokens", _ctx_default["max_context_tokens"])
-MEMORY_INJECT_LIMIT = _backend_ctx.get("memory_inject_limit", _ctx_default["memory_inject_limit"])
+MAX_CONTEXT_TOKENS    = _backend_ctx.get("max_context_tokens", _ctx_default["max_context_tokens"])
+MEMORY_INJECT_LIMIT   = _backend_ctx.get("memory_inject_limit", _ctx_default["memory_inject_limit"])
+# Per-backend like the two above — a document-heavy tool result on a
+# 1M-context backend (Gemini) shouldn't be truncated to the same ceiling as
+# a 16k-context local model. Used to be a flat literal in the "Agent
+# behavior" section below; moved up here so it resolves off the same
+# _backend_ctx/_ctx_default lookup while both are still in scope.
+TOOL_RESULT_MAX_CHARS = _backend_ctx.get("tool_result_max_chars", _ctx_default["tool_result_max_chars"])
 
 # Not per-backend — tool-call depth and response length are agent-behavior
 # choices, not something that varies by which model is answering.
@@ -200,6 +221,7 @@ QWEN_API_KEY, QWEN_DEFAULT_MODEL             = _cloud_override("qwen", QWEN_API_
 DREAM_SWEEP_ENABLED = _p.get("dream_sweep_enabled", True)
 DREAM_MIN_TOKENS    = _p.get("dream_min_tokens", 900)
 DREAM_IDLE_MINUTES  = _p.get("dream_idle_minutes", 13)
+HUMAN_PROFILE_CURATION_ENABLED = _p.get("human_profile_curation_enabled", True)
 
 # Subagents + background/scheduled tasks — same prefs-backed pattern as the
 # flags above, own flags rather than sharing one (same precedent as
@@ -216,6 +238,13 @@ DREAM_IDLE_MINUTES  = _p.get("dream_idle_minutes", 13)
 SUBAGENTS_ENABLED = _p.get("subagents_enabled", False)
 BACKGROUND_TASKS_ENABLED = _p.get("background_tasks_enabled", False)
 MAX_SUBAGENT_DEPTH = _p.get("max_subagent_depth", 2)
+
+# Context-trim compaction (MB-11) — messages dropped by build_messages()'s
+# trim loop are captured instead of silently discarded, batched, and
+# summarized into Palace L2 rather than lost outright. Off by default until
+# tested end-to-end, same pattern as SUBAGENTS_ENABLED above.
+CONTEXT_COMPACTION_ENABLED = _p.get("context_compaction_enabled", False)
+CONTEXT_COMPACTION_BATCH_TOKENS = _p.get("context_compaction_batch_tokens", 1400)
 
 # Chat UI — show/hide the model's <think> reasoning block in the chat
 # window. Purely a display toggle: the model still reasons and those tokens
@@ -244,7 +273,6 @@ TELEGRAM_OWNER_CHAT_ID = _p.get("telegram_owner_chat_id", None) or None
 
 
 # Agent behavior
-TOOL_RESULT_MAX_CHARS = 9000
 TOOL_CALL_TIMEOUT = 600  # per-request timeout (resets each tool call)
 
 # System prompt
@@ -262,6 +290,7 @@ TOOL USE RULES:
 - Do not retry searches with rephrased queries. One search is enough.
 - For normal queries, prefer 1-2 tool calls. For complex agentic workflows, coding tasks, and tool creation, multiple chained calls are acceptable.
 - If you feel something is important or worth remembering, create a memory and/or add it to your memory palace.
+- During non-trivial tool work, briefly tell the operator what you are checking, what you just learned, or why you are changing direction when that update is useful. Keep progress commentary concise. Continue to make the required structured tool call in the same response. Do not reveal private chain-of-thought and do not narrate every trivial tool invocation.
 
 TOOL WRITING RULES (when using create_tool):
 - Every tool file MUST have two things: the tool function, and a register_{name}_tool(registry) function.
@@ -297,4 +326,4 @@ def register_my_tool_tool(registry):
 MULTIMODAL_ROUTES = _p.get("multimodal_routes", {})
 MULTIMODAL_DISABLED_PROVIDERS = _p.get("multimodal_disabled_providers", [])
 
-del _p
+del _p, _saved_backend_endpoints
