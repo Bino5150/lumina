@@ -27,7 +27,7 @@ Companion, Security).
 - 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe)
 - 🧩 Specialized sub-agents for delegated tasks (optional, off by default)
 - ⏰ Background and scheduled task execution (optional, off by default)
-- 🗜️ Context compaction and an owner-facing `/context rebuild` continuity checkpoint
+- 🗜️ Context compaction and [Reforge](docs/reforge.md), an owner-facing `/context rebuild` transactional continuity checkpoint — live-tested to cut active context by 60–90% without touching the durable transcript
 - 💾 Memory backup, one click
 - ⌨️ Fully functional CLI mode with persona flags
 

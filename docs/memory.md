@@ -81,6 +81,11 @@ grounded in what actually happened rather than model narration. Backed by
 command family is desktop-only by design — it isn't reachable from
 Telegram, Discord, or any tool-call path.
 
+This mechanism has a name — **Reforge** — and a full technical and
+empirical reference of its own, including live-tested context-reduction
+results and an honestly-reported known limitation: see
+[Reforge](reforge.md).
+
 ## Dreaming
 
 When a session goes idle, Lumina reviews what was actually said and
