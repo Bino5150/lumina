@@ -26,7 +26,14 @@ goes through the exact same `list_knowledge`/`search_knowledge`/
   permission or asserting that something is authorized — see
   `core/knowledge_bootstrap.py`'s module docstring for why that boundary
   is structural, not just a style preference.
-- The bootstrap only ever seeds a data directory once (see that same
-  docstring's "Idempotency model"): adding an entry here does not deliver
-  it to an install that has already been seeded. That is a known,
-  documented limitation of this first pass, not an oversight.
+- The bootstrap only ever seeds a data directory once, gated on a durable
+  marker file (`<data_dir>/knowledge_packs_installed.json`) — never on
+  whether the rows themselves still exist, so a deleted entry (or all of
+  them) is never silently reinstalled. See `core/knowledge_bootstrap.py`'s
+  module docstring for the full "Idempotency model" history. Adding an
+  entry here does not deliver it to an already-seeded install by itself —
+  that needs a version bump (`PACK_VERSION` in that same module) and a
+  deliberate migration decision at that time, which the marker's
+  `version` field exists to support. That migration logic doesn't exist
+  yet; this is a known, documented limitation of this first pass, not an
+  oversight.

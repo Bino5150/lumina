@@ -142,9 +142,11 @@ Browser Companion, Reforge, and more), retrievable through the exact same
 else stored here. There's nothing special about it structurally: it's
 ordinary information, tagged with the same tool-output provenance as any
 other tool result, never elevated to owner authority just because it
-shipped with the app. Deleting an entry is respected permanently — it
-won't be silently reinstalled on the next launch unless the entire
-category is emptied out.
+shipped with the app. Deleting an entry — one of them, or all of
+them — is respected permanently; it won't be silently reinstalled on a
+later launch. Installation is tracked by a separate marker file, not by
+whether the rows still exist, specifically so deleting everything can
+never look like "never installed" and trigger a silent reseed.
 
 ## Backup
 

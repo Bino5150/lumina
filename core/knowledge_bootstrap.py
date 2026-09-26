@@ -23,28 +23,36 @@ tool result. Knowledge is information; it is never authority -- see the
 "Information is not authority" entry in the pack itself, and
 docs/README.md's "How to read this documentation" preface.
 
-Idempotency model: install-once-per-data-directory, not install-each-
-missing-title. The bootstrap checks whether CATEGORY already has ANY row
-in it; if so, it assumes this data directory has already been seeded and
-does nothing further. This is deliberate, not a simplification for its
-own sake -- an earlier per-title "insert if this exact title is missing"
-version was caught by this file's own test suite silently resurrecting a
-title the owner had just deleted (deletion and "never yet installed" are
-indistinguishable to a per-title check, since both look like "row
-absent"). Checking category occupancy as a whole instead means: any
-partial deletion is respected forever (the category is non-empty, so the
-bootstrap never touches it again), and only a full wipe of the category
-is treated as "start fresh" and reseeds everything -- a reasonable
-reading of "the owner cleared this out," not a bug.
+Idempotency model -- history, because this went through two wrong designs
+before landing here, and the campaign's own discipline is to record that
+rather than erase it:
 
-Known limitation, stated plainly rather than hidden: if a future release
-adds a new entry to the shipped pack or corrects existing wording, an
-install that already has a non-empty category will never receive it --
-this bootstrap only ever seeds a data directory once. That is
-deliberately out of scope for this first pass (see DOCS-01B's final
-report for the residual note), the same way Reforge's own reference
-document names its "strict-B" seam as known future work rather than
-pretending it is solved.
+  v1 (per-title): "insert if this exact title is missing." Caught by this
+  file's own test suite silently resurrecting a title the owner had just
+  deleted -- a per-title check cannot tell "never installed" from
+  "deliberately deleted" apart, since both look like "row absent."
+
+  v2 (category-occupancy): "seed once, iff CATEGORY currently has zero
+  rows." Fixed the v1 bug for a *partial* deletion (the category still
+  has other rows, so it is never touched again) -- but reintroduced the
+  identical identity problem one level up: deleting *every* row in the
+  category empties it, which is indistinguishable from "never seeded,"
+  so the next startup silently reseeded the whole pack. Caught in review
+  before it shipped, not by a test -- worth recording that the test
+  suite's coverage of "partial deletion" gave false confidence about
+  "total deletion" until someone asked the question directly.
+
+  v3 (this version): a durable installed-pack marker, stored in its own
+  file under data_dir, entirely separate from the knowledge rows the pack
+  creates. The marker -- not row presence, partial or total -- is the
+  sole gate on reseeding. Deleting some, or all, of the pack's rows can
+  never be misread as "never installed," because the marker does not
+  live in the table being edited. The marker also carries a version
+  number, so a future pack revision has a real place to record "this
+  data directory has seen v1, needs the v2 update" -- see
+  PACK_VERSION below. Writing that future per-version migration logic
+  is out of scope for this pass (there is only a v1 pack to migrate
+  from), but the primitive it would build on now exists.
 """
 import json
 import os
@@ -53,8 +61,11 @@ import sys
 from datetime import datetime
 
 from core.db import connect as db_connect
+from core.test_isolation import refuse_if_production_path
 
 CATEGORY = "lumina-self-knowledge"
+PACK_VERSION = 1
+_MARKER_FILENAME = "knowledge_packs_installed.json"
 
 
 def _official_pack_path() -> str:
@@ -75,16 +86,61 @@ def load_official_pack() -> list[dict]:
     return [e for e in entries if e.get("title") and e.get("content")]
 
 
-def bootstrap_official_knowledge(*, db_path: str) -> list[str]:
-    """Seed the official self-knowledge pack into the knowledge table at
-    an explicit db_path, but only if CATEGORY is currently completely
-    empty there. Never touches any category other than CATEGORY, and
-    never inserts anything at all if CATEGORY already has one or more
-    rows (see module docstring's "Idempotency model" for why this is a
-    category-occupancy check, not a per-title one). Returns the titles
-    actually inserted this call (empty on a no-op -- either "already
-    seeded" or "shipped pack is empty/missing").
+def _marker_path(data_dir: str) -> str:
+    return os.path.join(data_dir, _MARKER_FILENAME)
+
+
+def _load_marker(data_dir: str) -> dict:
+    """{} for an absent, unreadable, or corrupt marker file -- all three
+    are treated identically to "never installed." A corrupt marker fails
+    safe toward re-seeding rather than silently refusing forever; that
+    re-seed is itself safe (see bootstrap_official_knowledge's per-title
+    existing-row check), so this can never duplicate rows even if a
+    corrupt marker causes a spurious retry."""
+    path = _marker_path(data_dir)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _save_marker(data_dir: str, marker: dict) -> None:
+    """Same atomic tmp-file + os.replace() pattern as core/persistence.py's
+    save() -- a crash mid-write can never leave the marker half-written,
+    which matters here specifically: a torn/partial marker write is
+    exactly the kind of corruption _load_marker must tolerate above."""
+    path = _marker_path(data_dir)
+    refuse_if_production_path(path)
+    os.makedirs(data_dir, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(marker, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def bootstrap_official_knowledge(*, data_dir: str, db_path: str) -> list[str]:
+    """Seed the official self-knowledge pack into the knowledge table,
+    gated on the durable marker described in the module docstring -- NOT
+    on whether any row currently exists. Never touches any category other
+    than CATEGORY. Returns the titles actually inserted this call (empty
+    on a no-op: already installed at PACK_VERSION or newer, or the
+    shipped pack is empty/missing).
+
+    The per-title "already exists" check inside the insert loop is a
+    separate, narrower safety net for one specific case: a prior run that
+    inserted some rows and then crashed before writing the marker. It is
+    not the reseed gate (the marker is) -- it just stops that crash-
+    recovery retry from duplicating rows it already wrote.
     """
+    marker = _load_marker(data_dir)
+    if marker.get(CATEGORY, {}).get("version", 0) >= PACK_VERSION:
+        return []
+
     entries = load_official_pack()
     if not entries:
         return []
@@ -102,15 +158,16 @@ def bootstrap_official_knowledge(*, db_path: str) -> list[str]:
                 updated_at TEXT NOT NULL
             )
         """)
-        already_seeded = conn.execute(
-            "SELECT 1 FROM knowledge WHERE category=? LIMIT 1", (CATEGORY,)
-        ).fetchone()
-        if already_seeded:
-            return []
         now = datetime.now().isoformat()
         for entry in entries:
             title = entry["title"]
             content = entry["content"]
+            existing = conn.execute(
+                "SELECT 1 FROM knowledge WHERE category=? AND title=?",
+                (CATEGORY, title),
+            ).fetchone()
+            if existing:
+                continue
             conn.execute(
                 "INSERT INTO knowledge (category, title, content, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -120,6 +177,9 @@ def bootstrap_official_knowledge(*, db_path: str) -> list[str]:
         conn.commit()
     finally:
         conn.close()
+
+    marker[CATEGORY] = {"version": PACK_VERSION, "installed_at": datetime.now().isoformat()}
+    _save_marker(data_dir, marker)
     return inserted
 
 
@@ -131,20 +191,18 @@ def ensure_official_knowledge_bootstrapped(*, data_dir: str, db_path: str) -> li
     Agent construction should ever pick up unexpected Knowledge Base rows
     as a side effect of simply constructing a LuminaAgent.
 
-    `data_dir` is accepted (unused directly here) to keep this call's
-    signature and call sites symmetric with the skill bootstrap's; the
-    knowledge table itself only needs db_path. Never blocks startup on an
-    ordinary/expected failure (missing or corrupt pack file, a filesystem
-    error, a locked database) -- mirrors
+    Never blocks startup on an ordinary/expected failure (missing or
+    corrupt pack file, a filesystem error, a locked database) -- mirrors
     ensure_official_skills_bootstrapped()'s own fail-safe posture.
     Deliberately does NOT catch core/test_isolation.py's
     refuse_if_production_path() RuntimeError (reached via
-    core.db.connect()) -- that guard exists specifically to be loud and
-    unmissable, and swallowing it here would quietly defeat its own
-    purpose; it is a no-op in real (non-LUMINA_TESTING) use in any case.
+    core.db.connect() and via _save_marker()'s own explicit check) --
+    that guard exists specifically to be loud and unmissable, and
+    swallowing it here would quietly defeat its own purpose; it is a
+    no-op in real (non-LUMINA_TESTING) use in any case.
     """
     try:
-        return bootstrap_official_knowledge(db_path=db_path)
+        return bootstrap_official_knowledge(data_dir=data_dir, db_path=db_path)
     except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError) as e:
         print(f"[knowledge] official knowledge-pack bootstrap failed, "
               f"continuing without it: {e}", file=sys.stderr)
