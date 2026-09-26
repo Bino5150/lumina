@@ -99,6 +99,10 @@ function makeEnv(opts = {}) {
     storageSetHook: null,
     connectThrows: false,
     tabsGetHook: null,
+    createHook: null,
+    updateHook: null,
+    createCalls: [],
+    updateCalls: [],
     injectionHook: null,
     // Chrome's per-document identity (webNavigation documentId): a tab keeps
     // its id across navigations, a document does not. Replace an entry to
@@ -187,6 +191,33 @@ function makeEnv(opts = {}) {
         }
         const tab = env.tabs.find((t) => t.id === id);
         if (!tab) throw new Error(`No tab with id: ${id}.`);
+        return { ...tab };
+      },
+      async create(details) {
+        env.createCalls.push(details);
+        if (env.createHook) {
+          const hooked = await env.createHook(details);
+          if (hooked !== undefined) return hooked;
+        }
+        const id = Math.max(...env.tabs.map((t) => t.id)) + 1;
+        env.tabs.forEach((t) => { if (t.windowId === 1) t.active = false; });
+        const tab = { id, windowId: 1, active: true, incognito: false,
+          status: "complete", url: details.url, title: "" };
+        env.tabs.push(tab);
+        return { ...tab };
+      },
+      async update(id, details) {
+        env.updateCalls.push({ id, details });
+        if (env.updateHook) {
+          const hooked = await env.updateHook(id, details);
+          if (hooked !== undefined) return hooked;
+        }
+        const tab = env.tabs.find((t) => t.id === id);
+        if (!tab) throw new Error("tab gone");
+        if (details.active) {
+          env.tabs.forEach((t) => { if (t.windowId === tab.windowId) t.active = false; });
+          tab.active = true;
+        }
         return { ...tab };
       },
     },
@@ -1835,6 +1866,14 @@ function makePopup({ workerAnswer, tabUrl = "https://www.reddit.com/r/AgentsInte
 const REVOKED_NOTE = "Revoked. Lumina's companion confirmed it and discarded any read still in progress.";
 const ACK = REVOKE_OK;
 
+test("popup hides Navigation Allow when the connected worker is still the old version", async () => {
+  const popup = makePopup({ workerAnswer: async () => undefined });
+  await settle();
+  assert.equal(popup.elements.navigation.hidden, true);
+  assert.match(popup.text("navigation-state"), /Reload Lumina Chrome Companion at chrome:\/\/extensions/);
+  assert.equal(popup.calls.messages.some((message) => message.kind === "set_navigation"), false);
+});
+
 test("R3 popup: Revoke asks the worker and never removes the grant behind its back", async () => {
   const popup = makePopup({ workerAnswer: async () => {
     popup.chrome.permissions.granted = false; // the worker had Chrome remove it
@@ -2402,6 +2441,182 @@ test("R5 + R4 held-message contract: message in transit -> a pre-receipt read ma
   const late = await single(port, request("extract_text", { tab_id: 7 }));
   assert.equal(late.error.code, "site_access_required");
   assert.equal(port.sent.filter((m) => /CANARY/.test(JSON.stringify(m))).length, 1, "only the pre-receipt read");
+});
+
+// ── BC-01B-A navigation: a separate owner session grant, never a read grant ──
+
+test("navigation is off until the popup allows this exact connection", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  const url = "https://github.com/Bino5150/lumina";
+  const denied = await single(port, request("open_owner_url", { args: { url } }));
+  assert.equal(denied.error.code, "navigation_not_allowed");
+  assert.equal(env.createCalls.length, 0);
+  const forged = await env.popup({ kind: "set_navigation", allowed: true },
+    { id: EXT_ID, url: "https://github.com/" });
+  assert.equal(forged, "NO_RESPONSE");
+  assert.equal((await env.popup({ kind: "get_status" })).navigationAllowed, false);
+  assert.deepEqual(plain(await env.popup({ kind: "set_navigation", allowed: true })),
+    { ok: true, navigation_allowed: true });
+  const req = request("open_owner_url", { args: { url } });
+  const result = await single(port, req);
+  assert.equal(result.result.status, "browser_local_effect_observed");
+  assert.equal(result.result.operation_id, `${CID}:${req.request_id}`);
+  assert.equal(result.result.observed_url, url);
+  assert.equal(result.result.load_confirmed, true);
+  assert.equal(env.createCalls.length, 1);
+  assert.equal(env.injections.length, 0);
+  port.deliver(req); // same connection/request id: never a second dispatch
+  await settle();
+  assert.equal(env.createCalls.length, 1);
+});
+
+test("new worker keeps the old ping shape unless the new hub opts in", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  const oldHubPing = await single(port, request("ping"));
+  assert.deepEqual(plain(oldHubPing.result), { extension_version: "0.1.0" });
+  const newHubPing = await single(port, request("ping", { args: { include_navigation: true } }));
+  assert.deepEqual(plain(newHubPing.result), { extension_version: "0.1.0", navigation_allowed: true });
+  const malformed = await single(port, request("ping", { args: { include_navigation: 1 } }));
+  assert.equal(malformed.error.code, "invalid_args");
+});
+
+test("navigation grant is lost on PAUSE, reconnect, and worker restart", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  await env.popup({ kind: "set_paused", paused: true });
+  assert.equal(port.disconnected, true);
+  assert.equal((await env.popup({ kind: "get_status" })).navigationAllowed, false);
+  await env.popup({ kind: "set_paused", paused: false });
+  const next = env.port();
+  next.deliver({ v: 1, type: "host_status", state: "hub_connected" });
+  next.deliver({ v: 1, type: "welcome", connection_id: CID2, limits: {} });
+  await settle();
+  assert.equal((await env.popup({ kind: "get_status" })).navigationAllowed, false);
+  const restarted = makeEnv({ storage: env.storage });
+  await toReady(restarted);
+  assert.equal((await restarted.popup({ kind: "get_status" })).navigationAllowed, false);
+});
+
+test("a Companion Revoke hides tab metadata and blocks both navigation operations", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  await env.popupRevoke("https://www.reddit.com/*");
+  const listed = await single(port, request("list_tabs"));
+  const reddit = listed.result.tabs.find((t) => t.tab_id === 7);
+  assert.equal(reddit.restriction, "companion_revoked");
+  assert.equal(reddit.url, null);
+  assert.equal(reddit.title, null);
+  const opened = await single(port, request("open_owner_url", {
+    args: { url: "https://www.reddit.com/r/AgentsInteractive/" } }));
+  assert.equal(opened.error.code, "companion_revoked");
+  const switched = await single(port, request("switch_tab", { tab_id: 7,
+    args: { window_id: 1, expected_url: "https://www.reddit.com/r/AgentsInteractive/" } }));
+  assert.equal(switched.error.code, "navigated_during_request");
+  assert.equal(env.createCalls.length, 0);
+  assert.equal(env.updateCalls.length, 0);
+});
+
+test("Revoke during tab description hides metadata before the answer is sent", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  const held = deferred();
+  let first = true;
+  env.containsHook = async () => {
+    if (!first) return undefined;
+    first = false;
+    await held.promise;
+    return true; // stale Chrome answer from before Revoke
+  };
+  const req = request("list_tabs");
+  port.deliver(req);
+  await settle();
+  await env.popupRevoke("https://www.reddit.com/*");
+  held.resolve();
+  await settle(16);
+  const answer = port.sent.find((m) => m.request_id === req.request_id);
+  assert.equal(answer.ok, false);
+  assert.equal(answer.error.code, "site_access_required");
+  assert.doesNotMatch(JSON.stringify(answer), /AgentsInteractive/);
+});
+
+test("switch_tab rejects a changed identity before dispatch and confirms an exact selection", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  const stale = await single(port, request("switch_tab", { tab_id: 10,
+    args: { window_id: 1, expected_url: "https://github.com/old" } }));
+  assert.equal(stale.error.code, "navigated_during_request");
+  assert.equal(env.updateCalls.length, 0);
+  const req = request("switch_tab", { tab_id: 10,
+    args: { window_id: 1, expected_url: "https://github.com/" } });
+  const selected = await single(port, req);
+  assert.equal(selected.result.status, "browser_local_effect_observed");
+  assert.equal(selected.result.tab_id, 10);
+  assert.equal(selected.result.window_id, 1);
+  assert.equal(env.updateCalls.length, 1);
+});
+
+test("a lost Chrome create answer is ambiguous and is never retried", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  env.createHook = async () => { throw new Error("Chrome response lost"); };
+  const answer = await single(port, request("open_owner_url", {
+    args: { url: "https://github.com/" } }));
+  assert.equal(answer.ok, true);
+  assert.equal(answer.result.status, "ambiguous_after_dispatch");
+  assert.equal(env.createCalls.length, 1);
+});
+
+test("open observes a pending URL on the created tab without dispatching twice", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  const url = "https://www.reddit.com/";
+  const tab = { id: 101, windowId: 1, active: true, incognito: false,
+    status: "complete", url, title: "" };
+  env.createHook = async () => { env.tabs.push(tab); return { ...tab, url: "" }; };
+  let reads = 0;
+  env.tabsGetHook = async (id) => {
+    if (id === 101 && ++reads === 1) return { ...tab, url: "" };
+    return undefined;
+  };
+  const req = request("open_owner_url", { args: { url } });
+  port.deliver(req);
+  await settle();
+  env.runTimers(); // the one pending-URL observation delay
+  await settle(16);
+  const answer = port.sent.find((m) => m.request_id === req.request_id);
+  assert.equal(answer.result.status, "browser_local_effect_observed");
+  assert.equal(answer.result.observed_url, url);
+  assert.equal(answer.result.load_confirmed, true);
+  assert.equal(env.createCalls.length, 1);
+  assert.equal(reads, 2);
+});
+
+test("Revoke overtaking a dispatched navigation yields only an ambiguous receipt", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  const held = deferred();
+  env.createHook = async () => { await held.promise; return undefined; };
+  const req = request("open_owner_url", { args: { url: "https://github.com/private" } });
+  port.deliver(req);
+  await settle();
+  assert.equal(env.createCalls.length, 1);
+  await env.popupRevoke("https://github.com/*");
+  held.resolve();
+  await settle(16);
+  const answers = port.sent.filter((m) => m.request_id === req.request_id);
+  assert.equal(answers.length, 1);
+  assert.equal(answers[0].result.status, "ambiguous_after_dispatch");
+  assert.equal(answers[0].result.observed_url, null);
+  assert.equal(env.createCalls.length, 1);
 });
 
 // A test that awaits something that never settles would let Node drain its

@@ -29,6 +29,12 @@
 
   <button id="pause" type="button" class="primary">PAUSE LUMINA</button>
 
+  <section class="card">
+    <div class="label">Navigation in this Companion session</div>
+    <div id="navigation-state" class="muted">Checking…</div>
+    <button id="navigation" type="button" class="secondary" hidden>Allow navigation this session</button>
+  </section>
+
   <section class="card small">
     <div class="label">Pairing ID for this Chrome profile</div>
     <div class="row"><code id="instance">…</code><button id="copy" type="button" class="link">Copy</button></div>
@@ -38,7 +44,7 @@
     </div>
   </section>
 
-  <p class="footnote">Read-only. Lumina can list tabs and read sites you allow here. Pausing disconnects her immediately; only you can resume.</p>
+  <p class="footnote">Reading and navigation are separate permissions. Navigation allows Lumina to open a URL you directly requested and switch tabs in this session. It ends on disconnect or PAUSE; site Revoke blocks that site.</p>
 
   <script src="policy.js"></script>
   <script src="popup.js"></script>

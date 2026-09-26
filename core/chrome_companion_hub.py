@@ -1,11 +1,11 @@
 """
-core/chrome_companion_hub.py -- BROWSER-COMPANION-01A Lumina-side hub.
+core/chrome_companion_hub.py -- Lumina-side Chrome Companion hub.
 
 The trusted end of the Chrome Companion bridge. Listens on a private Unix
 socket (0600, inside an owner-only 0700 runtime dir; no TCP, no localhost
 HTTP/WebSocket) for the one native-host process Chrome launches per
-extension port, authenticates it, and issues bounded read-only requests on
-behalf of tools/chrome_companion.py.
+extension port, authenticates it, and issues bounded reads and the two
+BC-01B-A navigation requests on behalf of tools/chrome_companion.py.
 
 Handshake (every connection, re-read from disk every time):
     peer UID (SO_PEERCRED) == this process's UID      else drop, no reply
@@ -78,16 +78,18 @@ REJECT_TELEMETRY_INTERVAL_S = 60.0
 
 
 class CompanionError(Exception):
-    """A Chrome Companion call did not produce a trustworthy observation.
+    """A Chrome Companion call did not produce a confirmed result.
 
-    ``code`` is stable and content-free. ``executed`` is False whenever the
-    request is known not to have run in Chrome (all 01A operations are
-    read-only, so an unknown outcome is never a side-effect question)."""
+    ``code`` is stable and content-free. For an action, ``executed`` means
+    dispatch may have reached Chrome; it never asserts that an effect occurred.
+    ``operation_id`` identifies that one attempt for reconciliation."""
 
-    def __init__(self, code: str, message: str, *, executed: bool = False):
+    def __init__(self, code: str, message: str, *, executed: bool = False,
+                 operation_id: str | None = None):
         self.code = code
         self.message = message
         self.executed = executed
+        self.operation_id = operation_id
         super().__init__(f"{code}: {message}")
 
 
@@ -116,7 +118,11 @@ _DISCONNECT_MESSAGES = {
     "host_closed": "Chrome closed the companion connection (extension reloaded, "
                    "Chrome restarted, or the tab/browser went away)",
     "protocol_violation": "the companion connection was dropped after a malformed frame",
+    "unpaired": "the owner removed the Chrome Companion pairing",
+    "uninstalled": "the owner uninstalled Chrome Companion",
 }
+
+ACTION_OPS = frozenset({"open_owner_url", "switch_tab"})
 
 
 class _Waiter:
@@ -143,11 +149,14 @@ class _Connection:
     and is never revived -- a reconnect is always a new _Connection."""
 
     def __init__(self, sock: socket.socket, *, connection_id: str, seq: int,
-                 instance_fp: str, extension_version: str):
+                 instance_fp: str, extension_version: str,
+                 instance_id: str | None = None, origin: str | None = None):
         self.sock = sock
         self.connection_id = connection_id
         self.seq = seq
         self.instance_fp = instance_fp
+        self.instance_id = instance_id
+        self.origin = origin
         self.extension_version = extension_version
         self.opened_at = time.time()
         self.closed = False
@@ -465,6 +474,9 @@ class ChromeCompanionHub:
             if hello is None:
                 sock.close()
                 return
+            if hello.get("type") == "owner_revoke":
+                self._serve_owner_revoke(sock, hello)
+                return
             protocol.validate_host_hello(hello)
         except protocol.ProtocolError as exc:
             self._reject(sock, "unsupported_version" if exc.code == "unsupported_version" else "bad_hello")
@@ -487,7 +499,8 @@ class ChromeCompanionHub:
                 self._conn_seq += 1
                 conn = _Connection(sock, connection_id=secrets.token_hex(16), seq=self._conn_seq,
                                    instance_fp=state.instance_fingerprint(hello["instance_id"]),
-                                   extension_version=hello["extension_version"])
+                                   extension_version=hello["extension_version"],
+                                   instance_id=hello["instance_id"], origin=hello["origin"])
         if conn is None:
             self._reject(sock, "shutting_down")
             return
@@ -541,6 +554,28 @@ class ChromeCompanionHub:
         conn.release(cancelled)
         self._record("chrome_companion.connection", severity="warning", state="not_published",
                      reason=reason, connection_seq=conn.seq)
+
+    def _serve_owner_revoke(self, sock: socket.socket, message: dict) -> None:
+        """Retire the connection when same-UID owner CLI removed its authority."""
+        try:
+            if message.get("v") != protocol.PROTOCOL_VERSION or set(message) != {"v", "type", "reason"} \
+                    or message["reason"] not in {"unpaired", "uninstalled"}:
+                return
+            install = state.load_install(self.data_dir)
+            pairing = state.load_pairing(self.data_dir)
+            if install is not None and pairing is not None:
+                return  # never let a notification alone remove live authority
+            with self._lock:
+                conn = self._current
+                retired = self._retire_locked(conn, message["reason"]) if conn is not None else None
+            if retired is not None:
+                self._finish_retirement(conn, message["reason"], retired)
+            sock.sendall(protocol.encode_frame({"v": protocol.PROTOCOL_VERSION,
+                "type": "owner_revoke_ack", "ok": True}, protocol.MAX_TO_EXTENSION_BYTES))
+        except (OSError, state.StateError, protocol.ProtocolError):
+            pass
+        finally:
+            sock.close()
 
     def _read_loop(self, conn: _Connection) -> str:
         while True:
@@ -622,9 +657,11 @@ class ChromeCompanionHub:
         return conn.connection_id if conn is not None and not conn.closed else None
 
     def request(self, op: str, *, tab_id=None, args: dict | None = None, timeout_s: float = 10.0) -> dict:
-        """Issue one read-only request and return the validated response
-        (``result`` typed and policy-filtered). Raises CompanionError on any
-        failure -- never returns stale or partial data, never falls back."""
+        """Issue one bounded request and return a validated response.
+
+        Action failures after possible dispatch retain an operation ID and
+        ambiguity marker. Nothing is retried or routed to another browser.
+        """
         with self._lock:
             conn = self._current
         if conn is None or conn.closed:
@@ -632,16 +669,28 @@ class ChromeCompanionHub:
             self._record("chrome_companion.request", severity="warning", op=op, tab_id=tab_id,
                          result=error.code)
             raise error
+        if op in ACTION_OPS:
+            if self._authorize({"origin": conn.origin, "instance_id": conn.instance_id}) is not None:
+                with self._lock:
+                    retired = self._retire_locked(conn, "unpaired")
+                self._finish_retirement(conn, "unpaired", retired)
+                raise CompanionError("unpaired", "Chrome Companion pairing is no longer active")
+            if conn.extension_version != "0.2.0":
+                raise CompanionError("unsupported_version", "reload the BC-01B-A Chrome extension")
         started = time.monotonic()
         outcome, observed_origin, truncated = "error", None, None
         request_id = waiter = None
+        sent = False
+        worker_rejected = False
         try:
             try:
                 request_id, waiter = conn.send_request(
                     op=op, tab_id=tab_id, args=dict(args or {}),
                     deadline_ms=int((time.time() + timeout_s) * 1000))
+                sent = True
             except OSError as exc:
-                raise CompanionError("disconnected", "could not reach Chrome") from exc
+                raise CompanionError("disconnected", "could not reach Chrome",
+                                     executed=op in ACTION_OPS) from exc
             answered = waiter.event.wait(timeout_s)
             # Being woken is not success: claim() is the single terminal
             # transition, and fails if the connection was retired first.
@@ -651,6 +700,7 @@ class ChromeCompanionHub:
             truncated = response["truncated"]
             if not response["ok"]:
                 error = response["error"]
+                worker_rejected = True  # worker action errors occur before its dispatch boundary
                 raise CompanionError(error["code"], error["message"])
             if tab_id is not None and response["tab_id"] != tab_id:
                 raise CompanionError("tab_mismatch", "Chrome answered for a different tab")
@@ -658,10 +708,16 @@ class ChromeCompanionHub:
                 response["result"] = protocol.validate_result(op, response["result"])
             except protocol.ProtocolError as exc:
                 raise CompanionError("malformed_response", f"invalid {op} result ({exc.code})") from exc
+            if op in ACTION_OPS and response["result"]["operation_id"] != f"{conn.connection_id}:{request_id}":
+                raise CompanionError("malformed_response", "Chrome returned the wrong operation identity")
             self._apply_policy(op, response)
             outcome = "ok"
             return response
         except CompanionError as exc:
+            if op in ACTION_OPS and sent and not worker_rejected:
+                exc.executed = True  # possible dispatch, never proof of an effect
+            if op in ACTION_OPS and request_id is not None:
+                exc.operation_id = f"{conn.connection_id}:{request_id}"
             outcome = exc.code
             raise
         finally:
@@ -703,6 +759,13 @@ class ChromeCompanionHub:
                     or response["tab_id"] is None:
                 raise CompanionError("restricted_surface",
                                      "Chrome returned content for a restricted or unverifiable surface; discarded")
+        elif op in ACTION_OPS:
+            url = result["observed_url"]
+            if url is not None and not policy.classify_url(url).readable:
+                raise CompanionError("restricted_surface", "Chrome returned a restricted action surface")
+            if op == "switch_tab" and result["status"] == "browser_local_effect_observed" \
+                    and (response["tab_id"] != result["tab_id"] or result["tab_id"] is None):
+                raise CompanionError("tab_mismatch", "Chrome switched a different tab")
 
     # -- status ----------------------------------------------------------
 

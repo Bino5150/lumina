@@ -1450,13 +1450,14 @@ def _tool_call_fields(batch_ordinal: int, call_ordinal: int, name: str, args) ->
     uses), a bounded/redacted args representation for human debugging, and
     a stable args hash (flight_recorder.hash_args()) for duplicate-call
     detection across a turn's whole tool-burst -- mission section 6/12."""
+    private_chrome_action = name in {"chrome_open_owner_url", "chrome_switch_tab"}
     return {
         "batch_ordinal": batch_ordinal,
         "call_ordinal": call_ordinal,
         "tool_name": name,
         "tool_tier": TOOL_TIERS.get(name, "execute"),
-        "args": flight_recorder.bounded_repr(args),
-        "args_hash": flight_recorder.hash_args(args),
+        "args": "[Chrome action arguments withheld]" if private_chrome_action else flight_recorder.bounded_repr(args),
+        "args_hash": None if private_chrome_action else flight_recorder.hash_args(args),
         "start_ts": time.time(),
     }
 
@@ -1857,7 +1858,7 @@ class LuminaAgent:
             # own logged-in Chrome (Gmail/GitHub/Reddit sessions), so they must
             # never exist for a non-owner session. Registers nothing unless the
             # owner has installed the companion for this data dir.
-            register_chrome_companion_tools(self.registry)
+            register_chrome_companion_tools(self.registry, agent=self)
         register_palace_tools(self.registry)
         from tools.pin import register_pin_tools
         register_pin_tools(self.registry, channel_id)
@@ -2051,6 +2052,15 @@ class LuminaAgent:
         # word-match hook with nothing. Never derived from user_input --
         # the model has no path to this parameter either way.
         approval_event_id = approval_event_id or uuid.uuid4().hex
+        # BC-01B-A: capture only an explicit command in this authenticated
+        # ingress event. The grant lives in this execution context for this
+        # turn, never in model/tool/page text or durable conversation history.
+        from chrome_companion.navigation import begin_turn as begin_chrome_navigation_turn
+        from chrome_companion.navigation import end_turn as end_chrome_navigation_turn
+        chrome_navigation_token = begin_chrome_navigation_turn(
+            user_input, source=source, owner=getattr(self, "owner", False),
+            event_id=approval_event_id,
+        )
         # CASTLE-WALLS-REPAIR-01 R2 -- set as early as possible, before any
         # of chat()'s three add_user()-reaching branches, so a per-agent-
         # bound tool closure reading self._current_chat_id mid-turn always
@@ -2157,6 +2167,7 @@ class LuminaAgent:
                                 **_turn_telemetry_fields(turn_telemetry)})
             raise
         finally:
+            end_chrome_navigation_turn(chrome_navigation_token)
             if turn_cancellation is not None:
                 turn_cancellation._set(None)
 
@@ -3001,6 +3012,11 @@ class LuminaAgent:
                     print(f"[TOOL ERROR] {name}: {e}", flush=True)
                 _tool_duration = time.time() - _tool_start
                 _tool_success = not (isinstance(result, str) and result.startswith("[Tool error:"))
+                if name in {"chrome_open_owner_url", "chrome_switch_tab"}:
+                    try:
+                        _tool_success = json.loads(result).get("ok") is True
+                    except (TypeError, ValueError):
+                        _tool_success = False
                 _fr_machine(self, "tool.result", turn_id=turn_id, chat_id=chat_id,
                             severity="info" if _tool_success else "warning",
                             fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,

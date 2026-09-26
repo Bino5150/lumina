@@ -25,7 +25,7 @@ from core.flight_recorder import FlightRecorder
 from core.tool_profiles import OWNER_ONLY_TOOLS, TOOL_TIERS, resolve_enabled_set
 from tools.registry import ToolRegistry
 
-NAMES = chrome_tools.CHROME_TOOL_NAMES
+NAMES = chrome_tools.CHROME_READ_TOOL_NAMES
 
 
 class FakeHub:
@@ -304,8 +304,31 @@ def test_tab_id_argument_is_validated(installed):
 
 
 def test_status_reports_state_and_has_no_resume_power(installed):
-    registry = _registry(installed, FakeHub())
+    hub = FakeHub()
+    registry = _registry(installed, hub)
     status = json.loads(registry.call("chrome_status", {}))["status"]
-    assert status["round_trip"] == {"ok": True, "extension_version": "0.1.0"}
-    assert "cannot resume" in status["note"]
+    assert status["round_trip"] == {"ok": True, "extension_version": "0.1.0",
+                                    "navigation_allowed": False}
+    assert "cannot allow navigation or resume PAUSE" in status["note"]
     assert INSTANCE not in json.dumps(status)
+    assert hub.calls[-1]["args"] == {}  # legacy hub's exact ping shape
+
+
+def test_status_opts_in_to_navigation_field_only_for_new_worker(installed):
+    class NewHub(FakeHub):
+        def status(self):
+            info = super().status()
+            info["connection"]["extension_version"] = "0.2.0"
+            return info
+
+        def request(self, op, *, tab_id=None, args=None, timeout_s=10.0):
+            response = super().request(op, tab_id=tab_id, args=args, timeout_s=timeout_s)
+            if op == "ping" and args == {"include_navigation": True}:
+                response["result"] = {"extension_version": "0.2.0", "navigation_allowed": True}
+            return response
+
+    hub = NewHub()
+    status = json.loads(_registry(installed, hub).call("chrome_status", {}))["status"]
+    assert hub.calls[-1]["args"] == {"include_navigation": True}
+    assert status["round_trip"] == {"ok": True, "extension_version": "0.2.0",
+                                    "navigation_allowed": True}

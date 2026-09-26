@@ -117,6 +117,16 @@ def test_unknown_operation_rejected():
         assert action_op not in protocol.OPS
 
 
+def test_ping_navigation_status_is_explicit_opt_in_for_legacy_compatibility():
+    protocol.validate_request(_request(op="ping", tab_id=None, args={}))
+    protocol.validate_request(_request(op="ping", tab_id=None,
+                                       args={"include_navigation": True}))
+    for value in (False, 1, "true", None):
+        with pytest.raises(ProtocolError):
+            protocol.validate_request(_request(op="ping", tab_id=None,
+                                               args={"include_navigation": value}))
+
+
 @pytest.mark.parametrize("overrides", [
     {"tab_id": True},                       # bool posing as int
     {"tab_id": -1},

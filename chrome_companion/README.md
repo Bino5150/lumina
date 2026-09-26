@@ -1,13 +1,17 @@
 # Lumina Chrome Companion
 
-A **read-only** bridge that lets Lumina see tabs in *her own* Google Chrome
+A bounded bridge that lets Lumina see tabs in *her own* Google Chrome
 profile — the one where she is already signed in — instead of only the
 disposable Playwright browser.
 
 - Lists tabs (URL, title), finds the active tab.
 - Reads bounded visible text and links from sites **you** have allowed.
-- Cannot click, type, submit, navigate, take screenshots, read cookies or
-  passwords. Those capabilities do not exist in this version.
+- With a separate, temporary **Navigation Allow** in the popup, opens one URL
+  explicitly supplied in the current owner command or switches to an observed
+  tab. Navigation Allow ends when the Companion disconnects or PAUSE is used.
+- Cannot click page elements, type, submit, follow observed links, use browser
+  back/forward, take screenshots, or read cookies or passwords. Those
+  capabilities do not exist in this version.
 - Never touches Firefox or any other browser.
 - The Playwright `browser_*` tools are unchanged and separate; nothing falls
   back from one to the other.
@@ -63,6 +67,26 @@ your tabs
   "restricted sites" list is not a way to withdraw Lumina's access: in
   testing on Chrome 154 it did not stop this extension's reads. Use the
   popup, or PAUSE.)
+- **Navigation Allow is separate from Read Allow.** It is a grant for the
+  current Companion connection only, and must be clicked again after PAUSE,
+  disconnect, extension restart, or Lumina restart. It does not let a page
+  select a destination. To open a URL, begin a fresh owner message with
+  `open`, `visit`, `go to`, or `navigate to` followed by the URL (for example,
+  `open https://github.com/example`). Lumina may dispatch that exact URL once
+  for that owner event. Replaying the same owner event cannot open it again.
+  `switch_tab` needs the tab ID, window ID, and exact current URL; Chrome
+  checks them again before selecting the tab. Neither action falls back to
+  Playwright.
+- Revoke in the popup also hides that site's URL and title from Companion
+  tab listings. An opaque tab ID may remain visible. It refuses navigation
+  to or selection of a revoked site until the owner clicks Allow for that
+  site again. PAUSE stops all reads and actions. Unpair and uninstall retire
+  the current connection immediately.
+- Each action has a unique operation ID. A response distinguishes a browser
+  local effect from an ambiguous outcome after dispatch. A timeout or lost
+  answer after dispatch stays ambiguous and is never retried automatically.
+  A reported tab load is an observation inside Chrome, not proof of any
+  remote site's commit or resulting account change.
 - Restricted surfaces are never read: every non-`http(s)` scheme
   (`chrome://`, `chrome-extension://`, `file://`, `data:`, …), incognito
   tabs, and password/payment/account-security hosts such as
@@ -109,6 +133,9 @@ the default install uses `~/.local/share/lumina`).
 4. Restart Lumina. The popup should show **Connected to Lumina**.
 5. On a site you want Lumina to read, open the popup and click
    **Allow Lumina to read this site**.
+6. To permit the two navigation actions during this connection, click
+   **Allow navigation this session** in the popup. **Stop navigation** or
+   **PAUSE LUMINA** withdraws it.
 
 `status`, `unpair` and `uninstall` are also available. Reloading the
 extension keeps its pairing; removing it creates a new pairing ID.

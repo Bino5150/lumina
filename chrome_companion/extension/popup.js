@@ -78,6 +78,19 @@ async function renderStatus() {
   const paused = status && status.state === "PAUSED";
   $("pause").textContent = paused ? "RESUME LUMINA" : "PAUSE LUMINA";
   $("pause").classList.toggle("resume", Boolean(paused));
+  const ready = status && status.state === "READY";
+  // An unpacked extension can load this new popup from disk while Chrome
+  // keeps the previous service worker running. Its get_status response has
+  // no navigationAllowed field; show a reload instruction, never a button
+  // that the old worker cannot answer.
+  const navigationWorker = status && typeof status.navigationAllowed === "boolean";
+  $("navigation").hidden = !ready || !navigationWorker;
+  $("navigation").textContent = status && status.navigationAllowed
+    ? "Stop navigation" : "Allow navigation this session";
+  $("navigation-state").textContent = !ready ? "Connect and resume Companion first."
+    : !navigationWorker ? "Reload Lumina Chrome Companion at chrome://extensions to enable navigation."
+    : status.navigationAllowed ? "Allowed for this connection only."
+      : "Navigation is off; site reading is separate.";
   $("instance").textContent = formatId(status && status.instanceId);
   $("pair-hint").hidden = !(status && (status.lastError === "unpaired" || status.lastError === "wrong_instance"));
   const action = status && status.lastAction;
@@ -252,6 +265,23 @@ $("pause").addEventListener("click", async () => {
     return;
   }
   await render();
+});
+
+$("navigation").addEventListener("click", async () => {
+  if (!lastStatus || lastStatus.state !== "READY") return;
+  if (typeof lastStatus.navigationAllowed !== "boolean") return;
+  const allowed = !lastStatus.navigationAllowed;
+  try {
+    const result = await chrome.runtime.sendMessage({ kind: "set_navigation", allowed });
+    if (!result || result.ok !== true) {
+      $("navigation-state").textContent = "Companion did not confirm. Reload the extension at chrome://extensions and try again.";
+      return;
+    }
+  } catch {
+    $("navigation-state").textContent = "Companion did not confirm. Reload the extension at chrome://extensions and try again.";
+    return;
+  }
+  await renderStatus();
 });
 
 $("copy").addEventListener("click", async () => {

@@ -162,6 +162,10 @@ def uninstall(data_dir, *, chrome_dir: Path | None = None) -> list[str]:
     otherwise untrusted is left alone."""
     removed = []
     data_dir = state.absolute_path(data_dir)  # never resolved (R4 / AR4)
+    try:
+        prior_install = state.load_install(data_dir)
+    except state.StateError:
+        prior_install = None  # retain the existing hostile-path uninstall refusal
     host_dir = native_host_dir(data_dir)
     manifest_path = host_manifest_path(chrome_dir)
     if _remove_own_manifest(manifest_path, host_dir / LAUNCHER_FILENAME):
@@ -187,4 +191,9 @@ def uninstall(data_dir, *, chrome_dir: Path | None = None) -> list[str]:
                 removed.append(str(state.companion_dir(data_dir) / name))
     finally:
         os.close(companion_fd)
+    from chrome_companion.owner_control import retire_live_connection
+    try:
+        retire_live_connection(prior_install.socket_path if prior_install else None, "uninstalled")
+    except OSError as exc:
+        raise state.StateError(f"uninstalled but live connection retirement was not confirmed: {exc}") from exc
     return removed

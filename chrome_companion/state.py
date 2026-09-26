@@ -619,13 +619,20 @@ def save_pairing(data_dir, *, instance_id: str, extension_origin: str) -> Pairin
 def clear_pairing(data_dir) -> bool:
     """Remove the enrolment. The name is unlinked inside the anchored companion
     directory; a link there is removed itself, never followed."""
+    install = load_install(data_dir)
     dir_fd = _open_existing_companion_dir(data_dir)
     if dir_fd is None:
         return False
     try:
-        os.unlink(PAIRING_FILENAME, dir_fd=dir_fd)
+        try:
+            os.unlink(PAIRING_FILENAME, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return False
+        from chrome_companion.owner_control import retire_live_connection
+        try:
+            retire_live_connection(install.socket_path if install else None, "unpaired")
+        except OSError as exc:
+            raise StateError(f"pairing removed but live connection retirement was not confirmed: {exc}") from exc
         return True
-    except FileNotFoundError:
-        return False
     finally:
         os.close(dir_fd)

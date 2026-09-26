@@ -155,6 +155,31 @@ def test_full_read_path_through_real_worker_host_and_hub(world):
     assert CANARY not in repr(world.recorder.events)
 
 
+def test_owner_granted_navigation_through_worker_host_and_hub(world):
+    chrome = world.launch()
+    _ready(world.hub)
+    url = "https://github.com/Bino5150/lumina"
+    with pytest.raises(CompanionError) as denied:
+        world.hub.request("open_owner_url", args={"url": url}, timeout_s=5)
+    assert denied.value.code == "navigation_not_allowed" and denied.value.executed is False
+    assert chrome.command(cmd="navigation", allowed=True)["result"] == {
+        "ok": True, "navigation_allowed": True}
+    opened = world.hub.request("open_owner_url", args={"url": url}, timeout_s=5)["result"]
+    assert opened["status"] == "browser_local_effect_observed"
+    assert opened["load_confirmed"] is True and opened["observed_url"] == url
+    assert opened["tab_id"] > 10 and opened["window_id"] == 1
+    selected = world.hub.request("switch_tab", tab_id=7,
+                                 args={"window_id": 1, "expected_url": REDDIT}, timeout_s=5)["result"]
+    assert selected["status"] == "browser_local_effect_observed" and selected["tab_id"] == 7
+    grant = "https://github.com/*"
+    assert chrome.command(cmd="popup_revoke", pattern=grant)["result"]["invalidated"] is True
+    hidden = {t["tab_id"]: t for t in world.hub.request("list_tabs", timeout_s=5)["result"]["tabs"]}
+    assert hidden[opened["tab_id"]]["url"] is None and hidden[opened["tab_id"]]["title"] is None
+    with pytest.raises(CompanionError) as revoked:
+        world.hub.request("open_owner_url", args={"url": url}, timeout_s=5)
+    assert revoked.value.code == "companion_revoked" and revoked.value.executed is False
+
+
 def test_pause_and_resume_through_the_real_chain(world):
     chrome = world.launch()
     cid = _ready(world.hub)
@@ -335,7 +360,9 @@ def test_r5_popup_revoke_chrome_refuses_the_site_stays_blocked_through_restart_u
         assert CANARY not in exc.value.message
     refused()
     tab = {t["tab_id"]: t for t in world.hub.request("list_tabs", timeout_s=5)["result"]["tabs"]}[7]
-    assert tab["site_access"] == "not_granted"
+    assert tab["site_access"] == "restricted"
+    assert tab["restriction"] == "companion_revoked"
+    assert tab["url"] is None and tab["title"] is None
     chrome.command(cmd="grant", pattern=grant)  # Chrome (its settings) grants it: not the owner's Allow
     refused()
     chrome.crash()

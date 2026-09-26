@@ -1,4 +1,4 @@
-"""Chrome Companion wire protocol (BROWSER-COMPANION-01A), stdlib-only.
+"""Chrome Companion wire protocol (01A reads and 01B-A navigation), stdlib-only.
 
 Shared by the Lumina-side hub (core/chrome_companion_hub.py) and the
 Chrome-launched native host (chrome_companion/native_host.py). The MV3
@@ -73,11 +73,12 @@ MAX_IN_FLIGHT = 8
 REQUEST_SEQ_HEX = 12
 MAX_REQUEST_SEQ = 16 ** REQUEST_SEQ_HEX - 1
 
-OPS = frozenset({"ping", "list_tabs", "get_active_tab", "get_tab", "extract_text", "get_links"})
+OPS = frozenset({"ping", "list_tabs", "get_active_tab", "get_tab", "extract_text", "get_links",
+                 "open_owner_url", "switch_tab"})
 # tab_id rules per op: required, optional (null = the active tab), or absent.
-OPS_TAB_REQUIRED = frozenset({"get_tab"})
+OPS_TAB_REQUIRED = frozenset({"get_tab", "switch_tab"})
 OPS_TAB_OPTIONAL = frozenset({"extract_text", "get_links"})
-OPS_TAB_NONE = frozenset({"ping", "list_tabs", "get_active_tab"})
+OPS_TAB_NONE = frozenset({"ping", "list_tabs", "get_active_tab", "open_owner_url"})
 OP_ARGS = {
     "ping": {},
     "list_tabs": {},
@@ -85,6 +86,10 @@ OP_ARGS = {
     "get_tab": {},
     "extract_text": {"max_chars": (1, MAX_TEXT_CHARS)},
     "get_links": {"max_links": (1, MAX_LINKS)},
+    # Action arguments are checked separately below; they are strings and
+    # identities, not the bounded integer arguments of the 01A read ops.
+    "open_owner_url": {},
+    "switch_tab": {},
 }
 
 EXTENSION_TO_HUB_TYPES = frozenset({"response", "bye"})
@@ -350,6 +355,22 @@ def validate_request(message: dict) -> dict:
     args = message["args"]
     if not isinstance(args, dict):
         raise ProtocolError("invalid_args", "args")
+    if op == "ping":
+        if args != {} and not (set(args) == {"include_navigation"} and args["include_navigation"] is True):
+            raise ProtocolError("invalid_args", "ping args")
+        return message
+    if op == "open_owner_url":
+        if set(args) != {"url"} or not _bounded_str(args.get("url"), MAX_TAB_URL_CHARS) \
+                or not args["url"]:
+            raise ProtocolError("invalid_args", "url")
+        return message
+    if op == "switch_tab":
+        if set(args) != {"window_id", "expected_url"} \
+                or not _is_int(args.get("window_id")) \
+                or not _bounded_str(args.get("expected_url"), MAX_TAB_URL_CHARS) \
+                or not args["expected_url"]:
+            raise ProtocolError("invalid_args", "tab identity")
+        return message
     spec = OP_ARGS[op]
     if set(args) - set(spec):
         raise ProtocolError("invalid_args", "unknown arg")
@@ -438,9 +459,31 @@ def validate_result(op: str, result):
     if op == "ping":
         if not isinstance(result, dict):
             raise ProtocolError("bad_result", "ping")
-        _require_exact_keys(result, {"extension_version"})
+        _require_exact_keys(result, {"extension_version"}, {"navigation_allowed"})
         if not _bounded_str(result["extension_version"], 32):
             raise ProtocolError("bad_result", "extension_version")
+        if "navigation_allowed" in result and not _is_bool(result["navigation_allowed"]):
+            raise ProtocolError("bad_result", "navigation_allowed")
+        return result
+    if op in {"open_owner_url", "switch_tab"}:
+        if not isinstance(result, dict):
+            raise ProtocolError("bad_result", "action")
+        _require_exact_keys(result, {"operation_id", "status", "tab_id", "window_id",
+                                     "observed_url", "load_confirmed"})
+        if not _bounded_str(result["operation_id"], 65) \
+                or not re.fullmatch(r"[0-9a-f]{32}:[0-9a-f]{32}", result["operation_id"]):
+            raise ProtocolError("bad_result", "operation_id")
+        if result["status"] not in {"dispatched", "browser_local_effect_observed",
+                                    "ambiguous_after_dispatch"}:
+            raise ProtocolError("bad_result", "action status")
+        if result["tab_id"] is not None and not (_is_int(result["tab_id"]) and result["tab_id"] >= 0):
+            raise ProtocolError("bad_result", "tab_id")
+        if result["window_id"] is not None and not _is_int(result["window_id"]):
+            raise ProtocolError("bad_result", "window_id")
+        if not _bounded_str(result["observed_url"], MAX_TAB_URL_CHARS, allow_none=True):
+            raise ProtocolError("bad_result", "observed_url")
+        if not _is_bool(result["load_confirmed"]):
+            raise ProtocolError("bad_result", "load_confirmed")
         return result
     if op == "list_tabs":
         if not isinstance(result, dict):

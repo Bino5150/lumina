@@ -31,4 +31,4 @@ def test_extension_version_bumped_for_the_r5_1_revoke_contract():
     """A live harness gates on extension_version: Chrome still running the R5
     worker/popup (0.1.5, which lifted the block on a confirmed removal) must
     not pass for this candidate."""
-    assert json.loads((EXTENSION / "manifest.json").read_text())["version"] == "0.1.6"
+    assert json.loads((EXTENSION / "manifest.json").read_text())["version"] == "0.2.0"

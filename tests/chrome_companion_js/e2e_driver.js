@@ -146,6 +146,23 @@ const chrome = {
       if (!tab) throw new Error(`No tab with id: ${id}.`);
       return { ...tab };
     },
+    async create({ url, active }) {
+      const id = Math.max(...tabs.map((t) => t.id)) + 1;
+      if (active) tabs.forEach((t) => { if (t.windowId === 1) t.active = false; });
+      const tab = { id, windowId: 1, active: Boolean(active), incognito: false,
+        status: "complete", url, title: "" };
+      tabs.push(tab);
+      return { ...tab };
+    },
+    async update(id, { active }) {
+      const tab = tabs.find((t) => t.id === id);
+      if (!tab) throw new Error(`No tab with id: ${id}.`);
+      if (active) {
+        tabs.forEach((t) => { if (t.windowId === tab.windowId) t.active = false; });
+        tab.active = true;
+      }
+      return { ...tab };
+    },
   },
   permissions: {
     async contains({ origins }) { return origins.every((o) => granted.has(o)); },
@@ -215,6 +232,9 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       emit({ event: "ack", cmd: command.cmd, result: await popup({ kind: "set_paused", paused: command.cmd === "pause" }) });
     } else if (command.cmd === "status") {
       emit({ event: "status", ...(await popup({ kind: "get_status" })) });
+    } else if (command.cmd === "navigation") {
+      emit({ event: "ack", cmd: "navigation",
+        result: await popup({ kind: "set_navigation", allowed: command.allowed === true }) });
     } else if (command.cmd === "grant") {
       granted.add(command.pattern);
       emit({ event: "ack", cmd: "grant" });

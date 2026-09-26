@@ -1,10 +1,10 @@
 // Lumina Chrome Companion service worker (BROWSER-COMPANION-01A).
 //
-// A SENSOR, NOT AN AUTHORITY SOURCE. This worker answers bounded, read-only
-// requests from Lumina's hub (via the native host) about tabs in this Chrome
-// profile. It has no content scripts, no page message bridge
-// (window.postMessage), no externally_connectable surface, and no action
-// primitives: the page can never manufacture a command. Page text is read
+// A SENSOR, NOT AN AUTHORITY SOURCE. This worker answers bounded reads and
+// two owner-granted navigation requests from Lumina's hub (via the native
+// host) in this Chrome profile. It has no content scripts, no page message
+// bridge (window.postMessage), or externally_connectable surface: the page
+// can never manufacture a command. Page text is read
 // by chrome.scripting.executeScript in the ISOLATED world, only on sites the
 // owner granted through this extension's popup, never on restricted surfaces
 // (policy.js) or incognito tabs.
@@ -87,15 +87,16 @@ const HEX32 = /^[0-9a-f]{32}$/;
 const REQUEST_SEQ_HEX = 12;
 const REQUEST_KEYS = ["v", "type", "connection_id", "request_id", "op", "tab_id", "deadline_ms", "args"];
 const OP_TAB_RULE = { ping: "none", list_tabs: "none", get_active_tab: "none", get_tab: "required",
-  extract_text: "optional", get_links: "optional" };
+  extract_text: "optional", get_links: "optional", open_owner_url: "none", switch_tab: "required" };
 const OP_ARGS = { ping: {}, list_tabs: {}, get_active_tab: {}, get_tab: {},
-  extract_text: { max_chars: [1, LIMITS.MAX_TEXT_CHARS] }, get_links: { max_links: [1, LIMITS.MAX_LINKS] } };
+  extract_text: { max_chars: [1, LIMITS.MAX_TEXT_CHARS] }, get_links: { max_links: [1, LIMITS.MAX_LINKS] },
+  open_owner_url: null, switch_tab: null };
 const TAB_STATUS = new Set(["loading", "complete", "unloaded"]);
 // Fixed, content-free error texts. Raw Chrome error strings can embed URLs,
 // so they never cross the bridge.
 const ERROR_MESSAGES = Object.freeze({
   wrong_connection: "request addressed to a different connection",
-  unknown_op: "operation not supported by this read-only companion",
+  unknown_op: "operation not supported by this companion",
   invalid_args: "malformed request arguments",
   deadline_expired: "request deadline passed before it could be answered",
   tab_not_found: "no readable tab with that id",
@@ -107,6 +108,8 @@ const ERROR_MESSAGES = Object.freeze({
   document_identity_unavailable: "Chrome did not provide a document identity for this tab; nothing was read",
   injection_failed: "Chrome could not read this page",
   chrome_api_error: "Chrome API call failed",
+  navigation_not_allowed: "navigation is not allowed for this Companion session",
+  companion_revoked: "the owner revoked this site in Lumina Companion",
 });
 
 let paused = true; // fail closed until the persisted switch is read
@@ -175,7 +178,8 @@ function publicState() {
 }
 
 function statusSnapshot() {
-  return { state: publicState(), lastError, lastAction, updatedAt: Date.now() };
+  return { state: publicState(), navigationAllowed: Boolean(session && session.state === "READY"
+    && session.navigationAllowed && !paused), lastError, lastAction, updatedAt: Date.now() };
 }
 
 async function publishStatus() {
@@ -223,7 +227,8 @@ function connect() {
     void publishStatus();
     return;
   }
-  const s = { port, state: "CONNECTING", connectionId: null, lastSeq: 0, closed: false, endReason: null };
+  const s = { port, state: "CONNECTING", connectionId: null, lastSeq: 0, closed: false,
+    navigationAllowed: false, navigationEpoch: 0, endReason: null };
   session = s;
   port.onMessage.addListener((message) => onHostMessage(s, message));
   port.onDisconnect.addListener(() => onPortDisconnect(s));
@@ -247,6 +252,8 @@ function connect() {
 function teardown(s, reason, { retry = true } = {}) {
   if (s.closed) return;
   s.closed = true;
+  s.navigationAllowed = false;
+  s.navigationEpoch += 1;
   if (session === s) session = null;
   lastError = reason;
   try {
@@ -262,6 +269,8 @@ function onPortDisconnect(s) {
   const detail = (chrome.runtime.lastError && chrome.runtime.lastError.message) || "";
   if (s.closed || s !== session) return;
   s.closed = true;
+  s.navigationAllowed = false;
+  s.navigationEpoch += 1;
   session = null;
   if (s.endReason) lastError = s.endReason;
   else if (/not found/i.test(detail)) lastError = "host_not_installed";
@@ -338,6 +347,22 @@ function validateRequest(req) {
   if (rule === "none" && req.tab_id !== null) return "invalid_args";
   if (!Number.isSafeInteger(req.deadline_ms) || req.deadline_ms <= 0) return "invalid_args";
   if (!isPlainObject(req.args)) return "invalid_args";
+  if (req.op === "ping") {
+    // The daily 01A hub sends {} and requires the exact 01A result shape.
+    // Only a 01B-A hub opts in to the additional navigation status field.
+    return Object.keys(req.args).length === 0
+      || (Object.keys(req.args).length === 1 && req.args.include_navigation === true)
+      ? null : "invalid_args";
+  }
+  if (req.op === "open_owner_url") {
+    return Object.keys(req.args).length === 1 && typeof req.args.url === "string"
+      && req.args.url.length > 0 && req.args.url.length <= LIMITS.MAX_TAB_URL_CHARS ? null : "invalid_args";
+  }
+  if (req.op === "switch_tab") {
+    return Object.keys(req.args).length === 2 && Number.isSafeInteger(req.args.window_id)
+      && typeof req.args.expected_url === "string" && req.args.expected_url.length > 0
+      && req.args.expected_url.length <= LIMITS.MAX_TAB_URL_CHARS ? null : "invalid_args";
+  }
   const spec = OP_ARGS[req.op];
   for (const [name, value] of Object.entries(req.args)) {
     if (!spec[name]) return "invalid_args";
@@ -380,25 +405,59 @@ async function handleRequest(s, req) {
   if (problem) return fail(problem);
   if (Date.now() > req.deadline_ms) return fail("deadline_expired");
 
+  const metadataEpoch = grantRevocations;
   let outcome;
   try {
     outcome = await OPERATIONS[req.op](req, live);
   } catch (error) {
-    outcome = error instanceof CompanionFailure
-      ? { error: error.code, tab_id: error.tabId }
-      : { error: "chrome_api_error", tab_id: null };
+    outcome = req._actionDispatched
+      ? { result: actionReceipt(req, "ambiguous_after_dispatch") }
+      : error instanceof CompanionFailure
+        ? { error: error.code, tab_id: error.tabId }
+        : { error: "chrome_api_error", tab_id: null };
   }
   // The awaited Chrome call may have spanned PAUSE, a disconnect, or a
   // reconnect. A result from a dead session is dropped, never forwarded.
   if (!live()) return;
-  if (Date.now() > req.deadline_ms) return fail("deadline_expired", outcome.tab_id ?? null);
+  if (Date.now() > req.deadline_ms) {
+    if ((req.op === "open_owner_url" || req.op === "switch_tab") && outcome.result) {
+      outcome.result.status = "ambiguous_after_dispatch";
+    } else {
+      return fail("deadline_expired", outcome.tab_id ?? null);
+    }
+  }
   if (outcome.error) return fail(outcome.error, outcome.tab_id ?? null);
+  if ((req.op === "list_tabs" || req.op === "get_tab" || req.op === "get_active_tab")
+    && !grantHeld(metadataEpoch)) return fail("site_access_required", outcome.tab_id ?? null);
+  // A popup Revoke can arrive while describeTab awaits Chrome permission.
+  // Hide metadata again in the send tick, including a site just revoked.
+  if (req.op === "list_tabs" || req.op === "get_tab" || req.op === "get_active_tab") {
+    const hide = (tab) => {
+      if (!tab || tab.restricted || !tab.url) return tab;
+      const verdict = LuminaPolicy.classifyUrl(tab.url);
+      return blockedSites.has(verdict.pattern)
+        ? { ...tab, restricted: true, restriction: "companion_revoked",
+          site_access: "not_granted", url: null, title: null }
+        : tab;
+    };
+    if (req.op === "list_tabs") outcome.result.tabs = outcome.result.tabs.map(hide);
+    else outcome.result = hide(outcome.result);
+  }
   // Commit gate, part 2 (R2 / B2, R3 / B2-R3), in the same tick as the send:
   // no withdrawal the worker knows of began at any point since this read
   // began -- not even one the owner restored before it ended -- and no popup
   // revoke is still waiting for Chrome.
   if (outcome.grantEpoch !== undefined && !grantHeld(outcome.grantEpoch)) {
     return fail("site_access_required", outcome.tab_id ?? null);
+  }
+  if ((req.op === "open_owner_url" || req.op === "switch_tab") && outcome.result
+    && (!s.navigationAllowed || s.navigationEpoch !== outcome.navigationEpoch
+      || !grantHeld(outcome.actionGrantEpoch) || blockedSites.has(outcome.targetPattern))) {
+    // A browser action may already have happened. Never report it as a
+    // confirmed local effect after an owner control overtook it.
+    outcome.result.status = "ambiguous_after_dispatch";
+    outcome.result.observed_url = null;
+    outcome.result.load_confirmed = false;
   }
   if (send({ ok: true, result: outcome.result, tab_id: outcome.tab_id ?? null,
     observed: outcome.observed ?? null, truncated: Boolean(outcome.truncated) })) {
@@ -408,7 +467,7 @@ async function handleRequest(s, req) {
 }
 
 // ---------------------------------------------------------------------------
-// Operations (read-only)
+// Operations
 // ---------------------------------------------------------------------------
 
 function safeSlice(text, limit) {
@@ -442,6 +501,12 @@ async function describeTab(tab, accessCache) {
   if (!verdict.readable || tab.url.length > LIMITS.MAX_TAB_URL_CHARS) {
     return { ...base, restricted: true, restriction: verdict.reason || "url_too_long",
       site_access: "restricted", url: null, title: null };
+  }
+  // A Companion Revoke now hides metadata too. Chrome's tabs API can still
+  // supply it, but Lumina must receive only an opaque tab identity.
+  if (blockedSites.has(verdict.pattern)) {
+    return { ...base, restricted: true, restriction: "companion_revoked",
+      site_access: "not_granted", url: null, title: null };
   }
   let access = accessCache.get(verdict.pattern);
   if (access === undefined) {
@@ -649,9 +714,60 @@ async function readPage(req, func, funcArg, live) {
     observed: { url: before, origin: verdict.origin, document_id: start.documentId } };
 }
 
+// BC-01B-A actions never execute page code. The owner supplies a URL in a
+// trusted ingress event; the hub checks that provenance before forwarding it.
+// The worker independently enforces its own live session grant and site block.
+function navigationVerdict(s, url, live) {
+  if (!live() || !s.navigationAllowed) throw new CompanionFailure("navigation_not_allowed");
+  let parsed;
+  try { parsed = new URL(url); } catch { throw new CompanionFailure("invalid_args"); }
+  if (parsed.username || parsed.password || parsed.hash || parsed.href.length > LIMITS.MAX_TAB_URL_CHARS) {
+    throw new CompanionFailure("invalid_args");
+  }
+  const verdict = LuminaPolicy.classifyUrl(parsed.href);
+  if (!verdict.readable) throw new CompanionFailure("restricted_surface");
+  if (blockedSites.has(verdict.pattern) || revocationsPending) throw new CompanionFailure("companion_revoked");
+  return verdict;
+}
+
+function actionReceipt(req, status, tab = null, observedUrl = null, loadConfirmed = false) {
+  return { operation_id: `${req.connection_id}:${req.request_id}`, status,
+    tab_id: tab && isTabId(tab.id) ? tab.id : null,
+    window_id: tab && Number.isSafeInteger(tab.windowId) ? tab.windowId : null,
+    observed_url: observedUrl, load_confirmed: Boolean(loadConfirmed) };
+}
+
+async function safeActionTab(tabId, expectedWindow = null) {
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); } catch { return null; }
+  if (!tab || tab.incognito || !isTabId(tab.id)
+    || (expectedWindow !== null && tab.windowId !== expectedWindow)) return null;
+  const verdict = LuminaPolicy.classifyUrl(tab.url);
+  if (!verdict.readable || blockedSites.has(verdict.pattern)) return null;
+  return tab;
+}
+
+async function settleCreatedTab(tabId, req, s, navEpoch, grantEpoch, live) {
+  // tabs.create can answer with an ID before Chrome publishes its URL in
+  // tabs.get. Observe that same tab briefly; never issue a second create or
+  // navigation. A control change or deadline ends observation immediately.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
+      || grantRevocations !== grantEpoch || Date.now() >= req.deadline_ms) return null;
+    const tab = await safeActionTab(tabId);
+    if (tab) return tab;
+    if (attempt < 19) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
+
 const OPERATIONS = Object.freeze({
-  async ping() {
-    return { result: { extension_version: chrome.runtime.getManifest().version } };
+  async ping(req) {
+    const result = { extension_version: chrome.runtime.getManifest().version };
+    if (req.args.include_navigation === true) {
+      result.navigation_allowed = Boolean(session && session.navigationAllowed);
+    }
+    return { result };
   },
 
   async list_tabs() {
@@ -707,6 +823,69 @@ const OPERATIONS = Object.freeze({
       tab_id: tabId, observed, host, grantEpoch,
       truncated: Boolean(page.truncated) || links.length < page.links.length,
     };
+  },
+
+  async open_owner_url(req, live) {
+    const s = session;
+    const verdict = navigationVerdict(s, req.args.url, live);
+    const navEpoch = s.navigationEpoch;
+    const grantEpoch = grantRevocations;
+    if (Date.now() > req.deadline_ms) throw new CompanionFailure("deadline_expired");
+    // This is the dispatch boundary. A failure or disconnect from here on is
+    // ambiguous; Chrome may have created the tab before an answer was lost.
+    let created;
+    req._actionDispatched = true;
+    try {
+      created = await chrome.tabs.create({ url: req.args.url, active: true });
+    } catch {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch"),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
+    if (!created || !isTabId(created.id)) {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch"),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
+    const current = await settleCreatedTab(created.id, req, s, navEpoch, grantEpoch, live);
+    if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
+      || grantRevocations !== grantEpoch || blockedSites.has(verdict.pattern) || !current) {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch", created),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
+    const doc = current.status === "complete" ? await mainDocument(created.id) : null;
+    const loaded = Boolean(doc && doc.url === current.url);
+    return { result: actionReceipt(req, "browser_local_effect_observed", current,
+      current.url, loaded), tab_id: current.id, navigationEpoch: navEpoch,
+      actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+  },
+
+  async switch_tab(req, live) {
+    const s = session;
+    const before = await safeActionTab(req.tab_id, req.args.window_id);
+    if (!before || before.url !== req.args.expected_url) {
+      throw new CompanionFailure("navigated_during_request", req.tab_id);
+    }
+    const verdict = navigationVerdict(s, before.url, live);
+    const navEpoch = s.navigationEpoch;
+    const grantEpoch = grantRevocations;
+    if (Date.now() > req.deadline_ms) throw new CompanionFailure("deadline_expired", req.tab_id);
+    let updated;
+    req._actionDispatched = true;
+    try {
+      updated = await chrome.tabs.update(req.tab_id, { active: true });
+    } catch {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch"),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
+    const current = await safeActionTab(req.tab_id, req.args.window_id);
+    if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
+      || grantRevocations !== grantEpoch || blockedSites.has(verdict.pattern)
+      || !current || !current.active || current.url !== before.url || !updated) {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch", updated),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
+    return { result: actionReceipt(req, "browser_local_effect_observed", current,
+      current.url, current.status === "complete"), tab_id: current.id,
+      navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
   },
 });
 
@@ -848,6 +1027,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.kind === "set_paused" && typeof message.paused === "boolean") {
     void setPaused(message.paused).then(sendResponse);
     return true;
+  }
+  if (message.kind === "set_navigation" && typeof message.allowed === "boolean") {
+    const s = session;
+    if (!s || s.closed || s.state !== "READY" || paused) {
+      sendResponse({ ok: false, error: "not_connected" });
+      return false;
+    }
+    s.navigationAllowed = message.allowed;
+    s.navigationEpoch += 1;
+    void publishStatus();
+    sendResponse({ ok: true, navigation_allowed: s.navigationAllowed });
+    return false;
   }
   if (message.kind === "revoke_site") {
     if (!isSitePattern(message.pattern)) return false;

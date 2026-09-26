@@ -1,5 +1,5 @@
 """
-tools/chrome_companion.py -- BROWSER-COMPANION-01A read-only Chrome tools.
+tools/chrome_companion.py -- bounded Chrome Companion reads and navigation.
 
 Explicit companion primitives over Lumina's own, already-authenticated
 Google Chrome profile (see chrome_companion/ and core/chrome_companion_hub.py):
@@ -10,15 +10,17 @@ Google Chrome profile (see chrome_companion/ and core/chrome_companion_hub.py):
     chrome_get_url_title         URL + title of one tab
     chrome_extract_visible_text  bounded visible text of one tab
     chrome_get_links             bounded link list of one tab
+    chrome_open_owner_url        one URL from this authenticated owner turn
+    chrome_switch_tab            select an exact observed tab identity
 
 Deliberately NOT the Playwright lane: tools/browser.py keeps owning the
 clean, disposable, isolated browser, and no browser_* call is ever routed
 here. A companion failure is reported as a failure -- never silently
 retried through Playwright, never answered with data from an old connection.
 
-01A is read-only. There is no click, type, key press, navigation, submit,
-or screenshot here; generic page actions need the 01B action/approval
-contract first.
+The two 01B-A actions require a separate, live Navigation Allow. They do not
+expose generic click, type, key press, submit, observed-link navigation, or
+screenshot operations.
 
 Provenance: every observation is external content. The page may be logged
 in as Lumina; it is still external. Results carry an explicit
@@ -39,13 +41,16 @@ from __future__ import annotations
 import json
 import re
 
-from chrome_companion import protocol, state
+from chrome_companion import policy, protocol, state
+from chrome_companion.navigation import claim_owner_url
 from core.chrome_companion_hub import CompanionError, ensure_hub_started
 
-CHROME_TOOL_NAMES = frozenset({
+CHROME_READ_TOOL_NAMES = frozenset({
     "chrome_status", "chrome_list_tabs", "chrome_get_active_tab",
     "chrome_get_url_title", "chrome_extract_visible_text", "chrome_get_links",
 })
+CHROME_ACTION_TOOL_NAMES = frozenset({"chrome_open_owner_url", "chrome_switch_tab"})
+CHROME_TOOL_NAMES = CHROME_READ_TOOL_NAMES | CHROME_ACTION_TOOL_NAMES
 
 PROVENANCE = {"owner": False, "trust": "external_untrusted", "source": "chrome_companion"}
 NOTICE = (
@@ -80,6 +85,21 @@ def _observation(**payload) -> str:
 
 def _failure(tool: str, exc: CompanionError) -> str:
     return (f"[Tool error: {tool} failed — {exc.code}: {exc.message}] {NO_FALLBACK}")
+
+
+def _action_failure(exc: CompanionError) -> str:
+    status = "ambiguous_after_dispatch" if exc.executed else "failed_before_dispatch"
+    return _observation(ok=False, operation_id=exc.operation_id, status=status, failure_class=exc.code,
+                        note="An action that may have reached Chrome is never retried automatically. " + NO_FALLBACK)
+
+
+def _action_result(result: dict) -> str:
+    return _observation(ok=result["status"] == "browser_local_effect_observed",
+                        operation_id=result["operation_id"], status=result["status"],
+                        tab_id=result["tab_id"], window_id=result["window_id"],
+                        observed_url=result["observed_url"],
+                        load_confirmed=result["load_confirmed"],
+                        note="A created or selected tab is a browser-local effect, not proof of a remote commit.")
 
 
 def _tab_id_arg(value, *, required: bool):
@@ -130,7 +150,7 @@ def _observed(response: dict) -> dict:
             "origin": observed.get("origin"), "document_id": observed.get("document_id")}
 
 
-def register_chrome_companion_tools(registry, *, data_dir=None, hub=None) -> bool:
+def register_chrome_companion_tools(registry, *, data_dir=None, hub=None, agent=None) -> bool:
     """Register the chrome_* tools on an OWNER registry. Returns False (and
     registers nothing, starts nothing) unless the companion is installed
     for this data dir. The caller -- core/agent.py -- only calls this for
@@ -152,13 +172,16 @@ def register_chrome_companion_tools(registry, *, data_dir=None, hub=None) -> boo
         info = hub.status()
         if info["connection"] is not None:
             try:
-                response = hub.request("ping", timeout_s=TAB_TIMEOUT_S)
+                new_worker = info["connection"].get("extension_version") == "0.2.0"
+                response = hub.request("ping", args={"include_navigation": True} if new_worker else {},
+                                       timeout_s=TAB_TIMEOUT_S)
                 info["round_trip"] = {"ok": True, "extension_version":
-                                      response["result"]["extension_version"]}
+                                      response["result"]["extension_version"],
+                                      "navigation_allowed": response["result"].get("navigation_allowed", False)}
             except CompanionError as exc:
                 info["round_trip"] = {"ok": False, "error": exc.code}
-        info["note"] = ("Read-only companion to Lumina's own Chrome. PAUSE/RESUME is the owner's "
-                        "switch in the extension popup; Lumina cannot resume it.")
+        info["note"] = ("Reading and session navigation are separate owner controls in the extension popup. "
+                        "Lumina cannot allow navigation or resume PAUSE.")
         return json.dumps({"ok": True, "provider": "chrome_companion", "status": info}, indent=1)
 
     def chrome_list_tabs(**_):
@@ -217,7 +240,7 @@ def register_chrome_companion_tools(registry, *, data_dir=None, hub=None) -> boo
     tab_arg = {"type": "integer", "description": "Chrome tab id from chrome_list_tabs"}
     registry.register(
         "chrome_status", chrome_status,
-        "Status of the read-only companion to Lumina's own Google Chrome: installed, paired, "
+        "Status of the companion to Lumina's own Google Chrome: installed, paired, "
         "connected, paused, last disconnect reason.",
         no_args)
     registry.register(
@@ -249,4 +272,51 @@ def register_chrome_companion_tools(registry, *, data_dir=None, hub=None) -> boo
             "tab_id": tab_arg,
             "max_links": {"type": "integer", "description": "Maximum links (bounded)"},
         }, "required": []})
+    if agent is not None:
+        def chrome_open_owner_url(url=None, **_):
+            # claim_owner_url reads a context-local grant minted from this
+            # turn's authenticated owner text, never from the tool argument.
+            claimed = claim_owner_url(url)
+            if claimed is None:
+                return _observation(ok=False, operation_id=None, status="failed_before_dispatch",
+                                    failure_class="owner_url_required",
+                                    note="The URL must appear in an explicit open/visit command at the start of this owner turn.")
+            owner_url, _nonce = claimed
+            try:
+                response = hub.request("open_owner_url", args={"url": owner_url},
+                                       timeout_s=CONTENT_TIMEOUT_S)
+                return _action_result(response["result"])
+            except CompanionError as exc:
+                return _action_failure(exc)
+
+        def chrome_switch_tab(tab_id=None, window_id=None, expected_url=None, **_):
+            try:
+                tab_id_value = _tab_id_arg(tab_id, required=True)
+                if isinstance(window_id, bool) or not isinstance(window_id, int):
+                    raise CompanionError("invalid_args", "window_id must be an integer")
+                if not isinstance(expected_url, str) or len(expected_url) > protocol.MAX_TAB_URL_CHARS \
+                        or not policy.classify_url(expected_url).readable:
+                    raise CompanionError("invalid_args", "expected_url must be a readable HTTP(S) URL")
+                response = hub.request("switch_tab", tab_id=tab_id_value,
+                                       args={"window_id": window_id, "expected_url": expected_url},
+                                       timeout_s=TAB_TIMEOUT_S)
+                return _action_result(response["result"])
+            except CompanionError as exc:
+                return _action_failure(exc)
+
+        registry.register(
+            "chrome_open_owner_url", chrome_open_owner_url,
+            "Open one HTTP(S) URL explicitly supplied at the start of this authenticated owner turn "
+            "in Lumina's paired Chrome. Requires the separate session Navigation Allow. No page-supplied URL qualifies.",
+            {"type": "object", "properties": {"url": {"type": "string",
+                "description": "The exact URL from the owner's current open/visit command"}}, "required": ["url"]})
+        registry.register(
+            "chrome_switch_tab", chrome_switch_tab,
+            "Select a tab in Lumina's paired Chrome by the exact tab/window/URL identity observed in chrome_list_tabs. "
+            "Requires session Navigation Allow; revoked sites are refused.",
+            {"type": "object", "properties": {
+                "tab_id": tab_arg,
+                "window_id": {"type": "integer"},
+                "expected_url": {"type": "string"},
+            }, "required": ["tab_id", "window_id", "expected_url"]})
     return True
