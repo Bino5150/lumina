@@ -351,6 +351,20 @@ _SYNTHESIZED_MEMORY_TAGS = frozenset({
 })
 
 
+def render_closet_text(label: str, drawers) -> str:
+    """Pure: the closet text palace_store() would have produced for these
+    drawers (each with "content" and "untrusted"), already in
+    (created_at, id) order. Shared by _rebuild_closet_from_drawers() and
+    PALACE-GUARD-01A's read-only render-drift rule, so the two can never
+    disagree about what a closet "should" say."""
+    from core.context import tag_untrusted
+    segments = []
+    for row in drawers:
+        raw = aaak_compress(row["content"], label=label)
+        segments.append(tag_untrusted(label, raw) if row["untrusted"] else raw)
+    return " | ".join(segments)
+
+
 def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
     """Rebuild one rolling closet from its drawers and their authority bits."""
     location = conn.execute(
@@ -373,13 +387,8 @@ def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
         conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
         return
 
-    from core.context import tag_untrusted
     label = f"{location['wing']}.{location['room']}"
-    segments = []
-    for row in remaining:
-        raw = aaak_compress(row["content"], label=label)
-        segments.append(tag_untrusted(label, raw) if row["untrusted"] else raw)
-    rebuilt = " | ".join(segments)
+    rebuilt = render_closet_text(label, remaining)
     token_est = estimate_tokens(rebuilt)
     ever_untrusted = 1 if any(row["untrusted"] for row in remaining) else 0
     if (
