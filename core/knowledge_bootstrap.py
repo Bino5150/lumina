@@ -42,17 +42,39 @@ rather than erase it:
   suite's coverage of "partial deletion" gave false confidence about
   "total deletion" until someone asked the question directly.
 
-  v3 (this version): a durable installed-pack marker, stored in its own
-  file under data_dir, entirely separate from the knowledge rows the pack
-  creates. The marker -- not row presence, partial or total -- is the
-  sole gate on reseeding. Deleting some, or all, of the pack's rows can
-  never be misread as "never installed," because the marker does not
-  live in the table being edited. The marker also carries a version
-  number, so a future pack revision has a real place to record "this
-  data directory has seen v1, needs the v2 update" -- see
-  PACK_VERSION below. Writing that future per-version migration logic
-  is out of scope for this pass (there is only a v1 pack to migrate
-  from), but the primitive it would build on now exists.
+  v3 (durable marker, first cut): a marker file under data_dir, entirely
+  separate from the knowledge rows the pack creates, gating reseeding
+  instead of row presence. Fixed the v2 bug for a full wipe -- until
+  review pointed out the marker file itself can fail in a way row
+  presence cannot: v3's first cut treated an unreadable/corrupt marker
+  the same as an absent one ("fails safe toward re-seeding"). But under
+  these semantics that is not safe -- consider owner deletes every pack
+  row, then the marker later becomes corrupt (unrelated disk issue,
+  partial write from something else, whatever): the next startup would
+  see "no readable marker" and reseed the whole pack right back, the
+  exact resurrection this design exists to prevent, just reached through
+  a rarer path than v2's.
+
+  v3 (this version): absent and corrupt are treated as genuinely
+  different states, because they carry different evidence. No marker
+  file at all means no installation has ever recorded itself here --
+  safe to run the (per-title-safe) seed pass. A marker file that EXISTS
+  but cannot be parsed is itself evidence an installation happened at
+  some point, even though its content can no longer be trusted -- so it
+  fails *closed*: bootstrap_official_knowledge refuses to touch the
+  Knowledge Base at all, logs the corruption, and requires a human to
+  repair or remove the marker before anything reinstalls automatically.
+  The one case that still needs "no marker, but rows already exist" to
+  resolve automatically -- a prior run that inserted some rows and then
+  crashed before writing the marker -- is exactly the "marker absent"
+  branch, not the "marker corrupt" one, and is handled by the same
+  per-title-safe seed pass without redefining what corruption means.
+
+  The marker also carries a version number, so a future pack revision
+  has a real place to record "this data directory has seen v1, needs the
+  v2 update" -- see PACK_VERSION below. Writing that future per-version
+  migration logic is out of scope for this pass (there is only a v1 pack
+  to migrate from), but the primitive it would build on now exists.
 """
 import json
 import os
@@ -90,13 +112,18 @@ def _marker_path(data_dir: str) -> str:
     return os.path.join(data_dir, _MARKER_FILENAME)
 
 
-def _load_marker(data_dir: str) -> dict:
-    """{} for an absent, unreadable, or corrupt marker file -- all three
-    are treated identically to "never installed." A corrupt marker fails
-    safe toward re-seeding rather than silently refusing forever; that
-    re-seed is itself safe (see bootstrap_official_knowledge's per-title
-    existing-row check), so this can never duplicate rows even if a
-    corrupt marker causes a spurious retry."""
+def _load_marker(data_dir: str):
+    """Three distinct outcomes, not two:
+
+      {}    -- no marker file exists. No installation has ever recorded
+               itself here; safe to run the seed pass.
+      dict  -- a valid, parsed marker.
+      None  -- a marker file EXISTS but could not be read/parsed. This is
+               NOT the same as absent: the file's mere existence is
+               evidence an installation happened at some point, even
+               though its content can no longer be trusted. Callers must
+               treat None as "refuse to auto-mutate," never as "{}."
+    """
     path = _marker_path(data_dir)
     if not os.path.isfile(path):
         return {}
@@ -104,14 +131,15 @@ def _load_marker(data_dir: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError, ValueError):
-        return {}
+        return None
 
 
 def _save_marker(data_dir: str, marker: dict) -> None:
     """Same atomic tmp-file + os.replace() pattern as core/persistence.py's
-    save() -- a crash mid-write can never leave the marker half-written,
-    which matters here specifically: a torn/partial marker write is
-    exactly the kind of corruption _load_marker must tolerate above."""
+    save() -- a crash mid-write can never leave the marker half-written.
+    That matters more here than in most JSON-state writers: a torn/
+    partial write is exactly the corrupt-but-present case _load_marker
+    must distinguish from "absent" and refuse to auto-mutate over."""
     path = _marker_path(data_dir)
     refuse_if_production_path(path)
     os.makedirs(data_dir, exist_ok=True)
@@ -136,8 +164,20 @@ def bootstrap_official_knowledge(*, data_dir: str, db_path: str) -> list[str]:
     inserted some rows and then crashed before writing the marker. It is
     not the reseed gate (the marker is) -- it just stops that crash-
     recovery retry from duplicating rows it already wrote.
+
+    A marker file that exists but cannot be parsed is treated as an
+    installation-state error, not as "never installed": this function
+    refuses to touch the Knowledge Base at all in that case (see
+    _load_marker's docstring for why None and {} must not be conflated).
     """
     marker = _load_marker(data_dir)
+    if marker is None:
+        print(f"[knowledge] official knowledge-pack marker at {_marker_path(data_dir)} "
+              f"exists but is unreadable or invalid. Treating this as an installation-"
+              f"state error, not a fresh install -- the Knowledge Base will NOT be "
+              f"modified automatically. Repair or remove that file manually, then "
+              f"restart, to reinstall the official pack.", file=sys.stderr)
+        return []
     if marker.get(CATEGORY, {}).get("version", 0) >= PACK_VERSION:
         return []
 

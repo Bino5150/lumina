@@ -9,16 +9,28 @@ requires -- an official knowledge entry is never elevated above ordinary
 tool-output provenance. Every test targets an isolated tmp_path data
 directory and database; none ever touches a real data directory.
 
-This file's own history is part of what it tests: an earlier per-title
-design ("insert if this exact title is missing") was caught here
-resurrecting a deliberately-deleted entry; a follow-up category-occupancy
-design ("seed once iff the category is empty") fixed that but reintroduced
-the identical bug for a *full* wipe of the category, caught in review
-(Sol) before it shipped. test_bootstrap_never_reseeds_after_full_wipe
-below is the regression test for exactly that finding -- see
-core/knowledge_bootstrap.py's module docstring for the full account of
-why a durable marker file, separate from the knowledge rows themselves,
-replaced both prior designs.
+This file's own history is part of what it tests -- three rounds, each
+caught before it shipped to a release:
+
+  1. A per-title design ("insert if this exact title is missing") was
+     caught here resurrecting a deliberately-deleted entry.
+  2. A follow-up category-occupancy design ("seed once iff the category
+     is empty") fixed that, but reintroduced the identical bug for a
+     *full* wipe of the category -- caught in review (Sol), not by a
+     test; test_bootstrap_never_reseeds_after_full_wipe below is the
+     regression test written for that finding afterward.
+  3. The durable-marker design that replaced both still treated a
+     corrupt marker file the same as an absent one ("fail safe toward
+     re-seeding") -- which is not actually safe once row presence is no
+     longer the source of truth: delete every pack row, then have the
+     marker separately become corrupt, and the old rule would silently
+     resurrect the whole pack. Caught in review again (Sol) before
+     shipping; test_corrupt_marker_with_fully_deleted_pack_does_not_
+     resurrect below is that regression test.
+
+See core/knowledge_bootstrap.py's module docstring for the full account
+of why a durable, version-stamped marker file -- with absent and corrupt
+treated as genuinely different states -- replaced all three prior designs.
 """
 import sqlite3
 
@@ -149,11 +161,14 @@ def test_bootstrap_never_reseeds_after_full_wipe(kb_env):
     assert len(entries) > 0  # sanity: there really was something to wipe
 
 
-def test_corrupt_marker_reseeds_missing_titles_without_duplicating(kb_env):
-    """An unreadable/corrupt marker fails safe toward re-seeding (treated
-    as 'never installed') rather than refusing forever -- but the
-    per-title existing-row check inside the seed loop must still prevent
-    that re-seed from duplicating rows that are still present."""
+def test_corrupt_marker_refuses_to_auto_mutate(kb_env):
+    """A marker file that EXISTS but cannot be parsed must fail *closed*,
+    not fail toward re-seeding: its mere existence is evidence an install
+    happened at some point, even though its content can't be trusted.
+    Unlike a truly absent marker, this must never insert anything --
+    proven here even in the case where every row is still present, so a
+    naive per-title check would otherwise have "safely" no-op'd for the
+    wrong reason."""
     _bootstrap(kb_env)
     entries = load_official_pack()
 
@@ -163,15 +178,39 @@ def test_corrupt_marker_reseeds_missing_titles_without_duplicating(kb_env):
         f.write("{not valid json")
 
     result = _bootstrap(kb_env)
-    assert result == [], "every title was already present -- nothing new to insert"
-    assert _row_count(kb_env["db_path"], category=CATEGORY) == len(entries), (
-        "must not have duplicated any row"
-    )
-    # and the marker itself must have been repaired (written, valid JSON again)
+    assert result == [], "a corrupt marker must never trigger an automatic insert"
+    assert _row_count(kb_env["db_path"], category=CATEGORY) == len(entries)
+    # the marker must be left exactly as corrupt as it was -- repairing it
+    # automatically would be another form of auto-mutating installation
+    # state on unreliable evidence.
     with open(marker_path, encoding="utf-8") as f:
-        import json
-        marker = json.load(f)
-    assert marker[CATEGORY]["version"] == PACK_VERSION
+        assert f.read() == "{not valid json"
+
+
+def test_corrupt_marker_with_fully_deleted_pack_does_not_resurrect(kb_env):
+    """The exact scenario this fix exists for: pack installed, owner
+    deliberately deletes every entry, and only *afterward* does the
+    marker become corrupt (an unrelated disk issue, a partial write from
+    something else entirely -- anything other than the bootstrap itself).
+    The old 'corrupt -> treat as absent -> reseed' rule would silently
+    resurrect the whole pack here, reopening the exact hole the durable
+    marker was built to close, just through a rarer path. It must not."""
+    _bootstrap(kb_env)
+
+    conn = sqlite3.connect(kb_env["db_path"])
+    conn.execute("DELETE FROM knowledge WHERE category=?", (CATEGORY,))
+    conn.commit()
+    conn.close()
+    assert _row_count(kb_env["db_path"], category=CATEGORY) == 0
+
+    import os
+    marker_path = os.path.join(kb_env["data_dir"], "knowledge_packs_installed.json")
+    with open(marker_path, "w", encoding="utf-8") as f:
+        f.write("{not valid json, and the pack beneath it is empty too")
+
+    result = _bootstrap(kb_env)
+    assert result == [], "corrupt marker + fully deleted pack must never resurrect anything"
+    assert _row_count(kb_env["db_path"], category=CATEGORY) == 0
 
 
 def test_crash_recovery_partial_insert_then_marker_write(kb_env):
