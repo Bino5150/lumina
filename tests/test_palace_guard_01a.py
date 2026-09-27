@@ -67,6 +67,8 @@ def _seed_every_defect(path):
     l1 = palace.palace_store("lumina L1 note", wing="identity", room="self",
                              layer=1, untrusted=True)
     hall = palace.palace_store_hall("L0 hall fact", hall="facts", layer=0, untrusted=True)
+    legacy_hall = palace.palace_store_hall("pre-provenance hall", hall="events", layer=2,
+                                           untrusted=False)
     # D005: synthesized drawer, in a live chat's nightstand room (so D007 stays quiet)
     live_chat = memory.create_chat("live")
     dream = palace.palace_store("dream summary", wing="nightstand", room=str(live_chat),
@@ -90,6 +92,9 @@ def _seed_every_defect(path):
     conn = _raw(path)
     conn.execute("UPDATE palace_drawers SET untrusted=1 WHERE id=?", (legacy["drawer_id"],))
     conn.execute("UPDATE palace_drawers SET untrusted=0 WHERE id=?", (dream["drawer_id"],))
+    # D008: a hall written before palace_halls.untrusted existed (schema default 0)
+    conn.execute("UPDATE palace_halls SET created_at='2026-09-15T23:25:58.607676' WHERE id=?",
+                 (legacy_hall,))
     # D004: malformed tags
     conn.execute("UPDATE palace_drawers SET tags='[not json' WHERE id=?", (bad_tags["drawer_id"],))
     # D001: FK-off orphans
@@ -104,6 +109,7 @@ def _seed_every_defect(path):
     conn.close()
     return {
         "legacy_closet": legacy["closet_id"], "l1_closet": l1["closet_id"], "hall": hall,
+        "legacy_hall": legacy_hall,
         "dream_drawer": dream["drawer_id"], "deep_closet": deep["closet_id"],
         "weird_closet": weird["closet_id"], "bad_tags_drawer": bad_tags["drawer_id"],
         "edited_closet": edited["closet_id"], "chat_id": chat_id,
@@ -161,6 +167,9 @@ def test_every_rule_fires_on_its_specimen_and_only_there(db):
     assert _subject_ids(r, "PG-D005") == [s["dream_drawer"]]
     d6 = {f["subject"][0]["id"]: f["severity"] for f in _ids(r, "PG-D006")}
     assert d6 == {s["deep_closet"]: "info", s["weird_closet"]: "warning"}
+    d8 = _ids(r, "PG-D008")
+    assert [(f["subject"][0]["id"], f["severity"], f["evidence"]["provenance"]) for f in d8] == [
+        (s["legacy_hall"], "warning", "legacy_unknown_presumed_trusted")]
     d7 = _ids(r, "PG-D007")
     assert len(d7) == 1 and d7[0]["evidence"]["chat_id"] == s["chat_id"]
     d1 = _ids(r, "PG-D001")
@@ -236,7 +245,7 @@ def test_a_rule_that_tries_to_write_is_refused_and_recorded(db):
     receipt = pg.scan(db, rules=[rule])
 
     assert receipt["rules"][0]["state"] == "error"
-    assert "readonly" in receipt["rules"][0]["reason"].lower()
+    assert "not authorized" in receipt["rules"][0]["reason"].lower()
     assert receipt["status"] == "partial"
     assert receipt["mutation_state"] == "none"
     assert _fingerprint(db) == before
@@ -244,6 +253,76 @@ def test_a_rule_that_tries_to_write_is_refused_and_recorded(db):
     assert conn.execute("SELECT layer FROM palace_closets WHERE id=?",
                         (stored["closet_id"],)).fetchone()[0] == 2
     conn.close()
+
+
+def test_attach_cannot_create_a_file_during_a_scan(db, tmp_path):
+    target = tmp_path / "attached_by_rule.db"
+
+    def attacher(conn):
+        conn.execute(f"ATTACH DATABASE '{target}' AS side")
+        return []
+
+    rule = pg.Rule(rule_id="PG-D906", version=1, kind=pg.DETERMINISTIC, category="t",
+                   severity="info", title="attach", requires={}, check=attacher,
+                   remediation="-", uncertainty="-")
+    receipt = pg.scan(db, rules=[rule])
+
+    assert receipt["rules"][0]["state"] == "error"
+    assert "not authorized" in receipt["rules"][0]["reason"].lower()
+    assert not target.exists()
+
+
+def test_each_read_only_layer_holds_on_its_own(db, tmp_path):
+    """Authorizer and query_only are independent defenses: remove either
+    one and the other must still refuse the write."""
+    conn = pg._open_snapshot_connection(db)
+    try:
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        for sql in ("INSERT INTO palace_wings (name) VALUES ('x')",
+                    "PRAGMA query_only=OFF",
+                    "PRAGMA journal_mode=DELETE",
+                    f"ATTACH DATABASE '{tmp_path / 'x.db'}' AS x",
+                    "CREATE TEMP TABLE t (a)"):
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                conn.execute(sql)
+        assert not (tmp_path / "x.db").exists()
+        conn.set_authorizer(None)  # authorizer gone: query_only alone must hold
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("INSERT INTO palace_wings (name) VALUES ('x')")
+    finally:
+        conn.close()
+
+
+def test_d008_flags_only_halls_that_provably_predate_the_provenance_column(db):
+    owner_now = palace.palace_store_hall("owner fact today", hall="facts", untrusted=False)
+    legacy_l2 = palace.palace_store_hall("old fact", hall="facts", untrusted=False)
+    legacy_l1 = palace.palace_store_hall("old critical", hall="facts", layer=1,
+                                         untrusted=False)
+    legacy_framed = palace.palace_store_hall("old but framed", hall="facts", untrusted=True)
+    garbled = palace.palace_store_hall("bad timestamp", hall="facts", untrusted=False)
+    on_edge = palace.palace_store_hall("edge", hall="facts", untrusted=False)
+    aware_before = palace.palace_store_hall("aware", hall="facts", untrusted=False)
+    conn = _raw(db)
+    for hid, ts in ((legacy_l2, "2026-08-05T12:04:57"), (legacy_l1, "2026-09-01T00:00:00"),
+                    (legacy_framed, "2026-08-05T12:04:57"), (garbled, "yesterday-ish"),
+                    (on_edge, "2026-09-19T19:46:03"),
+                    (aware_before, "2026-09-20T07:46:02+00:00")):
+        conn.execute("UPDATE palace_halls SET created_at=? WHERE id=?", (ts, hid))
+    conn.commit()
+    conn.close()
+
+    receipt = pg.scan(db)
+
+    got = {f["subject"][0]["id"]: (f["severity"], f["evidence"]["provenance"])
+           for f in pg.findings(receipt, rule_id="PG-D008")}
+    assert got == {
+        legacy_l2: ("warning", "legacy_unknown_presumed_trusted"),
+        legacy_l1: ("high", "legacy_unknown_presumed_trusted"),
+        garbled: ("warning", "created_at_unparseable_presumed_trusted"),
+        aware_before: ("warning", "legacy_unknown_presumed_trusted"),
+    }
+    assert owner_now not in got and legacy_framed not in got and on_edge not in got
+    assert "old critical" not in json.dumps(receipt)
 
 
 # ── Authority boundary ────────────────────────────────────────────────────────
@@ -277,6 +356,9 @@ def test_memory_text_cannot_mint_authority_or_steer_guard(db):
     # trust sitting in an always-injected layer -- regardless of its claims.
     d3 = _subject_ids(receipt, "PG-D003")
     assert d3 == [attack["closet_id"]]
+    [attack_finding] = pg.findings(receipt, rule_id="PG-D003")
+    assert attack_finding["evidence"]["framing"] == "framed_at_write"
+    assert attack_finding["severity"] == "warning"
     assert victim["closet_id"] not in {
         f["subject"][0]["id"] for f in pg.findings(receipt)}
 
@@ -297,6 +379,8 @@ def test_legacy_l1_closet_with_fail_closed_drawer_is_flagged_by_d002_and_d003(db
     [d3] = pg.findings(receipt, rule_id="PG-D003")
     assert d3["subject"][0]["id"] == legacy["closet_id"]
     assert d3["evidence"]["closet_ever_had_untrusted_merge"] == 0
+    assert d3["evidence"]["framing"] == "unframed_legacy"
+    assert d3["severity"] == "high"
     assert d3["evidence"]["untrusted_linked_drawers"] == 1
     assert _subject_ids(receipt, "PG-D002") == [legacy["closet_id"]]
 
@@ -391,7 +475,7 @@ def test_missing_provenance_columns_are_reported_as_partial_not_clean(tmp_path):
 
     assert receipt["status"] == "partial"
     states = {r["rule_id"]: r for r in receipt["rules"]}
-    for rid in ("PG-D002", "PG-D003", "PG-D005", "PG-H001"):
+    for rid in ("PG-D002", "PG-D003", "PG-D005", "PG-D008", "PG-H001"):
         assert states[rid]["state"] == "skipped"
         assert "untrusted" in states[rid]["reason"] or "ever_had_untrusted_merge" in states[rid]["reason"]
     assert states["PG-D004"]["state"] == "ran"
@@ -420,18 +504,74 @@ def test_evidence_that_would_carry_memory_text_is_rejected(db):
     stored = palace.palace_store("SECRET-PAYLOAD-" + "x" * 200, wing="people", room="s",
                                  untrusted=True)
 
-    def leaky(conn):
-        row = conn.execute("SELECT id, content FROM palace_drawers").fetchone()
-        yield pg.Hit(subject=(pg.RecordRef("palace_drawers", row["id"]),),
-                     evidence={"content": row["content"]})
+    def row(conn):
+        return conn.execute("SELECT id, content FROM palace_drawers").fetchone()
 
-    rule = pg.Rule(rule_id="PG-D902", version=1, kind=pg.DETERMINISTIC, category="t",
-                   severity="info", title="leaky", requires={}, check=leaky,
+    def short_string_in_vocab_slot(conn):
+        r = row(conn)  # a short string: the old length cap would have let this through
+        yield pg.Hit(subject=(pg.RecordRef("palace_drawers", r["id"]),),
+                     evidence={"defect": r["content"][:20]})
+
+    def content_as_key(conn):
+        r = row(conn)
+        yield pg.Hit(subject=(pg.RecordRef("palace_drawers", r["id"]),),
+                     evidence={r["content"][:20]: 1})
+
+    def content_as_digest(conn):
+        r = row(conn)
+        yield pg.Hit(subject=(pg.RecordRef("palace_drawers", r["id"]),),
+                     evidence={"digest": r["content"][:16]})
+
+    rules = [
+        pg.Rule(rule_id=f"PG-D90{i}", version=1, kind=pg.DETERMINISTIC, category="t",
+                severity="info", title="leaky", requires={}, check=check,
+                remediation="-", uncertainty="-",
+                evidence={"defect": frozenset({"invalid_json"}), "digest": pg.DIGEST})
+        for i, check in enumerate((short_string_in_vocab_slot, content_as_key,
+                                   content_as_digest), start=2)
+    ]
+    receipt = pg.scan(db, rules=rules)
+    assert [r["state"] for r in receipt["rules"]] == ["error"] * 3
+    assert all("EvidenceSchemaError" in r["reason"] for r in receipt["rules"])
+    assert "SECRET-PAYLOAD" not in json.dumps(receipt)
+    assert stored["drawer_id"]
+
+
+def test_rule_exception_messages_that_could_quote_rows_are_withheld(db):
+    palace.palace_store("SECRET-PAYLOAD-ABC", wing="people", room="s", untrusted=True)
+
+    def quoting(conn):
+        content = conn.execute("SELECT content FROM palace_drawers").fetchone()[0]
+        int(content)  # ValueError: invalid literal for int() ... 'SECRET-PAYLOAD-ABC'
+        yield from ()
+
+    rule = pg.Rule(rule_id="PG-D905", version=1, kind=pg.DETERMINISTIC, category="t",
+                   severity="info", title="quoting", requires={}, check=quoting,
                    remediation="-", uncertainty="-")
     receipt = pg.scan(db, rules=[rule])
     assert receipt["rules"][0]["state"] == "error"
+    assert receipt["rules"][0]["reason"].startswith("ValueError")
     assert "SECRET-PAYLOAD" not in json.dumps(receipt)
-    assert stored["drawer_id"]
+
+
+def test_every_registered_rule_declares_a_closed_evidence_schema():
+    for rule in pg.DETERMINISTIC_RULES + pg.HEURISTIC_RULES:
+        assert rule.evidence, rule.rule_id
+    schemaless = pg.Rule(rule_id="PG-D998", version=1, kind=pg.DETERMINISTIC,
+                         category="x", severity="info", title="t", requires={},
+                         check=lambda c: [], remediation="r", uncertainty="u")
+    with pytest.raises(ValueError):
+        pg._validate_registry((schemaless,), ())
+    open_vocab = pg.Rule(rule_id="PG-D997", version=1, kind=pg.DETERMINISTIC,
+                         category="x", severity="info", title="t", requires={},
+                         check=lambda c: [], remediation="r", uncertainty="u",
+                         evidence={"k": "anything-goes"})
+    with pytest.raises(ValueError):
+        pg._validate_registry((open_vocab,), ())
+
+
+def test_synthesized_tag_vocabulary_is_pinned_to_the_palace_writer_set():
+    assert pg._SYNTHESIZED_TAG_VOCAB == palace._SYNTHESIZED_MEMORY_TAGS
 
 
 # ── Heuristic vs deterministic ────────────────────────────────────────────────
@@ -558,7 +698,7 @@ def test_scan_reads_one_snapshot_while_a_concurrent_writer_commits(db):
                 remediation="-", uncertainty="-"),
         pg.Rule(rule_id="PG-D911", version=1, kind=pg.DETERMINISTIC, category="t",
                 severity="info", title="count", requires={}, check=counter,
-                remediation="-", uncertainty="-"),
+                remediation="-", uncertainty="-", evidence={"drawers": pg.INT}),
     ]
     receipt = pg.scan(db, rules=rules)
 

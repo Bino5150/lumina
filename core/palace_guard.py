@@ -15,26 +15,41 @@ classifies, produces receipts, and proposes remediation. It never repairs.
 
 What this module structurally is not
 ------------------------------------
-- Not a writer. The scan connection runs with PRAGMA query_only=ON inside a
-  single read transaction that is always rolled back, and the runner
-  measures sqlite3's own total_changes counter afterwards instead of
-  asserting "no mutation" on faith. A rule that tries to write fails with
-  an error that is recorded in the receipt, never retried with more
-  privilege.
+- Not a writer. Three independent layers, each tested on its own: an SQLite
+  authorizer that allows only SELECT/READ/FUNCTION/TRANSACTION/RECURSIVE
+  plus four named read pragmas and denies everything else -- every write,
+  schema change, ATTACH/DETACH (which PRAGMA query_only alone does NOT
+  stop: ATTACH of a new path creates an empty file), and pragma
+  assignments; PRAGMA query_only=ON as defense in depth; and a single read
+  transaction that is always rolled back. The runner then measures
+  sqlite3's own total_changes counter instead of asserting "no mutation" on
+  faith. A rule that tries to write fails with an error that is recorded in
+  the receipt, never retried with more privilege.
 - Not an initializer. It never calls tools.palace.init_palace_db(), whose
   startup migrations are real writes; a missing Palace is reported as
   palace_not_initialized, and a missing DB file is never created (the
   connection is opened with SQLite's mode=rw, which refuses to create).
 - Not an authority source. Every finding and receipt carries
-  authority="diagnostic_only". No rule reads memory text as an instruction,
-  grants trust from tags, re-layers a record, or treats repetition/age/
-  confidence as permission. The one tag-reading authority rule
-  (PG-D005) can only ever argue for LESS trust, never more -- the same
-  fail-closed direction tools.palace._migrate_synthesized_drawer_authority
-  already uses.
-- Not a content logger. Evidence values are validated to be short JSON
-  scalars (identifiers, counts, flags, fixed vocabulary, digests); memory
-  content, closet text, tag text, and room names never enter a receipt.
+  authority="diagnostic_only". Memory content cannot mint authority,
+  promote trust, re-layer a record, or act as control input: no rule
+  interprets text as an instruction, grants trust from tags, or treats
+  repetition/age/confidence as permission. Content CAN change which
+  findings appear -- PG-H001 compares stored closet text with what its
+  drawers would render, by design -- but never whether Guard writes, what
+  it trusts, or what authority a finding carries. The one tag-reading
+  authority rule (PG-D005) can only ever argue for LESS trust, never more
+  -- the same fail-closed direction
+  tools.palace._migrate_synthesized_drawer_authority already uses.
+- Not a content logger, by construction for evidence. Each rule declares an
+  evidence schema; every evidence value must be an int, a bool, None, a
+  16-hex digest, or a string from that rule's closed vocabulary, and a key
+  the rule did not declare is rejected. A value outside the schema fails
+  the rule (recorded as an error) instead of reaching the receipt, so no
+  arbitrary memory-derived string can enter evidence. Rule error reasons
+  keep SQLite/schema-error messages (which come from SQL, not row data)
+  and withhold every other exception's message, which could quote a row.
+  Residual, stated rather than hidden: subject/related ids are row ids,
+  digests of very short values are guessable, and db_path is a path.
 
 Deterministic vs heuristic
 --------------------------
@@ -57,8 +72,10 @@ receipts by id and reports new / recurring / resolved, and refuses to call
 a finding "resolved" when its rule did not actually run in the later scan.
 """
 import hashlib
+import itertools
 import json
 import os
+import re
 import sqlite3
 import urllib.parse
 import uuid
@@ -85,8 +102,19 @@ INJECTED_LAYERS = (0, 1, 2)
 ALWAYS_INJECTED_LAYERS = (0, 1)
 DOCUMENTED_LAYERS = (0, 1, 2, 3)
 
-_MAX_EVIDENCE_STR = 80
+_MAX_VOCAB_STR = 80
 _MAX_RELATED = 50
+
+# Evidence value types a rule may declare. A spec is one of these, a
+# frozenset of allowed strings (closed vocabulary), or a tuple of
+# alternatives.
+INT = "int"
+BOOL = "bool"
+DIGEST = "digest"
+NONE = "none"
+_DIGEST_RE = re.compile(r"[0-9a-f]{16}")
+# What _scalar_repr() can return for a non-integer column value.
+_TYPE_PLACEHOLDERS = frozenset({"<str>", "<bytes>", "<float>", "<other>"})
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -122,6 +150,7 @@ class Rule:
     remediation: str
     uncertainty: str
     rationale: str = ""
+    evidence: dict = field(default_factory=dict)  # key -> spec (see INT/BOOL/...)
 
     def describe(self) -> dict:
         return {
@@ -153,23 +182,77 @@ def _digest(text) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
-def _validate_evidence(evidence: dict) -> dict:
-    """Evidence is identifiers/counts/flags/fixed vocabulary only. This is a
-    guard rail against a rule dumping memory text into a receipt, enforced
-    at the runner, not left to each rule's good manners."""
+class EvidenceSchemaError(ValueError):
+    """A hit's evidence fell outside its rule's declared schema. Messages
+    name only declared keys and spec kinds -- never the offending value."""
+
+
+def _spec_alternatives(spec) -> tuple:
+    return spec if isinstance(spec, tuple) else (spec,)
+
+
+def _matches(value, spec) -> bool:
+    for alt in _spec_alternatives(spec):
+        if alt == INT and isinstance(value, int) and not isinstance(value, bool):
+            return True
+        if alt == BOOL and isinstance(value, bool):
+            return True
+        if alt == NONE and value is None:
+            return True
+        if alt == DIGEST and isinstance(value, str) and _DIGEST_RE.fullmatch(value):
+            return True
+        if isinstance(alt, frozenset) and isinstance(value, str) and value in alt:
+            return True
+    return False
+
+
+def _validate_evidence(schema: dict, evidence: dict) -> dict:
+    """Structural content boundary: evidence carries only declared keys whose
+    values are ints, bools, None, 16-hex digests, or members of the rule's
+    closed string vocabulary. Enforced at the runner, not left to each
+    rule's good manners."""
     if not isinstance(evidence, dict):
-        raise TypeError("evidence must be a dict")
+        raise EvidenceSchemaError("evidence must be a dict")
     for k, v in evidence.items():
-        if not isinstance(k, str):
-            raise TypeError("evidence keys must be str")
-        if v is None or isinstance(v, (bool, int, float)):
-            continue
-        if isinstance(v, str):
-            if len(v) > _MAX_EVIDENCE_STR or "\n" in v:
-                raise ValueError(f"evidence[{k!r}] string too long / multi-line")
-            continue
-        raise TypeError(f"evidence[{k!r}] must be a JSON scalar, got {type(v).__name__}")
+        spec = schema.get(k) if isinstance(k, str) else None
+        if spec is None:
+            raise EvidenceSchemaError("undeclared evidence key")  # key may be data
+        if not _matches(v, spec):
+            raise EvidenceSchemaError(f"evidence[{k!r}] outside its declared schema")
     return dict(evidence)
+
+
+def _validate_schema_spec(rule_id: str, key, spec) -> None:
+    if not isinstance(key, str):
+        raise ValueError(f"{rule_id}: evidence keys must be str")
+    for alt in _spec_alternatives(spec):
+        if alt in (INT, BOOL, DIGEST, NONE):
+            continue
+        if isinstance(alt, frozenset) and alt and all(
+            isinstance(s, str) and 0 < len(s) <= _MAX_VOCAB_STR and "\n" not in s
+            for s in alt
+        ):
+            continue
+        raise ValueError(f"{rule_id}: bad evidence spec for {key!r}")
+
+
+def _joined_subsets(names) -> frozenset:
+    """Every sorted, comma-joined non-empty subset of a fixed name set."""
+    names = sorted(names)
+    return frozenset(
+        ",".join(combo)
+        for r in range(1, len(names) + 1)
+        for combo in itertools.combinations(names, r)
+    )
+
+
+def _error_reason(e: Exception) -> str:
+    """SQLite and evidence-schema errors describe SQL/schema, not row data;
+    anything else could quote a row (e.g. ValueError on int('<content>')),
+    so its message is withheld."""
+    if isinstance(e, (sqlite3.Error, EvidenceSchemaError)):
+        return f"{type(e).__name__}: {str(e)[:200]}"
+    return f"{type(e).__name__} (message withheld: may quote row data)"
 
 
 # ── Rule helpers ──────────────────────────────────────────────────────────────
@@ -191,12 +274,12 @@ def _parse_tags(raw):
 
 
 def _scalar_repr(value):
-    """Evidence-safe rendering of a column value that should have been an int."""
-    if isinstance(value, bool) or value is None:
+    """Evidence-safe rendering of a column value that should have been an int:
+    the int itself, None, or a type placeholder from _TYPE_PLACEHOLDERS."""
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
         return value
-    if isinstance(value, (int, float)):
-        return value
-    return f"<{type(value).__name__}>"
+    placeholder = f"<{type(value).__name__}>"
+    return placeholder if placeholder in _TYPE_PLACEHOLDERS else "<other>"
 
 
 def _related_ids(conn, sql, params=()) -> tuple:
@@ -211,13 +294,31 @@ _FK_CONSEQUENCE = {
     "palace_closets": "never_injected_by_build_context_block",
     "palace_rooms": "contents_unreachable",
 }
+_FK_PARENTS = frozenset({"palace_wings", "palace_rooms", "palace_closets"})
+
+# Kept literal (not imported) so the evidence vocabulary is closed at import
+# time; tests pin it to tools.palace._SYNTHESIZED_MEMORY_TAGS so it can't drift.
+_SYNTHESIZED_TAG_VOCAB = frozenset({"dream-sweep", "auto-compaction", "manual-compaction"})
+
+# Legacy-hall provenance epoch. palace_halls.untrusted arrived in
+# CASTLE-WALLS-REPAIR-01 (e9ab412, 2026-09-20T07:46:03Z) with DEFAULT 0, so
+# every hall written before any build carrying that commit inherited
+# "trusted" from the schema default, not from its writer. Hall created_at is
+# naive local time (datetime.now().isoformat()); the earliest local clock
+# reading of that instant anywhere is UTC-12, so a naive created_at before
+# the value below is provably pre-column in every timezone. Later rows are
+# not flagged even if the owner upgraded late (documented false negative).
+HALL_PROVENANCE_EPOCH_UTC = datetime(2026, 9, 20, 7, 46, 3, tzinfo=timezone.utc)
+HALL_PROVENANCE_EPOCH_NAIVE_FLOOR = datetime(2026, 9, 19, 19, 46, 3)
+_LAYER_SPEC = (INT, NONE, _TYPE_PLACEHOLDERS)
 
 
 def _check_fk_violations(conn):
     by_row = {}
     for table in ("palace_rooms", "palace_closets", "palace_drawers"):
         for row in conn.execute(f"PRAGMA foreign_key_check({table})").fetchall():
-            by_row.setdefault((row[0], row[1]), set()).add(row[2])
+            parent = row[2] if row[2] in _FK_PARENTS else "other"
+            by_row.setdefault((row[0], row[1]), set()).add(parent)
     for (table, rowid), parents in sorted(by_row.items()):
         yield Hit(
             subject=(RecordRef(table, rowid),),
@@ -273,14 +374,23 @@ def _check_lower_trust_in_always_injected_layer(conn):
     for r in closets:
         if not (r["flag"] or r["untrusted_drawers"]):
             continue
+        # L0/L1 writes never merge (palace_store INSERTs one closet per
+        # write below layer 2), and palace_store/_rebuild_closet_from_drawers
+        # set the flag and the tag_untrusted() framing together. So at
+        # L0/L1, flag=0 with a lower-trust drawer means the text is injected
+        # on every owner turn WITHOUT lower-trust framing (legacy rows);
+        # flag=1 means it was framed when written.
+        unframed = not r["flag"]
         yield Hit(
             subject=(RecordRef("palace_closets", r["closet_id"]),),
             evidence={
                 "layer": r["layer"],
-                "closet_ever_had_untrusted_merge": 1 if r["flag"] else 0,
+                "framing": "unframed_legacy" if unframed else "framed_at_write",
+                "closet_ever_had_untrusted_merge": 0 if unframed else 1,
                 "untrusted_linked_drawers": r["untrusted_drawers"],
                 "linked_drawers": r["linked_drawers"],
             },
+            severity="high" if unframed else "warning",
         )
     halls = conn.execute("""
         SELECT id, layer FROM palace_halls
@@ -288,9 +398,11 @@ def _check_lower_trust_in_always_injected_layer(conn):
         ORDER BY id
     """).fetchall()
     for r in halls:
+        # palace_store_hall() frames the row's text whenever untrusted is set.
         yield Hit(
             subject=(RecordRef("palace_halls", r["id"]),),
-            evidence={"layer": r["layer"], "hall_untrusted": 1},
+            evidence={"layer": r["layer"], "framing": "framed_at_write",
+                      "hall_untrusted": 1},
         )
 
 
@@ -383,6 +495,44 @@ def _check_nightstand_room_without_chat(conn):
         yield Hit(subject=(RecordRef("palace_rooms", r["room_id"]),), evidence=evidence)
 
 
+def _hall_predates_provenance(created_at):
+    """True / False, or None when created_at can't be parsed."""
+    if not isinstance(created_at, str):
+        return None
+    try:
+        ts = datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+    if ts.tzinfo is not None:
+        return ts.astimezone(timezone.utc) < HALL_PROVENANCE_EPOCH_UTC
+    return ts < HALL_PROVENANCE_EPOCH_NAIVE_FLOOR
+
+
+def _check_legacy_hall_presumed_trusted(conn):
+    rows = conn.execute(
+        "SELECT id, layer, created_at FROM palace_halls WHERE untrusted = 0 ORDER BY id"
+    ).fetchall()
+    for r in rows:
+        legacy = _hall_predates_provenance(r["created_at"])
+        if legacy is False:
+            continue  # written by a build that set the bit explicitly
+        layer = r["layer"]
+        always_injected = (
+            isinstance(layer, int) and not isinstance(layer, bool)
+            and layer in ALWAYS_INJECTED_LAYERS
+        )
+        yield Hit(
+            subject=(RecordRef("palace_halls", r["id"]),),
+            evidence={
+                "layer": _scalar_repr(layer),
+                "hall_untrusted": 0,
+                "provenance": ("legacy_unknown_presumed_trusted" if legacy
+                               else "created_at_unparseable_presumed_trusted"),
+            },
+            severity="high" if always_injected else "warning",
+        )
+
+
 # ── Heuristic rules ───────────────────────────────────────────────────────────
 
 def _check_closet_render_drift(conn):
@@ -449,6 +599,10 @@ DETERMINISTIC_RULES = (
             "the rule cannot tell which."
         ),
         rationale="SQLite PRAGMA foreign_key_check against the schema's own FK declarations.",
+        evidence={
+            "missing_parent_tables": _joined_subsets(_FK_PARENTS | {"other"}),
+            "consequence": frozenset(_FK_CONSEQUENCE.values()) | {"unknown"},
+        },
     ),
     Rule(
         rule_id="PG-D002", version=1, kind=DETERMINISTIC,
@@ -476,6 +630,10 @@ DETERMINISTIC_RULES = (
             "untrusted segment is merged and recomputed as any(drawer.untrusted) "
             "on rebuild; a 0 with an untrusted linked drawer contradicts both."
         ),
+        evidence={
+            "layer": _LAYER_SPEC, "closet_ever_had_untrusted_merge": INT,
+            "untrusted_linked_drawers": INT, "linked_drawers": INT,
+        },
     ),
     Rule(
         rule_id="PG-D003", version=1, kind=DETERMINISTIC,
@@ -490,14 +648,30 @@ DETERMINISTIC_RULES = (
         remediation=(
             "Owner review: keep, move to L2, or remove. L0/L1 are injected on "
             "every owner turn and are exempt from MEMORY_INJECT_LIMIT and decay "
-            "ordering. Guard never re-layers or demotes a record."
+            "ordering. severity=high when the record is injected WITHOUT its "
+            "lower-trust framing (framing=unframed_legacy): a provenance/"
+            "integrity risk -- lower-trust text presented like owner-voice "
+            "memory in the always-present tier -- not an authority bypass (no "
+            "tool/permission decision reads Palace text). Guard never re-layers, "
+            "re-frames, or demotes a record."
         ),
         uncertainty=(
             "palace_remember lets the model choose layer 0/1 directly and always "
-            "writes lower-trust, so this may be Lumina's own deliberate note; "
-            "lower-trust framing is still rendered per segment."
+            "writes lower-trust (framed_at_write), so this may be Lumina's own "
+            "deliberate note; unframed_legacy rows may be owner-authored text "
+            "whose drawer was fail-closed by the CANNON-08 migration."
         ),
-        rationale="Structural fields only: layer in (0,1) plus the closet flag / drawer bit / hall bit.",
+        rationale=(
+            "Structural fields only: layer in (0,1) plus the closet flag / drawer "
+            "bit / hall bit. Framing is inferred from the write-path invariant "
+            "that the flag and tag_untrusted() framing are set together and L0/L1 "
+            "never merge; PG-H001 independently catches rendered text that drifted."
+        ),
+        evidence={
+            "layer": INT, "framing": frozenset({"unframed_legacy", "framed_at_write"}),
+            "closet_ever_had_untrusted_merge": INT, "untrusted_linked_drawers": INT,
+            "linked_drawers": INT, "hall_untrusted": INT,
+        },
     ),
     Rule(
         rule_id="PG-D004", version=1, kind=DETERMINISTIC,
@@ -513,6 +687,10 @@ DETERMINISTIC_RULES = (
         ),
         uncertainty="The rule cannot tell which writer produced the malformed value.",
         rationale="Every Palace writer stores json.dumps(list[str]); every reader assumes that shape.",
+        evidence={
+            "defect": frozenset({"invalid_json", "not_a_list", "non_string_element"}),
+            "sqlite_type": frozenset({"text", "integer", "real", "blob"}),
+        },
     ),
     Rule(
         rule_id="PG-D005", version=1, kind=DETERMINISTIC,
@@ -532,6 +710,7 @@ DETERMINISTIC_RULES = (
             "arguing for less trust, never more."
         ),
         rationale="REDDIT-INGRESS-AUTHORITY-01: every model-authored durable summary is lower-trust.",
+        evidence={"synthesized_tags": _joined_subsets(_SYNTHESIZED_TAG_VOCAB), "untrusted": INT},
     ),
     Rule(
         rule_id="PG-D006", version=1, kind=DETERMINISTIC,
@@ -550,6 +729,7 @@ DETERMINISTIC_RULES = (
         ),
         uncertainty="Layer 3 closets may be intentional deep storage.",
         rationale="build_context_block() iterates layers [0, 1, 2] only.",
+        evidence={"layer": _LAYER_SPEC, "documented_layer": BOOL},
     ),
     Rule(
         rule_id="PG-D007", version=1, kind=DETERMINISTIC,
@@ -575,6 +755,44 @@ DETERMINISTIC_RULES = (
             "new chat."
         ),
         rationale="Nightstand room names are chat ids by construction (dreaming, auto/manual compaction).",
+        evidence={
+            "defect": frozenset({"chat_missing", "room_name_not_a_chat_id"}),
+            "chat_id": INT, "room_name_chars": (INT, NONE),
+            "closets": INT, "drawers": INT,
+        },
+    ),
+    Rule(
+        rule_id="PG-D008", version=1, kind=DETERMINISTIC,
+        category="provenance", severity="warning",
+        title="Legacy hall of unknown provenance is represented as trusted",
+        requires={"palace_halls": frozenset({"id", "layer", "created_at", "untrusted"})},
+        check=_check_legacy_hall_presumed_trusted,
+        remediation=(
+            "Owner review; remediation belongs to the legacy Palace provenance "
+            "campaign, not Guard. Halls have no verbatim drawer to rebuild from, "
+            "so the candidate repair is fail-closing the bit (untrusted=1, which "
+            "re-frames the rendered text) the way CANNON-08 did for drawers. "
+            "severity=high when the hall sits in always-injected L0/L1."
+        ),
+        uncertainty=(
+            "untrusted=0 on these rows is the schema DEFAULT the column was "
+            "added with (e9ab412), not a decision by the writer; the true source "
+            "is unknowable and may well have been the owner. Rows created after "
+            "the epoch are not flagged even if this DB upgraded late (false "
+            "negatives by design); an unparseable created_at is flagged as "
+            "provenance-unknown."
+        ),
+        rationale=(
+            "palace_halls.untrusted was added with DEFAULT 0 in CASTLE-WALLS-"
+            "REPAIR-01 (2026-09-20T07:46:03Z), while drawers were fail-closed to "
+            "DEFAULT 1 (C7, c539162); created_at before the UTC-12 local reading "
+            "of that instant proves a row predates every build with the column."
+        ),
+        evidence={
+            "layer": _LAYER_SPEC, "hall_untrusted": INT,
+            "provenance": frozenset({"legacy_unknown_presumed_trusted",
+                                     "created_at_unparseable_presumed_trusted"}),
+        },
     ),
 )
 
@@ -602,6 +820,11 @@ HEURISTIC_RULES = (
             "mismatch alone shows neither corruption nor tampering."
         ),
         rationale="tools.palace.render_closet_text() is the shared renderer used by closet rebuilds.",
+        evidence={
+            "stored_sha256_16": (DIGEST, NONE), "expected_sha256_16": DIGEST,
+            "stored_chars": (INT, NONE), "expected_chars": INT,
+            "linked_drawers": INT, "closet_ever_had_untrusted_merge": INT,
+        },
     ),
 )
 
@@ -622,6 +845,10 @@ def _validate_registry(deterministic, heuristic) -> None:
                 raise ValueError(f"{rule.rule_id}: unknown severity {rule.severity!r}")
             if rule.rule_id in seen:
                 raise ValueError(f"duplicate rule_id {rule.rule_id}")
+            if not rule.evidence:
+                raise ValueError(f"{rule.rule_id}: must declare an evidence schema")
+            for key, spec in rule.evidence.items():
+                _validate_schema_spec(rule.rule_id, key, spec)
             seen.add(rule.rule_id)
 
 
@@ -638,6 +865,32 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_AUTHORIZED_ACTIONS = frozenset({
+    sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+    sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_RECURSIVE,
+})
+# Read-only pragmas Guard issues (measured with an authorizer log, not
+# assumed). table_info/foreign_key_check take a table argument; the two
+# setting pragmas are allowed only as bare reads, never assignments.
+_ARG_READ_PRAGMAS = frozenset({"table_info", "foreign_key_check"})
+_BARE_READ_PRAGMAS = frozenset({"query_only", "data_version"})
+
+
+def _read_only_authorizer(action, arg1, arg2, _db_name, _source):
+    """Allowlist: anything not explicitly a read is denied at prepare time --
+    INSERT/UPDATE/DELETE, every CREATE/DROP/ALTER, ATTACH/DETACH (which
+    query_only does not stop from creating files), and pragma writes."""
+    if action in _AUTHORIZED_ACTIONS:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA:
+        name = (arg1 or "").lower()
+        if name in _ARG_READ_PRAGMAS:
+            return sqlite3.SQLITE_OK
+        if name in _BARE_READ_PRAGMAS and arg2 is None:
+            return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
 def _open_snapshot_connection(db_path: str) -> sqlite3.Connection:
     """mode=rw never creates a missing file; query_only refuses writes.
     Deliberately NOT core.db.connect(): that issues PRAGMA journal_mode=WAL,
@@ -649,6 +902,7 @@ def _open_snapshot_connection(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA query_only=ON")
+    conn.set_authorizer(_read_only_authorizer)  # last: the two pragmas above are assignments
     return conn
 
 
@@ -692,7 +946,7 @@ def _finding_dict(rule: Rule, hit: Hit, observed_at: str) -> dict:
         "title": rule.title,
         "subject": [r.to_dict() for r in subject],
         "related": [r.to_dict() for r in hit.related],
-        "evidence": _validate_evidence(hit.evidence),
+        "evidence": _validate_evidence(rule.evidence, hit.evidence),
         "proposed_remediation": rule.remediation,
         "uncertainty": rule.uncertainty,
         "mutation_state": "none",
@@ -743,9 +997,12 @@ def scan(db_path: str = None, *, rules: Iterable[Rule] = None) -> dict:
         receipt["finished_at"] = _now()
         return receipt
     try:
-        # One deferred read transaction: under WAL every rule below sees the
-        # same snapshot, and concurrent writers (Dreaming, compaction, the
-        # UI) are never blocked by the scan.
+        # One deferred read transaction: every rule below sees the same
+        # snapshot. Under WAL (the production journal mode) ordinary
+        # concurrent writers -- Dreaming, compaction, the UI -- can still
+        # commit while it is open; the open reader can delay WAL checkpoints
+        # (a TRUNCATE checkpoint reports busy). On a non-WAL database the
+        # read lock makes writers wait up to their own busy_timeout.
         conn.execute("BEGIN")
         schema = _schema(conn)
         present = [t for t in PALACE_TABLES if t in schema]
@@ -768,7 +1025,7 @@ def scan(db_path: str = None, *, rules: Iterable[Rule] = None) -> dict:
                     observed_at = _now()
                     found = [_finding_dict(rule, h, observed_at) for h in rule.check(conn)]
                 except Exception as e:
-                    entry.update(state="error", reason=f"{type(e).__name__}: {str(e)[:200]}")
+                    entry.update(state="error", reason=_error_reason(e))
                     incomplete = True
                     receipt["rules"].append(entry)
                     continue
