@@ -28,6 +28,7 @@ for the full model.
 - [Multimodal](multimodal.md) — Voice (TTS), Speech Input (STT), Vision, Image Generation
 - [Browser Companion](browser-companion.md) — the Chrome bridge's authorization model
 - [Channels](channels.md) — Telegram and Discord
+- [Telegram Setup](telegram-setup.md) — full step-by-step Telegram walkthrough, plus troubleshooting
 - [Personas & Skills](personas-and-skills.md) — persona system, Skills, Projects
 - [Security & Authority](security.md) — trust model, tool tiers, guardrails, Emergency Interlock, Flight Recorder
 - [Tools Reference](tools-reference.md) — the full built-in tool catalog

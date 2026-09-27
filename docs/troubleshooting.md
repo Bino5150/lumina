@@ -32,10 +32,9 @@ memory of the session.
 
 ## Telegram setup
 
-[TELEGRAM_SETUP.md](../TELEGRAM_SETUP.md) has a full walkthrough,
-including a troubleshooting table for the most common setup error
-strings. The GUI path (Settings → Communications) is faster if it works;
-this file covers the manual/legacy path and BotFather token creation.
+[Telegram Setup](telegram-setup.md) has the full step-by-step walkthrough
+— BotFather token creation through starting the bridge — plus a
+troubleshooting table for the most common setup error strings.
 
 ## Backend connection errors
 

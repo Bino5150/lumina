@@ -15,8 +15,8 @@ no acknowledgment. The emergency-stop interlock still applies — several
 checkpoints in the Telegram dispatch path check (never set) whether it's
 latched, closing Telegram ingress during/after an emergency stop.
 
-Set up through Settings → Communications (bot token, chat ID), or see
-[TELEGRAM_SETUP.md](../TELEGRAM_SETUP.md) for the manual/legacy path.
+Set up through Settings → Communications (bot token, chat ID) — see
+[Telegram Setup](telegram-setup.md) for the full step-by-step walkthrough.
 
 Because Telegram carries full owner trust, an owner-authenticated Telegram
 message can do anything a desktop-typed command can — including minting a

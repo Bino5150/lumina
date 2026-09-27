@@ -56,8 +56,6 @@ Hit Save. That's it — the token is stored securely in
 `~/.config/lumina/credentials.json` (not in your regular settings file), and your chat
 ID is saved to your preferences.
 
-*(Prefer the terminal? See [Advanced / Manual Setup](#advanced--manual-setup) below.)*
-
 ## Step 5 — Start the bridge
 
 Right below the token/chat ID fields is a **Bridge** toggle. Click **Start** — it flips
@@ -65,8 +63,7 @@ to "● Running" and Lumina starts listening for your messages immediately, righ
 the Settings tab. No terminal required.
 
 The bridge stays off by default every time Lumina launches — you turn it on when you
-want it, same as before. If you'd rather not touch the GUI, running it from a terminal
-still works exactly the same too (see [Advanced](#advanced--manual-setup)).
+want it, same as before.
 
 ## Step 6 — Test it
 

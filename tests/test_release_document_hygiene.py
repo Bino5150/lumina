@@ -5,7 +5,7 @@ import subprocess
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ALLOWED_ROOT_MARKDOWN = {"README.md", "TELEGRAM_SETUP.md"}
+ALLOWED_ROOT_MARKDOWN = {"README.md"}
 EVIDENCE_PROBE = "project-evidence/campaign-reports/_document-hygiene-probe.md"
 PRIVATE_REPORT_PREFIXES = ("reports/", "project-evidence/")
 
