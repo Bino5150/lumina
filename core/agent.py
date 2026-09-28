@@ -1941,6 +1941,11 @@ class LuminaAgent:
                 return True, ""
             self.registry.set_gate(_gate)
 
+        # B1.4: bind the actual constructed agent and registry, not owner flags
+        # on a chat-call test double. No store or browser is opened here.
+        from chrome_companion.site_actions.runtime_guard import bind_agent
+        self._site_action_route = bind_agent(self, self.registry, config.DATA_DIR)
+
     def chat(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
              cancel_event=None, reasoning_effort: Optional[str] = None,
              attachments=None, approval_event_id: Optional[str] = None) -> str:
@@ -2051,125 +2056,137 @@ class LuminaAgent:
         # above for why that's the correct default rather than leaving the
         # word-match hook with nothing. Never derived from user_input --
         # the model has no path to this parameter either way.
+        # Site intake preserves an invalid supplied transport ID so it fails
+        # closed. Only None denotes a new local owner event; legacy hooks keep
+        # their existing fallback semantics below.
+        site_action_event = approval_event_id
         approval_event_id = approval_event_id or uuid.uuid4().hex
-        # BC-01B-A: capture only an explicit command in this authenticated
-        # ingress event. The grant lives in this execution context for this
-        # turn, never in model/tool/page text or durable conversation history.
-        from chrome_companion.navigation import begin_turn as begin_chrome_navigation_turn
-        from chrome_companion.navigation import end_turn as end_chrome_navigation_turn
-        chrome_navigation_token = begin_chrome_navigation_turn(
-            user_input, source=source, owner=getattr(self, "owner", False),
-            event_id=approval_event_id,
-        )
-        # CASTLE-WALLS-REPAIR-01 R2 -- set as early as possible, before any
-        # of chat()'s three add_user()-reaching branches, so a per-agent-
-        # bound tool closure reading self._current_chat_id mid-turn always
-        # sees the chat this turn actually belongs to. getattr-guarded
-        # elsewhere it's read, for the same lightweight-test-stub reasons
-        # as every other self.-attribute access in this method.
-        self._current_chat_id = chat_id
+        if site_action_event is None:
+            site_action_event = approval_event_id
+        # B1.4: raw text only, after canonical provenance/event identity and
+        # before navigation, multimodal or history rewriting. The context
+        # manager always retires live handles and routing identity in finally.
+        from chrome_companion.site_actions.runtime_guard import turn as site_action_turn
+        with site_action_turn(self, raw_text=user_input, source=source,
+                              chat=chat_id, event=site_action_event):
+            # BC-01B-A: capture only an explicit command in this authenticated
+            # ingress event. The grant lives in this execution context for this
+            # turn, never in model/tool/page text or durable conversation history.
+            from chrome_companion.navigation import begin_turn as begin_chrome_navigation_turn
+            from chrome_companion.navigation import end_turn as end_chrome_navigation_turn
+            chrome_navigation_token = begin_chrome_navigation_turn(
+                user_input, source=source, owner=getattr(self, "owner", False),
+                event_id=approval_event_id,
+            )
+            # CASTLE-WALLS-REPAIR-01 R2 -- set as early as possible, before any
+            # of chat()'s three add_user()-reaching branches, so a per-agent-
+            # bound tool closure reading self._current_chat_id mid-turn always
+            # sees the chat this turn actually belongs to. getattr-guarded
+            # elsewhere it's read, for the same lightweight-test-stub reasons
+            # as every other self.-attribute access in this method.
+            self._current_chat_id = chat_id
 
-        # MULTIMODAL-M2-BOUNDED-VISION-LANE-01 -- routed vision interception.
-        # A multipart turn carrying image blocks may be committed to routed
-        # semantics by the owner's configured M1 vision route: the raw image
-        # blocks are extracted HERE, before either add_user site (the normal
-        # path in _chat_impl and the emergency-stop admission path below) can
-        # ever see them, and the turn carries a truthful image-free notice
-        # instead. The bounded specialist call itself runs inside
-        # _chat_impl(), after the user turn is safely in hot history -- so a
-        # mid-call cancellation still preserves the submitted turn exactly
-        # like every established pre-work cancellation path, with no
-        # half-observation and no raw-media residue. Lane inert (no route
-        # configured / lane owner-disabled) leaves user_input untouched --
-        # byte-identical legacy behavior, MB-34 guard fully in force. A lane
-        # defect must never brick an image turn: unexpected prepare failures
-        # fall back to the legacy image path loudly (print), the same
-        # session-protection posture as skill injection below.
-        vision_route_ctx = None
-        if isinstance(user_input, list) and any(
-            isinstance(block, dict) and block.get("type") == "image_url"
-            for block in user_input
-        ):
+            # MULTIMODAL-M2-BOUNDED-VISION-LANE-01 -- routed vision interception.
+            # A multipart turn carrying image blocks may be committed to routed
+            # semantics by the owner's configured M1 vision route: the raw image
+            # blocks are extracted HERE, before either add_user site (the normal
+            # path in _chat_impl and the emergency-stop admission path below) can
+            # ever see them, and the turn carries a truthful image-free notice
+            # instead. The bounded specialist call itself runs inside
+            # _chat_impl(), after the user turn is safely in hot history -- so a
+            # mid-call cancellation still preserves the submitted turn exactly
+            # like every established pre-work cancellation path, with no
+            # half-observation and no raw-media residue. Lane inert (no route
+            # configured / lane owner-disabled) leaves user_input untouched --
+            # byte-identical legacy behavior, MB-34 guard fully in force. A lane
+            # defect must never brick an image turn: unexpected prepare failures
+            # fall back to the legacy image path loudly (print), the same
+            # session-protection posture as skill injection below.
+            vision_route_ctx = None
+            if isinstance(user_input, list) and any(
+                isinstance(block, dict) and block.get("type") == "image_url"
+                for block in user_input
+            ):
+                try:
+                    from core.vision_lane import prepare_routed_turn
+                    user_input, vision_route_ctx = prepare_routed_turn(self, user_input)
+                except Exception as exc:
+                    vision_route_ctx = None
+                    print(f"[VISION LANE] prepare failed ({type(exc).__name__}); "
+                          "turn proceeds on the legacy image path", flush=True)
+            # TOKS-STREAM-TIMING-01 -- monotonic, not wall-clock: this is a
+            # DURATION (turn dispatch -> terminal completion), and time.time()
+            # can jump backward under an NTP/DST adjustment mid-turn, which
+            # would corrupt duration_s below in a way no caller could detect.
+            # No consumer ever compares this value against a wall-clock
+            # timestamp, so switching clocks is a pure robustness fix, not a
+            # behavior change.
+            turn_started_at = time.monotonic()
+            # Set by the EmergencyStopError handler below BEFORE it raises
+            # TurnCancelled -- so the outer `except TurnCancelled:` (which also
+            # catches every OTHER TurnCancelled raised directly from deep
+            # inside _chat_impl()'s own cooperative-cancel checks) never
+            # double-records the same cancellation under two different reasons.
+            cancel_already_recorded = False
             try:
-                from core.vision_lane import prepare_routed_turn
-                user_input, vision_route_ctx = prepare_routed_turn(self, user_input)
-            except Exception as exc:
-                vision_route_ctx = None
-                print(f"[VISION LANE] prepare failed ({type(exc).__name__}); "
-                      "turn proceeds on the legacy image path", flush=True)
-        # TOKS-STREAM-TIMING-01 -- monotonic, not wall-clock: this is a
-        # DURATION (turn dispatch -> terminal completion), and time.time()
-        # can jump backward under an NTP/DST adjustment mid-turn, which
-        # would corrupt duration_s below in a way no caller could detect.
-        # No consumer ever compares this value against a wall-clock
-        # timestamp, so switching clocks is a pure robustness fix, not a
-        # behavior change.
-        turn_started_at = time.monotonic()
-        # Set by the EmergencyStopError handler below BEFORE it raises
-        # TurnCancelled -- so the outer `except TurnCancelled:` (which also
-        # catches every OTHER TurnCancelled raised directly from deep
-        # inside _chat_impl()'s own cooperative-cancel checks) never
-        # double-records the same cancellation under two different reasons.
-        cancel_already_recorded = False
-        try:
-            try:
-                with emergency_stop.execution_scope(
-                    kind="foreground_turn",
-                    label=getattr(self, "channel_id", "default"),
-                    metadata={
-                        "channel_id": getattr(self, "channel_id", "default"),
-                        "owner": getattr(self, "owner", None),
-                        "chat_id": chat_id,
-                    },
-                ):
-                    result = LuminaAgent._chat_impl(
-                        self, user_input, source=source, chat_id=chat_id,
-                        cancel_event=cancel_event, reasoning_effort=reasoning_effort,
-                        turn_id=turn_id, turn_started_at=turn_started_at,
-                        turn_telemetry=turn_telemetry,
-                        vision_route_ctx=vision_route_ctx,
-                        attachments=attachments,
-                        approval_event_id=approval_event_id,
-                    )
-                    duration_s = time.monotonic() - turn_started_at
-                    if is_error_response(result):
-                        _fr_machine(self, "turn.failed", turn_id=turn_id, chat_id=chat_id,
-                                    severity="error",
-                                    fields={"reason": "error_sentinel", "duration_s": duration_s,
-                                            "response_preview": result,
-                                            **_turn_telemetry_fields(turn_telemetry)})
-                    else:
-                        _fr_machine(self, "turn.completed", turn_id=turn_id, chat_id=chat_id,
-                                    fields={"duration_s": duration_s,
-                                            "response_chars": len(result or ""),
-                                            **_turn_telemetry_fields(turn_telemetry)})
-                    return result
-            except emergency_stop.EmergencyStopError:
-                _add_user_compat(self.ctx, user_input, source, attachments)
-                _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
-                            severity="warning",
-                            fields={"reason": "emergency_stop", "duration_s": time.monotonic() - turn_started_at,
+                try:
+                    with emergency_stop.execution_scope(
+                        kind="foreground_turn",
+                        label=getattr(self, "channel_id", "default"),
+                        metadata={
+                            "channel_id": getattr(self, "channel_id", "default"),
+                            "owner": getattr(self, "owner", None),
+                            "chat_id": chat_id,
+                        },
+                    ):
+                        result = LuminaAgent._chat_impl(
+                            self, user_input, source=source, chat_id=chat_id,
+                            cancel_event=cancel_event, reasoning_effort=reasoning_effort,
+                            turn_id=turn_id, turn_started_at=turn_started_at,
+                            turn_telemetry=turn_telemetry,
+                            vision_route_ctx=vision_route_ctx,
+                            attachments=attachments,
+                            approval_event_id=approval_event_id,
+                        )
+                        duration_s = time.monotonic() - turn_started_at
+                        if is_error_response(result):
+                            _fr_machine(self, "turn.failed", turn_id=turn_id, chat_id=chat_id,
+                                        severity="error",
+                                        fields={"reason": "error_sentinel", "duration_s": duration_s,
+                                                "response_preview": result,
+                                                **_turn_telemetry_fields(turn_telemetry)})
+                        else:
+                            _fr_machine(self, "turn.completed", turn_id=turn_id, chat_id=chat_id,
+                                        fields={"duration_s": duration_s,
+                                                "response_chars": len(result or ""),
+                                                **_turn_telemetry_fields(turn_telemetry)})
+                        return result
+                except emergency_stop.EmergencyStopError:
+                    _add_user_compat(self.ctx, user_input, source, attachments)
+                    _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
+                                severity="warning",
+                                fields={"reason": "emergency_stop", "duration_s": time.monotonic() - turn_started_at,
+                                        **_turn_telemetry_fields(turn_telemetry)})
+                    cancel_already_recorded = True
+                    raise TurnCancelled()
+            except TurnCancelled:
+                if not cancel_already_recorded:
+                    _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
+                                severity="warning",
+                                fields={"reason": "cooperative_stop", "duration_s": time.monotonic() - turn_started_at,
+                                        **_turn_telemetry_fields(turn_telemetry)})
+                raise
+            except Exception as e:
+                _fr_machine(self, "turn.failed", turn_id=turn_id, chat_id=chat_id,
+                            severity="error",
+                            fields={"reason": "exception", "error_type": type(e).__name__,
+                                    "duration_s": time.monotonic() - turn_started_at,
                                     **_turn_telemetry_fields(turn_telemetry)})
-                cancel_already_recorded = True
-                raise TurnCancelled()
-        except TurnCancelled:
-            if not cancel_already_recorded:
-                _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
-                            severity="warning",
-                            fields={"reason": "cooperative_stop", "duration_s": time.monotonic() - turn_started_at,
-                                    **_turn_telemetry_fields(turn_telemetry)})
-            raise
-        except Exception as e:
-            _fr_machine(self, "turn.failed", turn_id=turn_id, chat_id=chat_id,
-                        severity="error",
-                        fields={"reason": "exception", "error_type": type(e).__name__,
-                                "duration_s": time.monotonic() - turn_started_at,
-                                **_turn_telemetry_fields(turn_telemetry)})
-            raise
-        finally:
-            end_chrome_navigation_turn(chrome_navigation_token)
-            if turn_cancellation is not None:
-                turn_cancellation._set(None)
+                raise
+            finally:
+                end_chrome_navigation_turn(chrome_navigation_token)
+                if turn_cancellation is not None:
+                    turn_cancellation._set(None)
 
     def _chat_impl(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
                     cancel_event=None, reasoning_effort: Optional[str] = None,

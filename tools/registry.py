@@ -8,6 +8,8 @@ import traceback
 from typing import Callable, Optional
 
 from core import emergency_stop
+from chrome_companion.site_actions.model import ContractError
+from chrome_companion.site_actions.runtime_guard import dispatch_scope
 
 
 class ToolRegistry:
@@ -80,6 +82,13 @@ class ToolRegistry:
             return f"[Tool error: '{name}' not found]"
         if name in self._disabled:
             return f"[Tool '{name}' is currently disabled.]"
+        try:
+            with dispatch_scope(self, name):
+                return self._call_guarded(name, args)
+        except ContractError as exc:
+            return f"[Tool error: Companion route blocked: {exc}]"
+
+    def _call_guarded(self, name: str, args: dict) -> str:
         if self._gate_fn:
             allowed, reason = self._gate_fn(name)
             if not allowed:

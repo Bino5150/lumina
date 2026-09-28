@@ -185,6 +185,8 @@ class StreamSignals(QObject):
     manual_compaction_finished = Signal(object)
     context_rebuild_finished = Signal(object)
     telegram_origin_dispatch = Signal(object)
+    site_action_review = Signal(object)
+    site_action_approved = Signal(object)
     
 class STTSignals(QObject):
     transcribed = Signal(str)
@@ -527,6 +529,11 @@ class LuminaWindow(QMainWindow):
         self._stt_signals.error.connect(self._on_stt_error)
         self.worker = None
         self.signals = StreamSignals()
+        self._site_action_dialog = None
+        route = getattr(agent, "_site_action_route", None)
+        if route is not None and route.owner:
+            self.signals.site_action_review.connect(self._on_site_action_review)
+            route.broker.attach_presenter(agent, self, self.signals.site_action_review.emit)
         self._telegram_origin_queue = deque()
         self._telegram_active_dispatch = None
         self._telegram_route_closed = False
@@ -615,6 +622,9 @@ class LuminaWindow(QMainWindow):
         self.setStyleSheet(APP_STYLESHEET)
 
     def closeEvent(self, event):
+        dialog = getattr(self, "_site_action_dialog", None)
+        if dialog is not None:
+            dialog.reject()
     # Load fresh prefs so we don't overwrite settings changes
         prefs = persistence.load()
         prefs["window_width"] = self.width()
@@ -1084,6 +1094,9 @@ class LuminaWindow(QMainWindow):
         if not self._chat_switch_admitted():
             return
         self._context_generation.bump()
+        dialog = getattr(self, "_site_action_dialog", None)
+        if dialog is not None:
+            dialog.reject()
         self._current_chat_id = chat_id
         if persist_as_last:
             self._prefs["last_chat_id"] = chat_id  # read-cache only
@@ -2571,6 +2584,31 @@ class LuminaWindow(QMainWindow):
         )
         if paths:
             self._on_files_dropped(paths)
+
+    def _on_site_action_review(self, delivery):
+        """Trusted queued kernel delivery, never parsed model/tool/chat text."""
+        from chrome_companion.site_actions.model import ContractError
+        from ui.site_action_review import SiteActionReviewDialog
+        route = getattr(self.agent, "_site_action_route", None)
+        if route is None:
+            return
+        try:
+            agent, chat = route.broker.review_scope(delivery, self)
+            if agent is not self.agent or chat != self._current_chat_id:
+                route.broker.cancel_review(delivery, self)
+                return
+            previous = self._site_action_dialog
+            if previous is not None:
+                previous.reject()
+            dialog = SiteActionReviewDialog(route.broker, delivery, self,
+                lambda: self.agent is agent and self._current_chat_id == chat, self)
+            # A sealed approval returns via a trusted signal. No synthetic user
+            # message or provider/tool dispatch is created by this callback.
+            dialog.approved.connect(self.signals.site_action_approved.emit)
+            self._site_action_dialog = dialog
+            dialog.show()
+        except ContractError:
+            route.broker.cancel_review(delivery, self)
 
     # ── Streaming signal handlers ──────────────────────────────────────────────
 

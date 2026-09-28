@@ -111,3 +111,7 @@ jobs:
       # Castle Walls selection above stays exactly as it was.
       - name: Run Qt-bound vision specialist settings guards (blocking)
         run: python -m pytest tests/test_vision_restore_01_settings.py -v -rs -m "not castle_walls_evidence"
+
+      # BC-01C-B1.4 -- actual plain-text review and owner UI events.
+      - name: Run Qt-bound site-action review guards (blocking)
+        run: python -m pytest tests/test_site_action_review_qt.py -v -rs -m "not castle_walls_evidence"

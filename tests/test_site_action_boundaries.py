@@ -1,4 +1,4 @@
-"""B1.1–B1.3 structural gates, including scratch changes that must break them.
+"""B1.1–B1.4 structural gates, including scratch changes that must break them.
 
 This is a closed audited data boundary, not a sandbox for hostile Python.
 Future checkpoint modules must explicitly extend these ownership rules.
@@ -18,7 +18,7 @@ from chrome_companion.site_actions.registry import CAPABILITY_IDS
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "chrome_companion" / "site_actions"
-FILES = {"__init__.py", "model.py", "registry.py", "claims.py", "kernel.py", "owner_intent.py", "review.py",
+FILES = {"__init__.py", "model.py", "registry.py", "claims.py", "kernel.py", "owner_intent.py", "review.py", "runtime_guard.py",
          "manifests/reddit.reply.json", "manifests/reddit.create_post.json"}
 WIRE_OPS = {"ping", "list_tabs", "get_active_tab", "get_tab", "extract_text", "get_links",
             "open_owner_url", "switch_tab"}
@@ -112,13 +112,17 @@ CALLS = {
 }
 
 
+# Audited B1.4 broker edges. No callable actor/provider is acquired here.
+IMPORTS["runtime_guard.py"] = {'from .review import ReviewController', 'from .model import ContractError', 'import asyncio', 'import weakref', 'import threading', 'import os', 'from .owner_intent import OwnerIntake, reopen_claim_store', 'from contextvars import ContextVar', 'from core import emergency_stop', 'from dataclasses import dataclass', 'from .kernel import AuthorityKernel', 'import secrets', 'from __future__ import annotations', 'from contextlib import contextmanager'}
+CALLS["runtime_guard.py"] = {'ROUTES.get', 'entry[1].review.approve', '_Task', 'self._context.reset', 'emergency_stop.is_latched', 'task.route.deliver', 'weakref.WeakKeyDictionary', 'dataclass', 'raw_text.startswith', 'self._frames.setdefault', 'self._deliveries.get', 'task.store.close', 'weakref.ref', 'ContextVar', 'task.intake.resolve', '_broker.dispatch', 'set', 'self._context.get', 'self._close_delivery', 'any', 'self._registries.get', 'task.intake.capture', 'list', '_broker.turn', '_execution', 'entry[1].review.cancel', 'ReviewDelivery', 'TaskIdentity', 'task.review._request', 'self._deliveries.values', '_broker.bind_agent', 'self._context.set', 'task.review.invalidate', 'reopen_claim_store', 'route.protected.add', 'AgentRoute', 'str', 'entry[1].review.present', 'origin.route.registry', 'self._registries.values', 'self._tasks.get', 'self._frames.get', 'task.route.agent', 'getattr', 'secrets.token_hex', 'self._frames.setdefault(execution, []).append', 'RoutingBroker', 'self._agents.get', 'ContractError', 'task.route.protected.discard', 'os.getpid', 'OwnerIntake', 'kernel._observation', 'asyncio.current_task', 'self._origin', 'threading.RLock', 'route.agent', 'task.intake.retire', 'threading.current_thread', 'type', 'ReviewController', 'self._deliveries.pop', 'self._review_current', 'self._frames[execution].remove'}
+
 def _package_sources():
     return {path.relative_to(PACKAGE).as_posix(): path.read_text()
             for path in PACKAGE.rglob("*") if path.is_file() and "__pycache__" not in path.parts}
 
 
 def _check_package(sources):
-    assert set(sources) == FILES, "checkpoint package expanded beyond B1.3"
+    assert set(sources) == FILES, "checkpoint package expanded beyond B1.4"
     for name, allowed in IMPORTS.items():
         tree = ast.parse(sources[name])
         imports = {ast.unparse(node) for node in ast.walk(tree)
@@ -146,7 +150,8 @@ def _check_package(sources):
                 if isinstance(node, ast.Assign):
                     startup_calls = [n for n in ast.walk(node.value) if isinstance(n, ast.Call)]
                     assert not startup_calls or (name == "registry.py" and
-                        ast.unparse(node) == "CAPABILITY_IDS = tuple((capability for capability, _ in _MANIFEST_FILES))")
+                        ast.unparse(node) == "CAPABILITY_IDS = tuple((capability for capability, _ in _MANIFEST_FILES))") or (
+                        name == "runtime_guard.py" and ast.unparse(node) == "_broker_lock = threading.RLock()")
     for capability in CAPABILITY_IDS:
         manifest = CapabilityManifest.from_data(decode_json(sources[f"manifests/{capability}.json"]))
         assert manifest.capability_id == capability
@@ -157,6 +162,7 @@ def _check_package(sources):
     assert ast.literal_eval(mapping) == tuple((c, c + ".json") for c in CAPABILITY_IDS)
     _check_claim_storage(ast.parse(sources["claims.py"]))
     _check_authority_edges(sources)
+    _check_routing_broker(sources["runtime_guard.py"])
 
 
 def _check_authority_edges(sources):
@@ -280,10 +286,108 @@ def _production_sources():
     return sources
 
 
+def _methods(source):
+    return {n.name: n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)}
+
+
+def _check_routing_broker(source):
+    tree = ast.parse(source)
+    broker = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "RoutingBroker")
+    methods = {n.name: n for n in ast.walk(broker) if isinstance(n, ast.FunctionDef)}
+    routes = next(n.value for n in tree.body if isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "ROUTES" for t in n.targets))
+    assert ast.literal_eval(routes) == {name: "navigation" if name in {
+        "chrome_open_owner_url", "chrome_switch_tab"} else "observation" for name in TOOLS}
+    dispatch = methods["dispatch"]
+    protected = [n for n in ast.walk(dispatch) if isinstance(n, ast.If)
+                 and ast.unparse(n.test) == "origin.protected"]
+    assert len(protected) == 1 and any(isinstance(n, ast.Raise) for n in protected[0].body), "dormant route denial removed"
+    assert not any(isinstance(n, (ast.Return, ast.With)) for n in protected[0].body), "protected executable route enabled"
+    origin = ast.unparse(methods["_origin"])
+    for seal in ("task.handle is not handle", "ambient is not anchored", "not task.alive", "os.getpid() != self._process",
+                 "self._frames.get(_execution(), ())", "self._tasks.get"):
+        assert seal in origin, "trusted context seal/frame removed"
+    for seal in ("origin.route.registry() is not registry", "route.protected",
+                 "any((r.protected for r in self._registries.values()))", "os.getpid() != self._process"):
+        assert seal in ast.unparse(dispatch), "missing/foreign runtime identity opened"
+    turn = ast.unparse(methods["turn"])
+    for edge in ("route.owner", "agent.owner is True", "source == 'OWNER_DIRECT'", "type(raw_text) is str",
+                 "raw_text.startswith('/companion-action')", "task.intake.capture", "raw_text=raw_text", "event_id=event",
+                 "finally:", "task.intake.retire()", "self._context.reset(token)", "del self._tasks[task.handle.identifier]"):
+        assert edge in turn, "canonical capture or finally lifetime removed"
+    assert "origin.protected" in turn and "site task cannot borrow" in turn
+    queue = ast.unparse(methods["queue_review"])
+    assert "self._tasks.get(task.handle.identifier) is not task" in queue and "self._origin() is not task" in queue
+    for name in ("approve_review", "present_review", "review_snapshot"):
+        assert "self._review_current" in ast.unparse(methods[name]), "live review scope validation bypassed"
+    live_review = ast.unparse(methods["_review_current"])
+    for edge in ("entry[0] is not delivery", "task.review._request(request)", "kernel._observation",
+                 "observation.principal.fingerprint != request.snapshot.principal_digest",
+                 "observation.principal.identity != request.snapshot.principal",
+                 "observation.surface_digest != request.snapshot.surface_digest",
+                 "kernel._epoch != request.snapshot.control_epoch", "emergency_stop.is_latched()"):
+        assert edge in live_review, "review identity/principal/scope check removed"
+    # Constructor acquisition is explicit; no model/adapter route-role,
+    # callback or observation provider can be installed by dispatch args.
+    for method in methods.values():
+        for node in ast.walk(method):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "task.route.deliver":
+                assert method.name == "queue_review"
+    assert "initialize_store" not in source and "pin_store_identity" not in source
+
+
+def _check_integration_edges(sources):
+    registry = _methods(sources["tools/registry.py"])
+    call = registry["call"]
+    scopes = [n for n in ast.walk(call) if isinstance(n, ast.With)
+              and any(ast.unparse(i.context_expr) == "dispatch_scope(self, name)" for i in n.items)]
+    assert len(scopes) == 1 and any(ast.unparse(n) == "return self._call_guarded(name, args)"
+                                  for n in scopes[0].body), "registry dispatch guard removed/bypassed"
+    assert not any("['fn']" in ast.unparse(n) for n in ast.walk(call)), "alternate unguarded function call"
+    guarded = ast.unparse(registry["_call_guarded"])
+    assert "self._gate_fn(name)" in guarded and "emergency_stop.begin_tool_dispatch(name)" in guarded
+    assert "finally:" in guarded and "emergency_stop.end_tool_dispatch(lease_id)" in guarded
+    assert "name in self._disabled" in ast.unparse(call), "disabled-tool gate replaced"
+    agent = _methods(sources["core/agent.py"])
+    assert "bind_agent(self, self.registry, config.DATA_DIR)" in ast.unparse(agent["__init__"])
+    chat = ast.unparse(agent["chat"])
+    hook = "site_action_turn(self, raw_text=user_input, source=source, chat=chat_id, event=site_action_event)"
+    assert hook in chat, "trusted raw ingress hook removed/widened"
+    assert chat.index("source = 'EXTERNAL_CHANNEL_INBOUND'") < chat.index("approval_event_id =") < chat.index(hook)
+    assert "site_action_event = approval_event_id" in chat and "if site_action_event is None:" in chat
+    assert chat.index(hook) < chat.index("vision_route_ctx =") < chat.index("result = LuminaAgent._chat_impl")
+    qt = _methods(sources["ui/site_action_review.py"])
+    assert "self.text.setPlainText(self._rendered)" in ast.unparse(qt["__init__"])
+    assert "self.text.setReadOnly(True)" in ast.unparse(qt["__init__"])
+    assert "self.approve.clicked.connect(self._approve_clicked)" in ast.unparse(qt["__init__"])
+    assert "self.cancel.clicked.connect(self.reject)" in ast.unparse(qt["__init__"])
+    for edge in ("not self.isVisible()", "not self._current_scope()", "self.text.toPlainText() != self._rendered",
+                 "is not self._snapshot"):
+        assert edge in ast.unparse(qt["_current"]), "actual UI presentation check removed"
+    click = ast.unparse(qt["_approve_clicked"])
+    assert "self._current()" in click and "self._broker.approve_review" in click
+    assert click.index("self._current()") < click.index("self._broker.approve_review")
+    assert "not self._presented" in click and "self._decided = True" in click
+    assert ast.unparse(qt["accept"]).endswith("self.reject()")
+    window = _methods(sources["ui/main_window.py"])
+    assert "route.broker.attach_presenter(agent, self, self.signals.site_action_review.emit)" in sources["ui/main_window.py"]
+    slot = ast.unparse(window["_on_site_action_review"])
+    assert "agent is not self.agent" in slot and "chat != self._current_chat_id" in slot
+    assert "dialog.approved.connect(self.signals.site_action_approved.emit)" in slot
+    assert not re.search(r"\.chat\(|add_user\(|_on_user_message\(", slot), "synthetic chat authority"
+
+
 def _check_no_consumers(sources):
+    allowed = {"core/agent.py", "tools/registry.py", "ui/main_window.py", "ui/site_action_review.py"}
     for path, source in sources.items():
-        assert not re.search(r"site_actions|reddit\.reply|reddit\.create_post", source), (
-            f"production consumer/integration outside B1.1: {path}")
+        if path not in allowed:
+            assert not re.search(r"site_actions|reddit\.reply|reddit\.create_post", source), (
+                f"production consumer outside dormant B1.4 boundary: {path}")
+        if path.endswith(".py"):
+            calls = {ast.unparse(n.func) for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Call)}
+            assert not calls & {"AuthorityKernel", "DispatchPermit", "WorkflowAuthorization", "initialize_store",
+                                "pin_store_identity", "kernel.consume_step", "kernel.consume_commit"}, "production actor/grant acquired"
+    _check_integration_edges(sources)
 
 
 def test_closed_package_dependency_and_call_graph():
@@ -324,7 +428,7 @@ def test_scratch_write_mutability_and_path_widening_break_guard(old, new):
 
 def test_scratch_extra_module_and_executable_manifest_break_guard():
     sources = _package_sources()
-    sources["runtime_guard.py"] = "# future checkpoint\n"
+    sources["site_executor.py"] = "# future checkpoint\n"
     with pytest.raises(AssertionError):
         _check_package(sources)
     sources = _package_sources()
@@ -368,10 +472,8 @@ def test_scratch_new_exposure_breaks_guard(surface):
         _check_exposure(proto, worker, tools)
 
 
-def test_no_production_consumer_or_B1_4_integration_exists_yet():
+def test_only_dormant_B1_4_consumers_and_no_actuator():
     _check_no_consumers(_production_sources())
-    assert not (PACKAGE / "runtime_guard.py").exists()
-    assert not (ROOT / "ui/site_action_review.py").exists()
 
 
 @pytest.mark.parametrize("consumer", [
@@ -415,7 +517,8 @@ def audit(event, args):
             reads.append(str(path))
 sys.addaudithook(audit)
 import chrome_companion.site_actions
-from chrome_companion.site_actions import model, registry, claims, kernel, owner_intent, review
+from chrome_companion.site_actions import model, registry, claims, kernel, owner_intent, review, runtime_guard
+assert runtime_guard._broker is None
 assert reads == [], reads
 assert not any(n == "config" or n.startswith(("core.", "tools.", "ui.")) for n in sys.modules)
 for capability in registry.CAPABILITY_IDS:
@@ -484,3 +587,48 @@ def test_scratch_removed_spend_revalidation_seal_or_restart_pin_breaks_guard(nam
     sources[name] = sources[name].replace(old, new)
     with pytest.raises(AssertionError):
         _check_package(sources)
+
+
+@pytest.mark.parametrize("old,new", [
+    ("if origin.protected:", "if False:"),
+    ("task.handle is not handle", "task.handle != handle"),
+    ("ambient is not anchored", "False"),
+    ("os.getpid() != self._process", "False"),
+    ("origin.route.registry() is not registry", "False"),
+    ("source == \"OWNER_DIRECT\"", "True"),
+    ("raw_text=raw_text", "raw_text=str(chat)"),
+    ("self._context.reset(token)", "pass"),
+    ("observation.principal.fingerprint != request.snapshot.principal_digest", "False"),
+    ("observation.surface_digest != request.snapshot.surface_digest", "False"),
+    ("observation.principal.identity != request.snapshot.principal", "False"),
+    ("self._review_current(delivery, presenter)[3].snapshot", "None"),
+    ("reopen_claim_store(task.route.data_dir)", "claims.initialize_store(task.route.data_dir)"),
+    ("self._tasks.get(task.handle.identifier) is not task", "False"),
+    ("self._origin() is not task", "False"),
+])
+def test_scratch_context_route_or_live_review_bypass_breaks_guard(old, new):
+    sources = _package_sources()
+    assert old in sources["runtime_guard.py"]
+    sources["runtime_guard.py"] = sources["runtime_guard.py"].replace(old, new)
+    with pytest.raises(AssertionError):
+        _check_package(sources)
+
+
+@pytest.mark.parametrize("path,old,new", [
+    ("tools/registry.py", "with dispatch_scope(self, name):", "if True:"),
+    ("tools/registry.py", "return self._call_guarded(name, args)", "return str(self._tools[name]['fn'](**args))"),
+    ("core/agent.py", "raw_text=user_input", "raw_text=str(attachments)"),
+    ("core/agent.py", "if site_action_event is None:", "if not site_action_event:"),
+    ("core/agent.py", "self._site_action_route = bind_agent(self, self.registry, config.DATA_DIR)", "pass"),
+    ("ui/site_action_review.py", "self.text.setPlainText(self._rendered)", "self.text.setHtml(self._rendered)"),
+    ("ui/site_action_review.py", "not self.isVisible()", "False"),
+    ("ui/site_action_review.py", "self._current()", "pass"),
+    ("ui/site_action_review.py", "not self._presented", "False"),
+    ("ui/main_window.py", "dialog.approved.connect(self.signals.site_action_approved.emit)", "self.agent.chat('approved')"),
+])
+def test_scratch_removed_registry_ingress_or_Qt_wiring_guard_is_detected(path, old, new):
+    sources = _production_sources()
+    assert old in sources[path]
+    sources[path] = sources[path].replace(old, new)
+    with pytest.raises(AssertionError):
+        _check_no_consumers(sources)
