@@ -263,6 +263,108 @@ def test_actual_Qt_worker_live_delivery_is_presented_only_on_UI_thread(ui_servic
     assert not broker._tasks and not broker._deliveries
 
 
+def test_one_window_compaction_stamp_and_trusted_review_coexist(ui_service, tmp_path, monkeypatch):
+    """Run real compaction/storage and owner review concurrently, offline.
+
+    The background writer's synthesized origin is durable lower-trust
+    provenance; it never supplies a dispatch identity or review approval.
+    """
+    from core import db, dreaming
+    from tools import palace
+    import ui.main_window as main_window
+
+    broker, agent, window, approvals, app = ui_service
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "reconciliation.db"))
+    monkeypatch.setattr(config, "CONTEXT_COMPACTION_ENABLED", True)
+    monkeypatch.setattr(config, "CONTEXT_COMPACTION_BATCH_TOKENS", 1)
+    palace.init_palace_db()
+    agent.ctx._pending_compaction = [{"role": "assistant", "content": "synthetic compaction input"}]
+    summary = "Synthetic derived summary: model text cannot approve a Companion action."
+    entered, release = threading.Event(), threading.Event()
+    workers, writes, blocked, actuated = [], [], [], []
+    real_thread, real_store = threading.Thread, palace.palace_store
+
+    def tracked_thread(*args, **kwargs):
+        worker = real_thread(*args, **kwargs)
+        workers.append(worker)
+        return worker
+
+    def summarize(raw, **kwargs):
+        assert "synthetic compaction input" in raw
+        entered.set()
+        assert release.wait(10)
+        return summary
+
+    def store(*args, **kwargs):
+        # A native helper lacking task identity cannot borrow the protected
+        # foreground registry. The real Palace write remains ordinary
+        # internal storage and has no browser actuator attached.
+        blocked.append(agent.registry.call("reconciliation_probe", {}))
+        result = real_store(*args, **kwargs)
+        writes.append(result)
+        return result
+
+    agent.registry.register("reconciliation_probe", lambda: actuated.append("called") or "ordinary", "", {})
+    monkeypatch.setattr(main_window.threading, "Thread", tracked_thread)
+    monkeypatch.setattr(dreaming, "run_summarization_call", summarize)
+    monkeypatch.setattr(palace, "palace_store", store)
+    spec = spec_for("reddit.reply")
+
+    def body(actual, raw, **kwargs):
+        task, kernel, request, delivery, world = prepare(broker, actual, spec)
+        dialog = window._site_action_dialog
+        window._maybe_compact(17)
+        try:
+            assert entered.wait(10) and agent.ctx._compacting
+            app.processEvents()
+            assert dialog._presented and dialog.thread() is app.thread()
+            assert dialog.text.toPlainText() == render_snapshot(request.snapshot)
+            assert not approvals  # presenting or compacting is never approval
+            assert "Companion route blocked" in actual.registry.call("reconciliation_probe", {})
+            release.set()
+            assert len(workers) == 1
+            workers[0].join(timeout=10)
+            assert not workers[0].is_alive()
+            assert len(writes) == 1 and not agent.ctx._compacting
+            assert not agent.ctx._pending_compaction
+            conn = db.connect()
+            try:
+                row = conn.execute(
+                    "SELECT d.content, d.origin, d.untrusted, d.source_memory_id, "
+                    "d.tags, r.name, c.layer FROM palace_drawers d "
+                    "JOIN palace_rooms r ON r.id=d.room_id "
+                    "JOIN palace_closets c ON c.id=d.closet_id WHERE d.id=?",
+                    (writes[0]["drawer_id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert tuple(row[:4]) == (summary, "auto_compaction", 1, None)
+            import json
+            assert json.loads(row[4]) == ["auto-compaction", "session:17", "trust:untrusted"]
+            assert tuple(row[5:]) == ("17", 2)
+            assert blocked and all("Companion route blocked" in result for result in blocked)
+            assert actuated == [] and approvals == []
+            assert window._site_action_dialog is dialog and dialog.isVisible()
+            QTest.mouseClick(dialog.approve, Qt.LeftButton)
+            assert len(approvals) == 1
+            admitted, snapshot = task.review.resolve(approvals[0])
+            assert snapshot is request.snapshot and snapshot.specification == spec
+            dialog.approve.clicked.emit()
+            assert len(approvals) == 1
+            return "compacted and reviewed offline"
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(timeout=10)
+                assert not worker.is_alive()
+
+    monkeypatch.setattr(LuminaAgent, "_chat_impl", body)
+    agent.chat(command(spec), chat_id=17)
+    assert not broker._tasks and not broker._deliveries and not broker._frames
+    assert agent.registry.call("reconciliation_probe", {}) == "ordinary"
+    assert actuated == ["called"]
+
+
 def test_Qt_gate_is_in_blocking_CI_selection():
     from pathlib import Path
     source = (Path(__file__).resolve().parents[1] / ".github/workflows/tests.yml").read_text()
