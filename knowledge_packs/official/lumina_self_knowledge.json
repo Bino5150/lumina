@@ -13,7 +13,7 @@
   },
   {
     "title": "Dreaming",
-    "content": "When a chat session goes idle, Lumina reviews what was actually discussed, distills a summary, and writes it to a dedicated 'nightstand' memory space -- always at MemPalace Layer 2, never promoted straight to permanent identity facts. Dreaming is on by default. A dream is a first draft, fully reviewable and undoable, not something Lumina silently 'just knows' without the owner ever seeing it."
+    "content": "When a chat session goes idle, Lumina reviews what was actually discussed, distills a summary, and writes it to a dedicated 'nightstand' memory space -- always at MemPalace Layer 2, never promoted straight to permanent identity facts. Dreaming is on by default. A dream is a first draft, reviewable and not something Lumina silently 'just knows' without the owner ever seeing it. Dreams written by the current version carry a provenance stamp and can be undone; older ones can't be undone, because undo refuses anything it can't prove was a dream."
   },
   {
     "title": "My Human",

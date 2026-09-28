@@ -2164,6 +2164,7 @@ class LuminaWindow(QMainWindow):
                     palace_store(
                         content=summary, wing="nightstand", room=str(chat_id),
                         layer=2, tags=["auto-compaction", f"session:{chat_id}"],
+                        origin="auto_compaction",  # PALACE-GUARD-01B-2 trusted stamp
                         untrusted=True,
                     )
                     committed = True

@@ -155,7 +155,12 @@ class MemoryTab(QWidget):
         # site that explicitly claims trusted storage -- self.new_content
         # is a QLineEdit the owner is directly typing into, in Settings
         # (GUI-only, owner-authenticated), not imported/pasted material.
-        save_memory(content, label, untrusted=False)
+        result = save_memory(content, label, untrusted=False)
+        if result.startswith("[Error"):
+            # PALACE-GUARD-01B-1: save_memory is all-or-nothing now; keep the
+            # typed text so the owner can retry instead of losing it.
+            QMessageBox.warning(self, "Memory Not Saved", result)
+            return
         self.new_content.clear()
         self._load()
 
@@ -167,12 +172,23 @@ class MemoryTab(QWidget):
         reply = QMessageBox.question(self, "Delete", f"Delete {len(ids)} memory entries?",
                                      QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
-            conn = _db()
+            # PALACE-GUARD-01B-2: the one canonical lifecycle delete (same as
+            # an approved delete_memory action) -- never a raw DELETE here.
+            from tools.memory import delete_memory_with_derivatives, describe_memory_deletion
+            notices = []
             for mid in ids:
-                conn.execute("DELETE FROM memories WHERE id=?", (int(mid),))
-            conn.commit()
-            conn.close()
+                try:
+                    result = delete_memory_with_derivatives(int(mid))
+                except Exception as e:
+                    notices.append(f"Memory {mid} was NOT deleted ({type(e).__name__}); "
+                                   "nothing was changed.")
+                    continue
+                if result.get("legacy_unlinked") or result.get("closets", {}).get("closet_withheld") \
+                        or not result.get("found"):
+                    notices.append(describe_memory_deletion(result))
             self._load()
+            if notices:
+                QMessageBox.information(self, "Delete", "\n\n".join(notices))
 
     def _paste_import(self):
         """Import memories pasted as plain text — one per line or JSON array."""
@@ -190,23 +206,25 @@ class MemoryTab(QWidget):
         # some other provenance domain, not composed by the owner in this
         # moment (see _add_memory() above for the one path that IS) --
         # the same reasoning R1A already applied to dropped files.
+        results = []
         # Try JSON first
         try:
             items = json.loads(text.strip())
             for item in items:
                 if isinstance(item, dict):
-                    save_memory(item.get("content",""), item.get("label","imported"),
-                                untrusted=True)
-                    count += 1
+                    results.append(save_memory(item.get("content",""), item.get("label","imported"),
+                                               untrusted=True))
                 elif isinstance(item, str):
-                    save_memory(item, "imported", untrusted=True)
-                    count += 1
+                    results.append(save_memory(item, "imported", untrusted=True))
         except Exception:
             # Plain text — one memory per line
             for line in text.strip().splitlines():
                 line = line.strip()
                 if line:
-                    save_memory(line, "imported", untrusted=True)
-                    count += 1
+                    results.append(save_memory(line, "imported", untrusted=True))
+        # PALACE-GUARD-01B-1: count only saves that actually committed.
+        failed = sum(1 for r in results if r.startswith("[Error"))
+        count = len(results) - failed
         self._load()
-        QMessageBox.information(self, "Import Complete", f"Imported {count} memories.")
+        note = f" {failed} could not be saved." if failed else ""
+        QMessageBox.information(self, "Import Complete", f"Imported {count} memories.{note}")

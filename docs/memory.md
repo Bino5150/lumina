@@ -9,6 +9,23 @@ A flat, weighted "let me jot this down" memory (`tools/memory.py`):
 `save_memory`, `search_memory`, `get_recent_memories`, `delete_memory`.
 Simple, direct, no layering.
 
+Each saved memory is also written into the MemPalace (below), and the two
+are written together or not at all. Deleting a memory — from Settings →
+Memory, or by approving a staged `delete_memory` — removes the Palace
+copies saved with it in the same step: its drawer, its segment of the
+shared closet, and any Hall entry. What deletion does and doesn't cover:
+
+- If the shared closet can be rebuilt exactly from the memories that
+  remain, it is. If it can't (its stored text has drifted from what its
+  memories would render today), it isn't rewritten; it's **withheld** —
+  kept out of Lumina's injected memory and out of Palace search — until
+  it's reviewed or its last memory is deleted.
+- Memories saved before this linkage existed are deleted from the flat
+  list only. Their Palace copy, if any, isn't guessed at or removed, and
+  the delete result says so.
+- It's exact for the Palace copies linked to that memory. The same text
+  can still exist in chat history, dream summaries, backups, or telemetry.
+
 ## The MemPalace
 
 A three-layer hierarchy, deliberately more structured than "embed
@@ -93,8 +110,11 @@ worked on, distills it into a summary, and writes it to a dedicated
 "nightstand" space — deliberately separate from her curated MemPalace
 wings, and always at Layer 2 (see the write invariant above). Dreaming is
 **on by default** (`DREAM_SWEEP_ENABLED`). A dream is a first draft, not a
-fact: fully reviewable and undoable, never silently promoted to something
-she "just knows."
+fact: reviewable (`palace_review_writes`) and never silently promoted to
+something she "just knows." Dreams and compaction summaries written by this
+version carry a provenance stamp and can be undone with
+`palace_undo_write`; older ones predate that stamp, so undo refuses them
+rather than guess.
 
 ## My Human
 

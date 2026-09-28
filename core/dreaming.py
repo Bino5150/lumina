@@ -176,6 +176,9 @@ def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None) -> str:
             room=str(chat_id),
             layer=2,
             tags=["dream-sweep", f"session:{chat_id}"],
+            # PALACE-GUARD-01B-2: trusted synthesis stamp (what makes this
+            # drawer undoable); no model tool can set it.
+            origin="dream_sweep",
             # REDDIT-INGRESS-AUTHORITY-01: this is Lumina/model-authored
             # synthesis, never the owner's own direct words.  Its immediate
             # 40-row input window may contain only a paraphrase of an older

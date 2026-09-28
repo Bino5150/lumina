@@ -264,7 +264,10 @@ class TestDeleteMemoryGate:
         memory.delete_memory(memory_id)
         aid = _staged_id()
         result = pending_actions._apply_action(aid, agent)
-        assert result == f"Memory {memory_id} deleted."
+        # PALACE-GUARD-01B-2: this fixture has no Palace, so nothing can be
+        # linked -- the lifecycle delete reports the limited (legacy) result.
+        assert result.startswith(f"Memory {memory_id} deleted.")
+        assert "no Palace copy was inferred or removed" in result
         assert not _memory_exists(memory_id)
         assert pending_actions._load_queue() == {}
 
