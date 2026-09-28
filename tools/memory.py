@@ -87,34 +87,43 @@ def save_memory(content: str, label: str = "general", *, untrusted: bool = True)
     if len(content) > 512:
         content = content[:512]
 
-    # Write to flat memories table (preserved for compatibility)
+    # PALACE-GUARD-01B-1: the flat row and every Palace derivative it produces
+    # (drawer + rolling-closet segment, plus a hall when the label maps to
+    # one) are ONE write transaction. The flat row's own id is captured and
+    # stamped on each derivative as source_memory_id, so later lifecycle
+    # operations follow a recorded link instead of guessing by content.
+    # Previously the flat row committed first and a Palace failure was
+    # swallowed as a successful save (the source of flat memories with no
+    # Palace copy); now it's all or nothing, and a failure says so.
+    from tools.palace import _store_in_conn, _store_hall_in_conn
     conn = get_db()
-    conn.execute(
-        "INSERT INTO memories (label, content, created_at, untrusted) VALUES (?, ?, ?, ?)",
-        (label, content, datetime.now().isoformat(), 1 if untrusted else 0)
-    )
-    conn.commit()
-    conn.close()
-
-    # Write-through to palace
     try:
-        from tools.palace import palace_store, palace_store_hall
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "INSERT INTO memories (label, content, created_at, untrusted) VALUES (?, ?, ?, ?)",
+            (label, content, datetime.now().isoformat(), 1 if untrusted else 0)
+        )
+        memory_id = cur.lastrowid
         wing = LABEL_TO_WING.get(label.lower(), "sessions")
         room = label.lower() if label != "general" else "general"
-        result = palace_store(
-            content, wing=wing, room=room, layer=2, untrusted=untrusted
+        result = _store_in_conn(
+            conn, content, wing, room, 2, None, True, untrusted,
+            source_memory_id=memory_id,
         )
-
         # Also drop into a hall if this label maps to one
         hall = LABEL_TO_HALL.get(label.lower())
         if hall:
-            palace_store_hall(content, hall=hall, layer=2, untrusted=untrusted)
-
-        compressed_preview = (result["compressed"] or "")[:80]
-        return f"Memory saved [{label}]. Compressed: {compressed_preview}"
+            _store_hall_in_conn(conn, content, hall, 2, untrusted,
+                                source_memory_id=memory_id)
+        conn.commit()
     except Exception as e:
-        # Palace failure is non-fatal — flat save already succeeded
-        return f"Memory saved [{label}]: {content[:80]} (palace: {e})"
+        conn.rollback()
+        return f"[Error: memory not saved ({type(e).__name__}); nothing was written.]"
+    finally:
+        conn.close()
+
+    compressed_preview = (result["compressed"] or "")[:80]
+    return f"Memory saved [{label}]. Compressed: {compressed_preview}"
 
 
 def search_memory(query: str, label: str = None) -> str:

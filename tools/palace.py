@@ -32,6 +32,14 @@ def get_db():
 
 def init_palace_db():
     """Create palace tables if they don't exist. Safe to call on every startup."""
+    # PALACE-GUARD-01B-1: palace_drawers / palace_halls carry a nullable
+    # source_memory_id FK to memories(id). With foreign keys enforced (every
+    # core.db connection), SQLite refuses ANY insert into a table whose FK
+    # parent table doesn't exist -- even with a NULL key -- so the parent must
+    # exist before the Palace is usable. init_memory_db() is idempotent.
+    from tools.memory import init_memory_db
+    init_memory_db()
+
     conn = get_db()
 
     conn.execute("""
@@ -135,6 +143,28 @@ def init_palace_db():
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e):
             raise
+
+    # PALACE-GUARD-01B-1: structural source linkage. A drawer/hall derived
+    # from a flat memory (save_memory's write-through) records that memory's
+    # exact id; everything else -- model-native palace_remember/palace_hall,
+    # Dreaming, compaction -- and every pre-existing row stays NULL. Existing
+    # rows are never linked after the fact: no content matching, no inferred
+    # provenance. Default ON DELETE NO ACTION on purpose: deleting a linked
+    # memory directly fails under FK enforcement instead of orphaning its
+    # derivatives (CASCADE could drop drawers but can't rebuild closets).
+    for table in ("palace_drawers", "palace_halls"):
+        try:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN source_memory_id "
+                "INTEGER REFERENCES memories(id)"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_source_memory_id "
+            f"ON {table}(source_memory_id)"
+        )
 
     # Seed default wings if empty
     wings = [
@@ -481,9 +511,28 @@ def palace_store(
     fold ContextManager's soft "Provenance reminder" nudge on; it is never
     consulted to decide what text actually renders -- that's the
     per-segment tag's job alone.
+
+    Model-native and autonomous callers (palace_remember, Dreaming,
+    compaction) come through here and never carry a source link; only
+    tools.memory.save_memory() links a drawer to its flat memory, inside its
+    own transaction, via _store_in_conn().
     """
-    from core.context import tag_untrusted
     conn = get_db()
+    try:
+        result = _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted)
+        conn.commit()
+    finally:
+        conn.close()
+    return result
+
+
+def _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted,
+                   source_memory_id=None) -> dict:
+    """palace_store()'s body on a caller-owned connection: no commit, no
+    close -- the caller's transaction decides. source_memory_id (PALACE-
+    GUARD-01B-1) is written only when given, so every caller that doesn't
+    pass one issues exactly the SQL it did before."""
+    from core.context import tag_untrusted
     now = datetime.now().isoformat()
 
     wing_id = _get_wing_id(conn, wing)
@@ -500,11 +549,20 @@ def palace_store(
     drawer_tags = list(tags or [])
     if untrusted and "trust:untrusted" not in drawer_tags:
         drawer_tags.append("trust:untrusted")
-    drawer_cur = conn.execute(
-        "INSERT INTO palace_drawers "
-        "(room_id, content, tags, untrusted, created_at) VALUES (?,?,?,?,?)",
-        (room_id, content, json.dumps(drawer_tags), 1 if untrusted else 0, now)
-    )
+    if source_memory_id is None:
+        drawer_cur = conn.execute(
+            "INSERT INTO palace_drawers "
+            "(room_id, content, tags, untrusted, created_at) VALUES (?,?,?,?,?)",
+            (room_id, content, json.dumps(drawer_tags), 1 if untrusted else 0, now)
+        )
+    else:
+        drawer_cur = conn.execute(
+            "INSERT INTO palace_drawers "
+            "(room_id, content, tags, untrusted, created_at, source_memory_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (room_id, content, json.dumps(drawer_tags), 1 if untrusted else 0, now,
+             source_memory_id)
+        )
     drawer_id = drawer_cur.lastrowid
 
     closet_id = None
@@ -552,9 +610,6 @@ def palace_store(
         # Link drawer to closet
         conn.execute("UPDATE palace_drawers SET closet_id=? WHERE id=?", (closet_id, drawer_id))
 
-    conn.commit()
-    conn.close()
-
     return {
         "closet_id": closet_id,
         "drawer_id": drawer_id,
@@ -576,19 +631,36 @@ def palace_store_hall(content: str, hall: str = "facts", layer: int = 2,
     no merge/append, so each hall fact is already atomic and a plain
     per-row flag (no segment-tagging needed) is correct. The row's own
     compressed text is tag_untrusted()-wrapped when true."""
-    from core.context import tag_untrusted
     conn = get_db()
+    try:
+        hall_id = _store_hall_in_conn(conn, content, hall, layer, untrusted)
+        conn.commit()
+    finally:
+        conn.close()
+    return hall_id
+
+
+def _store_hall_in_conn(conn, content, hall, layer, untrusted, source_memory_id=None) -> int:
+    """palace_store_hall()'s body on a caller-owned connection (no commit,
+    no close). source_memory_id is written only when given."""
+    from core.context import tag_untrusted
     raw = aaak_compress(content, label=hall)
     compressed = tag_untrusted(hall, raw) if untrusted else raw
-    cur = conn.execute(
-        "INSERT INTO palace_halls (hall, compressed, layer, created_at, untrusted) "
-        "VALUES (?,?,?,?,?)",
-        (hall, compressed, layer, datetime.now().isoformat(), 1 if untrusted else 0)
-    )
-    hall_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return hall_id
+    now = datetime.now().isoformat()
+    if source_memory_id is None:
+        cur = conn.execute(
+            "INSERT INTO palace_halls (hall, compressed, layer, created_at, untrusted) "
+            "VALUES (?,?,?,?,?)",
+            (hall, compressed, layer, now, 1 if untrusted else 0)
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO palace_halls "
+            "(hall, compressed, layer, created_at, untrusted, source_memory_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (hall, compressed, layer, now, 1 if untrusted else 0, source_memory_id)
+        )
+    return cur.lastrowid
 
 
 # ── Load API ───────────────────────────────────────────────────────────────────
