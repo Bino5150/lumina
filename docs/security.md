@@ -10,7 +10,8 @@ authority.**
 ## Trust is explicit, not assumed
 
 Every agent session is constructed with an `owner: bool` flag.
-`True` means it's speaking for you — full toolset, no restrictions.
+`True` makes the owner toolset available; operation-specific grants,
+task routing checks and the Emergency Interlock still apply.
 `False` means it isn't, regardless of who or what is on the other end.
 This flag is set once per session and never changes mid-session — nothing
 a conversation says can raise a non-owner session to owner. Today, only
@@ -18,6 +19,15 @@ two entry points ever produce `owner=True`: the desktop app/CLI, and the
 Telegram bridge (because Telegram is itself locked to your own chat ID —
 see [Channels](channels.md)). Discord is hardcoded `owner=False` with no
 code path to `True` at all.
+
+Browser Companion exposes only reads and owner-granted navigation. Its
+internal site-action authority and review infrastructure is dormant: it
+does not provide a posting or replying workflow. A protected Companion
+task cannot borrow Playwright, API, terminal or delegation routes, and
+Companion authorization cannot transfer to another runtime. These checks
+bind to trusted agent/session/task identity; owner status or a PIN alone
+does not grant that authority. See [Browser Companion](browser-companion.md)
+for the available tools and authorization rules.
 
 ## Tool tiers and owner-only tools
 

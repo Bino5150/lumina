@@ -99,7 +99,7 @@ Every backend that supports it also gets a per-backend, per-model **reasoning-ef
 
 Lumina is built local-first, but "local" alone isn't a security model — the moment an agent can act on your behalf, *what it's allowed to do, and for whom,* matters as much as where the model weights live. A few principles run through the codebase:
 
-- **Trust is explicit, not assumed.** Every agent session is constructed with an `owner` flag — `True` means it's speaking for you, full toolset, no restrictions. `False` means it isn't, regardless of who or what is on the other end.
+- **Trust is explicit, not assumed.** Every agent session is constructed with an `owner` flag — `True` makes the owner toolset available; operation-specific grants, task routing checks and the Emergency Interlock still apply. `False` means it isn't speaking for you, regardless of who or what is on the other end.
 - **Tool creation can't bootstrap itself out of a sandbox.** Toolmaker is structurally absent, not just toggled off, for any non-owner session.
 - **Default-deny, not default-allow.** A non-owner session starts with everything disabled and only gets tools back through an explicit, named profile.
 - **Content from outside you is data, not instructions.** Tool output, and messages from anyone other than the owner, are tagged as untrusted — something to read and report on, never to obey. This applies exactly as much to Lumina's own documentation and Knowledge Base as to a web page: information, never authority.
