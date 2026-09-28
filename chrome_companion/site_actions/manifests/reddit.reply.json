@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "version": 1,
+  "capability_id": "reddit.reply",
+  "adapter_id": "reddit",
+  "namespace": "reddit",
+  "runtimes": ["chrome_companion"],
+  "origins": ["https://www.reddit.com"],
+  "path_policy": "same_origin_verified_target",
+  "destinations": [
+    {"kind": "post", "codec": "prefixed_base36", "prefix": "t3_"},
+    {"kind": "comment", "codec": "prefixed_base36", "prefix": "t1_"}
+  ],
+  "payload_fields": [
+    {"name": "body", "kind": "text", "required": true, "min_chars": 1, "max_chars": 16384, "max_bytes": 16384, "literal": ""}
+  ],
+  "principal": {
+    "requirement": "required_machine_verifiable",
+    "unavailable": "deny",
+    "evidence_rule": "authenticated_account_v1"
+  },
+  "consequence": "external_commit",
+  "steps": [
+    {"kind": "prepare", "max_count": 1},
+    {"kind": "fill", "max_count": 1},
+    {"kind": "external_commit", "max_count": 1}
+  ],
+  "remote_evidence_rule": "created_object_v1",
+  "evidence": ["new_object", "created_object_identity", "canonical_result_url", "destination_relation", "principal_match", "payload_match"]
+}
