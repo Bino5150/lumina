@@ -25,6 +25,17 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 WITHHELD = palace.WITHHELD_SOURCE_DELETED
 
 
+def _tracked_product_py(root=REPO):
+    """Git-tracked, non-test .py files under root. Structural guards must be
+    judged on product code only: untracked or ignored local files (e.g. a
+    dev checkout's gitignored reports/ scripts) aren't product code and must
+    not decide the result either way."""
+    import subprocess
+    out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "*.py"],
+                         capture_output=True, check=True).stdout.decode("utf-8")
+    return [root / p for p in out.split("\0") if p and not p.startswith("tests/")]
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     path = str(tmp_path / "lifecycle.db")
@@ -112,7 +123,7 @@ def test_approved_delete_memory_action_uses_the_lifecycle_function(db, monkeypat
 
 def test_no_raw_memory_delete_remains_outside_the_lifecycle_function():
     hits = []
-    for py in REPO.rglob("*.py"):
+    for py in _tracked_product_py():
         rel = py.relative_to(REPO).as_posix()
         if rel.startswith(("tests/", ".git/")):
             continue
@@ -424,7 +435,7 @@ def test_only_internal_synthesized_writers_stamp_an_origin():
     with pytest.raises(ValueError):
         palace.palace_store("x", origin="owner_approved")  # closed vocabulary
     stamps = {}
-    for py in REPO.rglob("*.py"):
+    for py in _tracked_product_py():
         rel = py.relative_to(REPO).as_posix()
         if rel.startswith(("tests/", ".git/")) or rel == "tools/palace.py":
             continue
@@ -487,3 +498,20 @@ def test_lifecycle_delete_works_on_a_db_without_palace_tables(tmp_path, monkeypa
     r = memory.delete_memory_with_derivatives(1)
     assert r["found"] and r["legacy_unlinked"] and r["drawers_removed"] == 0 and r["halls_removed"] == 0
     assert _q(path, "SELECT COUNT(*) AS n FROM memories")[0]["n"] == 0
+
+
+def test_structural_scans_ignore_untracked_local_files(tmp_path):
+    """A dev checkout carries gitignored scripts (reports/) that may quote
+    product code; the scans must see only tracked product files."""
+    import subprocess
+    repo = tmp_path / "repo"
+    (repo / "core").mkdir(parents=True)
+    (repo / "reports").mkdir()
+    (repo / "tests").mkdir()
+    (repo / "core" / "real.py").write_text("x = 1\n")
+    (repo / "tests" / "t.py").write_text("DELETE FROM memories\n")
+    (repo / "reports" / "local.py").write_text('origin="auto_compaction"\nDELETE FROM memories\n')
+    for cmd in (["init", "-q"], ["add", "core/real.py", "tests/t.py"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True)
+    found = {p.relative_to(repo).as_posix() for p in _tracked_product_py(repo)}
+    assert found == {"core/real.py"}

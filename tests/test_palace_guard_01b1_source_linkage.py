@@ -26,6 +26,17 @@ from tools import memory, palace
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
+def _tracked_product_py(root=REPO):
+    """Git-tracked, non-test .py files under root. Structural guards must be
+    judged on product code only: untracked or ignored local files (e.g. a
+    dev checkout's gitignored reports/ scripts) aren't product code and must
+    not decide the result either way."""
+    import subprocess
+    out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "*.py"],
+                         capture_output=True, check=True).stdout.decode("utf-8")
+    return [root / p for p in out.split("\0") if p and not p.startswith("tests/")]
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     path = str(tmp_path / "linkage.db")
@@ -236,7 +247,7 @@ def test_only_save_memory_can_set_a_source_link():
     assert "source_memory_id" not in inspect.signature(palace.palace_store).parameters
     assert "source_memory_id" not in inspect.signature(palace.palace_store_hall).parameters
     offenders = []
-    for py in REPO.rglob("*.py"):
+    for py in _tracked_product_py():
         rel = py.relative_to(REPO).as_posix()
         if rel.startswith(("tests/", ".git/")) or rel in ("tools/palace.py", "tools/memory.py"):
             continue
