@@ -201,19 +201,33 @@ def test_cannon08_legacy_drawer_migration_fails_closed_without_parsing_tags(
 def test_cannon08_undo_preserves_each_survivors_trust_and_recomputes_aggregate(
     tmp_path, monkeypatch
 ):
+    # PALACE-GUARD-01B-2: palace_undo_write no longer removes arbitrary
+    # drawers (only origin-stamped synthesized nightstand writes), so the
+    # removals here go through the sanctioned lifecycle delete, which settles
+    # the shared closet under the same rebuild law this test guards. Every
+    # original assertion about per-survivor framing and the recomputed
+    # aggregate is unchanged.
+    from tools import memory as memory_tools
     _isolate_paths(tmp_path, monkeypatch)
     palace.init_palace_db()
-    owner = palace.palace_store(
-        "CANNON08_OWNER_A", wing="nightstand", room="mixed", untrusted=False
-    )
-    hostile = palace.palace_store(
-        "CANNON08_HOSTILE_B", wing="nightstand", room="mixed", untrusted=True
-    )
-    removable = palace.palace_store(
-        "CANNON08_OWNER_C", wing="nightstand", room="mixed", untrusted=False
-    )
 
-    assert palace.palace_undo_write(removable["drawer_id"])["ok"] is True
+    def _linked(content, untrusted):
+        memory_tools.save_memory(content, "mixed", untrusted=untrusted)
+        conn = palace.get_db()
+        mid = conn.execute("SELECT MAX(id) AS m FROM memories").fetchone()["m"]
+        drawer_id = conn.execute(
+            "SELECT id FROM palace_drawers WHERE source_memory_id=?", (mid,)
+        ).fetchone()["id"]
+        conn.close()
+        return {"memory_id": mid, "drawer_id": drawer_id}
+
+    owner = _linked("CANNON08_OWNER_A", untrusted=False)
+    hostile = _linked("CANNON08_HOSTILE_B", untrusted=True)
+    removable = _linked("CANNON08_OWNER_C", untrusted=False)
+    assert palace.palace_undo_write(removable["drawer_id"])["ok"] is False
+
+    removal = memory_tools.delete_memory_with_derivatives(removable["memory_id"])
+    assert removal["closets"] == {"closet_rebuilt": 1}
     block, had_untrusted = palace.build_context_block(return_meta=True)
     owner_segment = next(s for s in block.split(" | ") if "CANNON08_OWNER_A" in s)
     hostile_segment = next(s for s in block.split(" | ") if "CANNON08_HOSTILE_B" in s)
@@ -235,7 +249,8 @@ def test_cannon08_undo_preserves_each_survivors_trust_and_recomputes_aggregate(
 
     # Removing the last lower-trust survivor recomputes, rather than leaving
     # the coarse closet signal sticky forever.
-    assert palace.palace_undo_write(hostile["drawer_id"])["ok"] is True
+    removal = memory_tools.delete_memory_with_derivatives(hostile["memory_id"])
+    assert removal["closets"] == {"closet_rebuilt": 1}
     block, had_untrusted = palace.build_context_block(return_meta=True)
     assert "CANNON08_OWNER_A" in block
     assert "CANNON08_HOSTILE_B" not in block

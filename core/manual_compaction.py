@@ -163,6 +163,7 @@ def run_manual_compaction(history_snapshot: list, chat_id: int, cancel_event=Non
                 f"session:{chat_id}",
                 f"{CONTEXT_SKIP_TAG_PREFIX}{new_skip}",
             ],
+            origin="manual_compaction",  # PALACE-GUARD-01B-2 trusted synthesis stamp
             # REDDIT-INGRESS-AUTHORITY-01: every compaction summary is
             # model-authored derived state, not an owner command.  The current
             # incremental slice can contain a Lumina paraphrase whose original

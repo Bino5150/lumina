@@ -169,14 +169,93 @@ def get_recent_memories(limit: int = 5, label: str = None) -> str:
     return "\n".join(f"[{r['id']}] ({r['label']}) {r['content']}" for r in rows)
 
 
-def _delete_memory_direct(memory_id: int) -> str:
+LEGACY_UNLINKED_NOTICE = (
+    "It predates deterministic Palace linkage, so no Palace copy was "
+    "inferred or removed."
+)
+
+
+def delete_memory_with_derivatives(memory_id: int) -> dict:
+    """PALACE-GUARD-01B-2: THE deletion path for a flat memory -- used by
+    Settings > Memory > Delete and by the approved delete_memory pending
+    action alike. One BEGIN IMMEDIATE transaction:
+
+    1. every drawer linked by source_memory_id is removed, and its closet
+       settled under tools.palace._remove_drawer_in_conn()'s law (delete /
+       exact rebuild / withhold -- never string surgery, never a re-render
+       of unrelated drawers);
+    2. every hall linked by source_memory_id is removed (halls are atomic);
+    3. the flat row is deleted LAST (the source_memory_id FK makes any
+       other order fail).
+
+    Any failure rolls the whole thing back. A memory with no linked
+    derivatives -- one written before linkage existed -- is deleted flat-only
+    and reported as legacy_unlinked: nothing is matched by text, hash or
+    meaning, and no candidate is touched.
+
+    Returns {"found", "memory_id", "drawers_removed", "halls_removed",
+    "closets": {outcome: count}, "legacy_unlinked"}.
+    """
+    from tools.palace import _remove_drawer_in_conn
     conn = get_db()
-    cur = conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-    conn.commit()
-    conn.close()
-    if cur.rowcount:
-        return f"Memory {memory_id} deleted."
-    return f"Memory {memory_id} not found."
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM memories WHERE id=?", (memory_id,)).fetchone() is None:
+            conn.rollback()
+            return {"found": False, "memory_id": memory_id}
+        # A DB with no Palace (or one not yet migrated to source links) can't
+        # hold a linked derivative; it's handled exactly like legacy state.
+        linkable = {
+            t for t in ("palace_drawers", "palace_halls")
+            if conn.execute("SELECT 1 FROM pragma_table_info(?) WHERE name='source_memory_id'",
+                            (t,)).fetchone()
+        }
+        drawer_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM palace_drawers WHERE source_memory_id=? ORDER BY id", (memory_id,))
+        ] if "palace_drawers" in linkable else []
+        closets = {}
+        for drawer_id in drawer_ids:
+            outcome = _remove_drawer_in_conn(conn, drawer_id)
+            closets[outcome] = closets.get(outcome, 0) + 1
+        halls_removed = conn.execute(
+            "DELETE FROM palace_halls WHERE source_memory_id=?", (memory_id,)
+        ).rowcount if "palace_halls" in linkable else 0
+        conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {
+        "found": True,
+        "memory_id": memory_id,
+        "drawers_removed": len(drawer_ids),
+        "halls_removed": halls_removed,
+        "closets": closets,
+        "legacy_unlinked": not drawer_ids and not halls_removed,
+    }
+
+
+def describe_memory_deletion(result: dict) -> str:
+    """One owner-facing sentence for a delete_memory_with_derivatives() result."""
+    mid = result["memory_id"]
+    if not result.get("found"):
+        return f"Memory {mid} not found."
+    if result["legacy_unlinked"]:
+        return f"Memory {mid} deleted. {LEGACY_UNLINKED_NOTICE}"
+    parts = [f"Memory {mid} deleted with its linked Palace copies "
+             f"({result['drawers_removed']} drawer(s), {result['halls_removed']} hall(s))."]
+    withheld = result["closets"].get("closet_withheld", 0)
+    if withheld:
+        parts.append(f"{withheld} shared closet(s) couldn't be rebuilt exactly and are "
+                     "withheld from Lumina's memory pending review.")
+    return " ".join(parts)
+
+
+def _delete_memory_direct(memory_id: int) -> str:
+    """Approved delete_memory pending action -- same lifecycle as Settings."""
+    return describe_memory_deletion(delete_memory_with_derivatives(memory_id))
 
 
 def delete_memory(memory_id: int) -> str:

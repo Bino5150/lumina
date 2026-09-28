@@ -112,7 +112,7 @@ separate from Browser Companion below — neither falls back to the other.
 | `save_memory` | Save a flat memory entry. |
 | `search_memory` | Search flat memory. |
 | `get_recent_memories` | List recent flat memories. |
-| `delete_memory` | Delete a flat memory entry (staged — Tier-2 approval gate). |
+| `delete_memory` | Delete a memory and the MemPalace copies saved with it (staged — Tier-2 approval gate). |
 
 ## MemPalace
 
@@ -123,7 +123,7 @@ separate from Browser Companion below — neither falls back to the other.
 | `palace_recall` | Keyword search over the MemPalace. |
 | `palace_status` | MemPalace state/summary. |
 | `palace_review_writes` | List flagged/reviewable writes. |
-| `palace_undo_write` | Undo a MemPalace write. |
+| `palace_undo_write` | Undo a single dream or compaction write in the nightstand (provenance-stamped by this version); refuses anything else. |
 
 ## Knowledge Base
 

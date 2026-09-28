@@ -267,10 +267,10 @@ def test_deleting_a_linked_memory_directly_fails(db):
     mid = _latest_memory_id(db)
     conn = core_db.connect(db)
     with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
-        conn.execute("DELETE FROM memories WHERE id=?", (mid,))  # memory_tab's raw SQL
+        conn.execute("DELETE FROM memories WHERE id=?", (mid,))  # any raw, non-lifecycle delete
     conn.close()
-    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
-        memory._delete_memory_direct(mid)  # the approved pending-action path
+    # (01B-2 routes Settings and the approved action through
+    # delete_memory_with_derivatives(); see test_palace_guard_01b2_*.)
     drawers, halls = _derived(db, mid)
     assert _latest_memory_id(db) == mid and drawers and halls
 
@@ -281,7 +281,9 @@ def test_unlinked_legacy_memory_still_deletes(db):
     c.commit()
     mid = c.execute("SELECT MAX(id) FROM memories").fetchone()[0]
     c.close()
-    assert memory._delete_memory_direct(mid) == f"Memory {mid} deleted."
+    result = memory._delete_memory_direct(mid)
+    assert result.startswith(f"Memory {mid} deleted.")
+    assert "predates deterministic Palace linkage" in result  # 01B-2 legacy notice
 
 
 # ── Atomicity ─────────────────────────────────────────────────────────────────

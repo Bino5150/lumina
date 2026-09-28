@@ -166,6 +166,19 @@ def init_palace_db():
             f"ON {table}(source_memory_id)"
         )
 
+    # PALACE-GUARD-01B-2: lifecycle quarantine + trusted synthesis origin.
+    # Both migrate as NULL and nothing classifies existing rows: NULL
+    # withheld_reason = ordinary (not withheld); NULL origin = not provably
+    # synthesized. Readers treat ANY non-NULL withheld_reason as withheld --
+    # an unknown or malformed value fails closed instead of becoming
+    # injectable.
+    for table, column in (("palace_closets", "withheld_reason"), ("palace_drawers", "origin")):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+
     # Seed default wings if empty
     wings = [
         ("identity",    "Who Lumina is, who Bino is, core relationship"),
@@ -380,6 +393,19 @@ _SYNTHESIZED_MEMORY_TAGS = frozenset({
     "dream-sweep", "auto-compaction", "manual-compaction",
 })
 
+# PALACE-GUARD-01B-2 closed vocabularies. withheld_reason: the only value
+# this code ever writes. origin: stamped only by the internal synthesized
+# writers (core/dreaming.py, core/manual_compaction.py, ui/main_window.py's
+# auto-compaction) -- never reachable from a model tool argument -- mapped to
+# the tag each writer also records.
+WITHHELD_SOURCE_DELETED = "source_deleted_pending_review"
+WITHHELD_REASONS = frozenset({WITHHELD_SOURCE_DELETED})
+SYNTHESIZED_ORIGINS = {
+    "dream_sweep": "dream-sweep",
+    "auto_compaction": "auto-compaction",
+    "manual_compaction": "manual-compaction",
+}
+
 
 def render_closet_text(label: str, drawers) -> str:
     """Pure: the closet text palace_store() would have produced for these
@@ -399,7 +425,7 @@ def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
     """Rebuild one rolling closet from its drawers and their authority bits."""
     location = conn.execute(
         "SELECT w.name AS wing, r.name AS room, c.compressed, c.token_est, "
-        "c.ever_had_untrusted_merge "
+        "c.ever_had_untrusted_merge, c.withheld_reason "
         "FROM palace_closets c "
         "JOIN palace_rooms r ON c.room_id=r.id "
         "JOIN palace_wings w ON r.wing_id=w.id WHERE c.id=?",
@@ -416,6 +442,10 @@ def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
     if not remaining:
         conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
         return
+    if location["withheld_reason"] is not None:
+        # PALACE-GUARD-01B-2: a withheld closet is frozen until explicit
+        # remediation -- never re-rendered (and never un-withheld) here.
+        return
 
     label = f"{location['wing']}.{location['room']}"
     rebuilt = render_closet_text(label, remaining)
@@ -431,6 +461,77 @@ def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
             "ever_had_untrusted_merge=? WHERE id=?",
             (rebuilt, token_est, datetime.now().isoformat(), ever_untrusted, closet_id),
         )
+
+
+def _remove_drawer_in_conn(conn, drawer_id: int) -> str:
+    """PALACE-GUARD-01B-2: remove one drawer and settle its closet, on a
+    caller-owned write transaction. The closet is judged against its CURRENT
+    drawers BEFORE anything changes:
+
+    - withheld closet: drop the drawer; keep the closet withheld (never
+      re-rendered, never un-withheld) unless it is now empty -> delete it.
+    - single-drawer closet: delete drawer and closet.
+    - multi-drawer, render-exact (stored text == render of its drawers):
+      drop the drawer and rebuild from the rest -- every other segment is
+      reproduced byte for byte.
+    - multi-drawer, drifted: drop the drawer, do NOT splice or re-render the
+      unrelated segments; mark the closet withheld pending review.
+
+    Returns one of: "no_closet", "withheld_closet_emptied",
+    "withheld_kept", "closet_deleted", "closet_rebuilt", "closet_withheld".
+    """
+    row = conn.execute(
+        "SELECT closet_id FROM palace_drawers WHERE id=?", (drawer_id,)
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"drawer {drawer_id} not found")
+    closet_id = row["closet_id"]
+    if closet_id is None:
+        conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+        return "no_closet"
+
+    closet = conn.execute(
+        "SELECT c.compressed, c.withheld_reason, w.name AS wing, r.name AS room "
+        "FROM palace_closets c JOIN palace_rooms r ON c.room_id=r.id "
+        "JOIN palace_wings w ON r.wing_id=w.id WHERE c.id=?",
+        (closet_id,),
+    ).fetchone()
+    before = conn.execute(
+        "SELECT id, content, untrusted FROM palace_drawers "
+        "WHERE closet_id=? ORDER BY created_at, id",
+        (closet_id,),
+    ).fetchall()
+    remaining = [d for d in before if d["id"] != drawer_id]
+
+    if closet is None or closet["withheld_reason"] is not None:
+        conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+        if not remaining:
+            conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
+            return "withheld_closet_emptied"
+        return "withheld_kept"
+
+    if not remaining:
+        conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+        conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
+        return "closet_deleted"
+
+    label = f"{closet['wing']}.{closet['room']}"
+    exact = render_closet_text(label, before) == closet["compressed"]
+    conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+    if exact:
+        rebuilt = render_closet_text(label, remaining)
+        conn.execute(
+            "UPDATE palace_closets SET compressed=?, token_est=?, updated_at=?, "
+            "ever_had_untrusted_merge=? WHERE id=?",
+            (rebuilt, estimate_tokens(rebuilt), datetime.now().isoformat(),
+             1 if any(d["untrusted"] for d in remaining) else 0, closet_id),
+        )
+        return "closet_rebuilt"
+    conn.execute(
+        "UPDATE palace_closets SET withheld_reason=? WHERE id=?",
+        (WITHHELD_SOURCE_DELETED, closet_id),
+    )
+    return "closet_withheld"
 
 
 def _migrate_synthesized_drawer_authority(conn) -> int:
@@ -484,6 +585,8 @@ def palace_store(
     tags: list[str] = None,
     compress: bool = True,
     untrusted: bool = True,
+    *,
+    origin: str = None,
 ) -> dict:
     """
     Store a memory in the palace.
@@ -516,10 +619,22 @@ def palace_store(
     compaction) come through here and never carry a source link; only
     tools.memory.save_memory() links a drawer to its flat memory, inside its
     own transaction, via _store_in_conn().
+
+    origin (PALACE-GUARD-01B-2, keyword-only): stamped ONLY by the internal
+    synthesized writers -- core/dreaming.py ("dream_sweep"),
+    core/manual_compaction.py ("manual_compaction"), and ui/main_window.py's
+    auto-compaction ("auto_compaction"). No model tool can pass it: the
+    registered palace_remember wrapper has a fixed signature without it.
+    It is the provenance palace_undo_write() requires; tags alone can't
+    prove synthesis, because palace_remember accepts model-chosen
+    wing/room/tags and can reproduce any tag shape exactly.
     """
+    if origin is not None and origin not in SYNTHESIZED_ORIGINS:
+        raise ValueError(f"unknown synthesized origin {origin!r}")
     conn = get_db()
     try:
-        result = _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted)
+        result = _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted,
+                                origin=origin)
         conn.commit()
     finally:
         conn.close()
@@ -527,11 +642,11 @@ def palace_store(
 
 
 def _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted,
-                   source_memory_id=None) -> dict:
+                   source_memory_id=None, origin=None) -> dict:
     """palace_store()'s body on a caller-owned connection: no commit, no
     close -- the caller's transaction decides. source_memory_id (PALACE-
-    GUARD-01B-1) is written only when given, so every caller that doesn't
-    pass one issues exactly the SQL it did before."""
+    GUARD-01B-1) and origin (01B-2) are written only when given, so a caller
+    passing neither writes exactly the columns and values it did before."""
     from core.context import tag_untrusted
     now = datetime.now().isoformat()
 
@@ -549,20 +664,19 @@ def _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted,
     drawer_tags = list(tags or [])
     if untrusted and "trust:untrusted" not in drawer_tags:
         drawer_tags.append("trust:untrusted")
-    if source_memory_id is None:
-        drawer_cur = conn.execute(
-            "INSERT INTO palace_drawers "
-            "(room_id, content, tags, untrusted, created_at) VALUES (?,?,?,?,?)",
-            (room_id, content, json.dumps(drawer_tags), 1 if untrusted else 0, now)
-        )
-    else:
-        drawer_cur = conn.execute(
-            "INSERT INTO palace_drawers "
-            "(room_id, content, tags, untrusted, created_at, source_memory_id) "
-            "VALUES (?,?,?,?,?,?)",
-            (room_id, content, json.dumps(drawer_tags), 1 if untrusted else 0, now,
-             source_memory_id)
-        )
+    columns = ["room_id", "content", "tags", "untrusted", "created_at"]
+    values = [room_id, content, json.dumps(drawer_tags), 1 if untrusted else 0, now]
+    if source_memory_id is not None:
+        columns.append("source_memory_id")
+        values.append(source_memory_id)
+    if origin is not None:
+        columns.append("origin")
+        values.append(origin)
+    drawer_cur = conn.execute(
+        f"INSERT INTO palace_drawers ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' * len(columns))})",
+        values,
+    )
     drawer_id = drawer_cur.lastrowid
 
     closet_id = None
@@ -580,7 +694,7 @@ def _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted,
         # Check if a closet already exists for this room+layer — update it (rolling summary)
         existing = conn.execute(
             "SELECT id, compressed, ever_had_untrusted_merge FROM palace_closets "
-            "WHERE room_id=? AND layer=?",
+            "WHERE room_id=? AND layer=? AND withheld_reason IS NULL",
             (room_id, layer)
         ).fetchone()
 
@@ -679,7 +793,7 @@ def load_layer(layer: int) -> list[dict]:
         FROM palace_closets c
         JOIN palace_rooms r ON c.room_id = r.id
         JOIN palace_wings w ON r.wing_id = w.id
-        WHERE c.layer = ?
+        WHERE c.layer = ? AND c.withheld_reason IS NULL
         ORDER BY w.name, r.name
     """, (layer,)).fetchall()
     conn.close()
@@ -710,7 +824,9 @@ def _find_pinned_closet_ids(pin_tag: str) -> set[int]:
     returning the drawer rows themselves."""
     conn = get_db()
     rows = conn.execute(
-        "SELECT DISTINCT closet_id FROM palace_drawers WHERE tags LIKE ? AND closet_id IS NOT NULL",
+        "SELECT DISTINCT d.closet_id FROM palace_drawers d "
+        "JOIN palace_closets c ON c.id = d.closet_id "
+        "WHERE d.tags LIKE ? AND c.withheld_reason IS NULL",
         (f'%"{pin_tag}"%',)
     ).fetchall()
     conn.close()
@@ -815,6 +931,10 @@ def palace_recall(query: str, wing: str = None, limit: int = 5) -> str:
     """
     Search verbatim Drawer contents (L3).
     Returns formatted results with source wing/room.
+
+    PALACE-GUARD-01B-2: drawers of a lifecycle-withheld closet never surface
+    here (nor in build_context_block / palace_review_writes) until explicit
+    remediation -- the whole closet is pending owner review.
     """
     conn = get_db()
     if wing:
@@ -827,7 +947,8 @@ def palace_recall(query: str, wing: str = None, limit: int = 5) -> str:
             FROM palace_drawers d
             JOIN palace_rooms r ON d.room_id = r.id
             JOIN palace_wings w ON r.wing_id = w.id
-            WHERE w.id=? AND d.content LIKE ?
+            LEFT JOIN palace_closets c ON c.id = d.closet_id
+            WHERE (d.closet_id IS NULL OR c.withheld_reason IS NULL) AND w.id=? AND d.content LIKE ?
             ORDER BY d.created_at DESC LIMIT ?
         """, (wing_id, f"%{query}%", limit)).fetchall()
     else:
@@ -836,7 +957,8 @@ def palace_recall(query: str, wing: str = None, limit: int = 5) -> str:
             FROM palace_drawers d
             JOIN palace_rooms r ON d.room_id = r.id
             JOIN palace_wings w ON r.wing_id = w.id
-            WHERE d.content LIKE ?
+            LEFT JOIN palace_closets c ON c.id = d.closet_id
+            WHERE (d.closet_id IS NULL OR c.withheld_reason IS NULL) AND d.content LIKE ?
             ORDER BY d.created_at DESC LIMIT ?
         """, (f"%{query}%", limit)).fetchall()
     conn.close()
@@ -876,36 +998,87 @@ def list_flagged_writes(tag: str = "dream-sweep", limit: int = 20) -> list[dict]
         FROM palace_drawers d
         JOIN palace_rooms r ON d.room_id = r.id
         JOIN palace_wings w ON r.wing_id = w.id
-        WHERE d.tags LIKE ?
+        LEFT JOIN palace_closets c ON c.id = d.closet_id
+        WHERE (d.closet_id IS NULL OR c.withheld_reason IS NULL) AND d.tags LIKE ?
         ORDER BY d.created_at DESC LIMIT ?
     """, (f'%"{tag}"%', limit)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
+def _undo_refusal(conn, drawer) -> str | None:
+    """Why palace_undo_write must refuse this drawer, or None when its
+    provenance PROVES it is a synthesized nightstand write. The trusted
+    `origin` stamp is the proof; everything else is a consistency check. A
+    caller-supplied id, a tag shape, or a docstring is never provenance on
+    its own: palace_remember can write any wing/room/tags, so a model-native
+    drawer can mirror a dream/compaction drawer exactly -- except for origin.
+    Legacy drawers written before origin existed are NULL, i.e. ambiguous,
+    and are refused (fail closed)."""
+    if drawer["source_memory_id"] is not None:
+        return "linked_to_source_memory"
+    origin = drawer["origin"]
+    if origin not in SYNTHESIZED_ORIGINS:
+        return "not_provably_synthesized"
+    loc = conn.execute(
+        "SELECT w.name AS wing, r.name AS room FROM palace_rooms r "
+        "JOIN palace_wings w ON r.wing_id = w.id WHERE r.id=?",
+        (drawer["room_id"],),
+    ).fetchone()
+    room = loc["room"] if loc else None
+    if (loc is None or loc["wing"] != "nightstand" or not isinstance(room, str)
+            or not (room.isascii() and room.isdecimal())):
+        return "not_in_a_nightstand_chat_room"
+    try:
+        tags = json.loads(drawer["tags"] or "[]")
+    except (TypeError, ValueError):
+        return "provenance_inconsistent"
+    if (not isinstance(tags, list) or SYNTHESIZED_ORIGINS[origin] not in tags
+            or f"session:{room}" not in tags or not drawer["untrusted"]):
+        return "provenance_inconsistent"
+    if drawer["closet_id"] is None:
+        return "provenance_inconsistent"
+    closet = conn.execute(
+        "SELECT layer FROM palace_closets WHERE id=?", (drawer["closet_id"],)
+    ).fetchone()
+    if closet is None or closet["layer"] != 2:
+        return "privileged_or_unknown_layer"
+    return None
+
+
 def palace_undo_write(drawer_id: int) -> dict:
     """
-    Delete a single auto-write and rebuild its parent closet from
-    whatever drawers are still linked to it — repairs the rolling
-    merge instead of nuking the whole closet. Safe by construction
-    for nightstand-wing writes, since only nightstand drawers ever
-    feed a nightstand closet.
+    Delete a single synthesized nightstand write (dream sweep or compaction)
+    and settle its parent closet under the same law as memory deletion
+    (PALACE-GUARD-01B-2, _remove_drawer_in_conn): rebuild only when the
+    closet is render-exact, otherwise withhold it pending review.
+
+    Refuses -- without changing anything -- every drawer whose provenance
+    doesn't prove it is synthesized nightstand material: source-linked
+    memory drawers, model-native drawers (even ones written into nightstand
+    with dream/compaction-shaped tags), legacy drawers with no origin stamp,
+    and anything outside layer 2. See _undo_refusal().
     """
     conn = get_db()
-    drawer = conn.execute("SELECT * FROM palace_drawers WHERE id=?", (drawer_id,)).fetchone()
-    if not drawer:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        drawer = conn.execute("SELECT * FROM palace_drawers WHERE id=?", (drawer_id,)).fetchone()
+        if not drawer:
+            conn.rollback()
+            return {"ok": False, "error": "drawer not found"}
+        reason = _undo_refusal(conn, drawer)
+        if reason:
+            conn.rollback()
+            return {"ok": False, "error": f"refused: {reason}"}
+        closet_id = drawer["closet_id"]
+        outcome = _remove_drawer_in_conn(conn, drawer_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        return {"ok": False, "error": "drawer not found"}
-
-    closet_id = drawer["closet_id"]
-    conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
-
-    if closet_id:
-        _rebuild_closet_from_drawers(conn, closet_id)
-
-    conn.commit()
-    conn.close()
-    return {"ok": True, "closet_id": closet_id, "drawer_id": drawer_id}
+    return {"ok": True, "closet_id": closet_id, "drawer_id": drawer_id, "closet_outcome": outcome}
 
 # ── Tool Registration ──────────────────────────────────────────────────────────
 
@@ -991,10 +1164,11 @@ def register_palace_tools(registry):
     registry.register(
         name="palace_undo_write",
         fn=lambda drawer_id: (
-            lambda r: f"Undone — drawer {r['drawer_id']} removed, closet {r['closet_id']} rebuilt." if r["ok"]
+            lambda r: (f"Undone — drawer {r['drawer_id']} removed "
+                       f"(closet {r['closet_id']}: {r['closet_outcome']}).") if r["ok"]
             else f"[Error: {r.get('error')}]"
         )(palace_undo_write(drawer_id)),
-        description="Delete a single flagged auto-write (by drawer_id from palace_review_writes) and safely rebuild its parent closet. Owner-only — touches the nightstand wing, isolated from curated memory.",
+        description="Delete a single synthesized nightstand write (a dream sweep or compaction, by drawer_id from palace_review_writes). Anything else -- memories, notes stored with palace_remember, or older writes without a provenance stamp -- is refused.",
         parameters={
             "type": "object",
             "properties": {

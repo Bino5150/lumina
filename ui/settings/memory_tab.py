@@ -172,12 +172,23 @@ class MemoryTab(QWidget):
         reply = QMessageBox.question(self, "Delete", f"Delete {len(ids)} memory entries?",
                                      QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
-            conn = _db()
+            # PALACE-GUARD-01B-2: the one canonical lifecycle delete (same as
+            # an approved delete_memory action) -- never a raw DELETE here.
+            from tools.memory import delete_memory_with_derivatives, describe_memory_deletion
+            notices = []
             for mid in ids:
-                conn.execute("DELETE FROM memories WHERE id=?", (int(mid),))
-            conn.commit()
-            conn.close()
+                try:
+                    result = delete_memory_with_derivatives(int(mid))
+                except Exception as e:
+                    notices.append(f"Memory {mid} was NOT deleted ({type(e).__name__}); "
+                                   "nothing was changed.")
+                    continue
+                if result.get("legacy_unlinked") or result.get("closets", {}).get("closet_withheld") \
+                        or not result.get("found"):
+                    notices.append(describe_memory_deletion(result))
             self._load()
+            if notices:
+                QMessageBox.information(self, "Delete", "\n\n".join(notices))
 
     def _paste_import(self):
         """Import memories pasted as plain text — one per line or JSON array."""
