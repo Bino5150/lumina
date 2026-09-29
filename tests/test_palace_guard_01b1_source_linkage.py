@@ -429,8 +429,15 @@ def test_delete_blocked_behind_an_open_save_cannot_orphan(db, monkeypatch):
 
 # ── Unchanged in B1 ───────────────────────────────────────────────────────────
 
-def test_l0_l1_behavior_is_unchanged_in_b1(db):
-    """01B-3 adds the admission boundary; B1 must not change layer behavior."""
+def test_model_native_palace_write_stays_unlinked_and_l1_request_lands_at_l2(db, tmp_path,
+                                                                            monkeypatch):
+    """B1's invariant: a model-native palace_remember never carries a source
+    link. (It originally also pinned "L1 is still L1"; 01B-3 deliberately
+    changed that -- a request for L1 is stored at L2 and staged as a promotion
+    request -- so the layer expectation moved, the unlinked-ness one did not.)"""
+    from tools import pending_actions
+    monkeypatch.setattr(pending_actions, "QUEUE_PATH", str(tmp_path / "pending_actions.json"))
+    monkeypatch.setattr(pending_actions, "AUDIT_LOG_PATH", str(tmp_path / "audit.log"))
     tools = {}
 
     class Reg:
@@ -438,13 +445,13 @@ def test_l0_l1_behavior_is_unchanged_in_b1(db):
             tools[name] = fn
 
     palace.register_palace_tools(Reg())
-    tools["palace_remember"](content="still L1 in B1", wing="identity", room="self", layer=1)
+    tools["palace_remember"](content="still unlinked", wing="identity", room="self", layer=1)
     c = _raw(db)
     row = c.execute("SELECT c.layer, d.source_memory_id FROM palace_closets c "
-                    "JOIN palace_drawers d ON d.closet_id=c.id WHERE d.content='still L1 in B1'"
+                    "JOIN palace_drawers d ON d.closet_id=c.id WHERE d.content='still unlinked'"
                     ).fetchone()
     c.close()
-    assert row["layer"] == 1 and row["source_memory_id"] is None
+    assert row["layer"] == 2 and row["source_memory_id"] is None
 
 
 def test_tests_never_touch_owner_data(db):

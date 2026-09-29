@@ -11,7 +11,7 @@ Settings is a tabbed panel (`ui/settings/panel.py`). Current tabs, in order:
 | 🧠 Memory | Browse/edit flat memory and MemPalace entries |
 | 📚 Knowledge | Browse/edit Knowledge Base entries |
 | 🧩 Skills | Browse Lumina's procedural skills — see [Personas & Skills](personas-and-skills.md#skills) |
-| 🔧 Tools | Tool profiles, and the **Pending Actions**/**Pending Tools** approval queues — see [Security & Authority](security.md) |
+| 🔧 Tools | Tool profiles, and the **Pending Actions**/**Pending Tools** approval queues (a Palace promotion request opens a review of the record's live state instead of a plain confirm) — see [Security & Authority](security.md) |
 | 🗓 Scheduled Tasks | Inspect/cancel scheduled and background work |
 | 🖼 Multimodal | Voice (TTS), Speech-to-text, Vision routing, Image Generation routing and credentials — see [Multimodal](multimodal.md) |
 | 🔮 Oracle | Placeholder — a related, separate project, not yet available here |

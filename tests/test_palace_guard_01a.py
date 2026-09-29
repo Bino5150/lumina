@@ -17,7 +17,12 @@ import pytest
 
 import config
 from core import palace_guard as pg
+from palace_legacy_fixtures import legacy_privileged_closet, legacy_privileged_hall
 from tools import memory, palace
+
+# PALACE-GUARD-01B-3: the generic writers refuse layer 0/1, so this file's
+# L0/L1 specimens are built as what they are -- legacy rows left by older
+# builds (see tests/palace_legacy_fixtures.py) -- not through a bypass.
 
 
 @pytest.fixture
@@ -63,10 +68,11 @@ def _seed_every_defect(path):
     # D002: owner-trusted closet whose drawer was later fail-closed (CANNON-08 legacy shape)
     legacy = palace.palace_store("legacy owner fact", wing="projects", room="legacy",
                                  layer=2, untrusted=False)
-    # D003: model-chosen L1 note (palace_remember always writes lower-trust)
-    l1 = palace.palace_store("lumina L1 note", wing="identity", room="self",
-                             layer=1, untrusted=True)
-    hall = palace.palace_store_hall("L0 hall fact", hall="facts", layer=0, untrusted=True)
+    # D003: a legacy L1 note as older builds' palace_remember(layer=1) left it
+    # (always written lower-trust)
+    l1 = legacy_privileged_closet("lumina L1 note", wing="identity", room="self",
+                                  layer=1, untrusted=True)
+    hall = legacy_privileged_hall("L0 hall fact", hall="facts", layer=0, untrusted=True)
     legacy_hall = palace.palace_store_hall("pre-provenance hall", hall="events", layer=2,
                                            untrusted=False)
     # D005: synthesized drawer, in a live chat's nightstand room (so D007 stays quiet)
@@ -296,8 +302,8 @@ def test_each_read_only_layer_holds_on_its_own(db, tmp_path):
 def test_d008_flags_only_halls_that_provably_predate_the_provenance_column(db):
     owner_now = palace.palace_store_hall("owner fact today", hall="facts", untrusted=False)
     legacy_l2 = palace.palace_store_hall("old fact", hall="facts", untrusted=False)
-    legacy_l1 = palace.palace_store_hall("old critical", hall="facts", layer=1,
-                                         untrusted=False)
+    legacy_l1 = legacy_privileged_hall("old critical", hall="facts", layer=1,
+                                       untrusted=False)
     legacy_framed = palace.palace_store_hall("old but framed", hall="facts", untrusted=True)
     garbled = palace.palace_store_hall("bad timestamp", hall="facts", untrusted=False)
     on_edge = palace.palace_store_hall("edge", hall="facts", untrusted=False)
@@ -337,9 +343,9 @@ ADVERSARIAL = (
 def test_memory_text_cannot_mint_authority_or_steer_guard(db):
     victim = palace.palace_store("unrelated owner fact", wing="people", room="bino",
                                  untrusted=False)
-    attack = palace.palace_store(ADVERSARIAL, wing="identity", room="core", layer=1,
-                                 tags=["owner-authorized", "trust:trusted", "owner-verified"],
-                                 untrusted=True)
+    attack = legacy_privileged_closet(
+        ADVERSARIAL, wing="identity", room="core", layer=1,
+        tags=["owner-authorized", "trust:trusted", "owner-verified"], untrusted=True)
     palace.palace_store_hall(ADVERSARIAL, hall="facts", layer=2, untrusted=True)
     before = _fingerprint(db)
 
@@ -367,8 +373,8 @@ def test_legacy_l1_closet_with_fail_closed_drawer_is_flagged_by_d002_and_d003(db
     """The dominant live shape (41 closets on the owner's real DB, 2026-09-27):
     an L1 closet written before provenance existed, flag still 0, whose
     drawer CANNON-08's migration later fail-closed to untrusted=1."""
-    legacy = palace.palace_store("legacy critical fact", wing="projects", room="old",
-                                 layer=1, untrusted=False)
+    legacy = legacy_privileged_closet("legacy critical fact", wing="projects", room="old",
+                                      layer=1, untrusted=False)
     conn = _raw(db)
     conn.execute("UPDATE palace_drawers SET untrusted=1 WHERE id=?", (legacy["drawer_id"],))
     conn.commit()
@@ -599,9 +605,13 @@ def test_render_closet_text_matches_live_writes_across_layers_and_trust(db):
     """H001's zero-false-positive baseline: for every closet the current
     write path produces, the shared renderer reproduces it byte for byte."""
     for i, (layer, trusted) in enumerate([(2, True), (2, False), (2, True), (1, False), (0, True)]):
-        palace.palace_store(f"fact {i} with project and memory words", wing="projects",
-                            room="same" if layer == 2 else f"r{i}", layer=layer,
-                            untrusted=not trusted)
+        text = f"fact {i} with project and memory words"
+        if layer == 2:
+            palace.palace_store(text, wing="projects", room="same", layer=2,
+                                untrusted=not trusted)
+        else:  # legacy L0/L1 closets (the generic writer no longer makes them)
+            legacy_privileged_closet(text, wing="projects", room=f"r{i}", layer=layer,
+                                     untrusted=not trusted)
     conn = _raw(db)
     closets = conn.execute("""
         SELECT c.id, c.compressed, w.name AS wing, r.name AS room FROM palace_closets c

@@ -10,6 +10,9 @@ Structure:
 Layers:
   L0  ~50 tok  — Identity core. Always injected. Never changes unless you update it.
   L1  ~120 tok — Critical facts. Always injected. Updated when something important changes.
+  (L0/L1 are privileged: only the startup seed or an owner-approved promotion may place a
+   row there -- a model's request for them is stored at L2 and staged. See the admission
+   section below.)
   L2  ~300 tok — Recent sessions + active projects. Loaded at session start.
   L3  unlimited — Full verbatim originals. Searched on demand via recall tool.
 """
@@ -17,6 +20,8 @@ Layers:
 import sqlite3
 import json
 import re
+import threading
+import weakref
 from datetime import datetime
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -179,6 +184,43 @@ def init_palace_db():
             if "duplicate column name" not in str(e):
                 raise
 
+    # PALACE-GUARD-01B-3: privileged-layer admission provenance. Layer lives on
+    # the closet (and on the hall row); these columns record HOW a row came to
+    # occupy L0/L1: 'trusted_startup_seed' or 'explicit_owner_promotion' (see
+    # ADMISSION_CLASSES). Like withheld_reason/origin above, both migrate as
+    # NULL and nothing classifies existing rows: NULL = ordinary, legacy or
+    # unknown provenance. Never inferred from content, tags or layer.
+    for table in ("palace_closets", "palace_halls"):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN admission TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+
+    # PALACE-GUARD-01B-4: the promotion ledger. One row per executed owner
+    # promotion; approval_id is the PRIMARY KEY, so an approval can be consumed
+    # at most once even if the in-memory registry were bypassed. It is also the
+    # audit receipt: what was promoted, from/to which layer, against which
+    # approved snapshot digest, and the trust bit as it was when promoted (which
+    # promotion never changes). No FK to drawers/halls: a receipt outlives a
+    # later deletion of its target.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS palace_promotion_receipts (
+            approval_id      TEXT PRIMARY KEY,
+            operation_id     TEXT,
+            owner_event      TEXT,
+            target_kind      TEXT NOT NULL,
+            target_id        INTEGER NOT NULL,
+            from_layer       INTEGER,
+            to_layer         INTEGER NOT NULL,
+            snapshot_digest  TEXT NOT NULL,
+            untrusted        INTEGER NOT NULL,
+            result_closet_id INTEGER,
+            closet_outcome   TEXT,
+            promoted_at      TEXT NOT NULL
+        )
+    """)
+
     # Seed default wings if empty
     wings = [
         ("identity",    "Who Lumina is, who Bino is, core relationship"),
@@ -209,8 +251,231 @@ def init_palace_db():
     conn.close()
 
 
+# ── Privileged-layer admission (PALACE-GUARD-01B-3) ────────────────────────────
+#
+# Layer is not authority, and a requested layer is not an admission. L0/L1 are
+# injected into every owner turn and exempt from decay and inject limits, so no
+# generic write may place a row there. A row may occupy layer < 2 only when its
+# writer presents a PrivilegedAdmission -- an opaque capability that:
+#
+#   * can only be constructed by this module's private minters (a module-private
+#     token) and is registered in _MINTED_ADMISSIONS at mint time, so an object
+#     forged with object.__new__/copy/pickle or a look-alike (dict, str, bool,
+#     SimpleNamespace, subclass) is refused;
+#   * is scoped to a closed admission class, a row kind (closet|hall), the
+#     layers it may place, and -- for owner promotion -- one exact target;
+#   * is never a parameter of the generic writers. palace_store /
+#     palace_store_hall / _store_in_conn / _store_hall_in_conn take no admission
+#     argument at all and refuse layer < 2 unconditionally. The ONLY functions
+#     that accept one are the two INSERT chokepoints below, and only
+#     _seed_l0() (and, in 01B-4, the owner-promotion service) call them with one.
+#
+# A model may ask for the crown (palace_remember(layer=1)); the wrapper stores
+# the material at L2 and stages the request. Nothing here reads a tag, a string
+# or a flag to decide privilege, and none of it is a host sandbox: it closes the
+# tool/argument path, not hostile in-process Python.
+
+PRIVILEGED_LAYERS = frozenset({0, 1})
+ADMISSION_TRUSTED_STARTUP_SEED = "trusted_startup_seed"
+ADMISSION_EXPLICIT_OWNER_PROMOTION = "explicit_owner_promotion"
+ADMISSION_CLASSES = frozenset({
+    ADMISSION_TRUSTED_STARTUP_SEED,
+    ADMISSION_EXPLICIT_OWNER_PROMOTION,
+})
+
+
+class PrivilegedLayerRefused(ValueError):
+    """A write tried to occupy L0/L1 without a valid, correctly-scoped
+    PrivilegedAdmission (or with an ill-typed layer). Nothing was written."""
+
+
+_MINT = object()  # module-private mint token; never exported or stored on a row
+_MINTED_ADMISSIONS = weakref.WeakSet()
+_MINT_LOCK = threading.Lock()
+
+
+class PrivilegedAdmission:
+    """Opaque, immutable, non-copyable, non-subclassable admission capability.
+    Construct only through the private _mint_* functions."""
+
+    __slots__ = ("_admission_class", "_kinds", "_layers", "_target", "__weakref__")
+
+    def __init_subclass__(cls, **kwargs):
+        raise TypeError("PrivilegedAdmission cannot be subclassed")
+
+    def __init__(self, token, admission_class, *, kinds, layers, target=None):
+        if token is not _MINT:
+            raise TypeError("PrivilegedAdmission can only be minted by the Palace admission minters")
+        if admission_class not in ADMISSION_CLASSES:
+            raise ValueError(f"unknown admission class {admission_class!r}")
+        set_ = object.__setattr__
+        set_(self, "_admission_class", admission_class)
+        set_(self, "_kinds", frozenset(kinds))
+        set_(self, "_layers", frozenset(layers))
+        set_(self, "_target", target)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("PrivilegedAdmission is immutable")
+
+    def __delattr__(self, name):
+        raise AttributeError("PrivilegedAdmission is immutable")
+
+    def __copy__(self):
+        raise TypeError("PrivilegedAdmission cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("PrivilegedAdmission cannot be copied")
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("PrivilegedAdmission cannot be serialized")
+
+    @property
+    def admission_class(self) -> str:
+        return self._admission_class
+
+    def permits(self, kind: str, layer: int, target=None) -> bool:
+        return (
+            kind in self._kinds
+            and layer in self._layers
+            and (self._target is None or self._target == target)
+        )
+
+
+def _register_admission(admission: PrivilegedAdmission) -> PrivilegedAdmission:
+    with _MINT_LOCK:
+        _MINTED_ADMISSIONS.add(admission)
+    return admission
+
+
+def _mint_startup_seed_admission() -> PrivilegedAdmission:
+    """The startup identity seed's admission: one L0 closet, nothing else. It
+    cannot place L1, a hall, or anything bound to a target."""
+    return _register_admission(PrivilegedAdmission(
+        _MINT, ADMISSION_TRUSTED_STARTUP_SEED, kinds=("closet",), layers=(0,),
+    ))
+
+
+def _mint_owner_promotion_admission(target_kind: str, target_id: int,
+                                    dest_layer: int) -> PrivilegedAdmission:
+    """01B-4: admission for placing ONE record at ONE privileged layer.
+    Minted only by core.palace_promotion.promote_with_owner_approval(), and only
+    after it has re-read the live record inside its write transaction and found
+    it byte-for-byte what the owner approved. It cannot place a different
+    record, a different layer, or a different row kind."""
+    if target_kind not in ("drawer", "hall"):
+        raise ValueError(f"unknown promotion target kind {target_kind!r}")
+    if type(target_id) is not int or type(dest_layer) is not int \
+            or dest_layer not in PRIVILEGED_LAYERS:
+        raise ValueError("promotion admission needs an int target id and a layer of 0 or 1")
+    return _register_admission(PrivilegedAdmission(
+        _MINT, ADMISSION_EXPLICIT_OWNER_PROMOTION,
+        kinds=("closet" if target_kind == "drawer" else "hall",),
+        layers=(dest_layer,), target=(target_kind, target_id),
+    ))
+
+
+def _strict_layer(layer) -> int:
+    """A layer must be a real int. SQLite's INTEGER affinity would otherwise
+    store "1", 1.0 and True as layer 1, so a comparison on the raw value is not
+    a gate. bool, float, str, None and int subclasses are refused outright."""
+    if type(layer) is not int:
+        raise PrivilegedLayerRefused(
+            f"palace layer must be an int, got {type(layer).__name__}"
+        )
+    return layer
+
+
+def _require_admission(admission, kind: str, layer: int, target=None) -> str:
+    """Returns the admission class to stamp, or raises. Fails closed on any
+    object that is not a live, minted PrivilegedAdmission scoped to this row."""
+    try:
+        with _MINT_LOCK:
+            minted = admission in _MINTED_ADMISSIONS
+    except TypeError:
+        minted = False
+    if type(admission) is not PrivilegedAdmission or not minted:
+        raise PrivilegedLayerRefused(
+            f"layer {layer} requires a trusted admission; none was presented"
+        )
+    try:
+        allowed = admission.permits(kind, layer, target)
+        admission_class = admission.admission_class
+    except AttributeError:
+        allowed = False
+    if not allowed:
+        raise PrivilegedLayerRefused(
+            f"admission does not permit a {kind} at layer {layer}"
+        )
+    return admission_class
+
+
+def _refuse_generic_privileged_layer(layer) -> int:
+    """The generic writers' whole policy: strict int, and never below L2."""
+    layer = _strict_layer(layer)
+    if layer < 2:
+        raise PrivilegedLayerRefused(
+            f"layer {layer} is a privileged layer; generic Palace writes are limited to "
+            "L2 and below. Request promotion instead."
+        )
+    return layer
+
+
+def _insert_closet_row(conn, *, room_id, layer, compressed, token_est, now,
+                       ever_untrusted, admission=None, target=None) -> int:
+    """THE only place a palace_closets row is INSERTed (01B-3 chokepoint). A
+    layer < 2 needs a PrivilegedAdmission scoped to a closet at that layer and
+    is stamped with its class; an ordinary layer takes none and stays NULL.
+    `target` names the record the closet is being made for; a target-bound
+    admission (owner promotion) is refused unless it matches exactly."""
+    layer = _strict_layer(layer)
+    if layer < 2:
+        stamp = _require_admission(admission, "closet", layer, target)
+    elif admission is not None:
+        raise PrivilegedLayerRefused("an admission is only meaningful for layer < 2")
+    else:
+        stamp = None
+    cur = conn.execute(
+        "INSERT INTO palace_closets (room_id, layer, compressed, token_est, created_at, "
+        "updated_at, ever_had_untrusted_merge, admission) VALUES (?,?,?,?,?,?,?,?)",
+        (room_id, layer, compressed, token_est, now, now, 1 if ever_untrusted else 0, stamp),
+    )
+    return cur.lastrowid
+
+
+def _insert_hall_row(conn, *, hall, compressed, layer, now, untrusted,
+                     source_memory_id=None, admission=None) -> int:
+    """THE only place a palace_halls row is INSERTed (01B-3 chokepoint); same
+    admission rule as _insert_closet_row(). source_memory_id is written only
+    when given, exactly as before."""
+    layer = _strict_layer(layer)
+    if layer < 2:
+        stamp = _require_admission(admission, "hall", layer)
+    elif admission is not None:
+        raise PrivilegedLayerRefused("an admission is only meaningful for layer < 2")
+    else:
+        stamp = None
+    columns = ["hall", "compressed", "layer", "created_at", "untrusted"]
+    values = [hall, compressed, layer, now, 1 if untrusted else 0]
+    if source_memory_id is not None:
+        columns.append("source_memory_id")
+        values.append(source_memory_id)
+    if stamp is not None:
+        columns.append("admission")
+        values.append(stamp)
+    cur = conn.execute(
+        f"INSERT INTO palace_halls ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' * len(columns))})",
+        values,
+    )
+    return cur.lastrowid
+
+
 def _seed_l0(conn):
-    """Plant the L0 identity core. ~50 tokens. Auto-populated from config."""
+    """Plant the L0 identity core. ~50 tokens. Auto-populated from config.
+
+    The one legitimate startup L0 write: it presents the startup-seed
+    admission (L0 closet only) and its row is stamped
+    admission='trusted_startup_seed'. Rows seeded by older builds stay NULL."""
     wing_id = conn.execute("SELECT id FROM palace_wings WHERE name='identity'").fetchone()["id"]
     room_id = _ensure_room(conn, wing_id, "core")
 
@@ -225,9 +490,9 @@ def _seed_l0(conn):
     )
     token_est = estimate_tokens(compressed)
 
-    conn.execute(
-        "INSERT INTO palace_closets (room_id, layer, compressed, token_est, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-        (room_id, 0, compressed, token_est, now, now)
+    _insert_closet_row(
+        conn, room_id=room_id, layer=0, compressed=compressed, token_est=token_est,
+        now=now, ever_untrusted=False, admission=_mint_startup_seed_admission(),
     )
 
 
@@ -399,7 +664,12 @@ _SYNTHESIZED_MEMORY_TAGS = frozenset({
 # auto-compaction) -- never reachable from a model tool argument -- mapped to
 # the tag each writer also records.
 WITHHELD_SOURCE_DELETED = "source_deleted_pending_review"
-WITHHELD_REASONS = frozenset({WITHHELD_SOURCE_DELETED})
+# PALACE-GUARD-01B-4: a drawer was extracted (owner promotion) from a rolling
+# closet whose stored text no longer equals the render of its drawers. The
+# reason describes why the REMAINING closet can't be trusted for rendering; the
+# promotion's own provenance lives on the promoted row and its receipt.
+WITHHELD_DRAWER_EXTRACTED = "drawer_extracted_pending_review"
+WITHHELD_REASONS = frozenset({WITHHELD_SOURCE_DELETED, WITHHELD_DRAWER_EXTRACTED})
 SYNTHESIZED_ORIGINS = {
     "dream_sweep": "dream-sweep",
     "auto_compaction": "auto-compaction",
@@ -463,31 +733,49 @@ def _rebuild_closet_from_drawers(conn, closet_id: int) -> None:
         )
 
 
-def _remove_drawer_in_conn(conn, drawer_id: int) -> str:
-    """PALACE-GUARD-01B-2: remove one drawer and settle its closet, on a
-    caller-owned write transaction. The closet is judged against its CURRENT
-    drawers BEFORE anything changes:
+def _extract_drawer_in_conn(conn, drawer_id: int, *, keep_row: bool = False,
+                            withhold_reason: str = WITHHELD_SOURCE_DELETED) -> str:
+    """PALACE-GUARD-01B-2 closet law, shared by deletion and (01B-4) promotion:
+    take one drawer out of its closet and settle that closet, on a caller-owned
+    write transaction. The closet is judged against its CURRENT drawers BEFORE
+    anything changes:
 
     - withheld closet: drop the drawer; keep the closet withheld (never
       re-rendered, never un-withheld) unless it is now empty -> delete it.
-    - single-drawer closet: delete drawer and closet.
+    - single-drawer closet: drop drawer and closet.
     - multi-drawer, render-exact (stored text == render of its drawers):
       drop the drawer and rebuild from the rest -- every other segment is
       reproduced byte for byte.
     - multi-drawer, drifted: drop the drawer, do NOT splice or re-render the
-      unrelated segments; mark the closet withheld pending review.
+      unrelated segments; mark the closet withheld (with `withhold_reason`)
+      pending review.
+
+    "Drop" is a DELETE of the drawer row by default (memory deletion). With
+    keep_row=True the row survives, detached (closet_id NULL) for the caller to
+    re-home -- that is the only difference; the closet decision is the same
+    code. A drawer in an already-withheld closet is quarantined and is never
+    extractable with keep_row=True.
 
     Returns one of: "no_closet", "withheld_closet_emptied",
     "withheld_kept", "closet_deleted", "closet_rebuilt", "closet_withheld".
     """
+    if withhold_reason not in WITHHELD_REASONS:
+        raise ValueError(f"unknown withheld reason {withhold_reason!r}")
     row = conn.execute(
         "SELECT closet_id FROM palace_drawers WHERE id=?", (drawer_id,)
     ).fetchone()
     if row is None:
         raise LookupError(f"drawer {drawer_id} not found")
     closet_id = row["closet_id"]
+
+    def drop_drawer():
+        if keep_row:
+            conn.execute("UPDATE palace_drawers SET closet_id=NULL WHERE id=?", (drawer_id,))
+        else:
+            conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+
     if closet_id is None:
-        conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+        drop_drawer()
         return "no_closet"
 
     closet = conn.execute(
@@ -504,20 +792,25 @@ def _remove_drawer_in_conn(conn, drawer_id: int) -> str:
     remaining = [d for d in before if d["id"] != drawer_id]
 
     if closet is None or closet["withheld_reason"] is not None:
-        conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+        if keep_row and closet is not None:
+            raise ValueError(
+                f"drawer {drawer_id} sits in a withheld closet; a quarantined drawer "
+                "cannot be extracted"
+            )
+        drop_drawer()
         if not remaining:
             conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
             return "withheld_closet_emptied"
         return "withheld_kept"
 
     if not remaining:
-        conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+        drop_drawer()
         conn.execute("DELETE FROM palace_closets WHERE id=?", (closet_id,))
         return "closet_deleted"
 
     label = f"{closet['wing']}.{closet['room']}"
     exact = render_closet_text(label, before) == closet["compressed"]
-    conn.execute("DELETE FROM palace_drawers WHERE id=?", (drawer_id,))
+    drop_drawer()
     if exact:
         rebuilt = render_closet_text(label, remaining)
         conn.execute(
@@ -529,9 +822,75 @@ def _remove_drawer_in_conn(conn, drawer_id: int) -> str:
         return "closet_rebuilt"
     conn.execute(
         "UPDATE palace_closets SET withheld_reason=? WHERE id=?",
-        (WITHHELD_SOURCE_DELETED, closet_id),
+        (withhold_reason, closet_id),
     )
     return "closet_withheld"
+
+
+def _remove_drawer_in_conn(conn, drawer_id: int) -> str:
+    """PALACE-GUARD-01B-2: delete one drawer and settle its closet -- the
+    keep_row=False form of _extract_drawer_in_conn(). This is the deletion
+    entry point tools.memory and palace_undo_write call; behavior is exactly
+    what it was before promotion existed."""
+    return _extract_drawer_in_conn(conn, drawer_id)
+
+
+def _promote_drawer_in_conn(conn, drawer_id: int, dest_layer: int, admission) -> dict:
+    """PALACE-GUARD-01B-4: move ONE drawer to its own closet at a privileged
+    layer, on a caller-owned write transaction. Only
+    core.palace_promotion.promote_with_owner_approval() calls this, after it
+    has revalidated the live record against the owner's approved snapshot.
+
+    Layer lives on the closet, so promotion = (1) take the drawer out of its
+    current closet under B2's exact law (_extract_drawer_in_conn with
+    keep_row=True: single-drawer closet removed, render-exact closet rebuilt
+    byte for byte from the survivors, drifted closet withheld untouched), then
+    (2) give the SAME drawer row a fresh single-drawer closet at the destination
+    (L0/L1 closets never merge), rendered by the same render_closet_text() every
+    other closet uses and stamped with the promotion admission.
+
+    Trust is never touched: the drawer's `untrusted` column is not written, and
+    an untrusted drawer's new closet renders framed (tag_untrusted) with
+    ever_had_untrusted_merge=1, exactly as a fresh untrusted write would."""
+    _strict_layer(dest_layer)
+    # Scope check before ANY mutation: wrong record/layer/kind fails here.
+    _require_admission(admission, "closet", dest_layer, ("drawer", drawer_id))
+    drawer = conn.execute(
+        "SELECT d.id, d.room_id, d.content, d.untrusted, w.name AS wing, r.name AS room "
+        "FROM palace_drawers d JOIN palace_rooms r ON r.id=d.room_id "
+        "JOIN palace_wings w ON w.id=r.wing_id WHERE d.id=?",
+        (drawer_id,),
+    ).fetchone()
+    if drawer is None:
+        raise LookupError(f"drawer {drawer_id} not found")
+    extraction = _extract_drawer_in_conn(
+        conn, drawer_id, keep_row=True, withhold_reason=WITHHELD_DRAWER_EXTRACTED,
+    )
+    text = render_closet_text(f"{drawer['wing']}.{drawer['room']}", [drawer])
+    closet_id = _insert_closet_row(
+        conn, room_id=drawer["room_id"], layer=dest_layer, compressed=text,
+        token_est=estimate_tokens(text), now=datetime.now().isoformat(),
+        ever_untrusted=bool(drawer["untrusted"]), admission=admission,
+        target=("drawer", drawer_id),
+    )
+    conn.execute("UPDATE palace_drawers SET closet_id=? WHERE id=?", (closet_id, drawer_id))
+    return {"closet_id": closet_id, "extraction": extraction}
+
+
+def _promote_hall_in_conn(conn, hall_id: int, dest_layer: int, admission) -> dict:
+    """PALACE-GUARD-01B-4: raise ONE hall row to a privileged layer. Halls are
+    atomic rows with their own layer, so this is a layer + admission stamp and
+    nothing else: text, `untrusted`, source link and every other column stay as
+    they are. It only ever moves a row toward a MORE privileged layer."""
+    _strict_layer(dest_layer)
+    stamp = _require_admission(admission, "hall", dest_layer, ("hall", hall_id))
+    cur = conn.execute(
+        "UPDATE palace_halls SET layer=?, admission=? WHERE id=? AND layer > ?",
+        (dest_layer, stamp, hall_id, dest_layer),
+    )
+    if cur.rowcount != 1:
+        raise LookupError(f"hall {hall_id} not found or already at/above layer {dest_layer}")
+    return {}
 
 
 def _migrate_synthesized_drawer_authority(conn) -> int:
@@ -628,6 +987,13 @@ def palace_store(
     It is the provenance palace_undo_write() requires; tags alone can't
     prove synthesis, because palace_remember accepts model-chosen
     wing/room/tags and can reproduce any tag shape exactly.
+
+    layer (PALACE-GUARD-01B-3): must be a real int and >= 2. This generic
+    writer has no admission parameter and refuses L0/L1 outright with
+    PrivilegedLayerRefused -- privileged placement is not something a caller
+    can request here (see the admission section above). The model-facing
+    palace_remember wrapper turns a request for L0/L1 into an L2 write plus a
+    staged promotion request instead.
     """
     if origin is not None and origin not in SYNTHESIZED_ORIGINS:
         raise ValueError(f"unknown synthesized origin {origin!r}")
@@ -648,6 +1014,9 @@ def _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted,
     GUARD-01B-1) and origin (01B-2) are written only when given, so a caller
     passing neither writes exactly the columns and values it did before."""
     from core.context import tag_untrusted
+    # PALACE-GUARD-01B-3: refuse before ANY row is written (wing, room, drawer),
+    # so a refused write leaves nothing behind even if the caller never rolls back.
+    layer = _refuse_generic_privileged_layer(layer)
     now = datetime.now().isoformat()
 
     wing_id = _get_wing_id(conn, wing)
@@ -713,12 +1082,10 @@ def _store_in_conn(conn, content, wing, room, layer, tags, compress, untrusted,
             closet_id = existing["id"]
             compressed = merged
         else:
-            closet_cur = conn.execute(
-                "INSERT INTO palace_closets (room_id, layer, compressed, token_est, "
-                "created_at, updated_at, ever_had_untrusted_merge) VALUES (?,?,?,?,?,?,?)",
-                (room_id, layer, segment, token_est, now, now, 1 if untrusted else 0)
+            closet_id = _insert_closet_row(
+                conn, room_id=room_id, layer=layer, compressed=segment,
+                token_est=token_est, now=now, ever_untrusted=untrusted,
             )
-            closet_id = closet_cur.lastrowid
             compressed = segment
 
         # Link drawer to closet
@@ -744,7 +1111,10 @@ def palace_store_hall(content: str, hall: str = "facts", layer: int = 2,
     closets, every call here INSERTs a fresh, independent row -- there is
     no merge/append, so each hall fact is already atomic and a plain
     per-row flag (no segment-tagging needed) is correct. The row's own
-    compressed text is tag_untrusted()-wrapped when true."""
+    compressed text is tag_untrusted()-wrapped when true.
+
+    layer (PALACE-GUARD-01B-3): a real int, >= 2; L0/L1 is refused with
+    PrivilegedLayerRefused exactly as in palace_store()."""
     conn = get_db()
     try:
         hall_id = _store_hall_in_conn(conn, content, hall, layer, untrusted)
@@ -756,25 +1126,19 @@ def palace_store_hall(content: str, hall: str = "facts", layer: int = 2,
 
 def _store_hall_in_conn(conn, content, hall, layer, untrusted, source_memory_id=None) -> int:
     """palace_store_hall()'s body on a caller-owned connection (no commit,
-    no close). source_memory_id is written only when given."""
+    no close). source_memory_id is written only when given.
+
+    PALACE-GUARD-01B-3: like _store_in_conn(), refuses layer < 2 outright --
+    a Hall is not a way around the drawer boundary."""
     from core.context import tag_untrusted
+    layer = _refuse_generic_privileged_layer(layer)
     raw = aaak_compress(content, label=hall)
     compressed = tag_untrusted(hall, raw) if untrusted else raw
     now = datetime.now().isoformat()
-    if source_memory_id is None:
-        cur = conn.execute(
-            "INSERT INTO palace_halls (hall, compressed, layer, created_at, untrusted) "
-            "VALUES (?,?,?,?,?)",
-            (hall, compressed, layer, now, 1 if untrusted else 0)
-        )
-    else:
-        cur = conn.execute(
-            "INSERT INTO palace_halls "
-            "(hall, compressed, layer, created_at, untrusted, source_memory_id) "
-            "VALUES (?,?,?,?,?,?)",
-            (hall, compressed, layer, now, 1 if untrusted else 0, source_memory_id)
-        )
-    return cur.lastrowid
+    return _insert_hall_row(
+        conn, hall=hall, compressed=compressed, layer=layer, now=now,
+        untrusted=untrusted, source_memory_id=source_memory_id,
+    )
 
 
 # ── Load API ───────────────────────────────────────────────────────────────────
@@ -1080,6 +1444,75 @@ def palace_undo_write(drawer_id: int) -> dict:
         conn.close()
     return {"ok": True, "closet_id": closet_id, "drawer_id": drawer_id, "closet_outcome": outcome}
 
+# ── Model-facing layer requests (PALACE-GUARD-01B-3) ───────────────────────────
+
+_MODEL_LAYER_LIMIT = 2 ** 31  # nothing near this is a layer; it can't be stored as one
+
+
+def _strict_model_layer(raw) -> int | None:
+    """The model's layer argument is understood ONLY as a real int in a sane
+    range. Tool arguments arrive as JSON and SQLite would store True, 1.0, "1"
+    or " 1 " as integer 1, so none of those is allowed to mean "layer 1" -- in
+    particular none may mean "the owner should review this for promotion".
+    Returns the int, or None for bool, float, str, None, containers, and any
+    out-of-range value."""
+    if type(raw) is not int:
+        return None
+    if not -_MODEL_LAYER_LIMIT <= raw < _MODEL_LAYER_LIMIT:
+        return None
+    return raw
+
+
+def _admit_model_layer(raw) -> tuple[int, int | None, str]:
+    """A model-requested layer is a *requested destination*, never an
+    admission. Returns (layer_to_write, requested_privileged_layer_or_None,
+    warning). Only an exact int 0 or 1 is written at L2 and remembered as a
+    promotion request; any other in-range int passes through exactly as
+    before; everything else (bool, 1.0, "1", junk, oversized) falls back to
+    L2 with a warning and NEVER stages a request."""
+    layer = _strict_model_layer(raw)
+    if layer is None:
+        return 2, None, " (layer must be an integer; stored at L2)"
+    if layer in PRIVILEGED_LAYERS:
+        return 2, layer, ""
+    if layer < 0:
+        return 2, None, " (invalid layer; stored at L2)"
+    return layer, None, ""
+
+
+def _stage_privileged_request(target_kind: str, target_id: int, requested: int | None) -> str:
+    """After the L2 write has committed, stage the requested L0/L1 destination
+    as a promotion request for that exact record. Returns the sentence the
+    model is shown. A staging failure never un-writes the L2 memory and is
+    reported truthfully."""
+    if requested is None:
+        return ""
+    try:
+        from tools.pending_actions import stage_palace_promotion
+        action_id = stage_palace_promotion(target_kind, target_id, requested)
+    except Exception as e:
+        return (f" Requested L{requested} was NOT granted and could not be staged for "
+                f"owner review ({type(e).__name__}); the memory is stored at L2.")
+    return (f" Requested L{requested} was NOT granted: L0/L1 placement needs the owner's "
+            f"explicit approval. Staged as promotion request #{action_id} "
+            f"(Settings > Tools > Pending Actions); nothing is promoted until then.")
+
+
+def _palace_remember_tool(content, wing="sessions", room="general", layer=2, tags=None) -> str:
+    write_layer, requested, warning = _admit_model_layer(layer)
+    r = palace_store(content, wing, room, write_layer, tags, untrusted=True)
+    note = _stage_privileged_request("drawer", r["drawer_id"], requested)
+    return (f"Stored in {wing}/{room} (L{write_layer}){warning}.{note} "
+            f"Compressed: {r['compressed']} | Saved ~{r['tokens_saved']} tokens.")
+
+
+def _palace_hall_tool(content, hall="facts", layer=2) -> str:
+    write_layer, requested, warning = _admit_model_layer(layer)
+    hall_id = palace_store_hall(content, hall, write_layer, untrusted=True)
+    note = _stage_privileged_request("hall", hall_id, requested)
+    return f"Hall entry stored: {hall}/#{hall_id} (L{write_layer}){warning}.{note}"
+
+
 # ── Tool Registration ──────────────────────────────────────────────────────────
 
 def register_palace_tools(registry):
@@ -1087,17 +1520,15 @@ def register_palace_tools(registry):
 
     registry.register(
         name="palace_remember",
-        fn=lambda content, wing="sessions", room="general", layer=2, tags=None: (
-            lambda r: f"Stored in {wing}/{room} (L{layer}). Compressed: {r['compressed']} | Saved ~{r['tokens_saved']} tokens."
-        )(palace_store(content, wing, room, layer, tags, untrusted=True)),
-        description="Store a memory in the palace. Wing options: identity, projects, people, preferences, sessions.",
+        fn=_palace_remember_tool,
+        description="Store a memory in the palace. Wing options: identity, projects, people, preferences, sessions. Layers 0 and 1 (always-injected) are never granted by this tool: a request for them stores the memory at layer 2 and stages a promotion request for the owner to approve.",
         parameters={
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "The memory to store."},
                 "wing":    {"type": "string", "description": "Wing: identity|projects|people|preferences|sessions", "default": "sessions"},
                 "room":    {"type": "string", "description": "Sub-topic room name.", "default": "general"},
-                "layer":   {"type": "integer", "description": "0=identity 1=critical 2=recent 3=deep", "default": 2},
+                "layer":   {"type": "integer", "description": "Requested layer: 2=recent 3=deep. 0=identity and 1=critical are owner-granted only: asking for them stores at layer 2 and stages a promotion request.", "default": 2},
                 "tags":    {"type": "array", "items": {"type": "string"}, "description": "Optional search tags."}
             },
             "required": ["content"]
@@ -1106,16 +1537,14 @@ def register_palace_tools(registry):
 
     registry.register(
         name="palace_hall",
-        fn=lambda content, hall="facts", layer=2: (
-            lambda hall_id: f"Hall entry stored: {hall}/#{hall_id}"
-        )(palace_store_hall(content, hall, layer, untrusted=True)),
-        description="Store a cross-cutting fact in a Hall: facts|events|preferences|discoveries|advice.",
+        fn=_palace_hall_tool,
+        description="Store a cross-cutting fact in a Hall: facts|events|preferences|discoveries|advice. Layers 0 and 1 are never granted by this tool: a request for them stores the entry at layer 2 and stages a promotion request for the owner to approve.",
         parameters={
             "type": "object",
             "properties": {
                 "content": {"type": "string"},
                 "hall":    {"type": "string", "description": "facts|events|preferences|discoveries|advice", "default": "facts"},
-                "layer":   {"type": "integer", "default": 2}
+                "layer":   {"type": "integer", "description": "Requested layer (default 2). 0/1 are owner-granted only: they store at layer 2 and stage a promotion request.", "default": 2}
             },
             "required": ["content"]
         }

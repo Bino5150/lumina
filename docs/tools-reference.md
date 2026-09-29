@@ -118,8 +118,8 @@ separate from Browser Companion below — neither falls back to the other.
 
 | Tool | Purpose |
 |---|---|
-| `palace_remember` | Write into the Wings/Rooms/Closets/Drawers hierarchy. |
-| `palace_hall` | Store a cross-cutting fact in a Hall (facts/events/preferences/advice/discoveries). |
+| `palace_remember` | Write into the Wings/Rooms/Closets/Drawers hierarchy. Layers 0/1 are owner-granted only: asking for one stores at Layer 2 and stages a promotion request for you to review in Pending Actions. |
+| `palace_hall` | Store a cross-cutting fact in a Hall (facts/events/preferences/advice/discoveries). Layers 0/1 follow the same rule as `palace_remember`. |
 | `palace_recall` | Keyword search over the MemPalace. |
 | `palace_status` | MemPalace state/summary. |
 | `palace_review_writes` | List flagged/reviewable writes. |

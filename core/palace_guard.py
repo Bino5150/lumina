@@ -656,10 +656,13 @@ DETERMINISTIC_RULES = (
             "re-frames, or demotes a record."
         ),
         uncertainty=(
-            "palace_remember lets the model choose layer 0/1 directly and always "
-            "writes lower-trust (framed_at_write), so this may be Lumina's own "
-            "deliberate note; unframed_legacy rows may be owner-authored text "
-            "whose drawer was fail-closed by the CANNON-08 migration."
+            "Builds before PALACE-GUARD-01B-3 let palace_remember choose layer "
+            "0/1 directly (always lower-trust, framed_at_write), so a legacy "
+            "row may be Lumina's own deliberate note; since 01B-3 a lower-trust "
+            "row reaches L0/L1 only through an owner-approved promotion, which "
+            "changes layer and never trust. unframed_legacy rows may be "
+            "owner-authored text whose drawer was fail-closed by the "
+            "CANNON-08 migration."
         ),
         rationale=(
             "Structural fields only: layer in (0,1) plus the closet flag / drawer "

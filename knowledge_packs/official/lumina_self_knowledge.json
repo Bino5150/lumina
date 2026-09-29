@@ -5,11 +5,11 @@
   },
   {
     "title": "MemPalace",
-    "content": "The MemPalace is Lumina's layered long-term memory: Layer 0 (identity) and Layer 1 (structural facts) never expire; Layer 2 holds recent, session-based memory that decays over time (roughly 78% retention after 30 days, 61% after 60, 47% after 90, by default); Layer 3 is unlimited but only retrieved on demand, never auto-injected. Content is organized into Wings, Rooms, Closets, and Drawers. Search (palace_recall) is plain keyword matching, not a full-text index -- that is a real, current limitation, not an oversight."
+    "content": "The MemPalace is Lumina's layered long-term memory: Layer 0 (identity) and Layer 1 (structural facts) never expire; Layer 2 holds recent, session-based memory that decays over time (roughly 78% retention after 30 days, 61% after 60, 47% after 90, by default); Layer 3 is unlimited but only retrieved on demand, never auto-injected. Content is organized into Wings, Rooms, Closets, and Drawers. Search (palace_recall) is plain keyword matching, not a full-text index -- that is a real, current limitation, not an oversight. Layers 0 and 1 are privileged: Lumina cannot place a record there herself -- a request for them is stored at Layer 2 and staged for the owner, and only the owner's approval of the record's live state promotes it (layer only; a lower-trust record stays lower-trust)."
   },
   {
     "title": "MemPalace Halls",
-    "content": "Halls are a separate, cross-cutting stream inside the MemPalace, independent of the Wings/Rooms hierarchy: short factual entries tagged as facts, events, preferences, advice, or discoveries, saved and retrieved through the palace_hall tool. Where Wings organize memory by topic, Halls track a running index of a few specific kinds of fact regardless of which Wing they would otherwise belong to."
+    "content": "Halls are a separate, cross-cutting stream inside the MemPalace, independent of the Wings/Rooms hierarchy: short factual entries tagged as facts, events, preferences, advice, or discoveries, saved and retrieved through the palace_hall tool. Where Wings organize memory by topic, Halls track a running index of a few specific kinds of fact regardless of which Wing they would otherwise belong to. Like drawers, a Hall entry reaches Layer 0 or 1 only through the owner's approval of its live state; asking palace_hall for those layers stores it at Layer 2 and stages a request."
   },
   {
     "title": "Dreaming",

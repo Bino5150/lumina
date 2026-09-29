@@ -115,3 +115,12 @@ jobs:
       # BC-01C-B1.4 -- actual plain-text review and owner UI events.
       - name: Run Qt-bound site-action review guards (blocking)
         run: python -m pytest tests/test_site_action_review_qt.py -v -rs -m "not castle_walls_evidence"
+
+      # PALACE-GUARD-01B-4 -- the trusted GUI owner approval of a Palace
+      # promotion (L0/L1 placement). The real ToolsTab and review dialog are
+      # driven with real Qt mouse events, and every generic approval path is
+      # rigged to fail if touched, so this can only be proven under PySide6.
+      # Same job, same pinned PySide6, same LUMINA_REQUIRE_QT=1 fail-never-skip
+      # contract; its own step so the selections above stay exactly as they were.
+      - name: Run Qt-bound Palace promotion owner-approval guards (blocking)
+        run: python -m pytest tests/test_palace_guard_01b4_owner_promotion_qt.py -v -rs -m "not castle_walls_evidence"

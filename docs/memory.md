@@ -23,6 +23,8 @@ shared closet, and any Hall entry. What deletion does and doesn't cover:
 - Memories saved before this linkage existed are deleted from the flat
   list only. Their Palace copy, if any, isn't guessed at or removed, and
   the delete result says so.
+- A Palace copy you've promoted to Layer 0/1 (below) is removed with its
+  memory like any other linked copy.
 - It's exact for the Palace copies linked to that memory. The same text
   can still exist in chat history, dream summaries, backups, or telemetry.
 
@@ -34,7 +36,10 @@ everything, retrieve top-K":
 - **Wings → Rooms → Closets → Drawers** — a hierarchical container
   structure Lumina organizes memories into.
 - **Layer 0 & 1 — Permanent knowledge.** Core identity facts and
-  structural reality that never expires.
+  structural reality that never expires. These layers are *privileged*:
+  they're injected into every turn and exempt from decay, so Lumina can't
+  place anything there herself — see [Promoting a record to Layer
+  0/1](#promoting-a-record-to-layer-01) below.
 - **Layer 2 — Decaying episodic memory.** Recent, session-based
   knowledge, weighted by a temporal decay function (default λ=0.0083 —
   roughly 78% retention after 30 days, 61% after 60, 47% after 90). Old
@@ -60,12 +65,56 @@ Wings/Rooms/Closets/Drawers as *where* something lives and Halls as a
 running index of a few specific kinds of fact regardless of where they
 live.
 
-**Write invariant.** Nothing Dreaming or Compaction writes autonomously is
-promoted straight to permanent (Layer 0/1) identity — both of today's
-autonomous writers (Dreaming's idle-sweep, and manual `/compact`) always
-write to Layer 2. This is enforced by both call sites doing the right
-thing today, not by the storage function itself refusing a different
-layer — worth knowing if you're evaluating how hard a guarantee this is.
+**Write invariant.** Nothing Lumina writes on her own reaches Layer 0/1.
+Both autonomous writers (Dreaming's idle-sweep, and manual `/compact`)
+write to Layer 2, and so does everything `save_memory` mirrors into the
+Palace. If Lumina asks `palace_remember` or `palace_hall` for layer 0 or
+1, the memory is stored at Layer 2, the tool result says so, and the
+request is staged for you (below); only an exact integer 0 or 1 counts as
+such a request — `true`, `1.0` and `"1"` don't. This is enforced by the
+storage layer itself, not by each caller behaving: the Palace's generic
+write path refuses any layer below 2 (and any layer that isn't a real
+integer), and the only writers that can occupy Layer 0/1 are the one-time
+startup identity seed and an owner-approved promotion. Layer 0/1 records
+from older versions stay exactly where they are — they aren't demoted,
+re-stamped, or guessed at.
+
+### Promoting a record to Layer 0/1
+
+Asking for a privileged layer isn't the same as being granted one. When
+Lumina asks for layer 0 or 1, the memory lands at Layer 2 and a
+**promotion request** appears in Settings → Tools → **Pending Actions**.
+The request is only a pointer to one drawer or one Hall entry. It is never
+an approval, and nothing in it — its fields, a "confirmed" flag, or the
+audit log beside it — is trusted, because those are ordinary files Lumina
+can write to.
+
+Selecting the request shows the record's **live** state, read from the
+Palace at that moment rather than taken from the request: where it lives,
+its current layer, whether it's lower-trust, what will happen to the closet
+it sits in, and its exact text. **Approve** opens a review of that state,
+and your click on the dialog's Approve button is the only thing that can
+promote the record. Pressing Enter or closing the dialog does nothing.
+
+- **One record, exactly what you saw.** The approval is bound to that one
+  drawer or Hall entry — its content, layer, trust and provenance, its
+  location, and the layer you're approving. If anything changed after you
+  opened the review (even its trust, or a neighbouring drawer in the same
+  closet), the promotion is refused and nothing is written. An approval
+  works once and expires after two minutes.
+- **Layer only.** Promotion moves the record and changes nothing else. A
+  lower-trust record that becomes Layer 1 is still lower-trust and is still
+  shown to Lumina framed as data, not as your own words.
+- **Closets.** A promoted drawer gets its own closet at the new layer. If
+  it shared a Layer 2 closet, the drawers left behind are rebuilt byte for
+  byte when that closet matches its drawers; if it has drifted, it's left
+  untouched and **withheld** from Lumina's memory until reviewed — the same
+  rule deletion uses. A record in an already-withheld closet can't be
+  promoted.
+- **Receipt.** Every promotion writes a receipt (what was promoted, the
+  layers, the state you approved) and marks the new record as an owner
+  promotion. The startup identity seed carries its own mark; records from
+  older versions carry neither, and none is inferred for them.
 
 Six tools cover the MemPalace: `palace_remember`, `palace_hall`,
 `palace_recall`, `palace_status`, `palace_review_writes`,

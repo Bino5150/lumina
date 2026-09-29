@@ -73,6 +73,20 @@ making a bad call anyway.
   Actions** panel (Settings → Tools). The function that actually applies a
   staged action is deliberately never registered as a callable tool — no
   chat turn, injected or not, can reach it directly.
+- **Privileged memory layers.** MemPalace Layers 0 and 1 are injected into
+  every owner turn and never decay, so a model must not be able to grant
+  them to itself. Asking `palace_remember` or `palace_hall` for layer 0 or
+  1 stores the memory at Layer 2 and stages a *promotion request* in
+  Pending Actions. That request is text in a file the model can also write,
+  so it is never treated as an approval and the generic approve box never
+  applies it: the only thing that can promote a record is the owner
+  clicking Approve in a review that shows the record's **live** state. The
+  approval is bound to that exact record and state, works once, and expires
+  quickly; if anything changed, it's refused. Promotion changes the layer
+  only — it never raises a lower-trust record's trust. This closes the
+  tool, argument and queue path; it is not a defense against code already
+  running as you or direct access to the database file. See
+  [Memory](memory.md#promoting-a-record-to-layer-01).
 
 ## PIN / codeword gate
 

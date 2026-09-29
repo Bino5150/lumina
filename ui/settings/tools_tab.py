@@ -424,8 +424,15 @@ class ToolsTab(QWidget):
             self.pending_actions_preview.clear()
             return
         aid = self._pending_action_ids[rows[0].row()]
-        from tools.pending_actions import _load_queue
+        from tools.pending_actions import _load_queue, PALACE_PROMOTE
         entry = _load_queue().get(aid, {})
+        if entry.get("kind") == PALACE_PROMOTE:
+            # PALACE-GUARD-01B-4: the queue JSON is forgeable and is NOT what the
+            # owner approves. Show the record's LIVE state instead.
+            from core.palace_promotion import render_review_text
+            self.pending_actions_preview.setPlainText(
+                render_review_text(self._palace_promotion_snapshot(aid, entry)))
+            return
         self.pending_actions_preview.setPlainText(json.dumps(entry, indent=2))
 
     def _selected_pending_action_id(self):
@@ -438,8 +445,11 @@ class ToolsTab(QWidget):
         aid = self._selected_pending_action_id()
         if not aid:
             return
-        from tools.pending_actions import _load_queue
+        from tools.pending_actions import _load_queue, PALACE_PROMOTE
         entry = _load_queue().get(aid, {})
+        if entry.get("kind") == PALACE_PROMOTE:
+            self._review_palace_promotion(aid, entry)
+            return
         reply = QMessageBox.question(
             self, "Approve Action",
             f"Apply staged action #{aid} ({entry.get('kind', '?')}) now?\n\n"
@@ -453,6 +463,37 @@ class ToolsTab(QWidget):
         from tools.pending_actions import _apply_action
         result = _apply_action(aid, self.agent)
         self.pending_actions_status_lbl.setText(result)
+        self._load_pending_actions(preserve_status=True)
+
+    def _palace_promotion_snapshot(self, aid, entry):
+        """PALACE-GUARD-01B-4: the LIVE snapshot for a staged palace_promote
+        request. Only the pointer (kind, id, destination) is read from the
+        queue entry; a malformed pointer yields a blocked snapshot, never a
+        guess."""
+        from core.palace_promotion import capture_promotion_snapshot
+        payload = entry.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        return capture_promotion_snapshot(
+            payload.get("target_kind"), payload.get("target_id"), payload.get("dest_layer"),
+            operation_id=aid,
+        )
+
+    def _review_palace_promotion(self, aid, entry):
+        """Owner review of a staged Palace promotion. The only approval path for
+        this kind: a dialog over the record's live state whose Approve click is
+        the sole mint of an approval. The generic Yes/No box and _apply_action
+        are never involved."""
+        from ui.palace_promotion_review import PalacePromotionReviewDialog
+        from tools.pending_actions import _complete_palace_promotion
+        dialog = PalacePromotionReviewDialog(self._palace_promotion_snapshot(aid, entry), self)
+        dialog.exec()
+        if dialog.result_receipt is not None:
+            self.pending_actions_status_lbl.setText(
+                _complete_palace_promotion(aid, dialog.result_receipt))
+        elif dialog.result_error is not None:
+            from core.palace_promotion import describe_refusal
+            self.pending_actions_status_lbl.setText(
+                f"Promotion #{aid} was NOT applied. {describe_refusal(dialog.result_error)}")
         self._load_pending_actions(preserve_status=True)
 
     def _reject_pending_action(self):
