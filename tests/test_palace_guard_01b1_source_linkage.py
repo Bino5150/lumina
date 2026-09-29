@@ -10,10 +10,11 @@ Deletion propagation is deliberately NOT part of this slice (01B-2): until
 then, deleting a linked memory directly fails under FK enforcement, which is
 exactly the guarantee these tests pin down.
 """
+import ast
 import inspect
 import json
 import os
-import pathlib
+import re
 import sqlite3
 import threading
 
@@ -21,20 +22,11 @@ import pytest
 
 import config
 from core import db as core_db
+# Structural guards judge product code only -- tracked OR untracked-but-not-
+# ignored (a tracked-only scan is blind to a not-yet-committed module, which is
+# how this file's old substring scan passed locally and failed in CI).
+from palace_source_scan import REPO, product_py, scan, where
 from tools import memory, palace
-
-REPO = pathlib.Path(__file__).resolve().parent.parent
-
-
-def _tracked_product_py(root=REPO):
-    """Git-tracked, non-test .py files under root. Structural guards must be
-    judged on product code only: untracked or ignored local files (e.g. a
-    dev checkout's gitignored reports/ scripts) aren't product code and must
-    not decide the result either way."""
-    import subprocess
-    out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "*.py"],
-                         capture_output=True, check=True).stdout.decode("utf-8")
-    return [root / p for p in out.split("\0") if p and not p.startswith("tests/")]
 
 
 @pytest.fixture
@@ -240,21 +232,73 @@ def test_dreaming_write_stays_unlinked(db, monkeypatch):
 
 
 def test_only_save_memory_can_set_a_source_link():
-    """Structural: the public Palace write API has no source parameter, and
-    no module other than tools/memory.py reaches the connection-aware
-    helpers -- so Dreaming, compaction, palace_remember and palace_hall
-    cannot link, whatever arguments they pass."""
+    """Structural: only the flat-memory save lifecycle can CREATE a source
+    link. The public Palace write API has no source parameter; only
+    tools/memory.py's save_memory() reaches the connection-aware helpers; and
+    the sole code that writes the column is that helper chain -- so Dreaming,
+    compaction, palace_remember, palace_hall and (01B-4) owner promotion
+    cannot link, whatever arguments they pass.
+
+    Owner promotion legitimately READS the link -- it is bound into the
+    approval digest and shown to the owner -- and preserves it untouched while
+    changing only layer/location. So the promotion module may mention the
+    column, but only as a read (a SELECT or a row key); see also the
+    behavioural proofs in test_palace_guard_01b4_owner_promotion.py."""
     assert "source_memory_id" not in inspect.signature(palace.palace_store).parameters
     assert "source_memory_id" not in inspect.signature(palace.palace_store_hall).parameters
-    offenders = []
-    for py in _tracked_product_py():
-        rel = py.relative_to(REPO).as_posix()
-        if rel.startswith(("tests/", ".git/")) or rel in ("tools/palace.py", "tools/memory.py"):
-            continue
-        text = py.read_text(encoding="utf-8", errors="replace")
-        if "_store_in_conn" in text or "_store_hall_in_conn" in text or "source_memory_id" in text:
-            offenders.append(rel)
-    assert offenders == []
+
+    # (1) Nothing but the lifecycle chain reaches the connection-aware helpers.
+    helpers = {"_store_in_conn", "_store_hall_in_conn"}
+    assert where(lambda n: (isinstance(n, ast.Name) and n.id in helpers)
+                 or (isinstance(n, ast.Attribute) and n.attr in helpers)
+                 or (isinstance(n, ast.ImportFrom) and any(a.name in helpers for a in n.names))
+                 ) == {("tools/memory.py", "save_memory"),
+                       ("tools/palace.py", "palace_store"),
+                       ("tools/palace.py", "palace_store_hall")}
+
+    # (2) Nothing but the lifecycle chain passes a source link along...
+    assert where(lambda n: isinstance(n, ast.Call)
+                 and any(k.arg == "source_memory_id" for k in n.keywords)
+                 ) == {("tools/memory.py", "save_memory"),
+                       ("tools/palace.py", "_store_hall_in_conn")}
+    # ...or builds it into an INSERT column list...
+    assert where(lambda n: isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr in ("append", "extend", "insert", "add")
+                 and any(isinstance(a, ast.Constant) and a.value == "source_memory_id"
+                         for a in n.args)
+                 ) == {("tools/palace.py", "_store_in_conn"),
+                       ("tools/palace.py", "_insert_hall_row")}
+    # ...and no SQL anywhere spells out an INSERT/UPDATE of the column.
+    assert where(lambda n: isinstance(n, ast.Constant) and isinstance(n.value, str)
+                 and "source_memory_id" in n.value
+                 and re.search(r"\b(INSERT|UPDATE)\b", n.value, re.I)) == set()
+
+    # (3) Outside the two lifecycle modules, exactly one module may mention the
+    # column at all -- owner promotion -- and every mention there is a read.
+    mentioning = sorted(
+        py.relative_to(REPO).as_posix() for py in product_py()
+        if py.relative_to(REPO).as_posix() not in ("tools/palace.py", "tools/memory.py")
+        and any(t in py.read_text(encoding="utf-8", errors="replace")
+                for t in ("_store_in_conn", "_store_hall_in_conn", "source_memory_id")))
+    assert mentioning == ["core/palace_promotion.py"]
+    reads = [(fn, n.value) for rel, fn, n in scan(
+        lambda n: isinstance(n, ast.Constant) and isinstance(n.value, str)
+        and "source_memory_id" in n.value) if rel == "core/palace_promotion.py"]
+    assert reads, "promotion is expected to read the link (digest binding + owner display)"
+    for fn, value in reads:
+        assert value == "source_memory_id" or value.lstrip().upper().startswith("SELECT"), (fn, value)
+
+    # (4) The promotion WRITE primitives (which live in tools/palace.py, a file
+    # the old test never looked inside) do not so much as name the column.
+    tree = ast.parse((REPO / "tools" / "palace.py").read_text(encoding="utf-8"))
+    src = (REPO / "tools" / "palace.py").read_text(encoding="utf-8")
+    primitives = {"_promote_drawer_in_conn", "_promote_hall_in_conn",
+                  "_extract_drawer_in_conn", "_remove_drawer_in_conn", "_insert_closet_row"}
+    found = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in primitives}
+    assert found == primitives
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in primitives:
+            assert "source_memory_id" not in ast.get_source_segment(src, node), node.name
 
 
 # ── FK enforcement ────────────────────────────────────────────────────────────

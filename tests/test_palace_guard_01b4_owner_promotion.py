@@ -802,6 +802,104 @@ def test_deleting_the_source_memory_removes_promoted_derivatives(db):
     assert len(_receipts(db)) == 2  # the audit ledger outlives its targets
 
 
+# ── Promotion preserves a source link; it can never create, alter or infer one ──
+
+def _linked_world(db, text="linked promoted note"):
+    """A flat memory saved through the real lifecycle: one linked drawer and one linked hall."""
+    assert memory.save_memory(text, "preference", untrusted=True).startswith("Memory saved")
+    mid = _q(db, "SELECT MAX(id) AS m FROM memories")[0]["m"]
+    drawer = _q(db, "SELECT id FROM palace_drawers WHERE source_memory_id=?", mid)[0]["id"]
+    hall = _q(db, "SELECT id FROM palace_halls WHERE source_memory_id=?", mid)[0]["id"]
+    return mid, drawer, hall
+
+
+def _hall_row(path, hid):
+    return dict(_q(path, "SELECT * FROM palace_halls WHERE id=?", hid)[0])
+
+
+def test_promotion_preserves_an_existing_source_link_byte_for_byte(db):
+    mid, drawer, hall = _linked_world(db)
+    memories_before = [tuple(r) for r in _q(db, "SELECT * FROM memories")]
+    d0, h0 = _drawer_row(db, drawer), _hall_row(db, hall)
+    assert d0["source_memory_id"] == mid and h0["source_memory_id"] == mid
+
+    _promote("drawer", drawer, 1)
+    _promote("hall", hall, 0)
+
+    d1, h1 = _drawer_row(db, drawer), _hall_row(db, hall)
+    assert d1["source_memory_id"] == mid == h1["source_memory_id"]   # preserved, not re-derived
+    assert {k for k in d0 if d0[k] != d1[k]} == {"closet_id"}         # placement only
+    assert {k for k in h0 if h0[k] != h1[k]} == {"layer", "admission"}  # layer + stamp only
+    assert [tuple(r) for r in _q(db, "SELECT * FROM memories")] == memories_before
+
+
+def test_promotion_cannot_fabricate_or_infer_a_source_link(db):
+    """A model-native record whose text is IDENTICAL to a flat memory -- same
+    wing, same room, same hall -- must not become linked to it by being
+    promoted. Links are created only by the save lifecycle; nothing here
+    matches by text, room, hash or meaning."""
+    text = "identical text on purpose"
+    mid, linked_drawer, linked_hall = _linked_world(db, text)
+    where_ = _q(db, "SELECT w.name AS wing, r.name AS room FROM palace_drawers d "
+                    "JOIN palace_rooms r ON r.id=d.room_id JOIN palace_wings w ON w.id=r.wing_id "
+                    "WHERE d.id=?", linked_drawer)[0]
+    hall_name = _hall_row(db, linked_hall)["hall"]
+    native_drawer = _mk(text, wing=where_["wing"], room=where_["room"], untrusted=True)["drawer_id"]
+    native_hall = palace.palace_store_hall(text, hall=hall_name, layer=2, untrusted=True)
+    assert _drawer_row(db, native_drawer)["source_memory_id"] is None
+    assert _hall_row(db, native_hall)["source_memory_id"] is None
+
+    _promote("drawer", native_drawer, 1)
+    _promote("hall", native_hall, 0)
+
+    assert _drawer_row(db, native_drawer)["source_memory_id"] is None
+    assert _hall_row(db, native_hall)["source_memory_id"] is None
+    # the memory still has exactly the copies its own save made, and nothing else
+    assert [r["id"] for r in _q(db, "SELECT id FROM palace_drawers WHERE source_memory_id=?", mid)] == [linked_drawer]
+    assert [r["id"] for r in _q(db, "SELECT id FROM palace_halls WHERE source_memory_id=?", mid)] == [linked_hall]
+    # so deleting the memory removes only its own copies; the promoted native ones survive
+    result = memory.delete_memory_with_derivatives(mid)
+    assert result["drawers_removed"] == 1 and result["halls_removed"] == 1
+    assert _q(db, "SELECT COUNT(*) AS n FROM palace_drawers WHERE id=?", native_drawer)[0]["n"] == 1
+    assert _q(db, "SELECT COUNT(*) AS n FROM palace_halls WHERE id=?", native_hall)[0]["n"] == 1
+
+
+def test_promotion_never_writes_the_link_or_creates_or_deletes_a_drawer_or_hall(db):
+    """DB-level proof, independent of how the code is worded: triggers abort any
+    statement that writes source_memory_id, inserts a drawer/hall row, or
+    deletes one. Every promotion shape must still succeed -- so none of them
+    touches the column, fabricates a derivative, or drops a record."""
+    mid, linked_drawer, linked_hall = _linked_world(db)
+    native_drawer = _mk("native", room="solo")["drawer_id"]
+    native_hall = palace.palace_store_hall("native hall", hall="facts", layer=2, untrusted=True)
+    rolling = [_mk(f"rolling {i} with project and memory words", room="roll")["drawer_id"] for i in range(3)]
+    drifted = [_mk(f"drifted {i} with project and memory words", room="drift")["drawer_id"] for i in range(2)]
+    _exec(db, "UPDATE palace_closets SET compressed=compressed||' | hand edit' WHERE id=?",
+          (_drawer_row(db, drifted[0])["closet_id"],))
+    bare = _mk("bare", room="bare", compress=False)["drawer_id"]
+    for table in ("palace_drawers", "palace_halls"):
+        _exec(db, f"CREATE TRIGGER t_no_link_write_{table} BEFORE UPDATE OF source_memory_id ON {table} "
+                  "BEGIN SELECT RAISE(ABORT, 'source link written'); END")
+        _exec(db, f"CREATE TRIGGER t_no_insert_{table} BEFORE INSERT ON {table} "
+                  "BEGIN SELECT RAISE(ABORT, 'row inserted'); END")
+        _exec(db, f"CREATE TRIGGER t_no_delete_{table} BEFORE DELETE ON {table} "
+                  "BEGIN SELECT RAISE(ABORT, 'row deleted'); END")
+    counts = lambda: (_q(db, "SELECT COUNT(*) AS n FROM palace_drawers")[0]["n"],  # noqa: E731
+                      _q(db, "SELECT COUNT(*) AS n FROM palace_halls")[0]["n"])
+    before = counts()
+
+    for did in (linked_drawer, native_drawer, rolling[1], drifted[1], bare):
+        _promote("drawer", did, 1)
+    for hid in (linked_hall, native_hall):
+        _promote("hall", hid, 0)
+
+    assert counts() == before
+    assert _drawer_row(db, linked_drawer)["source_memory_id"] == mid
+    assert _hall_row(db, linked_hall)["source_memory_id"] == mid
+    assert {_drawer_row(db, d)["source_memory_id"] for d in (native_drawer, rolling[1], drifted[1], bare)} == {None}
+    assert len(_receipts(db)) == 7
+
+
 def test_palace_undo_write_still_refuses_a_promoted_drawer(db):
     chat = memory.create_chat("c")
     dream = palace.palace_store("dream summary", wing="nightstand", room=str(chat), layer=2,
