@@ -320,7 +320,7 @@ Manual compaction:
 - keeps the newest two user turns live;
 - summarizes an older persisted user/assistant prefix;
 - excludes raw tool-output rows from the summarizer;
-- writes an L2 Palace summary carrying a `context-skip` checkpoint;
+- writes an L2 Palace summary carrying a provenance-stamped `context-skip` checkpoint (only a stamped checkpoint may shorten the reloaded context; an unstamped legacy one is ignored and the fuller transcript is reloaded);
 - leaves the durable `chat_messages` transcript unchanged;
 - prunes live history only after the Palace write succeeds and the same chat/history snapshot is still current;
 - restores the full transcript visually while loading only the post-checkpoint live tail into the model context.

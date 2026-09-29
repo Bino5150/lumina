@@ -134,6 +134,21 @@ and pinned to the session it came from. Off by default
 The full, uncompressed chat history is never deleted by this — compaction
 only affects what's actively injected into context.
 
+**Manual `/compact`** is the on-demand version, for a chat that has grown
+long. It works whether or not that setting is on (it's owner-only and
+idle-only). It summarizes everything except your newest two turns into a
+Layer 2 nightstand summary and marks a checkpoint, so when you reopen that
+chat (or restart Lumina) only the summary plus the messages after the
+checkpoint go back into context. The whole transcript is still shown on
+screen and is never rewritten or deleted. Only a checkpoint written by
+`/compact` itself, which carries an internal provenance stamp, can shorten
+what gets reloaded: a memory Lumina saves herself that merely looks like a
+checkpoint has no such power, and a checkpoint that has been undone or
+quarantined stops having it. Checkpoints written by versions before that
+stamp existed can't be verified, so they're ignored: reopening such a chat
+reloads its fuller history into context, nothing is lost, and running
+`/compact` again writes a fresh, trusted checkpoint.
+
 ## `/context rebuild`
 
 A separate, owner-facing operator command (see [Operator
@@ -163,7 +178,8 @@ fact: reviewable (`palace_review_writes`) and never silently promoted to
 something she "just knows." Dreams and compaction summaries written by this
 version carry a provenance stamp and can be undone with
 `palace_undo_write`; older ones predate that stamp, so undo refuses them
-rather than guess.
+rather than guess (and, for a `/compact` checkpoint, it's the same stamp
+that lets it shorten a reloaded chat — see Context Compaction above).
 
 ## My Human
 

@@ -160,26 +160,49 @@ def test_manual_compaction_never_launders_raw_tool_output_into_palace_summary(mo
     assert "TOOL_OUTPUT" not in "\n".join(seen)
 
 
-def test_latest_skip_is_recovered_from_manual_compaction_drawer_tags(monkeypatch):
-    class Conn:
-        def __init__(self):
-            self.closed = False
+def test_latest_skip_is_recovered_from_the_trusted_checkpoint_drawers(tmp_path, monkeypatch):
+    """Real database, real writer call. (This used to feed the resolver a fake
+    connection returning bare tag rows -- i.e. it pinned the vulnerable
+    contract that tags alone authorize a skip. Trust-boundary coverage lives
+    in tests/test_compaction_skip_provenance_01.py.)"""
+    import config
+    import tools.memory as memory
+    import tools.palace as palace
 
-        def execute(self, sql, params):
-            assert params[0] == "77"
-            return self
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "skip.db"))
+    palace.init_palace_db()
+    memory.init_chat_db()
+    chat_id = memory.create_chat("skip chat")
+    for i in range(1, 6):
+        memory.save_chat_message(chat_id, "user", f"u{i}")
+        memory.save_chat_message(chat_id, "assistant", f"a{i}")
 
-        def fetchall(self):
-            return [
-                {"tags": '["manual-compaction", "session:77", "context-skip:8"]'},
-                {"tags": '["manual-compaction", "session:77", "context-skip:4"]'},
-                {"tags": 'not-json'},
-            ]
+    def write(tags, **kw):
+        palace.palace_store("summary", wing="nightstand", room=str(chat_id), layer=2,
+                            tags=tags, untrusted=True, **kw)
 
-        def close(self):
-            self.closed = True
+    write(["manual-compaction", f"session:{chat_id}", "context-skip:4"], origin="manual_compaction")
+    write(["manual-compaction", f"session:{chat_id}", "context-skip:8"], origin="manual_compaction")
+    write(["manual-compaction", f"session:{chat_id}", "context-skip:9"])  # no trusted stamp
+    assert manual.latest_manual_compaction_skip(chat_id) == 8
+    assert manual.latest_manual_compaction_skip(chat_id + 1) == 0
 
-    conn = Conn()
-    monkeypatch.setattr(manual, "get_palace_db", lambda: conn)
-    assert manual.latest_manual_compaction_skip(77) == 8
-    assert conn.closed is True
+
+def test_trusted_origin_constant_is_the_writers_stamp_and_a_closed_vocabulary_member():
+    """The resolver's trusted stamp must be the exact value the writer stamps
+    and the exact tag the Palace vocabulary pairs with it."""
+    import tools.palace as palace
+
+    assert manual.MANUAL_COMPACTION_ORIGIN in palace.SYNTHESIZED_ORIGINS
+    assert palace.SYNTHESIZED_ORIGINS[manual.MANUAL_COMPACTION_ORIGIN] == manual.MANUAL_COMPACTION_TAG
+
+
+def test_the_writer_stamps_the_trusted_origin_on_the_checkpoint_it_writes(monkeypatch):
+    calls = []
+    _state(monkeypatch, _persisted(4), previous_skip=0)
+    monkeypatch.setattr(manual, "run_summarization_call", lambda raw_text, **kw: "- s")
+    monkeypatch.setattr(manual, "palace_store", lambda **kw: calls.append(kw) or {"closet_id": 1})
+    assert manual.run_manual_compaction(_history(user_turns=4), chat_id=42)["status"] == "success"
+    [call] = calls
+    assert call["origin"] == manual.MANUAL_COMPACTION_ORIGIN
+    assert call["untrusted"] is True

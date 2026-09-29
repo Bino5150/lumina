@@ -61,10 +61,13 @@ def _spine(chat_id, context_skip=0):
 
 
 def _write_compaction_skip(chat_id, skip):
+    # The exact palace_store() call run_manual_compaction() makes, trusted
+    # origin stamp included (COMPACTION-CONTEXT-SKIP-PROVENANCE-01: tags alone
+    # no longer authorize a skip).
     palace.palace_store(
         content="summary", wing="nightstand", room=str(chat_id), layer=2,
         tags=["manual-compaction", f"session:{chat_id}", f"context-skip:{skip}"],
-        compress=False,
+        untrusted=True, origin="manual_compaction",
     )
 
 

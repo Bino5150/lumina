@@ -54,8 +54,10 @@ def _payload(**overrides):
 
 
 def _write_compaction_skip(chat_id, skip):
-    """Write a real manual-compaction Drawer -- same shape
-    core/manual_compaction.py::run_manual_compaction() writes -- so
+    """Write a real manual-compaction Drawer -- the same palace_store() call
+    core/manual_compaction.py::run_manual_compaction() makes, including the
+    trusted origin stamp (COMPACTION-CONTEXT-SKIP-PROVENANCE-01: tags alone
+    no longer authorize a skip) and a closet-linked, untrusted summary -- so
     resolve_context_skip()/latest_manual_compaction_skip() picks it up for
     real, rather than faking the resolved value."""
     palace.palace_store(
@@ -64,7 +66,8 @@ def _write_compaction_skip(chat_id, skip):
         room=str(chat_id),
         layer=2,
         tags=["manual-compaction", f"session:{chat_id}", f"context-skip:{skip}"],
-        compress=False,
+        untrusted=True,
+        origin="manual_compaction",
     )
 
 

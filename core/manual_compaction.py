@@ -4,6 +4,18 @@ The chat transcript is never rewritten or annotated. A manual compaction writes
 one normal nightstand Drawer carrying both the summary and a `context-skip:N`
 tag. That makes the summary and its reload checkpoint one atomic Palace write;
 undoing that Drawer also rolls the checkpoint back naturally.
+
+Provenance (COMPACTION-CONTEXT-SKIP-PROVENANCE-01). `context-skip:N` is
+reconstruction metadata, and honouring it makes reconstruction OMIT N durable
+rows from live context -- so it is an authority, and authority is never taken
+from what a record says about itself. Tags and text are what a record CLAIMS to
+be; `palace_remember` accepts any wing / room / tags a model chooses, so a
+model-native drawer can reproduce every tag of a genuine checkpoint exactly.
+Only the trusted `origin = 'manual_compaction'` stamp (PALACE-GUARD-01B-2) says
+what actually wrote a drawer, and no model-facing path can set it.
+latest_manual_compaction_skip() therefore authorizes a checkpoint only when
+_checkpoint_skip() proves all of that; every doubt resolves to "skip nothing"
+(restore more history), never to "skip more".
 """
 import json
 
@@ -23,43 +35,109 @@ SUMMARY_CHUNK_CHARS = 5500
 SUMMARY_MAX_TOKENS = 300
 MANUAL_COMPACTION_TAG = "manual-compaction"
 CONTEXT_SKIP_TAG_PREFIX = "context-skip:"
+# The trusted-synthesis stamp run_manual_compaction() writes and the only
+# provenance that can authorize a skip (same closed vocabulary as
+# tools.palace.SYNTHESIZED_ORIGINS; test_manual_compaction pins the two together).
+MANUAL_COMPACTION_ORIGIN = "manual_compaction"
+# No real transcript has 10**15 rows. Bounding the digit string keeps int()
+# away from CPython's int<->str digit-limit ValueError on absurd input.
+_MAX_SKIP_DIGITS = 15
 
 
 def _cancelled(cancel_event) -> bool:
     return bool(cancel_event is not None and cancel_event.is_set())
 
 
+def _parse_skip_value(text: str):
+    """The canonical, non-negative decimal integer run_manual_compaction()
+    emits (`str(int)`: "0", "6", "10"), else None. int() alone would also
+    accept signs, padding, underscores, surrounding whitespace and non-ASCII
+    digits; a trusted record carrying any of those is not something the
+    trusted writer produced, so it is refused rather than normalised."""
+    if not (text.isascii() and text.isdecimal()) or len(text) > _MAX_SKIP_DIGITS:
+        return None
+    if len(text) > 1 and text[0] == "0":
+        return None
+    return int(text)
+
+
+def _checkpoint_skip(row, chat_id: int):
+    """The skip ONE drawer authorizes for `chat_id`, or None if it authorizes
+    nothing. The caller has already required the trusted origin stamp and this
+    chat's nightstand room; this is the rest of what makes a drawer a live,
+    genuine checkpoint (the consistency checks mirror palace._undo_refusal):
+
+    - still eligible: it sits in a closet that exists and is not withheld. A
+      withheld (quarantined) or missing closet means its summary is no longer
+      injected, so the rows it replaced must not stay omitted either;
+    - tags are a JSON list of strings naming this checkpoint kind and THIS
+      chat, with exactly one `context-skip:` marker (duplicates are ambiguous);
+    - N is a canonical integer that leaves at least one durable conversation
+      row live. The writer always keeps the newest turns, so N >= the row count
+      is impossible for a genuine checkpoint and would restore nothing.
+    """
+    if row["closet_id"] is None or row["withheld_reason"] is not None:
+        return None
+    try:
+        tags = json.loads(row["tags"] or "[]")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        return None
+    if MANUAL_COMPACTION_TAG not in tags or f"session:{chat_id}" not in tags:
+        return None
+    markers = [t for t in tags if t.startswith(CONTEXT_SKIP_TAG_PREFIX)]
+    if len(markers) != 1:
+        return None
+    skip = _parse_skip_value(markers[0][len(CONTEXT_SKIP_TAG_PREFIX):])
+    if skip is None or skip >= row["conversation_rows"]:
+        return None
+    return skip
+
+
 def latest_manual_compaction_skip(chat_id: int) -> int:
-    """Return the durable persisted-row cutoff encoded in this chat's Drawers."""
+    """The durable persisted-row cutoff authorized by this chat's TRUSTED
+    manual-compaction checkpoints, or 0.
+
+    Only drawers stamped `origin = 'manual_compaction'` in nightstand/<chat_id>
+    are candidates; a tag-only lookalike (a model-native write, a clone, a
+    legacy drawer written before the stamp existed -- origin NULL) is
+    indistinguishable from a forgery and authorizes nothing. Legacy
+    checkpoints are not migrated, guessed at or destroyed: they simply stop
+    omitting history, and the owner's next /compact mints a trusted checkpoint
+    covering the whole prefix.
+
+    Among the eligible checkpoints the highest N wins. The lifecycle only ever
+    writes a checkpoint whose N exceeds every earlier one, so the highest N IS
+    the latest -- and unlike row order it cannot be gamed by ids, timestamps or
+    insertion order. Undoing the newest checkpoint therefore rolls the skip
+    back to the previous eligible one, and undoing them all restores 0.
+    """
     conn = get_palace_db()
     try:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(palace_drawers)")}
+        if "origin" not in columns:
+            # A database from before PALACE-GUARD-01B-2: no drawer can carry
+            # the trusted stamp yet, so none is a trusted checkpoint.
+            return 0
         rows = conn.execute("""
-            SELECT d.tags
+            SELECT d.tags, d.closet_id, c.withheld_reason,
+                   (SELECT COUNT(*) FROM chat_messages m
+                     WHERE m.chat_id = ? AND m.role IN ('user', 'assistant'))
+                       AS conversation_rows
             FROM palace_drawers d
             JOIN palace_rooms r ON d.room_id = r.id
             JOIN palace_wings w ON r.wing_id = w.id
+            LEFT JOIN palace_closets c ON d.closet_id = c.id
             WHERE w.name = 'nightstand'
               AND r.name = ?
-              AND d.tags LIKE ?
-            ORDER BY d.created_at DESC, d.id DESC
-        """, (str(chat_id), f'%"{MANUAL_COMPACTION_TAG}"%')).fetchall()
+              AND d.origin = ?
+        """, (chat_id, str(chat_id), MANUAL_COMPACTION_ORIGIN)).fetchall()
     finally:
         conn.close()
 
-    skip = 0
-    for row in rows:
-        try:
-            tags = json.loads(row["tags"] or "[]")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        for tag in tags:
-            if not isinstance(tag, str) or not tag.startswith(CONTEXT_SKIP_TAG_PREFIX):
-                continue
-            try:
-                skip = max(skip, max(0, int(tag[len(CONTEXT_SKIP_TAG_PREFIX):])))
-            except ValueError:
-                continue
-    return skip
+    skips = (_checkpoint_skip(row, chat_id) for row in rows)
+    return max((s for s in skips if s is not None), default=0)
 
 
 def _summarize_chunks(chunks: list[str], cancel_event=None):
