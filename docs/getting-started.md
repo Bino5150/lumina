@@ -58,6 +58,7 @@ lumina   # alias to start_lumina.sh — starts TTS + UI
 | `LUMINA_DATA_DIR` | Overrides the default data directory (`~/.local/share/lumina`) — used to run isolated installs/builds side by side. |
 | `LUMINA_BROWSER_HEADLESS` | Set to `0` to watch the Playwright browser session instead of running it headless (default `1`). |
 | `LUMINA_SECRETS_PATH` | Overrides where credentials (API keys, Higgsfield keys, Telegram token) are stored, outside `prefs.json` and outside version control (default `~/.config/lumina/credentials.json`, mode `0600`). |
+| `YDC_API_KEY` | Optional. When set, `web_search` tries the You.com Search API (`ydc-index.io/v1/search`) before its keyless DuckDuckGo fallback chain; any error or empty result falls back to the keyless chain. Get a key at [you.com/platform/api-keys](https://you.com/platform/api-keys). |
 | `LUMINA_TESTING` | Test-harness only — do not set this for normal use. |
 
 ## First-run notice

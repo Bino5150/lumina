@@ -71,7 +71,7 @@ There is no copy, move, rename, or delete-file tool in the registry.
 
 | Tool | Purpose |
 |---|---|
-| `web_search` | General web search. |
+| `web_search` | General web search (You.com first when `YDC_API_KEY` is set; keyless DuckDuckGo chain otherwise). |
 | `get_website` | Lightweight HTTP fetch of a static page (requests + BeautifulSoup). |
 | `get_wikipedia` | Wikipedia lookup. |
 

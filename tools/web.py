@@ -2,6 +2,7 @@
 Web Tools — search, fetch, wikipedia.
 Uses duckduckgo-search library (pip install ddgs).
 Falls back to direct HTML scraping if library unavailable.
+Optional: set YDC_API_KEY to try the You.com Search API first.
 """
 
 import requests
@@ -31,6 +32,13 @@ def _arxiv_abstract(url: str) -> str:
 
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web. Returns titles, URLs, and snippets. Use get_website to read a specific result."""
+    # Optional You.com provider - used only when YDC_API_KEY is set.
+    # Returns None (missing key, API error, or empty result) so the
+    # keyless chain below runs exactly as before.
+    youcom = _youcom_search(query, max_results)
+    if youcom:
+        return youcom
+
     # Try ddgs library first
     try:
         from ddgs import DDGS
@@ -124,6 +132,38 @@ def _ddg_html_search(query: str, max_results: int = 5) -> str:
 
     except Exception as e:
         return f"[Search error: {e}]"
+
+
+def _youcom_search(query: str, max_results: int = 5):
+    """Optional You.com provider for web_search - active only when the
+    YDC_API_KEY environment variable is set. Returns formatted results on
+    success, or None (no key, API error, empty response) so web_search
+    falls back to the keyless DuckDuckGo chain unchanged."""
+    api_key = os.environ.get("YDC_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        resp = requests.post(
+            "https://ydc-index.io/v1/search",
+            json={"query": query, "count": max(1, min(max_results, 100))},
+            headers={"X-API-Key": api_key},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        hits = resp.json().get("results", {}).get("web", [])
+        results = []
+        for hit in hits[:max_results]:
+            url = hit.get("url", "")
+            if not url:
+                continue
+            title = hit.get("title") or "No title"
+            snippet = hit.get("description") or (hit.get("snippets") or [""])[0] or ""
+            results.append({"title": title, "href": url, "body": snippet})
+        if results:
+            return _format_results(results)
+    except Exception:
+        pass  # fail open - the keyless chain still runs
+    return None
 
 
 def _is_safe_public_url(url: str) -> bool:
