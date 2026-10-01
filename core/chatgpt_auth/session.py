@@ -23,11 +23,11 @@ excluded from repr()).
 
 Session states (derived; only the persisted parts live in store.py):
   DISCONNECTED                       no active profile, or signed out with remote revocation confirmed
-  AUTHORIZING                        a browser authorization is pending in this process (memory only)
+  AUTHORIZING                        browser authorization or owner confirmation is pending (memory only)
   CONNECTED_NO_PLAN_PERMISSION       identity verified, `chatgpt.tokens.use.direct` not granted
   READY                              identity verified + plan scope granted + renewable credentials
   REFRESHING                         a received rotation is persisted but not yet published
-  REAUTH_REQUIRED                    terminal refresh/identity failure; tokens cleared, registration kept
+  REAUTH_REQUIRED                    terminal failure, or unknown refresh outcome requiring fresh authorization
   DISCONNECTING                      sign-out started; new use refused; tokens not yet cleared
   LOCAL_DISCONNECTED_REMOTE_UNCONFIRMED  tokens cleared; remote revocation NOT confirmed
   CORRUPT_SESSION                    store unreadable/unsafe; nothing is used, nothing is auto-deleted
@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import inspect
 import re
 import threading
 import time
@@ -70,7 +71,7 @@ from core.chatgpt_auth import oauth
 from core.chatgpt_auth.callback import CallbackCancelled, CallbackTimeout, LoopbackCallback
 from core.chatgpt_auth.store import (
     STATUS_CONNECTED, STATUS_DISCONNECTED, STATUS_DISCONNECTED_REMOTE_UNCONFIRMED,
-    STATUS_DISCONNECTING, STATUS_REAUTH_REQUIRED, Credentials, PendingRegistration,
+    STATUS_DISCONNECTING, STATUS_REAUTH_REQUIRED, Credentials,
     PendingRotation, Profile, SessionStore, StoreBusy, StoreCorrupt, StoreError, StoreUnsafe,
     new_record_id,
 )
@@ -78,7 +79,6 @@ from core.chatgpt_auth.store import (
 CHATGPT_PLAN_LANE = "openai_chatgpt_plan"   # core.backend_identity.OPENAI_CHATGPT_PLAN_LANE
 
 ATTEMPT_TTL_SECONDS = 600            # pending browser authorization lifetime
-PENDING_REGISTRATION_TTL_SECONDS = 15 * 60     # an unused issued client ID is kept only for a prompt retry
 REFRESH_SKEW_SECONDS = 120           # refresh this long before the access token expires
 DISCONNECT_REFRESH_WAIT_SECONDS = 90 # how long disconnect waits for an in-flight refresh
 
@@ -243,6 +243,7 @@ class DisconnectOutcome:
 class PendingSignIn:
     attempt_id: str
     mode: str
+    start_code: Optional[str] = dataclasses.field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +311,8 @@ def derive_state(profile: Optional[Profile]) -> SessionState:
         return SessionState.DISCONNECTED
     if profile.pending_rotation is not None and profile.pending_rotation.promotable:
         return SessionState.REFRESHING
+    if profile.refresh_outcome_unknown:
+        return SessionState.REAUTH_REQUIRED
     if oauth.PLAN_SCOPE not in profile.credentials.scopes:
         return SessionState.CONNECTED_NO_PLAN_PERMISSION
     if "offline_access" not in profile.credentials.scopes or not profile.credentials.refresh_token:
@@ -324,6 +327,8 @@ class _Attempt:
         self.auth = auth
         self.listener = listener
         self.cancelled = False
+        self.committing = False
+        self.candidate = None  # (client_id, verified identity, credentials), process-local only
 
 
 class ChatGPTSessionManager:
@@ -404,7 +409,9 @@ class ChatGPTSessionManager:
 
     def get_session_state(self, profile_id: Optional[str] = None) -> SessionStatus:
         with self._attempt_lock:
-            authorizing = self._attempt is not None and not self._attempt.auth.finished
+            attempt = self._attempt
+            authorizing = attempt is not None and not attempt.auth.finished
+            candidate = attempt.candidate if authorizing else None
         try:
             doc = self._read_doc()
         except SessionStorageError:
@@ -412,6 +419,10 @@ class ChatGPTSessionManager:
                                  error_category=ErrorCategory.STORAGE)
         pid = self._resolve_profile_id(doc, profile_id)
         profile = doc.profile(pid)
+        if candidate is not None and profile_id is None:
+            _client_id, identity, creds = candidate
+            return SessionStatus(SessionState.AUTHORIZING, _plan_permission(creds),
+                                 account_display=identity.email or identity.name or "Verified ChatGPT account")
         if authorizing and profile_id is None:
             return SessionStatus(SessionState.AUTHORIZING, _plan_permission(
                 profile.credentials if profile else None),
@@ -460,10 +471,9 @@ class ChatGPTSessionManager:
             with self.store.locked():
                 doc = self.store.read()
                 host_id = self.store.get_or_create_host_id()
-                fresh = [r for r in doc.pending_registrations
-                         if 0 <= now - r.created_at < PENDING_REGISTRATION_TTL_SECONDS]
-                if len(fresh) != len(doc.pending_registrations):
-                    doc.pending_registrations = fresh
+                # Legacy failed first registrations are never trusted or reused.
+                if doc.pending_registrations:
+                    doc.pending_registrations = []
                     self.store.write(doc)
                 if profile_id is not None:
                     profile = doc.profile(profile_id)
@@ -478,11 +488,6 @@ class ChatGPTSessionManager:
                             profile.subject, None
                     return host_id, oauth.MODE_REAUTHORIZE, profile.client_id, profile.profile_id, \
                         profile.subject, None
-                reg = None if new_account or not fresh else fresh[0]
-                if reg is not None:
-                    # An issued client ID survived a failed exchange: reuse it
-                    # rather than registering another client.
-                    return host_id, oauth.MODE_REAUTHORIZE, reg.client_id, None, None, reg.registration_id
                 return host_id, oauth.MODE_NEW_REGISTRATION, None, None, None, None
 
         host_id, mode, client_id, expected_pid, expected_subject, reg_id = self._guard_store(prepare)
@@ -512,23 +517,36 @@ class ChatGPTSessionManager:
         # The browser is handed only a one-shot local start URL; the real
         # authorize URL (state, nonce, challenge, host ID) reaches it as a
         # redirect, never as a launcher process argument.
-        start_url = listener.arm_start(oauth.build_authorization_url(endpoints.authorization_endpoint, auth))
+        start_url, start_code = listener.arm_start(
+            oauth.build_authorization_url(endpoints.authorization_endpoint, auth),
+            owner_code=(mode == oauth.MODE_NEW_REGISTRATION))
         try:
-            opened = self._open_browser(start_url)
+            try:
+                inspect.signature(self._open_browser).bind(start_url, start_code)
+            except (TypeError, ValueError):
+                opened = self._open_browser(start_url)
+            else:
+                opened = self._open_browser(start_url, start_code)
         except Exception:
             opened = False
         if opened is False:
             self._end_attempt(attempt)
             self._emit("chatgpt.auth.failed", operation="sign_in", error_class="browser_unavailable")
             raise BrowserUnavailable("browser_unavailable")
-        return PendingSignIn(attempt_id=auth.attempt_id, mode=mode)
+        return PendingSignIn(attempt_id=auth.attempt_id, mode=mode, start_code=start_code)
 
     def cancel_sign_in(self) -> None:
         with self._attempt_lock:
             attempt = self._attempt
-        if attempt is not None and not attempt.auth.finished:
+            if attempt is None or attempt.auth.finished or attempt.committing:
+                return
             attempt.cancelled = True
+        if attempt is not None:
             attempt.listener.close()
+            if attempt.candidate is not None:
+                client_id, identity, creds = attempt.candidate
+                self._end_attempt(attempt)
+                self._revoke_unless_live_grant(client_id, identity.subject, creds.refresh_token)
 
     def _end_attempt(self, attempt: _Attempt) -> None:
         attempt.listener.close()
@@ -543,7 +561,8 @@ class ChatGPTSessionManager:
         verifies and -- only if everything holds -- commits the registration."""
         with self._attempt_lock:
             attempt = self._attempt
-        if attempt is None or attempt.auth.attempt_id != pending.attempt_id or attempt.auth.finished:
+        if (attempt is None or attempt.auth.attempt_id != pending.attempt_id
+                or attempt.auth.finished or attempt.candidate is not None):
             raise AuthorizationCancelled("attempt_not_pending")
         auth = attempt.auth
         result = None
@@ -574,9 +593,12 @@ class ChatGPTSessionManager:
                 raise TemporaryAuthError(result.error)
             status = self._finish_sign_in(
                 auth, result.code, result.client_id,
-                is_cancelled=lambda: attempt.cancelled or attempt.listener.compromised)
-            self._emit("chatgpt.auth.completed", operation="sign_in", mode=auth.mode,
-                       to_state=status.state, plan_permission=status.plan_permission)
+                is_cancelled=lambda: attempt.cancelled or attempt.listener.compromised,
+                stage_candidate=lambda client_id, identity, creds: self._stage_candidate(
+                    attempt, client_id, identity, creds))
+            if status.state is not SessionState.AUTHORIZING:
+                self._emit("chatgpt.auth.completed", operation="sign_in", mode=auth.mode,
+                           to_state=status.state, plan_permission=status.plan_permission)
             return status
         except ChatGPTAuthError as exc:
             if attempt.listener.compromised and auth.mode == oauth.MODE_NEW_REGISTRATION \
@@ -588,38 +610,53 @@ class ChatGPTSessionManager:
                        error_class=exc.error_class)
             raise
         finally:
+            if attempt.candidate is None:
+                self._end_attempt(attempt)
+
+    def _stage_candidate(self, attempt: _Attempt, client_id: str, identity, creds: Credentials) -> SessionStatus:
+        with self._attempt_lock:
+            if self._attempt is not attempt or attempt.cancelled or attempt.listener.compromised:
+                raise AuthorizationCancelled("attempt_compromised")
+            attempt.candidate = (client_id, identity, creds)
+        return SessionStatus(SessionState.AUTHORIZING, _plan_permission(creds),
+                             account_display=identity.email or identity.name or "Verified ChatGPT account")
+
+    def confirm_sign_in(self, pending: PendingSignIn) -> SessionStatus:
+        """Owner confirmation of the verified account shown in Settings.
+        First-registration credentials stay attempt-scoped until this call."""
+        with self._attempt_lock:
+            attempt = self._attempt
+            if (attempt is None or attempt.auth.attempt_id != pending.attempt_id
+                    or attempt.candidate is None or attempt.cancelled):
+                raise AuthorizationCancelled("attempt_not_pending")
+            client_id, identity, creds = attempt.candidate
+            safe = attempt.listener.seal_start()
+            if safe:
+                attempt.committing = True
+        if not safe:
+            self._end_attempt(attempt)
+            self._revoke_unless_live_grant(client_id, identity.subject, creds.refresh_token)
+            raise IdentityNotVerified("attempt_compromised")
+        try:
+            status = self._commit_sign_in(attempt.auth, client_id, identity, creds,
+                                          is_cancelled=lambda: attempt.cancelled)
+            self._emit("chatgpt.auth.completed", operation="sign_in", mode=attempt.auth.mode,
+                       to_state=status.state, plan_permission=status.plan_permission)
+            return status
+        finally:
             self._end_attempt(attempt)
 
     def _finish_sign_in(self, auth: oauth.AuthorizationAttempt, code: str, client_id: str,
-                        is_cancelled: Callable[[], bool] = lambda: False) -> SessionStatus:
-        # 1. A first registration's issued client ID is saved before the
-        #    one-time code is spent, so a failed exchange never re-registers.
+                        is_cancelled: Callable[[], bool] = lambda: False,
+                        stage_candidate=None) -> SessionStatus:
+        # An issued client ID is attempt-scoped through exchange and identity verification.
         if auth.mode == oauth.MODE_NEW_REGISTRATION:
-            reg_id = new_record_id()
-
-            def save_registration():
-                with self.store.locked():
-                    doc = self.store.read()
-                    known = next((p for p in doc.profiles if p.client_id == client_id), None)
-                    if known is not None:
-                        # The vendor answered with a registration we already
-                        # hold: this is that profile's reconnect, and its
-                        # verified subject must come back.
-                        return known.profile_id, known.subject, None
-                    reg = next((r for r in doc.pending_registrations if r.client_id == client_id), None)
-                    if reg is not None:
-                        return None, None, reg.registration_id
-                    doc.pending_registrations.append(
-                        PendingRegistration(reg_id, client_id, self._clock()))
-                    self.store.write(doc)
-                    return None, None, reg_id
-            known_pid, known_subject, saved_reg = self._guard_store(save_registration)
-            if known_pid is not None:
-                auth.expected_profile_id = known_pid
-                auth.expected_subject = known_subject
-            auth.pending_registration_id = saved_reg
-
-        # 2. Exchange with this attempt's PKCE verifier and exact redirect URI.
+            doc = self._read_doc()
+            known = next((p for p in doc.profiles if p.client_id == client_id), None)
+            if known is not None:
+                auth.expected_profile_id = known.profile_id
+                auth.expected_subject = known.subject
+        # 1. Exchange with this attempt's PKCE verifier and exact redirect URI.
         try:
             token = self.provider.exchange_code(client_id=client_id, code=code, verifier=auth.verifier,
                                                 redirect_uri=auth.redirect_uri, now=self._clock())
@@ -640,7 +677,7 @@ class ChatGPTSessionManager:
         except oauth.ProtocolError as exc:
             raise IdentityNotVerified(exc.error_class) from None
 
-        # 3. Verify the ID token: signature/issuer/audience=issued client/
+        # 2. Verify the ID token: signature/issuer/audience=issued client/
         #    expiry/nonce/subject. A token response alone is not proof.
         try:
             identity = self.provider.verify_id_token(token.id_token, client_id=client_id,
@@ -650,13 +687,20 @@ class ChatGPTSessionManager:
         except oauth.IdentityInvalid as exc:
             raise IdentityNotVerified(exc.error_class) from None
 
-        # 4. Reconnecting account A must not become account B.
+        # 3. Reconnecting account A must not become account B.
         if auth.expected_subject is not None and identity.subject != auth.expected_subject:
             # The other account's freshly issued session is never kept.
             self._revoke_unless_live_grant(client_id, identity.subject, token.credentials.refresh_token)
             raise AccountMismatch("subject_mismatch")
 
         token.credentials.id_token = token.id_token
+        if auth.mode == oauth.MODE_NEW_REGISTRATION:
+            try:
+                return stage_candidate(client_id, identity, token.credentials)
+            except ChatGPTAuthError:
+                self._revoke_unless_live_grant(client_id, identity.subject,
+                                               token.credentials.refresh_token)
+                raise
         # Plan permission is read from the granted scopes; a missing
         # refresh token (offline_access not granted) can never be READY.
         return self._commit_sign_in(auth, client_id, identity, token.credentials, is_cancelled)
@@ -674,11 +718,13 @@ class ChatGPTSessionManager:
         except ChatGPTAuthError:
             pass
 
-    def _revoke_unless_live_grant(self, client_id: str, subject: str, refresh_token: str) -> None:
+    def _revoke_unless_live_grant(self, client_id: str, subject: str, refresh_token: Optional[str]) -> None:
         """Best-effort revocation of a token Lumina will not keep -- unless a
         saved profile still holds a live session for the same (client,
         subject). OAuth revocation may end every token of the same grant
         (RFC 7009), so revoking a sibling would also end that live session."""
+        if not refresh_token:
+            return
         try:
             doc = self._read_doc()
         except ChatGPTAuthError:
@@ -816,10 +862,16 @@ class ChatGPTSessionManager:
         doc = self._read_doc()
         pid = self._resolve_profile_id(doc, profile_id)
         profile = doc.profile(pid)
-        self._refuse_unusable(profile)
-        if profile.pending_rotation is None and not self._needs_refresh(profile.credentials, self._clock()):
-            return self._checked_grant(profile, profile_id)
-        grant = self._refresh(pid)
+        if profile is not None and profile.refresh_outcome_unknown and profile.pending_rotation is None:
+            # Another process may currently hold the refresh lock. Wait for
+            # its settled result; if it lost the response, _refresh_locked
+            # refuses the old token without sending it again.
+            grant = self._refresh(pid)
+        else:
+            self._refuse_unusable(profile)
+            if profile.pending_rotation is None and not self._needs_refresh(profile.credentials, self._clock()):
+                return self._checked_grant(profile, profile_id)
+            grant = self._refresh(pid)
         if grant.expires_at - REFRESH_SKEW_SECONDS <= self._clock():
             # A resumed rotation (after an outage or restart) can publish a
             # token that has meanwhile expired: renew it once more.
@@ -1123,13 +1175,15 @@ class ChatGPTSessionManager:
                 client_id = profile.client_id
                 outcome_unknown = profile.refresh_outcome_unknown
                 tokens = []
-                if profile.pending_rotation is not None:
+                if profile.pending_rotation is not None and profile.pending_rotation.credentials.refresh_token:
                     tokens.append(profile.pending_rotation.credentials.refresh_token)
-                if profile.credentials is not None and profile.credentials.refresh_token not in tokens:
+                if (profile.credentials is not None and profile.credentials.refresh_token
+                        and profile.credentials.refresh_token not in tokens):
                     tokens.append(profile.credentials.refresh_token)
 
             # Newest first; confirmation is about the newest renewable session.
-            confirmed = False
+            had_tokens = bool(tokens)
+            confirmed = not tokens
             for index, token in enumerate(tokens):
                 ok = self.provider.revoke(client_id=client_id, refresh_token=token)
                 if index == 0:
@@ -1157,11 +1211,11 @@ class ChatGPTSessionManager:
                 refresh_lock.__exit__(None, None, None)
         if confirmed:
             self._emit("chatgpt.disconnect.completed", operation="disconnect",
-                       remote_revocation="confirmed", to_state=final)
+                       remote_revocation="confirmed" if had_tokens else "not_applicable", to_state=final)
         else:
             self._emit("chatgpt.disconnect.remote_unconfirmed", operation="disconnect",
                        remote_revocation="unconfirmed", to_state=final)
-        return DisconnectOutcome(final, confirmed)
+        return DisconnectOutcome(final, confirmed if had_tokens else None)
 
 
 # ---------------------------------------------------------------------------

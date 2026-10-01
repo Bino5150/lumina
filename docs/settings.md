@@ -72,14 +72,22 @@ doesn't apply.
 ## ChatGPT Plan — sign-in
 
 The bottom of the General page has its own **ChatGPT Plan — sign-in**
-section. **Continue with ChatGPT** opens your system browser on OpenAI's
-own sign-in page; you sign in and approve there, and Lumina never sees
+section. **Continue with ChatGPT** opens your system browser. For a first
+registration, enter the one-time code shown in Lumina into the local browser
+page; it then opens OpenAI's sign-in page. You sign
+in and approve there, and Lumina never sees
 your OpenAI password, browser cookies or another app's tokens. When you
-return, the section shows the connected account, whether **plan
+return, check the verified account shown in Lumina and choose **Confirm this
+account** before a first registration is saved. If the account is unexpected,
+cancel and start a fresh sign-in. The section then shows whether **plan
 permission** was granted (signing in and granting plan use are separate
 OpenAI permissions), and the session state, with **Reconnect**,
 **Enable plan permission**, **Add another account** and **Disconnect**
 as they apply.
+An identity sign-in without offline access or plan permission is shown as
+connected without plan permission; it cannot renew a session or use a model.
+If a refresh may have rotated but Lumina lost the response, the session
+requires a fresh authorization rather than retrying the old refresh token.
 
 In this version that is all it does: it holds a ChatGPT session on this
 computer. Using your ChatGPT plan to power chat is **not available yet** —

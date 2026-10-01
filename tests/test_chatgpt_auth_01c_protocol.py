@@ -56,7 +56,8 @@ def make_manager(tmp_path, fake, clock, browser=None, **kw):
 
 def sign_in(m, **kw):
     pending = m.begin_sign_in(**kw)
-    return m.complete_sign_in(pending, timeout=10)
+    status = m.complete_sign_in(pending, timeout=10)
+    return m.confirm_sign_in(pending) if status.state is SessionState.AUTHORIZING else status
 
 
 def read_doc(m):
@@ -198,8 +199,8 @@ def _two_step_browser(fake, first_mutation):
     captured = {}
     responses = []
 
-    def open_browser(url):
-        real(url)
+    def open_browser(url, start_code):
+        real(url, start_code)
         redirect = seen[-1]["redirect_uri"]
         bad_url, headers = first_mutation(redirect, dict(captured))
         responses.append(_get(bad_url, **headers).status_code)
@@ -275,6 +276,8 @@ def test_stale_attempt_callback_cannot_complete_a_new_attempt(tmp_path, fake, cl
     with pytest.raises(requests.ConnectionError):
         _get(old_redirect + "?" + urllib.parse.urlencode(old))
     status = m.complete_sign_in(pending, timeout=10)
+    assert status.state is SessionState.AUTHORIZING
+    status = m.confirm_sign_in(pending)
     assert status.state is SessionState.READY
     assert seen[0]["state"] != seen[1]["state"]
 
@@ -283,9 +286,9 @@ def test_expired_attempt_never_accepts_a_late_callback(tmp_path, fake, clock):
     m = make_manager(tmp_path, fake, clock)
     real_browser = fake.browser()
 
-    def late(url):
+    def late(url, start_code):
         clock.advance(m._attempt_ttl + 1)
-        return real_browser(url)
+        return real_browser(url, start_code)
     m._open_browser = late
     with pytest.raises(AuthorizationCancelled) as exc:
         sign_in(m)
@@ -366,7 +369,7 @@ def test_reconnect_callback_with_a_different_client_id_is_rejected(tmp_path, fak
     assert after.credentials.access_token == before.credentials.access_token
 
 
-def test_pkce_mismatch_fails_and_keeps_issued_client_for_the_retry(tmp_path, fake, clock):
+def test_pkce_mismatch_fails_and_requires_fresh_registration(tmp_path, fake, clock):
     seen = []
     m = make_manager(tmp_path, fake, clock, browser=fake.browser(record=seen))
     original = oauth.ProviderClient.exchange_code
@@ -380,12 +383,12 @@ def test_pkce_mismatch_fails_and_keeps_issued_client_for_the_retry(tmp_path, fak
     assert exc.value.error_class == "authorization_code_rejected"
     doc = read_doc(m)
     assert doc.profiles == []
-    assert [r.client_id for r in doc.pending_registrations] == ["oaiapp_test1"]
+    assert doc.pending_registrations == []
 
-    # The retry reuses that issued client: no second registration.
+    # The retry cannot reuse a client returned by an unverified attempt.
     m.provider.exchange_code = original.__get__(m.provider)
     status = sign_in(m)
-    assert seen[1]["client_id"] == "oaiapp_test1" and "agent_name_hint" not in seen[1]
+    assert seen[1]["client_id"] == "dynamic_agent_client" and seen[1]["agent_name_hint"] == "Lumina"
     assert status.state is SessionState.READY
     assert read_doc(m).pending_registrations == []
 

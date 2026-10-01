@@ -45,6 +45,7 @@ class ChatGPTPlanCard(QWidget):
         self._busy = False
         self._status = None
         self._profiles = []
+        self._pending = None
         self._worker_done.connect(self._on_worker_done)
         self._build()
         app = QApplication.instance()
@@ -106,8 +107,10 @@ class ChatGPTPlanCard(QWidget):
         self.permission_label = _lbl("", c)
         self.session_label = _lbl("", c)
         self.message_label = _lbl("", c)
+        self.code_label = _lbl("", c)
         self.message_label.setWordWrap(True)
-        for w in (self.account_label, self.permission_label, self.session_label, self.message_label):
+        for w in (self.account_label, self.permission_label, self.session_label,
+                  self.code_label, self.message_label):
             layout.addWidget(w)
 
         row = QHBoxLayout()
@@ -116,9 +119,10 @@ class ChatGPTPlanCard(QWidget):
         self.enable_btn = _btn("Enable plan permission", c)
         self.add_btn = _btn("Add another account", c)
         self.cancel_btn = _btn("Cancel sign-in", c)
+        self.confirm_btn = _btn("Confirm this account", c, accent=True)
         self.disconnect_btn = _btn("Disconnect", c, danger=True)
         for b in (self.continue_btn, self.reconnect_btn, self.enable_btn, self.add_btn,
-                  self.cancel_btn, self.disconnect_btn):
+                  self.cancel_btn, self.confirm_btn, self.disconnect_btn):
             row.addWidget(b)
         row.addStretch()
         layout.addLayout(row)
@@ -127,7 +131,8 @@ class ChatGPTPlanCard(QWidget):
         self.add_btn.clicked.connect(lambda: self._sign_in(new_account=True))
         self.reconnect_btn.clicked.connect(lambda: self._sign_in(reconnect=True))
         self.enable_btn.clicked.connect(lambda: self._sign_in(reconnect=True, consent=True))
-        self.cancel_btn.clicked.connect(self._cancel_pending_sign_in)
+        self.cancel_btn.clicked.connect(self._cancel_and_refresh)
+        self.confirm_btn.clicked.connect(self._confirm_sign_in)
         self.disconnect_btn.clicked.connect(lambda: self._run("disconnect", lambda m: m.disconnect()))
         self._render()
 
@@ -147,9 +152,20 @@ class ChatGPTPlanCard(QWidget):
         def flow(m):
             pending = m.begin_sign_in(profile_id=pid, new_account=new_account,
                                       request_plan_consent=consent)
+            self._pending = pending
             self._worker_done.emit(("authorizing", ("ok", None), m.get_session_state(), m.list_profiles()))
             return m.complete_sign_in(pending)
         self._run("sign_in", flow)
+
+    def _confirm_sign_in(self) -> None:
+        pending = self._pending
+        if pending is not None:
+            self._run("confirm", lambda m: m.confirm_sign_in(pending))
+
+    def _cancel_and_refresh(self) -> None:
+        self._cancel_pending_sign_in()
+        self._pending = None
+        self.refresh()
 
     def _on_account_picked(self, index: int) -> None:
         if self._busy or index < 0 or index >= len(self._profiles):
@@ -166,9 +182,18 @@ class ChatGPTPlanCard(QWidget):
             self._status = status
             self._profiles = list(profiles)
         if kind == "error":
+            if action in ("sign_in", "confirm"):
+                self._pending = None
             self.message_label.setText(value)
-        elif action == "sign_in" and status is not None and status.state.value == "ready":
-            self.message_label.setText("Connected to ChatGPT. Plan permission enabled.")
+        elif action == "sign_in" and value is not None and value.state.value == "authorizing":
+            self.message_label.setText("Check the ChatGPT account shown here, then confirm it in Lumina.")
+        elif action == "sign_in" and value is not None:
+            self._pending = None
+            if status is not None and status.state.value == "ready":
+                self.message_label.setText("Connected to ChatGPT. Plan permission enabled.")
+        elif action == "confirm":
+            self._pending = None
+            self.message_label.setText("Connected to ChatGPT.")
         elif action == "disconnect" and value is not None:
             self.message_label.setText(
                 "Disconnected." if value.remote_revocation_confirmed is not False else
@@ -184,7 +209,8 @@ class ChatGPTPlanCard(QWidget):
         authorizing = state == "authorizing"
         self.session_label.setText("Session: " + (_STATE_TEXT.get(state, "Checking…") if state else "Checking…"))
         if status is not None and status.account_display and state not in ("disconnected", None):
-            self.account_label.setText(f"Connected account: {status.account_display}")
+            prefix = "Account to confirm: " if authorizing and self._pending is not None else "Connected account: "
+            self.account_label.setText(prefix + status.account_display)
         elif status is not None and status.profile_label:
             self.account_label.setText(f"Saved account: {status.profile_label}")
         else:
@@ -192,6 +218,10 @@ class ChatGPTPlanCard(QWidget):
         perm = None if status is None else status.plan_permission.value
         self.permission_label.setText(
             {"granted": "Plan permission: Enabled", "not_granted": "Plan permission: Not enabled"}.get(perm, ""))
+        self.code_label.setText(
+            "Enter this one-time code in your browser: " + self._pending.start_code
+            if authorizing and self._pending is not None and self._pending.start_code
+            and (status is None or not status.account_display) else "")
 
         self.account_combo.blockSignals(True)
         self.account_combo.clear()
@@ -212,6 +242,8 @@ class ChatGPTPlanCard(QWidget):
         self.enable_btn.setVisible(idle and state == "connected_no_plan_permission")
         self.add_btn.setVisible(idle and has_profile and state not in ("corrupt_session", "disconnecting"))
         self.cancel_btn.setVisible(authorizing)
+        self.confirm_btn.setVisible(not self._busy and self._pending is not None and authorizing
+                                    and status is not None and bool(status.account_display))
         self.disconnect_btn.setVisible(idle and state in (
             "ready", "connected_no_plan_permission", "refreshing", "reauth_required", "disconnecting"))
 

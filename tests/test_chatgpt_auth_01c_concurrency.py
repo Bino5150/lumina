@@ -56,7 +56,9 @@ def make_manager(directory, fake, clock, **kw):
 
 
 def sign_in(m, **kw):
-    return m.complete_sign_in(m.begin_sign_in(**kw), timeout=10)
+    pending = m.begin_sign_in(**kw)
+    status = m.complete_sign_in(pending, timeout=10)
+    return m.confirm_sign_in(pending) if status.state is SessionState.AUTHORIZING else status
 
 
 def doc_of(m):
@@ -244,30 +246,29 @@ def test_two_processes_refresh_once(tmp_path, fake, clock):
     assert fake.family_alive_for(active(m).credentials.refresh_token)
 
 
-def test_crash_before_request_leaves_session_usable(tmp_path, fake, clock):
+def test_crash_before_request_requires_reauth_when_dispatch_is_unprovable(tmp_path, fake, clock):
     m = ready_and_expired(tmp_path, fake, clock)
     code, _out, _err = finish(spawn(tmp_path, fake, clock, "crash_before_request"))
     assert code == 9
     assert fake.refresh_count() == 0
-    grant = m.get_valid_access_token()             # lock was released by the kernel
-    assert fake.refresh_count() == 1 and m.is_grant_current(grant)
+    with pytest.raises(ReauthRequired):
+        m.get_valid_access_token()
+    assert fake.refresh_count() == 0
+    assert m.get_session_state().state is SessionState.REAUTH_REQUIRED
 
 
 def test_crash_after_vendor_rotation_before_publish_is_reported_truthfully(tmp_path, fake, clock):
-    """The vendor retired the old refresh token and the only copy of the new
-    one died with the process. The next refresh presents the old token, the
-    vendor reports reuse, and the session lands in REAUTH_REQUIRED with its
-    tokens cleared -- never READY on stale credentials, never a silent
-    fallback."""
+    """A lost successor blocks reuse of the possibly retired token."""
     m = ready_and_expired(tmp_path, fake, clock)
     code, _out, _err = finish(spawn(tmp_path, fake, clock, "crash_after_response"))
     assert code == 9 and fake.refresh_count() == 1
     assert active(m).pending_rotation is None
-    with pytest.raises(ReauthRequired) as exc:
+    with pytest.raises(ReauthRequired):
         m.get_valid_access_token()
-    assert exc.value.error_class in oauth.TERMINAL_REFRESH_CODES
+    assert fake.refresh_count() == 1
     p = active(m)
-    assert p.credentials is None and p.status == store_mod.STATUS_REAUTH_REQUIRED
+    assert p.credentials is not None and p.refresh_outcome_unknown
+    assert m.get_session_state().state is SessionState.REAUTH_REQUIRED
     assert p.client_id == "oaiapp_test1" and p.subject == "user-sub-A"   # registration kept
 
 
@@ -506,18 +507,24 @@ def test_temporary_or_unknown_refresh_failures_never_destroy_credentials(tmp_pat
     after = active(m)
     assert after.credentials.refresh_token == before.credentials.refresh_token
     assert after.generation == before.generation
-    assert m.get_session_state().state is SessionState.READY
-    m.get_valid_access_token()                  # and it recovers
-    assert fake.refresh_count() == 2
+    if fault[0] >= 500:
+        assert m.get_session_state().state is SessionState.REAUTH_REQUIRED
+        with pytest.raises(ReauthRequired):
+            m.get_valid_access_token()
+        assert fake.refresh_count() == 1
+    else:
+        assert m.get_session_state().state is SessionState.READY
+        m.get_valid_access_token()
+        assert fake.refresh_count() == 2
 
 
-def test_network_failure_never_destroys_credentials(tmp_path, fake, clock):
+def test_network_failure_blocks_ambiguous_refresh_without_destroying_credentials(tmp_path, fake, clock):
     m = ready_and_expired(tmp_path, fake, clock)
     m.provider.endpoints()
     fake.close()                                 # provider unreachable
     with pytest.raises(TemporaryAuthError):
         m.get_valid_access_token()
-    assert m.get_session_state().state is SessionState.READY
+    assert m.get_session_state().state is SessionState.REAUTH_REQUIRED
     assert active(m).credentials is not None
 
 

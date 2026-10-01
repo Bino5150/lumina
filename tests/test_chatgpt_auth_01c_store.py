@@ -49,7 +49,9 @@ def make_manager(directory, fake, clock, recorder=None, **kw):
 
 
 def sign_in(m, **kw):
-    return m.complete_sign_in(m.begin_sign_in(**kw), timeout=10)
+    pending = m.begin_sign_in(**kw)
+    status = m.complete_sign_in(pending, timeout=10)
+    return m.confirm_sign_in(pending) if status.state is SessionState.AUTHORIZING else status
 
 
 def full_lifecycle(m, clock):

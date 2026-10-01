@@ -231,13 +231,19 @@ def test_browser_is_launched_with_a_one_shot_local_start_url_only(tmp_path, fake
 
 def test_start_url_answers_exactly_once(tmp_path, fake, clock):
     m = make_manager(tmp_path / "chatgpt", fake, clock, browser=lambda url: fake.launched_urls.append(url))
-    m.begin_sign_in()
+    pending = m.begin_sign_in()
     [start] = fake.launched_urls
     s = requests.Session()
     s.trust_env = False
     first = s.get(start, allow_redirects=False, timeout=5)
-    second = s.get(start, allow_redirects=False, timeout=5)
-    assert first.status_code == 302 and first.headers["Location"].startswith(fake.issuer)
+    assert first.status_code == 200 and "one-time code" in first.text
+    assert fake.issuer not in first.text
+    assert pending.start_code not in start and pending.start_code not in first.text
+    denied = s.post(start, data={"code": "WRONG"}, allow_redirects=False, timeout=5)
+    assert denied.status_code == 403
+    authorized = s.post(start, data={"code": pending.start_code}, allow_redirects=False, timeout=5)
+    assert authorized.status_code == 302 and authorized.headers["Location"].startswith(fake.issuer)
+    second = s.post(start, data={"code": pending.start_code}, allow_redirects=False, timeout=5)
     assert second.status_code == 404
     m.cancel_sign_in()
 
@@ -254,13 +260,13 @@ def test_forged_callback_cannot_poison_future_sign_ins(tmp_path, fake, clock):
     assert seen[0]["client_id"] == "dynamic_agent_client"
 
 
-def test_pending_registrations_expire(tmp_path, fake, clock):
+def test_failed_registration_is_never_pending_for_retry(tmp_path, fake, clock):
     m = make_manager(tmp_path / "chatgpt", fake, clock)
     real_exchange = m.provider.exchange_code
     m.provider.exchange_code = lambda **kw: real_exchange(**{**kw, "verifier": oauth.new_pkce_verifier()})
     with pytest.raises(AuthorizationCancelled):
         sign_in(m)
-    assert len(doc_of(m).pending_registrations) == 1
+    assert doc_of(m).pending_registrations == []
     m.provider.exchange_code = real_exchange
     clock.advance(16 * 60)
     seen = []
@@ -327,7 +333,8 @@ def test_a_stalled_local_connection_cannot_block_the_callback(tmp_path, fake, cl
         started = time.monotonic()
         response = s.get(redirect + "?" + urllib.parse.urlencode(captured), timeout=3)
         assert response.status_code == 200 and time.monotonic() - started < 3
-        assert m.complete_sign_in(pending, timeout=5).state is SessionState.READY
+        assert m.complete_sign_in(pending, timeout=5).state is SessionState.AUTHORIZING
+        assert m.confirm_sign_in(pending).state is SessionState.READY
     finally:
         stall.close()
 
@@ -341,23 +348,16 @@ def _start_and_location(url):
 
 
 def test_raced_start_url_marks_the_attempt_compromised_and_keeps_nothing(tmp_path, fake, clock):
-    """An attacker fetches the one-shot start URL first (learning the state),
-    the real browser's fetch is the second hit, then a forged callback with
-    the attacker's real issued client and a junk code arrives."""
+    """A URL-only attacker gets the code-entry page, never OAuth state."""
     fake.clients["oaiapp_ATTACKER"] = "attacker-sub"
     launched = []
     m = make_manager(tmp_path / "chatgpt", fake, clock, browser=lambda url: launched.append(url))
     pending = m.begin_sign_in()
     attacker = _start_and_location(launched[0])
-    assert attacker.status_code == 302
-    assert _start_and_location(launched[0]).status_code == 404      # the real browser, too late
-    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(attacker.headers["Location"]).query))
-    forged = q["redirect_uri"] + "?" + urllib.parse.urlencode(
-        {"state": q["state"], "code": "junk", "client_id": "oaiapp_ATTACKER"})
-    assert _start_and_location(forged).status_code == 200
-    with pytest.raises(IdentityNotVerified) as exc:
-        m.complete_sign_in(pending, timeout=5)
-    assert exc.value.error_class == "attempt_compromised"
+    assert attacker.status_code == 200 and fake.issuer not in attacker.text
+    assert "Location" not in attacker.headers
+    with pytest.raises(AuthorizationCancelled):
+        m.complete_sign_in(pending, timeout=0.1)
     assert doc_of(m).pending_registrations == [] and doc_of(m).profiles == []
     assert fake.grants == []                                         # never even exchanged
 

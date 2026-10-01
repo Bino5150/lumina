@@ -131,13 +131,16 @@ class FakeOpenAIAuth:
         """A replacement for the system browser: validates the authorize URL
         like OpenAI would, signs the user in as `subject`, and immediately
         delivers the loopback callback (the listener is already bound)."""
-        def open_browser(url):
+        def open_browser(url, start_code=None):
             self.launched_urls.append(url)
             start = urllib.parse.urlsplit(url)
             if start.path.startswith("/auth/start/"):
                 s0 = requests.Session()
                 s0.trust_env = False
                 hop = s0.get(url, allow_redirects=False, timeout=10)
+                if start_code is not None:
+                    assert hop.status_code == 200, hop.status_code
+                    hop = s0.post(url, data={"code": start_code}, allow_redirects=False, timeout=10)
                 assert hop.status_code == 302, hop.status_code
                 url = hop.headers["Location"]
             parts = urllib.parse.urlsplit(url)

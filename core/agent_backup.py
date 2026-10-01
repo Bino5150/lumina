@@ -625,6 +625,7 @@ import unicodedata
 import warnings
 import zipfile
 from datetime import datetime, timezone
+from core.backup_credential_recognizer import is_session_document as _contains_chatgpt_session_document
 
 MANIFEST_FORMAT = "lumina-agent-backup"
 MANIFEST_FORMAT_VERSION = {"major": 1, "minor": 0}
@@ -1949,12 +1950,9 @@ _FORBIDDEN_BASENAMES = {"credentials.json", "credentials"}
 # links to them are already refused by the universal capture boundary
 # (never dereferenced / st_nlink == 1); a session document *renamed, moved
 # or copied* into a collected position keeps neither its path nor (for a
-# copy) its inode, so it is caught by content instead: both store documents
-# always carry their schema tag as a JSON member. The pattern matches that
-# serialized form only (so prose or source code merely naming the tag is not
-# caught); a match fails the whole backup without ever echoing the content.
-_CHATGPT_SESSION_DOCUMENT_RE = re.compile(
-    rb'"schema"\s*:\s*"lumina\.chatgpt\.(?:sessions|host)/')
+# copy) its inode, so a bounded semantic JSON schema check rejects it.
+# Ambiguous oversized JSON objects fail closed; ordinary prose naming a
+# schema is unaffected. Rejection never echoes credential content.
 
 _ROOT_FIELD_TYPES = {
     "format": str, "lumina_version": str, "created_at": str,
@@ -2647,7 +2645,7 @@ def _stage_physical_state_file(source_path: str, staging_root: str, archive_path
             f"-- refusing to silently omit it (or exclude it with a mere warning) from a "
             f"backup that would otherwise claim completeness (SECURITY_REJECTED_STATE)"
         )
-    if _CHATGPT_SESSION_DOCUMENT_RE.search(data):
+    if _contains_chatgpt_session_document(data):
         raise AgentBackupError(
             f"{label} contains a ChatGPT sign-in session or host-identity document: "
             f"{source_path} -- OS-local credential custody never enters a backup "

@@ -260,7 +260,8 @@ def parse_token_response(data, *, now: float, previous_scopes: Optional[tuple] =
     if (isinstance(expires_in, bool) or not isinstance(expires_in, (int, float))
             or not math.isfinite(expires_in) or expires_in <= 0 or expires_in > MAX_EXPIRES_IN_SECONDS):
         raise InvalidTokenResponse("token_response_expiry")
-    if not isinstance(refresh, str) or not refresh:
+    renewable = "offline_access" in scopes or PLAN_SCOPE in scopes or not require_id_token
+    if (not isinstance(refresh, str) or not refresh) and (renewable or refresh is not None):
         raise InvalidTokenResponse("token_response_refresh")
     id_token = data.get("id_token")
     if id_token is not None and (not isinstance(id_token, str) or not id_token):

@@ -239,11 +239,14 @@ never look like "never installed" and trigger a silent reseed.
 (`core/memory_backup.py`) that checkpoints the database
 (`PRAGMA wal_checkpoint(TRUNCATE)`) and zips the entire data directory —
 chat history, MemPalace, flat memories, Knowledge Base, the pending-action
-audit log, custom tools, projects, and preferences. Credentials never make
-it in: `credentials.json` and ChatGPT sign-in sessions live outside the
-data directory by design, symbolic links inside the data directory are
+audit log, custom tools, projects, and preferences. The normal
+`credentials.json` and ChatGPT sign-in stores live outside the data
+directory by design. Symbolic links inside the data directory are
 not followed, and a ChatGPT session file copied or moved into the data
-directory is left out of the archive.
+directory is left out of the archive when its bounded JSON schema check
+recognizes the document. The bytes checked are the bytes archived; a
+source-path replacement during backup cannot substitute later bytes.
+Keep other copies of credentials out of the data directory.
 
 There is no separate "restore" UI for this yet — the backup is a file you
 keep.

@@ -4,8 +4,8 @@ card, under real Qt.
 
 Pins: the card is mounted in the General page but outside its backend
 selector and Save; a READY session never adds the plan lane to the
-selector; the card only ever renders sanitized DTO text (no token, code,
-identity, URL) and claims nothing 01C has not earned (no model, no chat
+selector; the card renders verified identity and the app-generated start
+code, but no token or authorization URL, and claims nothing 01C has not earned (no model, no chat
 readiness); every session call runs off the Qt main thread; app quit
 cancels a pending browser sign-in.
 
@@ -145,6 +145,48 @@ def test_sign_in_runs_off_the_main_thread_and_ui_stays_responsive(qapp):
     manager.gate.set()
     assert pump(qapp, card, lambda: "Plan permission enabled" in card.message_label.text())
     assert all(not on_main for on_main in manager.threads)
+
+
+def test_first_registration_requires_visible_owner_confirmation(qapp):
+    class StagedManager(StubManager):
+        def __init__(self):
+            super().__init__()
+            self.candidate = False
+
+        def get_session_state(self, profile_id=None):
+            self._note("get_session_state")
+            return SessionStatus(self.state, self.plan,
+                                 account_display="owner@example.test" if self.candidate else None)
+
+        def begin_sign_in(self, **kw):
+            self._note("begin_sign_in")
+            self.state = SessionState.AUTHORIZING
+            return PendingSignIn("a" * 32, "new_registration", "CODETEST42")
+
+        def complete_sign_in(self, pending, timeout=None):
+            self._note("complete_sign_in")
+            assert self.gate.wait(10)
+            self.candidate = True
+            return self.get_session_state()
+
+        def confirm_sign_in(self, pending):
+            self._note("confirm_sign_in")
+            self.state = SessionState.READY
+            self.plan = PlanPermission.GRANTED
+            return self.get_session_state()
+
+    manager = StagedManager()
+    manager.gate = threading.Event()
+    card = make_card(qapp, manager)
+    card.continue_btn.click()
+    assert pump(qapp, card, lambda: "CODETEST42" in card.code_label.text())
+    assert card.confirm_btn.isHidden()
+    manager.gate.set()
+    assert pump(qapp, card, lambda: not card.confirm_btn.isHidden())
+    assert "Account to confirm: owner@example.test" in visible_text(card)
+    card.confirm_btn.click()
+    assert pump(qapp, card, lambda: card._status.state is SessionState.READY)
+    assert "confirm_sign_in" in manager.calls
 
 
 def test_sign_in_error_shows_only_the_category_message(qapp):

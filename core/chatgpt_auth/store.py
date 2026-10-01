@@ -143,7 +143,7 @@ class LockDiscipline(StoreError):
 class Credentials:
     """One token generation. Secret fields are excluded from repr()."""
     access_token: str = dataclasses.field(repr=False)
-    refresh_token: str = dataclasses.field(repr=False)
+    refresh_token: Optional[str] = dataclasses.field(repr=False)
     id_token: Optional[str] = dataclasses.field(repr=False)
     token_type: str
     expires_at: float
@@ -167,7 +167,8 @@ class Credentials:
     def from_dict(cls, value) -> "Credentials":
         _require(isinstance(value, dict), "credentials")
         _require(_nonempty_str(value.get("access_token")), "credentials.access_token")
-        _require(_nonempty_str(value.get("refresh_token")), "credentials.refresh_token")
+        refresh = value.get("refresh_token")
+        _require(refresh is None or _nonempty_str(refresh), "credentials.refresh_token")
         _require(value.get("id_token") is None or _nonempty_str(value.get("id_token")),
                  "credentials.id_token")
         _require(value.get("token_type") == "Bearer", "credentials.token_type")
@@ -178,6 +179,8 @@ class Credentials:
         scopes = value.get("scopes")
         _require(isinstance(scopes, list) and all(_nonempty_str(s) for s in scopes),
                  "credentials.scopes")
+        _require(refresh is not None or ("offline_access" not in scopes
+                 and "chatgpt.tokens.use.direct" not in scopes), "credentials.refresh_token")
         _require(_finite_number(value.get("received_at")), "credentials.received_at")
         return cls(
             access_token=value["access_token"],
@@ -335,9 +338,9 @@ class Profile:
 
 @dataclasses.dataclass
 class PendingRegistration:
-    """An issued client ID the vendor returned on a first-registration
-    callback, saved before the one-time code exchange so a failed exchange
-    never forces another registration. Holds no token material."""
+    """Legacy 01C field, read only for compatibility. R1 never writes or
+    reuses an unverified first-registration client ID and clears old entries
+    on the next sign-in."""
     registration_id: str
     client_id: str = dataclasses.field(repr=False)
     created_at: float

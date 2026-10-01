@@ -149,10 +149,13 @@ permissions are loosened, if they are replaced by a link, or if they fail
 an integrity check, and it never deletes a damaged file to "start over".
 They are local to this OS installation — another OS (for example a
 second distro on the same machine) signs in separately with its own host
-identifier — and they never enter `prefs.json`, the data directory,
-conversation history, the Flight Recorder, logs, Memory Backup or Agent
-Backup (a session file copied, moved or linked into backed-up data makes
-Agent Backup refuse to run, and is left out of a Memory Backup). The Flight Recorder records only categorical sign-in,
+identifier. Lumina does not put them in `prefs.json`, the data directory,
+conversation history, the Flight Recorder or logs. The normal session
+store is outside Memory Backup and Agent Backup; a recognized session or
+host document copied, moved or linked into collected data makes Agent
+Backup refuse to run and is left out of Memory Backup. Memory Backup classifies the
+same captured bytes it archives. Oversized JSON objects with an uncheckable
+schema are omitted. The Flight Recorder records only categorical sign-in,
 renewal and disconnect events — never a token, code, email, account or
 client identifier. Signing in with ChatGPT never uses or replaces an API
 key, and a sign-in, renewal or disconnect failure never falls back to an

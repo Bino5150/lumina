@@ -34,7 +34,7 @@ from core.chatgpt_auth.session import (
     ReauthRequired, SessionState, SessionStorageError, SignInRequired, TemporaryAuthError,
 )
 from core.chatgpt_auth.store import SessionStore
-from chatgpt_auth_fakes import NO_PLAN_SCOPES, FakeClock, FakeOpenAIAuth, provider_session
+from chatgpt_auth_fakes import DROP, NO_PLAN_SCOPES, FakeClock, FakeOpenAIAuth, provider_session
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = os.path.join(ROOT, "core", "chatgpt_auth")
@@ -63,7 +63,9 @@ def make_manager(directory, fake, clock, **kw):
 
 
 def sign_in(m, **kw):
-    return m.complete_sign_in(m.begin_sign_in(**kw), timeout=10)
+    pending = m.begin_sign_in(**kw)
+    status = m.complete_sign_in(pending, timeout=10)
+    return m.confirm_sign_in(pending) if status.state is SessionState.AUTHORIZING else status
 
 
 def ready_store(tmp_path, fake, clock):
@@ -256,6 +258,15 @@ def test_no_auth_failure_reaches_any_other_fuel(tmp_path, fake, clock, paid_keys
     sign_in(m)
     with pytest.raises(PlanPermissionNotGranted):
         m.get_valid_access_token()
+    # Identity granted without offline access remains connected but unusable.
+    fake.code_scope_override = "openid profile email"
+    fake.code_response_overrides["refresh_token"] = DROP
+    m = make_manager(tmp_path / "s2_identity_only", fake, clock)
+    sign_in(m)
+    with pytest.raises(PlanPermissionNotGranted):
+        m.get_valid_access_token()
+    fake.code_scope_override = None
+    fake.code_response_overrides.clear()
     # 3. terminal refresh failure
     m = make_manager(tmp_path / "s3", fake, clock)
     sign_in(m)
@@ -277,6 +288,9 @@ def test_no_auth_failure_reaches_any_other_fuel(tmp_path, fake, clock, paid_keys
     fake.refresh_faults.append((503, {}))
     with pytest.raises(TemporaryAuthError):
         m.get_valid_access_token()
+    with pytest.raises(ReauthRequired):
+        m.get_valid_access_token()
+    assert m.disconnect().remote_revocation_confirmed is False
     # 6. corrupt session
     with open(m.store.sessions_path, "wb") as fh:
         fh.write(b"{broken")
@@ -286,6 +300,13 @@ def test_no_auth_failure_reaches_any_other_fuel(tmp_path, fake, clock, paid_keys
     fake.code_id_token_overrides = {"aud": "oaiapp_other"}
     m = make_manager(tmp_path / "s7", fake, clock)
     _expect_auth_error(lambda: sign_in(m))
+    fake.code_id_token_overrides = {}
+    # A forged first-registration callback cannot create reusable custody.
+    m = make_manager(tmp_path / "s8", fake, clock, browser=fake.browser(
+        mutate_callback=lambda cb: {**cb, "code": "junk"}))
+    _expect_auth_error(lambda: sign_in(m))
+    with m.store.locked():
+        assert m.store.read().pending_registrations == []
 
     assert tw.foreign_requests() == []
     assert tw.dns == []
@@ -341,7 +362,7 @@ def _package_sources():
 
 
 def test_auth_package_imports_are_allowlisted():
-    allowed = _STDLIB_OK | {"jwt", "requests", "core.test_isolation", "core.flight_recorder",
+    allowed = _STDLIB_OK | {"inspect", "jwt", "requests", "core.test_isolation", "core.flight_recorder",
                             "core.chatgpt_auth", "core.chatgpt_auth.store", "core.chatgpt_auth.oauth",
                             "core.chatgpt_auth.callback", "core.chatgpt_auth.session"}
     for name, src in _package_sources():

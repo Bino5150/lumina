@@ -27,8 +27,9 @@ the authorization code and state.
 The browser is never launched with the authorize URL itself (it carries the
 state, nonce, PKCE challenge and host ID, and a launcher's process arguments
 are readable by other local users). It is launched with a one-shot
-/auth/start/<random> URL on this listener, which answers exactly once with a
-302 to the authorize URL and 404 afterwards. Requests are served on worker
+/auth/start/<random> URL on this listener. A first registration requires a
+separate code displayed in Lumina before the listener releases the authorize
+URL; a URL-only first hit gets only the code-entry page. Requests are served on worker
 threads so one stalled local connection cannot block the real callback.
 """
 from __future__ import annotations
@@ -58,6 +59,14 @@ _DONE_PAGE = (
     "<h1>Return to Lumina</h1><p>Lumina will finish checking your ChatGPT connection. "
     "You can close this tab.</p>"
     f"<script>{_HISTORY_SCRIPT}</script></html>"
+).encode("utf-8")
+_START_PAGE = (
+    '<!doctype html><html lang="en"><meta charset="utf-8"><title>Continue in Lumina</title>'
+    '<style>body{font:16px system-ui;max-width:32rem;margin:18vh auto;padding:24px}'
+    'input,button{font:inherit;padding:8px}</style>'
+    '<h1>Continue in Lumina</h1><p>Enter the one-time code shown in Lumina.</p>'
+    '<form method="post"><label>Code <input name="code" required autocomplete="off"></label>'
+    '<button type="submit">Continue</button></form></html>'
 ).encode("utf-8")
 
 
@@ -128,26 +137,52 @@ class LoopbackCallback:
         self._thread = threading.Thread(target=self._serve, name="chatgpt-auth-callback", daemon=True)
         self._thread.start()
 
-    def arm_start(self, authorize_url: str) -> str:
-        """Returns the one-shot local URL to hand to the browser."""
+    def arm_start(self, authorize_url: str, *, owner_code: bool = False) -> tuple[str, Optional[str]]:
+        """Return the start URL and an optional code shown only in Lumina."""
         with self._lock:
             self._start_path = f"/auth/start/{secrets.token_urlsafe(24)}"
             self._authorize_url = authorize_url
-            return f"http://{LOOPBACK_HOST}:{self.port}{self._start_path}"
+            self._start_code = ("".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
+                                        for _ in range(10)) if owner_code else None)
+            self._bad_start_codes = 0
+            return f"http://{LOOPBACK_HOST}:{self.port}{self._start_path}", self._start_code
 
-    def _take_start(self, method: str, host: Optional[str], target: str) -> Optional[str]:
-        """The authorize URL, exactly once, for the armed start path."""
+    def _take_start(self, method: str, host: Optional[str], target: str, code: Optional[str]):
+        """Return (status, redirect, body) for an armed start request."""
         path = urllib.parse.urlsplit(target).path
         with self._lock:
             if self._spent_start_path is not None and path == self._spent_start_path:
                 self.compromised = True
-                return None
-            if (method != "GET" or host != f"{LOOPBACK_HOST}:{self.port}" or self._settled.is_set()
+                return 404, None, b""
+            if (host != f"{LOOPBACK_HOST}:{self.port}" or self._settled.is_set()
                     or self._start_path is None or path != self._start_path):
                 return None
+            if self.compromised:
+                return 404, None, b""
+            if self._start_code is not None:
+                if method == "GET":
+                    return 200, None, _START_PAGE
+                if method != "POST" or code is None or not hmac.compare_digest(code, self._start_code):
+                    self._bad_start_codes += 1
+                    if self._bad_start_codes >= 3:
+                        self.compromised = True
+                    return 403, None, b""
+            elif method != "GET":
+                return 404, None, b""
             url, self._authorize_url = self._authorize_url, None
             self._spent_start_path, self._start_path = self._start_path, None
-            return url
+            self._start_code = None
+            return 302, url, b""
+
+    def seal_start(self) -> bool:
+        """Freeze start-link collision evidence before owner publication."""
+        with self._lock:
+            compromised = self.compromised
+            self._spent_start_path = None
+            self._start_path = None
+            self._authorize_url = None
+            self._start_code = None
+            return not compromised
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -164,6 +199,7 @@ class LoopbackCallback:
         self._closed.set()
         with self._lock:
             self._authorize_url = self._start_path = None
+            self._start_code = None
         self._settle(CallbackResult(error="cancelled"))
         self._server.shutdown()
         self._thread.join(timeout=5)
@@ -248,7 +284,7 @@ class LoopbackCallback:
                 self.send_header(
                     "Content-Security-Policy",
                     f"default-src 'none'; script-src 'sha256-{_SCRIPT_HASH}'; "
-                    "style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+                    "style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
                 )
                 self.send_header("Content-Type", "text/html; charset=utf-8" if body else "text/plain")
                 self.send_header("Content-Length", str(len(body)))
@@ -257,9 +293,24 @@ class LoopbackCallback:
                     self.wfile.write(body)
 
             def _handle(self, method: str) -> None:
-                location = owner._take_start(method, self.headers.get("Host"), self.path)
-                if location is not None:
-                    self.send_response(302)
+                code = None
+                if method == "POST":
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                    except ValueError:
+                        length = 0
+                    if 0 < length <= 128:
+                        values = urllib.parse.parse_qs(
+                            self.rfile.read(length).decode("ascii", "ignore")).get("code", [])
+                        if len(values) == 1:
+                            code = values[0].strip().upper()
+                start = owner._take_start(method, self.headers.get("Host"), self.path, code)
+                if start is not None:
+                    status, location, body = start
+                    if location is None:
+                        self._respond(status, body)
+                        return
+                    self.send_response(status)
                     self.send_header("Location", location)
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("Referrer-Policy", "no-referrer")
