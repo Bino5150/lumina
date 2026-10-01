@@ -4,7 +4,7 @@ Settings is a tabbed panel (`ui/settings/panel.py`). Current tabs, in order:
 
 | Tab | Covers |
 |---|---|
-| ⚙ General | Backend selection, reasoning effort, context compaction, dreaming toggles, global agent behavior prompt |
+| ⚙ General | Backend selection, reasoning effort, context compaction, dreaming toggles, global agent behavior prompt, and the separate **ChatGPT Plan — sign-in** section (see below) |
 | 👤 User Profile | Your own bio and Lumina's curated notes about you — see [My Human](memory.md#my-human) |
 | 🎭 Personas | Create/edit/import/export personas — see [Personas & Skills](personas-and-skills.md) |
 | 📡 Communications | Telegram, Discord, and your public bio — see [Channels](channels.md) |
@@ -68,6 +68,32 @@ If a backend doesn't declare any reasoning capability, the default is
 rather than guessing. Your choice is saved per backend *and* per model, so
 switching models on the same backend doesn't carry over a setting that
 doesn't apply.
+
+## ChatGPT Plan — sign-in
+
+The bottom of the General page has its own **ChatGPT Plan — sign-in**
+section. **Continue with ChatGPT** opens your system browser on OpenAI's
+own sign-in page; you sign in and approve there, and Lumina never sees
+your OpenAI password, browser cookies or another app's tokens. When you
+return, the section shows the connected account, whether **plan
+permission** was granted (signing in and granting plan use are separate
+OpenAI permissions), and the session state, with **Reconnect**,
+**Enable plan permission**, **Add another account** and **Disconnect**
+as they apply.
+
+In this version that is all it does: it holds a ChatGPT session on this
+computer. Using your ChatGPT plan to power chat is **not available yet** —
+the ChatGPT-plan backend is not in the backend list, nothing is sent to a
+model, and no plan usage is consumed. The section is independent of
+**Save All Settings**: saving General never starts, renews or ends a
+ChatGPT sign-in, and an OpenAI API key never stands in for it.
+
+**Disconnect** stops use, asks OpenAI to end the renewable session, and
+removes the saved tokens. If OpenAI can't be reached to confirm, the
+tokens are still removed locally and the section says remote disconnect
+was not confirmed — you can also disconnect Lumina in ChatGPT Settings.
+Where the session is stored and how it is protected:
+[Security & Authority](security.md#credentials-live-apart-from-settings).
 
 ## Vision & Image Generation routing
 

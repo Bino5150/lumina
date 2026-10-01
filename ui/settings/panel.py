@@ -12,6 +12,7 @@ from .communications_tab import CommunicationsTab
 from .personas_tab import PersonasTab
 from .scheduled_tasks_tab import ScheduledTasksTab
 from .about_tab import AboutTab
+from .chatgpt_plan_card import ChatGPTPlanCard
 from .coming_soon_tab import ComingSoonTab
 
 
@@ -60,6 +61,14 @@ class SettingsPanel(QWidget):
 
         c = self.colors
         self.general_tab = GeneralTab(self.agent, c)
+        # SUBSCRIPTION-PLAN-BACKENDS-01C: ChatGPT sign-in/session custody only,
+        # mounted as its own section of the General page. Connecting an
+        # account is not backend selection: the plan lane stays out of the
+        # backend selector, and this card never takes part in General's Save.
+        self.chatgpt_plan_card = ChatGPTPlanCard(self.agent, c)
+        mount = getattr(self.general_tab, "add_extension_section", None)
+        if mount is not None:      # test doubles of GeneralTab may not offer the slot
+            mount(self.chatgpt_plan_card)
         tabs.addTab(self.general_tab,      "⚙  General")
         tabs.addTab(UserProfileTab(self.agent, c),  "👤  User Profile")
         self.personas_tab = PersonasTab(self.agent, c)

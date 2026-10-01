@@ -240,7 +240,10 @@ never look like "never installed" and trigger a silent reseed.
 (`PRAGMA wal_checkpoint(TRUNCATE)`) and zips the entire data directory —
 chat history, MemPalace, flat memories, Knowledge Base, the pending-action
 audit log, custom tools, projects, and preferences. Credentials never make
-it in: `credentials.json` lives outside the data directory by design.
+it in: `credentials.json` and ChatGPT sign-in sessions live outside the
+data directory by design, symbolic links inside the data directory are
+not followed, and a ChatGPT session file copied or moved into the data
+directory is left out of the archive.
 
 There is no separate "restore" UI for this yet — the backup is a file you
 keep.

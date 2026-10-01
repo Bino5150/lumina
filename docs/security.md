@@ -137,3 +137,23 @@ permission-locked file (`~/.config/lumina/credentials.json`, mode `0600`
 by default, overridable via `LUMINA_SECRETS_PATH`) — separate from
 ordinary preferences, deliberately excluded from version control, and
 never included in a Memory Backup archive.
+
+**ChatGPT sign-in sessions** (General → ChatGPT Plan — sign-in) are kept
+apart again, in `~/.config/lumina/chatgpt/` (override:
+`LUMINA_CHATGPT_AUTH_DIR`): a directory readable only by you (`0700`)
+holding owner-only files (`0600`) — the saved registrations and their
+tokens, and this computer's host identifier. They are protected by file
+permissions, **not encrypted**; anything running as your OS user can read
+them, the same as `credentials.json`. Lumina refuses to use them if their
+permissions are loosened, if they are replaced by a link, or if they fail
+an integrity check, and it never deletes a damaged file to "start over".
+They are local to this OS installation — another OS (for example a
+second distro on the same machine) signs in separately with its own host
+identifier — and they never enter `prefs.json`, the data directory,
+conversation history, the Flight Recorder, logs, Memory Backup or Agent
+Backup (a session file copied, moved or linked into backed-up data makes
+Agent Backup refuse to run, and is left out of a Memory Backup). The Flight Recorder records only categorical sign-in,
+renewal and disconnect events — never a token, code, email, account or
+client identifier. Signing in with ChatGPT never uses or replaces an API
+key, and a sign-in, renewal or disconnect failure never falls back to an
+API key or any other backend.

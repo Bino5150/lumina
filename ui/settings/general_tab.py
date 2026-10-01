@@ -322,10 +322,18 @@ class GeneralTab(QWidget):
         layout.addWidget(self.status_lbl)
         self._apply_feedback = ButtonFeedback(self.apply_btn)
         self._save_feedback = ButtonFeedback(self.save_btn)
+        self._sections_layout = layout
         layout.addStretch()
         self.setLayout(QVBoxLayout())
         self.layout().setContentsMargins(0, 0, 0, 0)
         self.layout().addWidget(_scroll_wrap(outer, self.c))
+
+    def add_extension_section(self, widget: QWidget) -> None:
+        """Mounts a self-contained section below Save (before the trailing
+        stretch). The section owns its own controls and persistence; nothing
+        mounted here takes part in this tab's Save or backend selection."""
+        layout = self._sections_layout
+        layout.insertWidget(layout.count() - 1, widget)
 
     def _on_dream_toggled(self, checked: bool):
         self.dream_idle_spin.setEnabled(checked)

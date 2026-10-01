@@ -20,6 +20,13 @@ config.py`, that's a regression worth reporting, not expected behavior.
 - Credentials: `~/.config/lumina/credentials.json`, mode `0600` (override
   with `LUMINA_SECRETS_PATH`) — never inside the data directory, never in
   a Memory Backup archive.
+- ChatGPT sign-in sessions: `~/.config/lumina/chatgpt/` (override with
+  `LUMINA_CHATGPT_AUTH_DIR`) — owner-only files, local to this OS
+  installation, never in any backup. If Settings reports the saved ChatGPT
+  connection "could not be read safely", the files were damaged or their
+  permissions/ownership changed; Lumina leaves them untouched. Restore the
+  files, or move that directory aside to sign in from scratch (a moved-aside
+  session can still be ended in ChatGPT Settings).
 
 ## Diagnosing a bad run
 

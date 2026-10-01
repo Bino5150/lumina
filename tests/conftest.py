@@ -41,6 +41,10 @@ import tempfile
 _TEST_DATA_ROOT = tempfile.mkdtemp(prefix="lumina-pytest-")
 os.environ["LUMINA_DATA_DIR"] = _TEST_DATA_ROOT
 os.environ["LUMINA_SECRETS_PATH"] = os.path.join(_TEST_DATA_ROOT, "credentials.json")
+# SUBSCRIPTION-PLAN-BACKENDS-01C: ChatGPT session custody lives outside the
+# data dir (OS-local, ~/.config/lumina/chatgpt by default) -- isolate it the
+# same way, before anything can import core.chatgpt_auth.
+os.environ["LUMINA_CHATGPT_AUTH_DIR"] = os.path.join(_TEST_DATA_ROOT, "chatgpt_auth")
 os.environ["LUMINA_TESTING"] = "1"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

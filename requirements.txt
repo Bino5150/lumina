@@ -51,6 +51,13 @@ pyenchant==3.3.0                # spellcheck backend for the message box —
 # ── Diff / Patch ─────────────────────────────────────────────────────────────
 # difflib — stdlib, no install needed
 
+# ── Sign in with ChatGPT (SUBSCRIPTION-PLAN-BACKENDS-01C) ─────────────────────
+# OIDC ID-token verification (RS256 against OpenAI's published JWKS). No
+# hand-written JWT/crypto: PyJWT verifies, `cryptography` is its RSA backend.
+# Pinned to the versions the 01C campaign was tested against.
+PyJWT==2.8.0
+cryptography==46.0.5
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dateutil==2.9.0.post0    # robust datetime parsing
 psutil==7.2.2                   # system info (memory, CPU) for meta tools

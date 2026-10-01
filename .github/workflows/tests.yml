@@ -43,7 +43,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libenchant-2-2
 
       - name: Install test dependencies
-        run: pip install pytest==9.1.1 requests==2.34.2 platformdirs pyenchant==3.3.0 python-telegram-bot==22.8
+        run: pip install pytest==9.1.1 requests==2.34.2 platformdirs pyenchant==3.3.0 python-telegram-bot==22.8 PyJWT==2.8.0 cryptography==46.0.5
 
       - name: Run tests (the real gate)
         run: python -m pytest tests/ -v -m "not castle_walls_evidence"
@@ -95,7 +95,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libenchant-2-2 libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
 
       - name: Install test dependencies plus PySide6
-        run: pip install pytest==9.1.1 requests==2.34.2 platformdirs pyenchant==3.3.0 python-telegram-bot==22.8 PySide6==6.11.1
+        run: pip install pytest==9.1.1 requests==2.34.2 platformdirs pyenchant==3.3.0 python-telegram-bot==22.8 PySide6==6.11.1 PyJWT==2.8.0 cryptography==46.0.5
 
       - name: Preflight -- Qt must start headless (fail, never skip)
         run: python -c "from PySide6.QtWidgets import QApplication; app = QApplication([]); print('Qt', app.platformName())"
@@ -124,3 +124,11 @@ jobs:
       # contract; its own step so the selections above stay exactly as they were.
       - name: Run Qt-bound Palace promotion owner-approval guards (blocking)
         run: python -m pytest tests/test_palace_guard_01b4_owner_promotion_qt.py -v -rs -m "not castle_walls_evidence"
+
+      # SUBSCRIPTION-PLAN-BACKENDS-01C -- the ChatGPT sign-in card in Settings:
+      # mounted outside General's backend selector and Save, a READY session
+      # never makes the plan lane selectable, only sanitized DTO text is shown,
+      # and every session call runs off the Qt main thread. Same job, same
+      # pinned PySide6 (plus the two 01C auth pins), fail-never-skip.
+      - name: Run Qt-bound ChatGPT sign-in settings guards (blocking)
+        run: python -m pytest tests/test_chatgpt_auth_01c_settings_qt.py -v -rs -m "not castle_walls_evidence"
