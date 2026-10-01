@@ -524,7 +524,12 @@ def test_import_purity_no_network_io():
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             imported.add(node.module or "")
-    allowed = {"__future__", "dataclasses", "enum", "typing", "core.redaction"}
+    # SUBSCRIPTION-PLAN-BACKENDS-01B: core.backend_identity joins the
+    # allowlist. It is itself held to a stricter stdlib-only/no-I/O AST pin
+    # (tests/test_subscription_plan_backends_01b.py), so the router's
+    # purity guarantee is unchanged.
+    allowed = {"__future__", "dataclasses", "enum", "typing", "core.redaction",
+               "core.backend_identity"}
     assert imported <= allowed, f"unexpected imports: {sorted(imported - allowed)}"
     forbidden = {"requests", "urllib", "http", "socket", "httpx", "aiohttp",
                  "ssl", "subprocess", "pathlib", "sqlite3", "PySide6"}

@@ -5,7 +5,8 @@ Provider-neutral capability registry + deterministic specialist selection
 for the Multimodal Capability Router (MULTIMODAL-CAPABILITY-ROUTER-01, M1).
 
 This module is pure infrastructure: Qt-free, stdlib-only (plus the
-established ``core.redaction`` secret-shape primitive), zero I/O, zero
+established ``core.redaction`` secret-shape primitive and the equally pure
+``core.backend_identity`` fuel policy), zero I/O, zero
 network, zero threads, and nothing executes at import time. It establishes
 the architectural layer that later routing slices (M2 vision, M4 image
 generation, M5 audio understanding, M6 speech presentation, M7 video) will
@@ -65,6 +66,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
+from core.backend_identity import QuotaClass, fuel_crossing_admitted, quota_class_of
 from core.redaction import redact_secret_shapes
 
 __all__ = [
@@ -213,6 +215,16 @@ class SpecialistRecord:
         Owner-declared quality label (V1: declared, never measured). Only
         meaningful against a route's ``quality_floor`` via the policy's
         ``quality_order``.
+    quota_class:
+        SUBSCRIPTION-PLAN-BACKENDS-01B -- which tank this specialist draws
+        from (``core.backend_identity.QuotaClass`` or its string value).
+        ``None`` (every record built before this field existed) means
+        "unclassified". Classification is the CALLER's job (core.vision_lane
+        reads it from the lane registry); this module still never imports a
+        backend or the loader. Used only by resolve_capability()'s fuel
+        gate: a candidate may not cross protected (subscription) fuel
+        relative to the primary backend, whatever its model name or
+        provider family. Unclassified specialists carry no fuel claim.
     """
 
     name: str
@@ -221,6 +233,7 @@ class SpecialistRecord:
     capabilities: Mapping[str, EvidenceClass]
     enabled: bool = True
     quality_label: Optional[str] = None
+    quota_class: Optional[QuotaClass] = None
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name:
@@ -228,6 +241,13 @@ class SpecialistRecord:
         if not isinstance(self.kind, str) or not self.kind:
             raise ValueError("SpecialistRecord.kind must be a non-empty string")
         object.__setattr__(self, "capabilities", _normalize_capability_map(self.capabilities))
+        if self.quota_class is not None:
+            try:
+                object.__setattr__(self, "quota_class", QuotaClass(self.quota_class))
+            except ValueError:
+                raise ValueError(
+                    f"SpecialistRecord.quota_class is not a QuotaClass value: {self.quota_class!r}"
+                ) from None
 
 
 @dataclass(frozen=True)
@@ -480,6 +500,7 @@ def resolve_capability(
     policy: RoutingPolicy,
     capability,
     primary_backend: Optional[str] = None,
+    primary_quota_class=None,
 ) -> RoutingDecision:
     """Deterministic specialist selection. PURE: no I/O, no network, no
     mutation of registry or policy; identical inputs -> identical decision.
@@ -500,6 +521,18 @@ def resolve_capability(
     ``primary_backend`` is recorded as an exclusion fact only: a candidate
     matching it is skipped with a structural reason, and no code path can
     select or mutate the primary conversational backend.
+
+    ``primary_quota_class`` (SUBSCRIPTION-PLAN-BACKENDS-01B) is the fuel the
+    primary operation runs on. Every candidate -- explicit, fallback, OR
+    Auto -- must pass core.backend_identity.fuel_crossing_admitted() against
+    it: default DENY across protected (subscription) fuel in both
+    directions, so a route can never turn a subscription failure into paid
+    API traffic or spend the owner's allowance on a capability they pointed
+    at something else. Crossings between non-protected classes keep their
+    pre-01B behavior. Omitting the argument means the primary's fuel is
+    unspecified, which still denies any protected candidate. There is no
+    override: a future owner-authorized cross-fuel policy is a deliberate
+    new slice.
     """
     cap = _normalize_capability(capability)
     if cap is None:
@@ -509,6 +542,8 @@ def resolve_capability(
             reason="requested capability is not in the canonical vocabulary; refusing to improvise",
             excluded_primary_backend=primary_backend,
         )
+
+    primary_fuel = None if primary_quota_class is None else quota_class_of(primary_quota_class)
 
     route = policy.routes.get(cap.value)
     if route is None:
@@ -567,6 +602,21 @@ def resolve_capability(
             continue
         if not record.enabled:
             entry["skip_reason"] = "specialist disabled"
+            ledger[name] = entry
+            continue
+        # Fuel gate. Pure and cheap, so it runs before any evidence/health
+        # lookup (which may be a live probe): a denied candidate is never
+        # probed, never constructed, never billed.
+        if record.quota_class is not None:
+            entry["quota_class"] = record.quota_class.value
+        if not fuel_crossing_admitted(primary_fuel, record.quota_class):
+            entry["skip_reason"] = (
+                "cross-fuel candidate denied: primary fuel "
+                f"{primary_fuel.value if primary_fuel is not None else 'unspecified'}"
+                f" -> candidate fuel "
+                f"{record.quota_class.value if record.quota_class is not None else 'unspecified'}; "
+                "automatic and fallback routing never cross subscription fuel"
+            )
             ledger[name] = entry
             continue
         entry["local"] = record.local

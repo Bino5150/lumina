@@ -103,6 +103,7 @@ from typing import Callable, Optional
 import config
 import core.coding_checkpoint as checkpoint_store
 from core.agent import LuminaAgent
+from core.backend_identity import subagent_lane_refusal
 from core.project_context import ProjectContext
 from core.tool_profiles import apply_tool_profile
 
@@ -205,6 +206,19 @@ def spawn_subagent(task: str,
     if _parent_depth >= config.MAX_SUBAGENT_DEPTH:
         return {"success": False, "result": "", "tool_calls_made": 0,
                 "error": f"Max subagent depth ({config.MAX_SUBAGENT_DEPTH}) reached."}
+
+    # SUBSCRIPTION-PLAN-BACKENDS-01B -- fuel lock. `backend` is a model-
+    # supplied argument on spawn_subagent / run_background_subagent /
+    # schedule_background_subagent (all of which end here), and a default
+    # child inherits whatever lane is selected at THIS moment -- for a
+    # scheduled task, long after it was queued. Neither may cross
+    # subscription fuel, and a lane that does not admit subagent work
+    # refuses it. Evaluated here, at construction time, so a task scheduled
+    # under one fuel can never fire on another. Legacy lanes are unaffected.
+    lane_refusal = subagent_lane_refusal(getattr(config, "LLM_BACKEND", None), backend)
+    if lane_refusal is not None:
+        return {"success": False, "result": "", "tool_calls_made": 0,
+                "error": lane_refusal}
 
     try:
         resolved_context = resolve_dispatch_project_context(

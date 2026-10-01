@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Generator
 
+from core.backend_identity import (
+    BackendIdentity,
+    LaneOperationUnavailable,
+    OperationKind,
+    identity_of_backend,
+    operation_refusal,
+)
 from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 
 
@@ -442,6 +449,14 @@ class BaseLLMBackend(ABC):
         """
         pass
 
+    def backend_identity(self) -> BackendIdentity:
+        """SUBSCRIPTION-PLAN-BACKENDS-01B -- this backend's lane/fuel
+        identity (core/backend_identity.py), derived from its own ``name``
+        registry key and network-free configured_model(). The lane is the
+        class's own declaration, never inferred from a model id, a provider
+        family, or which credentials happen to be populated."""
+        return identity_of_backend(self)
+
     def configured_model(self) -> Optional[str]:
         """
         Patch 3A.4 Part 4 -- side-effect-free read of this backend's
@@ -678,7 +693,8 @@ class BaseLLMBackend(ABC):
         return None
 
     def _complete_utility_request(self, prompt: str, prefill: str,
-                                   max_tokens: int, temperature: float) -> dict:
+                                   max_tokens: int, temperature: float,
+                                   operation: OperationKind = OperationKind.UTILITY) -> dict:
         """
         CONTEXT-LIFECYCLE-A4I. Shared, unguarded transport for both
         complete_utility() and complete_utility_content_only() below: build
@@ -715,6 +731,17 @@ class BaseLLMBackend(ABC):
         default) -- a failed refresh just leaves this call exactly as
         unaware of mandatory-reasoning as it was pre-UTILITY-RUNTIME-01.
         """
+        # SUBSCRIPTION-PLAN-BACKENDS-01B -- fuel lock. Utility work (auto-
+        # name, Dream, My Human curation, compaction) and Reforge are served
+        # by THIS lane or not at all: a lane that does not admit the
+        # operation fails unavailable here (the public wrappers below log it
+        # and return None), BEFORE any discovery or chat() I/O. Nothing in
+        # this path ever selects another backend. Every legacy lane admits
+        # both kinds, so this is a no-op for them.
+        refusal = operation_refusal(self.backend_identity(), operation)
+        if refusal is not None:
+            raise LaneOperationUnavailable(refusal)
+
         model = self.configured_model()
         if model is not None and not self.reasoning_capabilities_ready(model):
             self.refresh_reasoning_capabilities()
@@ -763,7 +790,9 @@ class BaseLLMBackend(ABC):
         contract (byte-identical prefixes callers/tests already depend on)
         still holds.
         """
-        if isinstance(exc, TimeoutError):
+        if isinstance(exc, LaneOperationUnavailable):
+            reason = "lane_unavailable"
+        elif isinstance(exc, TimeoutError):
             reason = "timeout"
         elif isinstance(exc, ConnectionError):
             reason = "network_error"
@@ -896,7 +925,10 @@ class BaseLLMBackend(ABC):
         response.
         """
         try:
-            message = self._complete_utility_request(prompt, prefill, max_tokens, temperature)
+            message = self._complete_utility_request(
+                prompt, prefill, max_tokens, temperature,
+                operation=OperationKind.REFORGE,
+            )
         except Exception as e:
             self._log_utility_failure("complete_utility_content_only", e)
             return None

@@ -17,6 +17,12 @@ import config
 import core.coding_checkpoint as checkpoint_store
 from core import emergency_stop
 from core import flight_recorder
+from core.backend_identity import (
+    LaneFuelViolation,
+    OperationKind,
+    dispatch_lane_refusal,
+    identity_of_backend,
+)
 from core.backends.base import BackendStreamTelemetry, TerminationStatus, ToolChoiceMode
 from core.backends.loader import get_llm_backend
 from core.context import ContextManager, estimate_tokens
@@ -627,13 +633,31 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
         dispatch_fields = _dispatch_measurements(chat_kwargs)
     except Exception:
         dispatch_fields = {}
+    # SUBSCRIPTION-PLAN-BACKENDS-01B -- one operation, one lane. Refused
+    # BEFORE anything is dispatched or recorded as dispatched: the turn
+    # ends here with a visible reason; no other backend is tried.
+    refusal = _dispatch_refusal(agent, OperationKind.FOREGROUND_CHAT)
+    if refusal is not None:
+        _record_dispatch_refusal(agent, refusal, turn_id=turn_id, chat_id=chat_id)
+        if tools_used_this_turn:
+            # Same operator-honesty rule as the continuation-failure wording
+            # below: tool effects already happened this turn, so say so
+            # rather than letting a refusal read as "nothing was done".
+            just_ran = ", ".join(f"`{n}`" for n in sorted(tools_used_this_turn))
+            err = f"[Lumina error: Tool {just_ran} completed, but the next request was refused. {refusal}]"
+        else:
+            err = f"[Lumina error: {refusal}]"
+        on_response_token = getattr(agent, "on_response_token", None)
+        if callable(on_response_token):
+            on_response_token(err)
+        return None, err
     _llm = getattr(agent, "llm", None)
     _configured_model = getattr(_llm, "configured_model", None)
     _fr_machine(
         agent, "provider.dispatch", turn_id=turn_id, chat_id=chat_id,
         backend=getattr(_llm, "name", None),
         model=_configured_model() if callable(_configured_model) else None,
-        fields=dispatch_fields,
+        fields={**dispatch_fields, **_identity_fields(agent, OperationKind.FOREGROUND_CHAT)},
     )
     try:
         return agent.llm.chat(**chat_kwargs), None
@@ -663,6 +687,7 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
                 "cause_type": type(cause).__name__ if cause is not None else None,
                 "cause_detail": (redact_secret_shapes(str(cause))[:300] if cause is not None else None),
                 **dispatch_fields,
+                **_identity_fields(agent, OperationKind.FOREGROUND_CHAT),
             },
         )
         if tools_used_this_turn:
@@ -1339,6 +1364,44 @@ def _fr_machine(agent, event_type: str, *, turn_id=None, chat_id=None,
         pass
 
 
+def _identity_fields(agent, operation_kind) -> dict:
+    """SUBSCRIPTION-PLAN-BACKENDS-01B -- lane/fuel attribution fields for a
+    recorder event, from the agent's LIVE backend. Telemetry only: this
+    never feeds a decision (the guard below does that), so a failure here
+    degrades to "no attribution" rather than breaking a turn."""
+    try:
+        return identity_of_backend(getattr(agent, "llm", None)).telemetry_fields(operation_kind)
+    except Exception:
+        return {}
+
+
+def _dispatch_refusal(agent, operation_kind) -> Optional[str]:
+    """SUBSCRIPTION-PLAN-BACKENDS-01B -- immutable-dispatch guard. Compares
+    the backend about to be dispatched against (a) what its lane admits and
+    (b) the identity captured when this turn began. None means proceed;
+    a string is a bounded, credential-free reason to refuse. Deliberately
+    NOT wrapped in a catch-all: identity_of_backend() and
+    dispatch_lane_refusal() are total, so an exception here is a real bug
+    that must surface, not silently disable the guard. Every legacy lane
+    admits every operation and legacy<->legacy swaps are grandfathered, so
+    this is a no-op for them (see core/backend_identity.py)."""
+    return dispatch_lane_refusal(
+        getattr(agent, "_turn_dispatch_identity", None),
+        identity_of_backend(getattr(agent, "llm", None)),
+        operation_kind,
+    )
+
+
+def _record_dispatch_refusal(agent, refusal: str, *, turn_id=None, chat_id=None) -> None:
+    _llm = getattr(agent, "llm", None)
+    _fr_machine(
+        agent, "provider.dispatch_refused", turn_id=turn_id, chat_id=chat_id,
+        severity="error",
+        backend=getattr(_llm, "name", None),
+        fields={"reason": refusal, **_identity_fields(agent, OperationKind.FOREGROUND_CHAT)},
+    )
+
+
 def _tool_result_summary(name: str, result) -> str:
     """tool.result's result_summary. BROWSER-COMPANION-01A: a chrome_* result
     can carry Lumina's authenticated page content (Gmail, Reddit drafts,
@@ -1745,6 +1808,11 @@ class LuminaAgent:
         # this at call time rather than at registration time, since it
         # changes every turn while channel_id never does.
         self._current_chat_id = None
+        # SUBSCRIPTION-PLAN-BACKENDS-01B -- the dispatch identity (lane/fuel)
+        # captured at the top of each turn by _chat_impl(); None between
+        # turns. Read by _dispatch_refusal() so a running operation cannot
+        # silently change fuel mid-turn. Never an account/session identifier.
+        self._turn_dispatch_identity = None
         # Per-instance holder, never a module/process global — see
         # core/project_context.py's own module docstring for why. Two
         # LuminaAgent instances always get two distinct holders.
@@ -2198,6 +2266,12 @@ class LuminaAgent:
                     approval_event_id: Optional[str] = None) -> str:
         if turn_telemetry is None:
             turn_telemetry = _new_turn_telemetry()
+        # SUBSCRIPTION-PLAN-BACKENDS-01B -- capture the dispatch identity
+        # BEFORE any provider request in this turn. Every WORK round, gate
+        # request, corrective retry, tool-ceiling final and streamed final
+        # below dispatches through _dispatch_refusal(), which compares the
+        # live backend to this record.
+        self._turn_dispatch_identity = identity_of_backend(getattr(self, "llm", None))
         tools_used_this_turn = set()
         think_step = [0]
         tool_batch_ordinal = 0  # AGENT-FLIGHT-RECORDER-01A1 -- per-turn, incremented once per tool-bearing WORK round
@@ -2480,6 +2554,7 @@ class LuminaAgent:
                     "channel_id": getattr(self, "channel_id", None),
                     "owner": getattr(self, "owner", None),
                     **_effective_tool_budgets(self),
+                    **_identity_fields(self, OperationKind.FOREGROUND_CHAT),
                 },
             )
         except Exception:
@@ -3169,6 +3244,15 @@ class LuminaAgent:
         try:
             if _cancel_requested(cancel_event):
                 _raise_cancelled()
+            # SUBSCRIPTION-PLAN-BACKENDS-01B -- same immutable-dispatch guard
+            # as _provider_chat_or_error(), for the streamed final
+            # generation. LaneFuelViolation is a RuntimeError, so the
+            # handler below renders it as a visible "[Stream error: ...]"
+            # and returns -- it never retries on another backend.
+            refusal = _dispatch_refusal(self, OperationKind.FOREGROUND_CHAT)
+            if refusal is not None:
+                _record_dispatch_refusal(self, refusal, turn_id=turn_id)
+                raise LaneFuelViolation(refusal)
             final_request_dispatch_at = time.monotonic()
             stream = iter(self.llm.chat_stream(
                 messages=messages,

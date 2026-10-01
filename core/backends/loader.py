@@ -9,6 +9,11 @@ Reads config.LLM_BACKEND to select which backend to instantiate.
 """
 
 import config
+from core.backend_identity import (
+    ReservedBackendLaneError,
+    UnclassifiedBackendLaneError,
+    lane_descriptor,
+)
 from .lmstudio import LMStudioBackend
 from .ollama import OllamaBackend
 from .llamacpp import LlamaCppBackend
@@ -210,11 +215,30 @@ def get_llm_backend(name: str = None, url: str = None, api_key: str = None, mode
     function.
     """
     backend_name = (name or getattr(config, "LLM_BACKEND", "llamacpp")).lower()
+    # SUBSCRIPTION-PLAN-BACKENDS-01B: a RESERVED lane (known identity, no
+    # installed implementation) fails here, loudly and BEFORE any credential
+    # lookup or class selection. It must never fall through to a sibling
+    # lane that shares its provider family (e.g. "openai") -- the sibling's
+    # API key is a different fuel source.
+    descriptor = lane_descriptor(backend_name)
+    if descriptor is not None and not descriptor.constructible:
+        raise ReservedBackendLaneError(
+            f"Backend lane '{backend_name}' is reserved and cannot be constructed "
+            "in this build. Lumina will not substitute another backend or "
+            "credential source for it."
+        )
     cls = BACKENDS.get(backend_name)
     if cls is None:
         raise ValueError(
             f"Unknown backend '{backend_name}'. "
             f"Available: {', '.join(BACKENDS.keys())}"
+        )
+    if descriptor is None:
+        # A constructible backend with no declared fuel classification is a
+        # registry bug (tests pin BACKENDS/LANES parity); refuse rather than
+        # dispatch on an unclassified lane.
+        raise UnclassifiedBackendLaneError(
+            f"Backend '{backend_name}' has no lane fuel classification."
         )
     # A caller-supplied URL is meaningful only for a backend that explicitly
     # owns a configurable endpoint.  Fixed providers always receive their

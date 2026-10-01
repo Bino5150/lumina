@@ -84,6 +84,13 @@ reported as an outcome the AGENT translates into its own TurnCancelled.
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from core.backend_identity import (
+    OperationKind,
+    identity_for_lane,
+    identity_of_backend,
+    is_local_placement,
+)
+
 # ---------------------------------------------------------------------------
 # Bounded-lane constants. Central definitions, each covered by tests.
 # ---------------------------------------------------------------------------
@@ -104,14 +111,14 @@ VISION_MAX_OUTPUT_TOKENS = 1024
 # the established format_provider_error() path already excludes headers.
 _DIAGNOSTIC_MAX_CHARS = 300
 
-# Cloud LLM backends (established classification -- mirrors the
-# CLOUD_BACKENDS set ui/settings/general_tab.py has carried since Patch 3A.4;
-# duplicated here rather than imported from the UI layer on purpose: core
-# must not import ui). Anything else known to the loader is treated as a
-# local placement fact for M1's local-first tiering.
-_CLOUD_LLM_BACKENDS = frozenset(
-    {"openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen"}
-)
+# SUBSCRIPTION-PLAN-BACKENDS-01B: placement (local vs cloud) and fuel are
+# read from the single lane registry in core/backend_identity.py, replacing
+# the hardcoded cloud set this module used to carry. The eight cloud
+# API-key lanes and the six local/endpoint-defined lanes classify exactly as
+# before (a test pins that parity); the difference is that a name ABSENT
+# from the registry is now NOT assumed local -- absence from a list must
+# never read as "runs on this box" -- and a subscription lane can never be
+# mistaken for local merely because nobody listed it as cloud.
 
 _OUTCOME_SUCCESS = "success"
 _OUTCOME_CANCELLED = "cancelled"
@@ -268,8 +275,9 @@ def _build_routing():
         cr.SpecialistRecord(
             name=name,
             kind="llm_backend",
-            local=name not in _CLOUD_LLM_BACKENDS,
+            local=is_local_placement(name),
             capabilities={cr.Capability.VISION_UNDERSTANDING: cr.EvidenceClass.EVIDENCED},
+            quota_class=identity_for_lane(name).quota_class,
         )
         for name in sorted(names)
     ]
@@ -310,9 +318,13 @@ def prepare_routed_turn(agent, user_input):
         return user_input, None
 
     primary_backend = getattr(getattr(agent, "llm", None), "name", None)
+    # 01B fuel gate: the specialist must not cross subscription fuel
+    # relative to the primary backend this turn is running on -- explicit,
+    # fallback and Auto candidates alike.
     decision = cr.resolve_capability(
         registry, policy, cr.Capability.VISION_UNDERSTANDING,
         primary_backend=primary_backend,
+        primary_quota_class=identity_of_backend(getattr(agent, "llm", None)).quota_class,
     )
 
     user_text = _text_of_content(user_input)
@@ -638,6 +650,17 @@ def _append_to_current_user_turn(agent, text: str) -> None:
         ctx.mark_untrusted_seen()
 
 
+def _specialist_identity_fields(result) -> dict:
+    """Lane/fuel attribution of the specialist that was reached (empty when
+    routing never admitted one). The primary's own lane stays in
+    ``primary_backend``; these describe the dispatched vision operation."""
+    if not result.provider:
+        return {}
+    return identity_for_lane(result.provider).telemetry_fields(
+        OperationKind.VISION_SPECIALIST
+    )
+
+
 def _record_route_event(agent, route_ctx, result, turn_id=None, chat_id=None,
                         primary_backend=None):
     """Minimum structured observability (M2 scroll §12): counts, identities,
@@ -660,6 +683,8 @@ def _record_route_event(agent, route_ctx, result, turn_id=None, chat_id=None,
                 "primary_backend": primary_backend,
                 "primary_backend_unchanged": True,
                 "bounded": True,
+                **_specialist_identity_fields(result),
+                "primary_quota_class": identity_for_lane(primary_backend).quota_class.value,
             },
         )
     except Exception:
