@@ -518,13 +518,13 @@ def test_temporary_or_unknown_refresh_failures_never_destroy_credentials(tmp_pat
         assert fake.refresh_count() == 2
 
 
-def test_network_failure_blocks_ambiguous_refresh_without_destroying_credentials(tmp_path, fake, clock):
+def test_connection_refused_before_send_keeps_refresh_retryable(tmp_path, fake, clock):
     m = ready_and_expired(tmp_path, fake, clock)
     m.provider.endpoints()
     fake.close()                                 # provider unreachable
     with pytest.raises(TemporaryAuthError):
         m.get_valid_access_token()
-    assert m.get_session_state().state is SessionState.REAUTH_REQUIRED
+    assert m.get_session_state().state is SessionState.READY
     assert active(m).credentials is not None
 
 

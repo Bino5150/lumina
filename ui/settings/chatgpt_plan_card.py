@@ -209,7 +209,8 @@ class ChatGPTPlanCard(QWidget):
         authorizing = state == "authorizing"
         self.session_label.setText("Session: " + (_STATE_TEXT.get(state, "Checking…") if state else "Checking…"))
         if status is not None and status.account_display and state not in ("disconnected", None):
-            prefix = "Account to confirm: " if authorizing and self._pending is not None else "Connected account: "
+            candidate = authorizing and self._pending is not None and status.profile_id is None
+            prefix = "Account to confirm: " if candidate else "Connected account: "
             self.account_label.setText(prefix + status.account_display)
         elif status is not None and status.profile_label:
             self.account_label.setText(f"Saved account: {status.profile_label}")
@@ -221,7 +222,7 @@ class ChatGPTPlanCard(QWidget):
         self.code_label.setText(
             "Enter this one-time code in your browser: " + self._pending.start_code
             if authorizing and self._pending is not None and self._pending.start_code
-            and (status is None or not status.account_display) else "")
+            and (status is None or status.profile_id is not None or not status.account_display) else "")
 
         self.account_combo.blockSignals(True)
         self.account_combo.clear()
@@ -243,7 +244,8 @@ class ChatGPTPlanCard(QWidget):
         self.add_btn.setVisible(idle and has_profile and state not in ("corrupt_session", "disconnecting"))
         self.cancel_btn.setVisible(authorizing)
         self.confirm_btn.setVisible(not self._busy and self._pending is not None and authorizing
-                                    and status is not None and bool(status.account_display))
+                                    and status is not None and status.profile_id is None
+                                    and bool(status.account_display))
         self.disconnect_btn.setVisible(idle and state in (
             "ready", "connected_no_plan_permission", "refreshing", "reauth_required", "disconnecting"))
 

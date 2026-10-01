@@ -627,7 +627,7 @@ class ChatGPTSessionManager:
         with self._attempt_lock:
             attempt = self._attempt
             if (attempt is None or attempt.auth.attempt_id != pending.attempt_id
-                    or attempt.candidate is None or attempt.cancelled):
+                    or attempt.candidate is None or attempt.cancelled or attempt.committing):
                 raise AuthorizationCancelled("attempt_not_pending")
             client_id, identity, creds = attempt.candidate
             safe = attempt.listener.seal_start()
@@ -967,10 +967,11 @@ class ChatGPTSessionManager:
                     self._emit("chatgpt.refresh.failed", operation="refresh", error_class=exc.error_class)
                     raise TemporaryAuthError(exc.error_class) from None
                 except oauth.ProviderUnavailable as exc:
-                    if exc.status == 429:
+                    if exc.status == 429 or exc.refresh_request_sent is False:
                         # Rate-limited before processing: nothing rotated. A
-                        # 5xx (possibly from a gateway in front of the origin)
-                        # proves nothing about whether the origin rotated.
+                        # typed DNS/connect failure or failed discovery proves
+                        # the token POST was never sent. A 5xx/read timeout or
+                        # reset may follow rotation and remains no-resend.
                         self._settle_outcome(pid, base_gen)
                     self._emit("chatgpt.refresh.failed", operation="refresh", error_class=exc.error_class)
                     raise TemporaryAuthError(exc.error_class) from None

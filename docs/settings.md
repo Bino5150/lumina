@@ -73,12 +73,14 @@ doesn't apply.
 
 The bottom of the General page has its own **ChatGPT Plan — sign-in**
 section. **Continue with ChatGPT** opens your system browser. For a first
-registration, enter the one-time code shown in Lumina into the local browser
-page; it then opens OpenAI's sign-in page. You sign
+registration, **Add another account**, or registration again after an invalid
+client, enter the one-time code shown in Lumina into the local browser page;
+it then opens OpenAI's sign-in page. You sign
 in and approve there, and Lumina never sees
 your OpenAI password, browser cookies or another app's tokens. When you
-return, check the verified account shown in Lumina and choose **Confirm this
-account** before a first registration is saved. If the account is unexpected,
+return, check the verified **Account to confirm** shown in Lumina and choose
+**Confirm this account** before the new authorization is saved. A previously
+connected account is shown separately while a new authorization waits. If the account is unexpected,
 cancel and start a fresh sign-in. The section then shows whether **plan
 permission** was granted (signing in and granting plan use are separate
 OpenAI permissions), and the session state, with **Reconnect**,
@@ -88,6 +90,12 @@ An identity sign-in without offline access or plan permission is shown as
 connected without plan permission; it cannot renew a session or use a model.
 If a refresh may have rotated but Lumina lost the response, the session
 requires a fresh authorization rather than retrying the old refresh token.
+Discovery, DNS, connection refusal and connect-timeout failures that prove the
+refresh request was never sent leave the saved token retryable. After a request
+may have been sent, Lumina conservatively requires reauthorization if the
+outcome is unknown, including a post-send 5xx or lost response. This is the
+current no-resend policy pending a clear vendor answer on rotating-token
+retries after an ambiguous delivery.
 
 In this version that is all it does: it holds a ChatGPT session on this
 computer. Using your ChatGPT plan to power chat is **not available yet** —

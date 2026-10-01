@@ -131,4 +131,4 @@ jobs:
       # and every session call runs off the Qt main thread. Same job, same
       # pinned PySide6 (plus the two 01C auth pins), fail-never-skip.
       - name: Run Qt-bound ChatGPT sign-in settings guards (blocking)
-        run: python -m pytest tests/test_chatgpt_auth_01c_settings_qt.py -v -rs -m "not castle_walls_evidence"
+        run: python -m pytest tests/test_chatgpt_auth_01c_settings_qt.py tests/test_chatgpt_auth_01c_r2_qt.py -v -rs -m "not castle_walls_evidence"

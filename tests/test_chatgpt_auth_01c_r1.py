@@ -206,9 +206,10 @@ def test_escaped_or_malformed_documents_never_enter_archives(tmp_path, monkeypat
         _agent_backup(data_dir, base_dir, str(tmp_path / "agent.zip"))
 
 
-def test_document_size_boundary_is_fail_closed(tmp_path):
+def test_document_size_boundary_scans_late_schema_without_blanket_exclusion(tmp_path):
     body = b"{" + b" " * (1024 * 1024) + b'"schema":"lumina.chatgpt.sessions/1"}'
-    assert mb.is_session_document(body[:1024 * 1024 + 1])
+    assert not mb.is_session_document(body[:1024 * 1024 + 1])
+    assert mb.is_session_document(body)
     assert ab._contains_chatgpt_session_document(body)
 
 

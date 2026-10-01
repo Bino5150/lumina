@@ -119,12 +119,20 @@ class MemoryTab(QWidget):
         if not dest:
             return
         try:
-            _build_memory_backup(_config.DATA_DIR, dest)
+            exclusions = _build_memory_backup(_config.DATA_DIR, dest)
         except Exception as e:
             QMessageBox.critical(self, "Backup Failed", f"Could not write backup archive: {e}")
             return
         size_mb = os.path.getsize(dest) / (1024 * 1024)
-        QMessageBox.information(self, "Backup Complete", f"Memory backup saved to:\n{dest}\n\n({size_mb:.1f} MB)")
+        message = f"Memory backup saved to:\n{dest}\n\n({size_mb:.1f} MB)"
+        if exclusions.count:
+            names = "\n".join(repr(path) for path in exclusions.paths)
+            rest = exclusions.count - len(exclusions.paths)
+            message += (f"\n\n{exclusions.count} possible ChatGPT session or ambiguous file(s) excluded "
+                        f"from the archive:\n{names}")
+            if rest:
+                message += f"\n…and {rest} more."
+        QMessageBox.information(self, "Backup Complete", message)
 
     def _render(self, rows: list):
         self.table.setRowCount(0)

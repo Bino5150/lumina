@@ -31,6 +31,7 @@ from typing import Callable, Optional
 
 import jwt
 import requests
+from urllib3.exceptions import NewConnectionError, NameResolutionError
 
 from core.chatgpt_auth.store import BOOTSTRAP_CLIENT_ID, Credentials, _client_id_ok
 
@@ -87,6 +88,32 @@ class ProviderUnavailable(ProtocolError):
     session (vendor: "Do not erase credentials solely because of a temporary
     network or infrastructure failure")."""
     retryable = True
+
+    def __init__(self, error_class: str, status: Optional[int] = None, *,
+                 refresh_request_sent: Optional[bool] = None):
+        super().__init__(error_class, status)
+        # False is a transport-level proof that the rotating token was not
+        # sent. None means delivery is ambiguous and must retain no-resend.
+        self.refresh_request_sent = refresh_request_sent
+
+
+def _connect_failed_before_send(exc: BaseException) -> bool:
+    """Recognize typed DNS/connect failures, never message text or resets."""
+    pending = [exc]
+    seen = set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, (NewConnectionError, NameResolutionError,
+                             requests.ConnectTimeout)):
+            return True
+        for child in (getattr(item, "reason", None), item.__cause__, item.__context__):
+            if isinstance(child, BaseException):
+                pending.append(child)
+        pending.extend(arg for arg in item.args if isinstance(arg, BaseException))
+    return False
 
 
 class ProviderRejected(ProtocolError):
@@ -338,10 +365,14 @@ class ProviderClient:
         try:
             return self._http.request(method, url, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
                                       allow_redirects=False, **kwargs)
-        except requests.Timeout:
-            raise ProviderUnavailable("network_timeout") from None
-        except requests.RequestException:
-            raise ProviderUnavailable("network_error") from None
+        except requests.Timeout as exc:
+            raise ProviderUnavailable("network_timeout",
+                                      refresh_request_sent=False if _connect_failed_before_send(exc)
+                                      else None) from None
+        except requests.RequestException as exc:
+            raise ProviderUnavailable("network_error",
+                                      refresh_request_sent=False if _connect_failed_before_send(exc)
+                                      else None) from None
 
     @staticmethod
     def _json_or_none(response: requests.Response):
@@ -489,7 +520,13 @@ class ProviderClient:
     # -- token endpoint ------------------------------------------------------
 
     def _token_request(self, form: dict) -> dict:
-        endpoints = self.endpoints()
+        try:
+            endpoints = self.endpoints()
+        except ProviderUnavailable as exc:
+            # Discovery is a GET with no refresh token. A failure here proves
+            # the later token POST was never attempted.
+            exc.refresh_request_sent = False
+            raise
         response = self._request("POST", endpoints.token_endpoint, data=form,
                                  headers={"Accept": "application/json"})
         self._raise_for_status(response)

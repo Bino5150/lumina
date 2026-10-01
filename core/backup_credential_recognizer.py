@@ -1,61 +1,58 @@
-"""Bounded, semantic recognition of OS-local ChatGPT custody documents.
-
-This module does not import the credential store or instantiate its records.
-"""
+"""Recognize copied ChatGPT custody documents without inspecting credential values."""
 import json
+import re
 
 MAX_DOCUMENT_BYTES = 1024 * 1024
 _SCHEMA_PREFIXES = ("lumina.chatgpt.sessions/", "lumina.chatgpt.host/")
+_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_SCHEMA_FIELD = re.compile(r'"schema"\s*:\s*"(lumina\.chatgpt\.(?:sessions|host)/)')
 
 
-class _AmbiguousSchema(ValueError):
-    pass
+def _decoded_views(data: bytes):
+    # Later chunks have no BOM. Try UTF-16/32 when NULs suggest wide text.
+    yield data.decode("utf-8-sig", errors="ignore")
+    if b"\x00" in data:
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be",
+                         "utf-32", "utf-32-le", "utf-32-be"):
+            try:
+                yield data.decode(encoding, errors="ignore")
+            except UnicodeError:
+                continue
 
 
-def _object(pairs):
-    seen_schema = False
-    result = {}
-    for key, value in pairs:
-        if key == "schema":
-            if seen_schema:
-                raise _AmbiguousSchema()
-            seen_schema = True
-        result[key] = value
-    return result
-
-
-def _candidate_object_text(sample: bytes):
-    """Decode only bounded object-shaped input for malformed-JSON decisions."""
-    if not (sample.lstrip().startswith((b"{", b"\xef\xbb\xbf"))
-            or b"\x00" in sample[:32] or sample.startswith((b"\xff\xfe", b"\xfe\xff"))):
-        return None
-    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
-                     "utf-32", "utf-32-le", "utf-32-be"):
-        try:
-            candidate = sample.decode(encoding, errors="ignore").lstrip("\ufeff \t\r\n")
-        except UnicodeError:
-            continue
-        if candidate.startswith("{") and "\x00" not in candidate[:64]:
-            return candidate
-    return None
+def _has_schema_field(data: bytes) -> bool:
+    for view in _decoded_views(data):
+        # JSON permits Unicode escapes in either the key or schema value.
+        normalized = _ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), view)
+        if _SCHEMA_FIELD.search(normalized):
+            return True
+    return False
 
 
 def is_session_document(data: bytes) -> bool:
-    """Exclude recognized documents and ambiguous candidates, including
-    differently escaped JSON. Oversized JSON objects are conservatively
-    excluded because their schema cannot be checked within the size cap."""
-    sample = data[:MAX_DOCUMENT_BYTES + 1]
-    candidate = _candidate_object_text(sample)
+    """Classify captured bytes; deeply nested ambiguous JSON fails closed.
+
+    The any-position field scan catches credential copies in fences, arrays,
+    nested objects and leading text. Generic prose/JSONL words such as
+    ``schema`` or ``ChatGPT`` do not identify a credential document.
+    Callers with large sources scan every chunk of their captured snapshot.
+    """
     if len(data) > MAX_DOCUMENT_BYTES:
-        return candidate is not None
+        # Fixed-size windows bound decoding and normalization for Agent
+        # Backup members, which are already captured as immutable bytes.
+        window = 64 * 1024
+        overlap = 8192
+        for start in range(0, len(data), window):
+            if _has_schema_field(data[max(0, start - overlap):start + window]):
+                return True
+        return False
+    if _has_schema_field(data):
+        return True
     try:
-        decoded = json.loads(data, object_pairs_hook=_object)
-    except _AmbiguousSchema:
+        decoded = json.loads(data)
+    except RecursionError:
         return True
     except (UnicodeError, ValueError):
-        if candidate is None:
-            return False
-        lowered = candidate.casefold()
-        return "chatgpt" in lowered or "schema" in lowered or "\\u" in lowered
+        return False
     schema = decoded.get("schema") if isinstance(decoded, dict) else None
     return isinstance(schema, str) and schema.startswith(_SCHEMA_PREFIXES)

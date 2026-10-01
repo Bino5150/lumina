@@ -362,7 +362,10 @@ def _package_sources():
 
 
 def test_auth_package_imports_are_allowlisted():
-    allowed = _STDLIB_OK | {"inspect", "jwt", "requests", "core.test_isolation", "core.flight_recorder",
+    # urllib3 is requests' transport; its typed connect failures are needed
+    # to prove a rotating refresh token never left the machine.
+    allowed = _STDLIB_OK | {"inspect", "jwt", "requests", "urllib3.exceptions",
+                            "core.test_isolation", "core.flight_recorder",
                             "core.chatgpt_auth", "core.chatgpt_auth.store", "core.chatgpt_auth.oauth",
                             "core.chatgpt_auth.callback", "core.chatgpt_auth.session"}
     for name, src in _package_sources():

@@ -243,8 +243,12 @@ audit log, custom tools, projects, and preferences. The normal
 `credentials.json` and ChatGPT sign-in stores live outside the data
 directory by design. Symbolic links inside the data directory are
 not followed, and a ChatGPT session file copied or moved into the data
-directory is left out of the archive when its bounded JSON schema check
-recognizes the document. The bytes checked are the bytes archived; a
+directory is left out of the archive when its specific session or host schema
+field is recognized, including wrapped and escaped copies. Memory Backup
+reports the count and names of possible session or ambiguous files it excluded. It does
+not exclude ordinary JSONL audit logs or benign large JSON merely because
+they mention ChatGPT, schema, Unicode escapes or exceed 1 MiB. Deep JSON that
+cannot be parsed safely is excluded as ambiguous. The bytes checked are the bytes archived; a
 source-path replacement during backup cannot substitute later bytes.
 Keep other copies of credentials out of the data directory.
 

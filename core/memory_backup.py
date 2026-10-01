@@ -30,11 +30,32 @@ import shutil
 import stat
 import tempfile
 import zipfile
+from dataclasses import dataclass
 
 from core.backup_credential_recognizer import is_session_document, MAX_DOCUMENT_BYTES
 
 
-def build_memory_backup(data_dir: str, dest_path: str) -> None:
+@dataclass(frozen=True)
+class BackupExclusions:
+    count: int = 0
+    paths: tuple[str, ...] = ()  # first 20 names only; never file contents
+
+
+def _snapshot_has_session(snapshot) -> bool:
+    """Scan the captured inode to EOF with bounded memory and overlap."""
+    snapshot.seek(0)
+    tail = b""
+    first = True
+    while block := snapshot.read(MAX_DOCUMENT_BYTES if first else 64 * 1024):
+        sample = block if first else tail + block
+        if is_session_document(sample):
+            return True
+        tail = sample[-8192:]
+        first = False
+    return False
+
+
+def build_memory_backup(data_dir: str, dest_path: str) -> BackupExclusions:
     """Checkpoint the WAL, then zip everything under data_dir into
     dest_path. Deliberately does NOT touch ~/.config/lumina/credentials.json
     — that lives outside config.DATA_DIR entirely, so this can't leak an
@@ -60,6 +81,8 @@ def build_memory_backup(data_dir: str, dest_path: str) -> None:
         flight_recorder.checkpoint()
     except Exception:
         pass
+    excluded_count = 0
+    excluded_paths = []
     with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, _dirs, files in os.walk(data_dir):
             for fname in files:
@@ -79,13 +102,15 @@ def build_memory_backup(data_dir: str, dest_path: str) -> None:
                     # and ZIP payload both consume this same captured snapshot.
                     with tempfile.SpooledTemporaryFile(max_size=MAX_DOCUMENT_BYTES) as snapshot:
                         shutil.copyfileobj(source, snapshot)
-                        snapshot.seek(0)
-                        prefix = snapshot.read(MAX_DOCUMENT_BYTES + 1)
-                        if is_session_document(prefix):
+                        if _snapshot_has_session(snapshot):
+                            excluded_count += 1
+                            if len(excluded_paths) < 20:
+                                excluded_paths.append(arcname)
                             continue
                         snapshot.seek(0)
                         with zf.open(arcname, "w") as member:
                             shutil.copyfileobj(snapshot, member)
+    return BackupExclusions(excluded_count, tuple(excluded_paths))
 
 
 def _db():
