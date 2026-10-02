@@ -155,11 +155,17 @@ store is outside Memory Backup and Agent Backup; a recognized session or
 host document copied, moved or linked into collected data makes Agent
 Backup refuse to run and is left out of Memory Backup with a visible
 exclusion count and file names. Recognition checks the specific ChatGPT
-session or host schema field, including escaped, wrapped and embedded copies,
-across the captured file. Generic words such as "schema" and "ChatGPT" and
-benign large JSON files are not excluded just for containing those words or
-exceeding 1 MiB. Deep JSON that cannot be parsed safely is excluded as
-ambiguous. Memory Backup classifies the same captured bytes it archives.
+session or host schema field in direct and wrapped copies. For JSON up to
+1 MiB, it also inspects string values that contain serialized JSON, through
+at most four layers of serialization with bounded depth and work. Larger
+files are scanned in overlapping windows for the exact literal schema field;
+quote-escaped fields are also checked in text views, not binary database
+pages. Other transformations that hide that field
+may evade recognition; do not put session or host documents in backup roots.
+Generic words such as "schema" and "ChatGPT" and benign large JSON files
+are not excluded just for containing those words or exceeding 1 MiB.
+Deep or over-limit JSON candidates are excluded as ambiguous. Memory Backup
+classifies the same captured bytes it archives.
 The Flight Recorder records only categorical sign-in,
 renewal and disconnect events — never a token, code, email, account or
 client identifier. Signing in with ChatGPT never uses or replaces an API
