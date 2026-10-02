@@ -52,8 +52,9 @@ def _has_serialized_schema_field(data: bytes) -> bool:
 def _has_embedded_document(decoded) -> bool:
     """Inspect JSON string values without unbounded recursive reparsing.
 
-    Ambiguous candidates that exceed a bound fail closed. Non-JSON prose and
-    ordinary stringified JSON stay archivable.
+    Every string value is scanned for the exact schema field, whether or
+    not it parses as JSON. Ambiguous candidates that exceed a bound fail
+    closed. Non-JSON prose and ordinary stringified JSON stay archivable.
     """
     pending = [(decoded, 0, 0)]
     work = 0
@@ -70,6 +71,10 @@ def _has_embedded_document(decoded) -> bool:
         elif isinstance(value, list):
             pending.extend((item, depth + 1, layers) for item in value)
         elif isinstance(value, str):
+            # Scan every string value, parseable or not: prose-wrapped
+            # serialized copies carry the exact field too.
+            if _has_schema_field(value.encode("utf-8", errors="surrogatepass")):
+                return True
             candidate = value.lstrip()
             if not candidate.startswith(("{", "[", '"')):
                 continue
@@ -84,12 +89,6 @@ def _has_embedded_document(decoded) -> bool:
                 return True
             except (UnicodeError, ValueError):
                 continue
-            # Reuse the precise schema-field scan for a parsed JSON value.
-            # Escaped quotes in ordinary prose do not become a field here.
-            if isinstance(nested, (dict, list)) and _has_schema_field(
-                candidate.encode("utf-8", errors="surrogatepass")
-            ):
-                return True
             pending.append((nested, depth + 1, layers + 1))
     return False
 

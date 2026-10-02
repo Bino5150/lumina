@@ -156,8 +156,10 @@ host document copied, moved or linked into collected data makes Agent
 Backup refuse to run and is left out of Memory Backup with a visible
 exclusion count and file names. Recognition checks the specific ChatGPT
 session or host schema field in direct and wrapped copies. For JSON up to
-1 MiB, it also inspects string values that contain serialized JSON, through
-at most four layers of serialization with bounded depth and work. Larger
+1 MiB, it also scans every string value for that exact field, whether or
+not the string parses as JSON, and follows serialized JSON inside string
+values through at most four layers of serialization with bounded depth and
+work. Larger
 files are scanned in overlapping windows for the exact literal schema field;
 quote-escaped fields are also checked in text views, not binary database
 pages. Other transformations that hide that field
