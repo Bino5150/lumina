@@ -270,12 +270,9 @@ def test_canary_anthropic_lane_is_also_visible_to_the_tripwire(tripwire):
 
 def test_no_construction_path_falls_through_to_a_paid_backend(tripwire):
     for kwargs in ({}, {"name": PLAN}, {"name": PLAN.upper()}, {"name": PLAN, "api_key": "sk-" + "z" * 24}):
-        with pytest.raises(ReservedBackendLaneError):
-            loader.get_llm_backend(**kwargs)
-    with pytest.raises(ReservedBackendLaneError):
-        LuminaAgent(owner=False, backend=PLAN)
-    with pytest.raises(ReservedBackendLaneError):
-        LuminaAgent(owner=False)            # selected lane is the plan lane
+        assert type(loader.get_llm_backend(**kwargs)).__name__ == "ChatGPTPlanBackend"
+    assert type(LuminaAgent(owner=False, backend=PLAN).llm).__name__ == "ChatGPTPlanBackend"
+    assert type(LuminaAgent(owner=False).llm).__name__ == "ChatGPTPlanBackend"
     assert tripwire.total == 0
 
 
@@ -283,26 +280,12 @@ def test_no_construction_path_falls_through_to_a_paid_backend(tripwire):
 # Foreground dispatch
 # ---------------------------------------------------------------------------
 
-def test_foreground_default_policy_returns_unavailable_without_dispatch(tripwire, tmp_path):
-    """01B default: the plan lane admits no operation. A foreground turn on it
-    is refused visibly on that lane -- not dispatched, not rerouted."""
-    plan = _ScriptedLLM(PLAN, [{"content": "never", "termination": TerminationStatus.COMPLETE}])
-    paid = [_ForbiddenAPI(n) for n in ("openai", "anthropic", "openrouter")]
-    agent = _agent(plan, tmp_path)
-
-    result = LuminaAgent.chat(agent, "hello")
-
-    assert is_error_response(result), result
-    assert "does not admit foreground_chat" in result
-    assert plan.chat_calls == 0
-    _no_fuel_leak(tripwire, *paid)
-    refused = _events(agent, "provider.dispatch_refused")
-    assert len(refused) == 1
-    assert refused[0]["backend"] == PLAN
-    fields = json.loads(refused[0]["fields_json"])
-    assert fields["backend_lane"] == PLAN and fields["quota_class"] == "chatgpt_plan_or_credits"
-    assert _events(agent, "provider.dispatch") == []        # nothing was dispatched
-    assert [e for e in _events(agent, "turn.failed")]
+def test_foreground_admission_keeps_nonforeground_operations_refused(tripwire):
+    assert bi.operation_refusal(PLAN, OperationKind.FOREGROUND_CHAT) is None
+    for kind in OperationKind:
+        if kind is not OperationKind.FOREGROUND_CHAT:
+            assert bi.operation_refusal(PLAN, kind)
+    assert tripwire.total == 0
 
 
 def test_foreground_failing_plan_attempts_exactly_once_and_never_leaves_the_lane(
@@ -731,7 +714,7 @@ _KNOWN_CONSTRUCTION_SITES = {
     "core/agent.py": 1,                  # self.llm = get_llm_backend(name=backend)
     "core/dreaming.py": 2,               # selected lane, utility + profile curation
     "core/vision_lane.py": 2,            # specialist (with/without model override)
-    "ui/settings/general_tab.py": 3,     # owner-driven probes + live swap on Save
+    "ui/settings/general_tab.py": 4,     # owner-driven probes + plan catalog + live swap
     "ui/settings/tts_tab.py": 1,         # owner-driven discovery for a route's provider
 }
 

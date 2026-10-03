@@ -138,7 +138,7 @@ by default, overridable via `LUMINA_SECRETS_PATH`) — separate from
 ordinary preferences, deliberately excluded from version control, and
 never included in a Memory Backup archive.
 
-**ChatGPT sign-in sessions** (General → ChatGPT Plan — sign-in) are kept
+**ChatGPT sign-in sessions** (General → Backend: ChatGPT Plan → account controls) are kept
 apart again, in `~/.config/lumina/chatgpt/` (override:
 `LUMINA_CHATGPT_AUTH_DIR`): a directory readable only by you (`0700`)
 holding owner-only files (`0600`) — the saved registrations and their

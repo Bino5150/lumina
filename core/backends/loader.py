@@ -22,6 +22,7 @@ from .openrouter import OpenRouterBackend
 from .deepseek import DeepSeekBackend
 from .groq import GroqBackend
 from .openai_backend import OpenAIBackend
+from .openai_chatgpt_plan import ChatGPTPlanBackend
 from .anthropic_backend import AnthropicBackend
 from .gemini_backend import GeminiBackend
 from .kimi import KimiBackend
@@ -68,6 +69,7 @@ BACKENDS = {
     "deepseek":   DeepSeekBackend,
     "groq":       GroqBackend,
     "openai":     OpenAIBackend,
+    "openai_chatgpt_plan": ChatGPTPlanBackend,
     "anthropic":  AnthropicBackend,
     "gemini":     GeminiBackend,
     "kimi":       KimiBackend,
@@ -215,11 +217,9 @@ def get_llm_backend(name: str = None, url: str = None, api_key: str = None, mode
     function.
     """
     backend_name = (name or getattr(config, "LLM_BACKEND", "llamacpp")).lower()
-    # SUBSCRIPTION-PLAN-BACKENDS-01B: a RESERVED lane (known identity, no
-    # installed implementation) fails here, loudly and BEFORE any credential
-    # lookup or class selection. It must never fall through to a sibling
-    # lane that shares its provider family (e.g. "openai") -- the sibling's
-    # API key is a different fuel source.
+    # SUBSCRIPTION-PLAN-BACKENDS-01B: any reserved lane (known identity, no
+    # installed implementation) fails before credential lookup or class
+    # selection. It cannot fall through to a sibling lane with different fuel.
     descriptor = lane_descriptor(backend_name)
     if descriptor is not None and not descriptor.constructible:
         raise ReservedBackendLaneError(

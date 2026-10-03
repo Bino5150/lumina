@@ -1,4 +1,5 @@
 from typing import Optional
+import threading
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QCheckBox, QLineEdit, QLabel, QCompleter,
@@ -23,6 +24,8 @@ class GeneralTab(QWidget):
     # the previously displayed connection status may have gone stale.
     # Carries no payload; consumers re-read truth from the live agent.
     backend_connection_changed = Signal()
+    _plan_models_done = Signal(object)
+    PLAN_BACKEND = "openai_chatgpt_plan"
     CLOUD_BACKENDS = {"openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen"}
 
     # Patch 3A.4 Part 5 -- raw provider value -> display label. Case-
@@ -67,6 +70,10 @@ class GeneralTab(QWidget):
         # failed refresh useful without ever carrying provider A's models
         # into provider B's UI.
         self._discovered_models: dict[str, tuple[str, ...]] = {}
+        self._plan_card = None
+        self._plan_catalog_profile_id = None
+        self._plan_refresh_generation = 0
+        self._plan_models_done.connect(self._on_plan_models_done)
         self._build()
 
     def _wlbl(self, text: str) -> QLabel:
@@ -88,15 +95,19 @@ class GeneralTab(QWidget):
         be_col.addWidget(_lbl("Backend", self.c))
         self.backend_combo = _combo(self.c)
         self.backend_combo.addItems(["llamacpp", "lmstudio", "ollama", "vllm", "openrouter", "deepseek", "groq", "openai", "anthropic", "gemini", "kimi", "qwen", "custom", "omniroute"])
-        self.backend_combo.setCurrentText(config.LLM_BACKEND)
+        self.backend_combo.insertItem(8, "ChatGPT Plan", self.PLAN_BACKEND)
+        self.backend_combo.setCurrentText(
+            "ChatGPT Plan" if config.LLM_BACKEND == self.PLAN_BACKEND else config.LLM_BACKEND)
         self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
         be_col.addWidget(self.backend_combo)
-        url_col = QVBoxLayout()
+        self.url_widget = QWidget()
+        url_col = QVBoxLayout(self.url_widget)
+        url_col.setContentsMargins(0, 0, 0, 0)
         url_col.addWidget(_lbl("Server URL", self.c))
         self.url = _le("", self.c)
         url_col.addWidget(self.url)
         backend_row.addLayout(be_col, 1)
-        backend_row.addLayout(url_col, 3)
+        backend_row.addWidget(self.url_widget, 3)
         layout.addLayout(backend_row)
 
         # ── Model Name / API Key row — shared between "custom" and
@@ -174,6 +185,29 @@ class GeneralTab(QWidget):
         # saved Custom model displayed under an active OpenRouter backend.
         self.custom_model_widget.setVisible(config.LLM_BACKEND in ("custom", "omniroute"))
 
+        # OAuth account/model controls occupy the same top backend-dependent
+        # surface as the API-key and freeform model rows. The custody card is
+        # mounted by SettingsPanel after this tab has been constructed.
+        self.plan_widget = QWidget()
+        self.plan_layout = QVBoxLayout(self.plan_widget)
+        self.plan_layout.setContentsMargins(0, 4, 0, 0)
+        self.plan_layout.addWidget(_lbl("Model", self.c))
+        plan_model_row = QHBoxLayout()
+        self.plan_model = _combo(self.c)
+        self.plan_model.setEditable(False)
+        self.plan_model.setPlaceholderText("Select an account model")
+        self.plan_model.currentIndexChanged.connect(self._on_reasoning_model_changed)
+        plan_model_row.addWidget(self.plan_model, 1)
+        self.plan_refresh_models_btn = _btn("⟳", self.c)
+        self.plan_refresh_models_btn.setToolTip("Refresh models available to the connected ChatGPT account")
+        self.plan_refresh_models_btn.clicked.connect(self._refresh_plan_models)
+        plan_model_row.addWidget(self.plan_refresh_models_btn)
+        self.plan_layout.addLayout(plan_model_row)
+        self.plan_model_status = self._wlbl("")
+        self.plan_layout.addWidget(self.plan_model_status)
+        layout.addWidget(self.plan_widget)
+        self.plan_widget.setVisible(config.LLM_BACKEND == self.PLAN_BACKEND)
+
         # ── Reasoning Effort (Patch 3A.4 Part 5) ──
         # Always visible regardless of backend -- unlike cloud_widget/
         # custom_model_widget above, a backend/model with no selectable
@@ -247,13 +281,16 @@ class GeneralTab(QWidget):
         iter_col.addWidget(_lbl("Max Tool Iterations", self.c))
         self.iter_spin = _spin(config.MAX_TOOL_ITERATIONS, 1, 100, 1, self.c)
         iter_col.addWidget(self.iter_spin)
-        resp_col = QVBoxLayout()
+        self.response_tokens_widget = QWidget()
+        resp_col = QVBoxLayout(self.response_tokens_widget)
+        resp_col.setContentsMargins(0, 0, 0, 0)
         resp_col.addWidget(_lbl("Response Tokens", self.c))
         self.resp_spin = _spin(config.RESPONSE_RESERVE_TOKENS, 256, 1048576, 256, self.c)
         resp_col.addWidget(self.resp_spin)
         row2.addLayout(iter_col)
-        row2.addLayout(resp_col)
+        row2.addWidget(self.response_tokens_widget)
         layout.addLayout(row2)
+        self.response_tokens_widget.setVisible(config.LLM_BACKEND != self.PLAN_BACKEND)
 
         row_compaction = QHBoxLayout()
         row_compaction.setSpacing(16)
@@ -335,6 +372,85 @@ class GeneralTab(QWidget):
         layout = self._sections_layout
         layout.insertWidget(layout.count() - 1, widget)
 
+    def set_plan_card(self, widget: QWidget) -> None:
+        self._plan_card = widget
+        self.plan_layout.insertWidget(0, widget)
+        widget.account_changed.connect(self._on_plan_account_changed)
+        if self._backend_name() == self.PLAN_BACKEND:
+            self._refresh_plan_models()
+
+    def _backend_name(self) -> str:
+        """Return the stored lane key behind the plan option's display name."""
+        return self.backend_combo.currentData() or self.backend_combo.currentText()
+
+    def _on_plan_account_changed(self, profile_id) -> None:
+        self._plan_refresh_generation += 1
+        self._plan_catalog_profile_id = None
+        self.plan_model.clear()
+        self.plan_model.setCurrentIndex(-1)
+        if self._backend_name() == self.PLAN_BACKEND and profile_id:
+            self._refresh_plan_models()
+
+    def _refresh_plan_models(self) -> None:
+        if self._backend_name() != self.PLAN_BACKEND:
+            return
+        self._plan_refresh_generation += 1
+        generation = self._plan_refresh_generation
+        profile_id = (None if self._plan_card is None or self._plan_card._status is None
+                      else self._plan_card._status.profile_id)
+        self.plan_refresh_models_btn.setEnabled(False)
+        self.plan_model_status.setText("Checking account models…")
+
+        def work():
+            try:
+                from core.backends.loader import get_llm_backend
+                backend = get_llm_backend(name=self.PLAN_BACKEND)
+                result = backend.discover_models()
+                labels = backend.model_labels
+                found_profile = backend.catalog_profile_id
+            except Exception as exc:
+                from core.backends.base import ModelDiscoveryOutcome, ModelDiscoveryResult
+                result = ModelDiscoveryResult(ModelDiscoveryOutcome.FAILED,
+                                              diagnostic=f"Model discovery could not start ({type(exc).__name__}).")
+                labels, found_profile = {}, None
+            self._plan_models_done.emit((generation, profile_id, found_profile, result, labels))
+
+        threading.Thread(target=work, name="chatgpt-plan-models", daemon=True).start()
+
+    def _on_plan_models_done(self, payload) -> None:
+        from core.backends.base import ModelDiscoveryOutcome
+        generation, expected_profile, found_profile, result, labels = payload
+        if generation != self._plan_refresh_generation:
+            return
+        self.plan_refresh_models_btn.setEnabled(True)
+        current_profile = (None if self._plan_card is None or self._plan_card._status is None
+                           else self._plan_card._status.profile_id)
+        if expected_profile != current_profile or found_profile != current_profile:
+            self.plan_model_status.setText("Account changed. Refresh models.")
+            return
+        if result.outcome not in (ModelDiscoveryOutcome.SUCCESS, ModelDiscoveryOutcome.EMPTY):
+            self.plan_model.clear()
+            self.plan_model.setCurrentIndex(-1)
+            self._plan_catalog_profile_id = None
+            self.plan_model_status.setText(result.diagnostic)
+            return
+        draft = self.plan_model.currentData()
+        from core import lane_preferences
+        saved = lane_preferences.get_lane_model(persistence.load(), self.PLAN_BACKEND)
+        self.plan_model.blockSignals(True)
+        self.plan_model.clear()
+        for slug in result.models:
+            self.plan_model.addItem(labels.get(slug, slug), slug)
+        selected = draft if draft in result.models else saved
+        index = self.plan_model.findData(selected) if selected else -1
+        self.plan_model.setCurrentIndex(index)
+        self.plan_model.blockSignals(False)
+        self._plan_catalog_profile_id = current_profile
+        self.plan_model_status.setText(
+            "Saved model is unavailable to this account. Select another model."
+            if saved and saved not in result.models else result.diagnostic)
+        self._refresh_reasoning_row()
+
     def _on_dream_toggled(self, checked: bool):
         self.dream_idle_spin.setEnabled(checked)
 
@@ -404,12 +520,16 @@ class GeneralTab(QWidget):
         self.url.setPlaceholderText(
             "Enter your OpenAI-compatible endpoint URL" if configurable else ""
         )
+        self.url_widget.setVisible(backend != self.PLAN_BACKEND)
 
     def _on_backend_changed(self, name: str):
+        name = self._backend_name()
         self._refresh_cloud_row(name)
         self._refresh_endpoint_row(name)
         is_freeform = name in ("custom", "omniroute")
         self.custom_model_widget.setVisible(is_freeform)
+        self.plan_widget.setVisible(name == self.PLAN_BACKEND)
+        self.response_tokens_widget.setVisible(name != self.PLAN_BACKEND)
         if name == "omniroute":
             self.custom_model.setText(config.OMNIROUTE_DEFAULT_MODEL)
             self.custom_api_key.setText(config.OMNIROUTE_API_KEY)
@@ -421,6 +541,8 @@ class GeneralTab(QWidget):
         if is_freeform:
             self._refresh_freeform_model_suggestions(name)
         self._refresh_context_row(name)
+        if name == self.PLAN_BACKEND and self._plan_card is not None:
+            self._refresh_plan_models()
         # Patch 3A.4 Part 5 -- after the model field for the new backend
         # has been populated above, so this reads the right model text.
         self._refresh_reasoning_row()
@@ -462,9 +584,11 @@ class GeneralTab(QWidget):
         same disabled-at-Provider-Default treatment as any other
         no-capability-data case.
         """
-        backend_name = self.backend_combo.currentText()
+        backend_name = self._backend_name()
         if backend_name in self.CLOUD_BACKENDS:
             model = self.cloud_model.currentText().strip()
+        elif backend_name == self.PLAN_BACKEND:
+            model = self.plan_model.currentData()
         elif backend_name in ("custom", "omniroute"):
             model = self.custom_model.text().strip()
         else:
@@ -498,7 +622,7 @@ class GeneralTab(QWidget):
         (_populate_reasoning_combo) always runs inside
         blockSignals(True)/(False), so it can never reach this handler.
         """
-        backend_name = self.backend_combo.currentText()
+        backend_name = self._backend_name()
         model = self._current_reasoning_model()
         if model is None:
             return
@@ -590,7 +714,7 @@ class GeneralTab(QWidget):
           6. Discovered, efforts empty for this model -> behaves like case
              2 -- genuinely known now, distinct tooltip-wise from case 4.
         """
-        backend_name = self.backend_combo.currentText()
+        backend_name = self._backend_name()
         model = self._current_reasoning_model()
         key = (backend_name, model)
 
@@ -682,7 +806,10 @@ class GeneralTab(QWidget):
 
     def _refresh_models(self):
         """Run truthful live discovery without persisting draft settings."""
-        backend_name = self.backend_combo.currentText()
+        backend_name = self._backend_name()
+        if backend_name == self.PLAN_BACKEND:
+            self._refresh_plan_models()
+            return
         credential = None
         if backend_name in self.CLOUD_BACKENDS:
             credential = self.cloud_key.text().strip()
@@ -749,6 +876,14 @@ class GeneralTab(QWidget):
             get_llm_backend,
             migrate_legacy_backend_endpoint,
         )
+        if self._backend_name() == self.PLAN_BACKEND:
+            current_profile = (None if self._plan_card is None or self._plan_card._status is None
+                               else self._plan_card._status.profile_id)
+            if (not current_profile or self._plan_catalog_profile_id != current_profile
+                    or not self.plan_model.currentData()):
+                self._save_feedback.failure("⚠ Not Saved")
+                self.status_lbl.setText("Connect an account and select an available ChatGPT Plan model first.")
+                return
         # Consume the old universal URL against the backend it originally
         # accompanied before changing the selected backend below.  This is a
         # one-time no-op after migration.
@@ -766,7 +901,7 @@ class GeneralTab(QWidget):
         config.DREAM_SWEEP_ENABLED = self.dream_enabled_cb.isChecked()
         config.DREAM_IDLE_MINUTES = self.dream_idle_spin.value()
         config.SHOW_THINK_BLOCKS = self.show_think_cb.isChecked()
-        config.LLM_BACKEND = self.backend_combo.currentText()
+        config.LLM_BACKEND = self._backend_name()
         backend_endpoints = {
             name: value
             for name, value in getattr(config, "BACKEND_ENDPOINTS", {}).items()
@@ -797,6 +932,10 @@ class GeneralTab(QWidget):
 
         from core.persistence import load as load_prefs, save as save_prefs
         prefs = load_prefs()
+        if config.LLM_BACKEND == self.PLAN_BACKEND:
+            from core import lane_preferences
+            lane_preferences.set_lane_model(prefs, self.PLAN_BACKEND,
+                                            self.plan_model.currentData())
         prefs["llm_backend"] = config.LLM_BACKEND
         prefs["llm_backend_url"] = config.LLM_BACKEND_URL
         prefs["backend_endpoints"] = backend_endpoints

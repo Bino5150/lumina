@@ -4,7 +4,7 @@ Settings is a tabbed panel (`ui/settings/panel.py`). Current tabs, in order:
 
 | Tab | Covers |
 |---|---|
-| ⚙ General | Backend selection, reasoning effort, context compaction, dreaming toggles, global agent behavior prompt, and the separate **ChatGPT Plan — sign-in** section (see below) |
+| ⚙ General | Backend selection, reasoning effort, context compaction, dreaming toggles, global agent behavior prompt, and the backend-specific **ChatGPT Plan** account and model controls (see below) |
 | 👤 User Profile | Your own bio and Lumina's curated notes about you — see [My Human](memory.md#my-human) |
 | 🎭 Personas | Create/edit/import/export personas — see [Personas & Skills](personas-and-skills.md) |
 | 📡 Communications | Telegram, Discord, and your public bio — see [Channels](channels.md) |
@@ -25,7 +25,7 @@ one tab.)
 ## Backend Abstraction
 
 Lumina's LLM layer is fully abstracted behind one shared interface —
-switching backends is a dropdown in General, not a code change. Fourteen
+switching backends is a dropdown in General, not a code change. Fifteen
 ship out of the box:
 
 **Local**
@@ -39,6 +39,7 @@ ship out of the box:
 
 **Cloud, native**
 - Anthropic (Claude), Google (Gemini), OpenAI, Moonshot (Kimi), Alibaba (Qwen/DashScope)
+- ChatGPT Plan — foreground text chat using a connected ChatGPT account, separate from the OpenAI API-key backend
 
 **Cloud, OpenAI-compatible**
 - OpenRouter, DeepSeek, Groq, and any other OpenAI-compatible endpoint via the generic Custom slot
@@ -69,13 +70,22 @@ rather than guessing. Your choice is saved per backend *and* per model, so
 switching models on the same backend doesn't carry over a setting that
 doesn't apply.
 
-## ChatGPT Plan — sign-in
+## ChatGPT Plan
 
-The bottom of the General page has its own **ChatGPT Plan — sign-in**
-section. **Continue with ChatGPT** opens your system browser. For a first
+Select **ChatGPT Plan** in General's Backend dropdown to show its account
+controls and account-specific Model picker near the top of the page. The
+model picker shows names supplied by the connected account's catalog and
+saves the selected model slug. If that model is no longer listed, select
+another one; Lumina does not substitute a model. **Reasoning Effort** stays
+at **Provider Default**. The API Key, Server URL, custom model and Response
+Tokens controls are hidden for this backend. The other local context
+controls remain available.
+
+**Continue with ChatGPT** opens your system browser. For a first
 registration, **Add another account**, or registration again after an invalid
 client, enter the one-time code shown in Lumina into the local browser page;
-it then opens OpenAI's sign-in page. You sign
+the adjacent **Copy** button copies that code only when you click it.
+The browser then opens OpenAI's sign-in page. You sign
 in and approve there, and Lumina never sees
 your OpenAI password, browser cookies or another app's tokens. When you
 return, check the verified **Account to confirm** shown in Lumina and choose
@@ -84,7 +94,7 @@ connected account is shown separately while a new authorization waits. If the ac
 cancel and start a fresh sign-in. The section then shows whether **plan
 permission** was granted (signing in and granting plan use are separate
 OpenAI permissions), and the session state, with **Reconnect**,
-**Enable plan permission**, **Add another account** and **Disconnect**
+**Enable plan permission**, **Add another account** and **Unlink Account**
 as they apply.
 An identity sign-in without offline access or plan permission is shown as
 connected without plan permission; it cannot renew a session or use a model.
@@ -97,14 +107,15 @@ outcome is unknown, including a post-send 5xx or lost response. This is the
 current no-resend policy pending a clear vendor answer on rotating-token
 retries after an ambiguous delivery.
 
-In this version that is all it does: it holds a ChatGPT session on this
-computer. Using your ChatGPT plan to power chat is **not available yet** —
-the ChatGPT-plan backend is not in the backend list, nothing is sent to a
-model, and no plan usage is consumed. The section is independent of
-**Save All Settings**: saving General never starts, renews or ends a
-ChatGPT sign-in, and an OpenAI API key never stands in for it.
+In this version the ChatGPT Plan backend handles foreground text chat only.
+It cannot use tools, vision, utilities, Reforge, subagents or scheduled work.
+Requests use the connected account's OAuth session, never an OpenAI API key,
+and do not automatically fall back to another backend. Plan or enabled
+ChatGPT credits may be consumed; check ChatGPT Settings → Usage for the
+account's allowance. **Save All Settings** saves backend and model choices
+but never starts, renews or ends a ChatGPT sign-in.
 
-**Disconnect** stops use, asks OpenAI to end the renewable session, and
+**Unlink Account** stops use, asks OpenAI to end the renewable session, and
 removes the saved tokens. If OpenAI can't be reached to confirm, the
 tokens are still removed locally and the section says remote disconnect
 was not confirmed — you can also disconnect Lumina in ChatGPT Settings.

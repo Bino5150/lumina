@@ -2518,6 +2518,24 @@ class LuminaAgent:
         if user_skills_block:
             self.ctx.push_ephemeral_assistant(user_skills_block)
 
+        # SUBSCRIPTION-PLAN-BACKENDS-01D-A.1: a backend that explicitly has
+        # no tool-work capability cannot use either product schemas or the
+        # tool-only completion gate. Its streamed final still passes through
+        # the existing dispatch guard, cancellation and final persistence;
+        # the backend must prove terminal completion before its iterator ends.
+        # All existing backends default to True and retain the WORK/gate loop.
+        supports_tool_work = getattr(self.llm, "supports_tool_work", lambda: True)
+        if not supports_tool_work():
+            messages = self.ctx.build_messages(chat_id=chat_id)
+            if _cancel_requested(cancel_event):
+                raise TurnCancelled()
+            return self._stream_final(
+                messages, think_step, cancel_event=cancel_event,
+                reasoning_effort=reasoning_effort, turn_id=turn_id,
+                turn_started_at=turn_started_at, turn_telemetry=turn_telemetry,
+                require_terminal_completion=True,
+            )
+
         # MB-03 — soft ceiling, warning only. No mechanism yet exists to narrow
         # tool schemas to fit (that's MB-10's job); this just turns "we don't know
         # if schema bloat is a problem" into a real, visible signal.
@@ -3170,7 +3188,8 @@ class LuminaAgent:
                        turn_id: Optional[str] = None,
                        retain_partial_on_cancel: bool = True,
                        turn_started_at: Optional[float] = None,
-                       turn_telemetry: Optional[dict] = None) -> str:
+                       turn_telemetry: Optional[dict] = None,
+                       require_terminal_completion: bool = False) -> str:
         """Stream the final response, firing callbacks for UI updates.
 
         ``retain_partial_on_cancel`` separates two facts that used to be
@@ -3191,6 +3210,8 @@ class LuminaAgent:
         throughout this file for every optional telemetry callback.
         """
         full_response = []
+        completed_terminal = False
+        terminal_fields = {}
         in_think = False
         stream = None
         _think_buffer = []  # AGENT-FLIGHT-RECORDER-01A1 -- see __THINK_END__ handling below
@@ -3253,6 +3274,16 @@ class LuminaAgent:
             if refusal is not None:
                 _record_dispatch_refusal(self, refusal, turn_id=turn_id)
                 raise LaneFuelViolation(refusal)
+            if require_terminal_completion:
+                llm = getattr(self, "llm", None)
+                model_reader = getattr(llm, "configured_model", None)
+                _fr_machine(
+                    self, "provider.dispatch", turn_id=turn_id,
+                    backend=getattr(llm, "name", None),
+                    model=model_reader() if callable(model_reader) else None,
+                    fields={"request_streamed": True,
+                            **_identity_fields(self, OperationKind.FOREGROUND_CHAT)},
+                )
             final_request_dispatch_at = time.monotonic()
             stream = iter(self.llm.chat_stream(
                 messages=messages,
@@ -3296,6 +3327,13 @@ class LuminaAgent:
                 if _cancel_requested(cancel_event):
                     _raise_cancelled()
                 if isinstance(chunk, BackendStreamTelemetry):
+                    if require_terminal_completion and chunk.fields.get("stream_completion_state") == "completed":
+                        completed_terminal = True
+                        terminal_fields = {
+                            key: chunk.fields[key]
+                            for key in ("http_status", "provider_request_id")
+                            if key in chunk.fields
+                        }
                     _accumulate_provider_telemetry(
                         self, chunk.fields, turn_telemetry, "final",
                     )
@@ -3361,6 +3399,14 @@ class LuminaAgent:
                 if _cancel_requested(cancel_event):
                     _raise_cancelled()
 
+            if require_terminal_completion and not completed_terminal:
+                raise RuntimeError("Provider stream ended without a completed terminal event.")
+            if require_terminal_completion:
+                _fr_machine(self, "provider.stream_terminal", turn_id=turn_id,
+                            fields={"stream_completion_state": "completed",
+                                    **terminal_fields,
+                                    **_identity_fields(self, OperationKind.FOREGROUND_CHAT)})
+
             # TOKS-STREAM-TIMING-01 -- the terminal boundary of a
             # successfully-exhausted provider stream, i.e. right where the
             # while loop above ends via StopIteration/break -- never
@@ -3373,6 +3419,17 @@ class LuminaAgent:
                 final_stream_ended_at = time.monotonic()
 
         except (ConnectionError, TimeoutError, RuntimeError, ValueError) as e:
+            if require_terminal_completion:
+                state = getattr(e, "stream_completion_state", "none")
+                error_fields = {
+                    key: getattr(e, key)
+                    for key in ("http_status", "provider_request_id")
+                    if getattr(e, key, None) is not None
+                }
+                _fr_machine(self, "provider.stream_terminal", turn_id=turn_id,
+                            severity="error", fields={"stream_completion_state": state,
+                                                       **error_fields,
+                                                       **_identity_fields(self, OperationKind.FOREGROUND_CHAT)})
             if _cancel_requested(cancel_event):
                 _raise_cancelled()
             # ValueError added alongside Bug C's base_url validation

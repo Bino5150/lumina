@@ -1,14 +1,7 @@
-"""
-SUBSCRIPTION-PLAN-BACKENDS-01C -- the Settings "ChatGPT Plan — sign-in"
-card, under real Qt.
+"""ChatGPT Plan account card under real Qt; custody stays outside Save.
 
-Pins: the card is mounted in the General page but outside its backend
-selector and Save; a READY session never adds the plan lane to the
-selector; the card renders verified identity and the app-generated start
-code, but no token or authorization URL, and claims nothing 01C has not earned (no model, no chat
-readiness); every session call runs off the Qt main thread; app quit
-cancels a pending browser sign-in.
-
+The card renders verified identity and the app-generated start code, never
+a token or authorization URL. Session calls stay off the Qt main thread.
 tests.yml runs this file with LUMINA_REQUIRE_QT=1 (fail, never skip).
 """
 import os
@@ -128,7 +121,7 @@ def test_ready_session_renders_only_truthful_sanitized_text(qapp):
     for claim in ("model available", "ready to chat", "gpt ready", "unlimited", "free", "tools supported",
                   "vision", "reforge"):
         assert claim not in lowered, claim
-    assert "not available in this version" in lowered       # says what 01C has NOT earned
+    assert "adds no new allowance" in lowered
     assert not card.disconnect_btn.isHidden()
     assert card.continue_btn.isHidden()
     assert all(not on_main for on_main in manager.threads)   # never on the Qt main thread
@@ -179,7 +172,12 @@ def test_first_registration_requires_visible_owner_confirmation(qapp):
     manager.gate = threading.Event()
     card = make_card(qapp, manager)
     card.continue_btn.click()
-    assert pump(qapp, card, lambda: "CODETEST42" in card.code_label.text())
+    assert pump(qapp, card, lambda: "CODETEST42" in card.code_value_label.text())
+    assert "#FFFFFF" in card.code_value_label.styleSheet()
+    assert not card.copy_btn.isHidden()
+    card.copy_btn.click()
+    assert qapp.clipboard().text() == "CODETEST42"
+    assert card.copy_feedback_label.text() == "Copied"
     assert card.confirm_btn.isHidden()
     manager.gate.set()
     assert pump(qapp, card, lambda: not card.confirm_btn.isHidden())
@@ -203,7 +201,8 @@ def test_disconnect_and_quit_cancel(qapp):
     manager = StubManager(SessionState.READY, PlanPermission.GRANTED)
     card = make_card(qapp, manager)
     card.disconnect_btn.click()
-    assert pump(qapp, card, lambda: card.message_label.text() == "Disconnected.")
+    assert pump(qapp, card, lambda: card.message_label.text() ==
+                "Unlinked locally; remote revocation confirmed.")
     qapp.aboutToQuit.emit()
     assert "cancel_sign_in" in manager.calls
 
@@ -247,8 +246,51 @@ def test_card_is_mounted_in_general_outside_selector_and_save(qapp, monkeypatch,
     assert general.isAncestorOf(card)
     assert pump(qapp, card, lambda: "Connected to ChatGPT" in card.session_label.text())
     items = [general.backend_combo.itemText(i) for i in range(general.backend_combo.count())]
-    assert PLAN not in items and not any("chatgpt" in i.lower() for i in items)
+    assert "ChatGPT Plan" in items
+    assert general.backend_combo.itemData(items.index("ChatGPT Plan")) == PLAN
+    assert general.plan_widget.isAncestorOf(card)
     # General's Save never drives the session manager.
     before = list(manager.calls)
     general._save()
     assert [c for c in manager.calls[len(before):] if c not in ("get_session_state", "list_profiles")] == []
+    existing = persistence.load()
+    existing["cloud_credentials"] = {
+        "openai": {"default_model": "paid-model"},
+        "openrouter": {"default_model": "router-model"},
+    }
+    assert persistence.save(existing)
+
+    # 01D-B: the account card and catalog live in the active backend area;
+    # the API-key, fixed URL and provider-output-token controls disappear.
+    from core.backends.base import ModelDiscoveryOutcome, ModelDiscoveryResult
+    from core.backends.openai_chatgpt_plan import ChatGPTPlanBackend
+    def synthetic_catalog(self):
+        self.model_labels = {"model-b": "Second", "model-a": "First"}
+        self.catalog_profile_id = "p" * 32
+        return ModelDiscoveryResult(ModelDiscoveryOutcome.SUCCESS,
+                                    models=("model-b", "model-a"),
+                                    diagnostic="Account models refreshed.")
+    monkeypatch.setattr(ChatGPTPlanBackend, "discover_models", synthetic_catalog)
+    general.backend_combo.setCurrentText("ChatGPT Plan")
+    assert pump(qapp, card, lambda: general.plan_model.count() == 2)
+    assert general.url_widget.isHidden()
+    assert general.response_tokens_widget.isHidden()
+    assert general.cloud_widget.isHidden()
+    assert general.custom_model_widget.isHidden()
+    assert not general.plan_widget.isHidden()
+    assert general.plan_model.currentIndex() == -1
+    assert general.plan_model.itemText(1) == "First"
+    assert general.plan_model.itemData(1) == "model-a"
+    general.plan_model.setCurrentIndex(1)
+    general._save()
+    from core.lane_preferences import get_lane_model
+    saved = persistence.load()
+    assert get_lane_model(saved, PLAN) == "model-a"
+    assert saved["cloud_credentials"] == {
+        "openai": {"default_model": "paid-model"},
+        "openrouter": {"default_model": "router-model"},
+    }
+    from ui.settings.general_tab import GeneralTab
+    reopened = GeneralTab(agent, COLORS)
+    assert reopened.backend_combo.currentText() == "ChatGPT Plan"
+    assert reopened._backend_name() == PLAN

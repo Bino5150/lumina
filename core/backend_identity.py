@@ -17,7 +17,7 @@ Foundational law (frozen by 01A / 01B):
   A backend lane is the registry key Lumina dispatches through ("openai",
   "anthropic", ...). It is NOT a model id and NOT a provider family. The
   persisted keys "openai" and "anthropic" keep their existing meaning: the
-  API-key backends. A future ChatGPT-plan lane is a SIBLING lane
+  API-key backends. The ChatGPT-plan lane is a SIBLING lane
   ("openai_chatgpt_plan") that shares a provider family with "openai" but
   shares NOTHING else -- not credentials, not quota, not cost, not
   transport, not preference slots.
@@ -41,13 +41,12 @@ What lives here:
     a new lane cannot be added without declaring its fuel.
   - fuel_crossing_admitted(): the one default-deny policy for "may an
     operation that began on fuel A be served by fuel B".
-  - operation_refusal(): per-lane admitted operation kinds. Subscription
-    lanes admit NOTHING until a later slice proves a capability live.
+  - operation_refusal(): per-lane admitted operation kinds. ChatGPT Plan
+    admits foreground chat only; other subscription operations remain denied.
   - Refusal helpers used by the agent dispatch seam and subagent spawning.
 
 What does NOT live here: any OAuth/session/token code, any request
-translation, any network, any preference I/O. 01B pours the slab; the
-plumbing (session manager, wire contract) lands in later slices.
+translation, any network, any preference I/O.
 
 Claude subscription ("claude plan") decision, recorded: there is NO lane,
 NO descriptor, NO constant and NO placeholder class for it anywhere. A
@@ -298,8 +297,8 @@ _DESCRIPTORS = (
     _legacy("gemini", Transport.GENERATE_CONTENT_API, *_METERED),
     _legacy("kimi", _CC, *_METERED),
     _legacy("qwen", _CC, *_METERED),
-    # RESERVED -- schema/design only in 01B. Sibling of "openai" in provider
-    # family only. Not constructible, not selectable, admits no operation.
+    # 01D-B foreground plan lane. Sibling of "openai" in provider family
+    # only; auth source, quota, cost, transport and preferences stay separate.
     LaneDescriptor(
         lane=OPENAI_CHATGPT_PLAN_LANE,
         provider_family="openai",
@@ -308,8 +307,8 @@ _DESCRIPTORS = (
         quota_class=QuotaClass.CHATGPT_PLAN_OR_CREDITS,
         cost_class=CostClass.UNKNOWN_DEBIT,
         local=False,
-        constructible=False,
-        admitted_operations=frozenset(),
+        constructible=True,
+        admitted_operations=frozenset({OperationKind.FOREGROUND_CHAT}),
     ),
 )
 

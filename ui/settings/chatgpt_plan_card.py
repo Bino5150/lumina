@@ -1,21 +1,11 @@
-"""
-SUBSCRIPTION-PLAN-BACKENDS-01C -- Settings surface for Sign in with ChatGPT.
+"""ChatGPT Plan account custody controls for the backend-specific surface.
 
-Mounted as a self-contained section of the General page (below Save, with
-its own controls): connecting a ChatGPT account is session custody, not
-backend selection, and nothing here takes part in General's Save. The `openai_chatgpt_plan`
-lane stays unselectable (General's selector never lists it) and admits no
-operation until a later slice earns it, so this page says exactly that and
-claims nothing else -- no model picker, no usage meter, no "ready to chat".
-
-Every session-manager call runs on a worker thread (sign-in waits on the
-browser; refresh/disconnect do network I/O); results come back through a
-queued Qt signal as sanitized DTOs. The page never receives a token, code,
-URL or identity claim -- only state, plan permission and a display label.
+Session-manager calls run off the Qt main thread. The browser start code is
+held only for the pending authorization attempt and copied on owner click.
 """
 import threading
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import QApplication, QComboBox, QHBoxLayout, QVBoxLayout, QWidget
 
 from ._widgets import _btn, _lbl, _sec
@@ -31,12 +21,13 @@ _STATE_TEXT = {
     "local_disconnected_remote_unconfirmed": "Signed out on this computer",
     "corrupt_session": "The saved ChatGPT connection could not be read safely",
 }
-_SCOPE_NOTE = ("Signing in stores a ChatGPT session on this computer only. Using your "
-               "ChatGPT plan for chat is not available in this version of Lumina yet.")
+_SCOPE_NOTE = ("ChatGPT Plan chat uses this account's eligible plan allowance or enabled "
+               "ChatGPT credits. It adds no new allowance. Check ChatGPT Settings → Usage.")
 
 
 class ChatGPTPlanCard(QWidget):
     _worker_done = Signal(object)
+    account_changed = Signal(object)
 
     def __init__(self, agent=None, c: dict = None, parent=None, manager=None):
         super().__init__(parent)
@@ -108,10 +99,22 @@ class ChatGPTPlanCard(QWidget):
         self.session_label = _lbl("", c)
         self.message_label = _lbl("", c)
         self.code_label = _lbl("", c)
+        self.code_value_label = _lbl("", c)
+        self.code_value_label.setStyleSheet("color:#FFFFFF;font-weight:700;font-size:16px;")
+        self.copy_btn = _btn("⧉ Copy", c)
+        self.copy_btn.clicked.connect(self._copy_code)
+        self.copy_feedback_label = _lbl("", c)
         self.message_label.setWordWrap(True)
         for w in (self.account_label, self.permission_label, self.session_label,
-                  self.code_label, self.message_label):
+                  self.code_label):
             layout.addWidget(w)
+        code_row = QHBoxLayout()
+        code_row.addWidget(self.code_value_label)
+        code_row.addWidget(self.copy_btn)
+        code_row.addWidget(self.copy_feedback_label)
+        code_row.addStretch()
+        layout.addLayout(code_row)
+        layout.addWidget(self.message_label)
 
         row = QHBoxLayout()
         self.continue_btn = _btn("Continue with ChatGPT", c, accent=True)
@@ -120,7 +123,7 @@ class ChatGPTPlanCard(QWidget):
         self.add_btn = _btn("Add another account", c)
         self.cancel_btn = _btn("Cancel sign-in", c)
         self.confirm_btn = _btn("Confirm this account", c, accent=True)
-        self.disconnect_btn = _btn("Disconnect", c, danger=True)
+        self.disconnect_btn = _btn("Unlink Account", c, danger=True)
         for b in (self.continue_btn, self.reconnect_btn, self.enable_btn, self.add_btn,
                   self.cancel_btn, self.confirm_btn, self.disconnect_btn):
             row.addWidget(b)
@@ -167,6 +170,14 @@ class ChatGPTPlanCard(QWidget):
         self._pending = None
         self.refresh()
 
+    def _copy_code(self) -> None:
+        pending = self._pending
+        if pending is None or not pending.start_code or not self.copy_btn.isVisible():
+            return
+        QApplication.clipboard().setText(pending.start_code)
+        self.copy_feedback_label.setText("Copied")
+        QTimer.singleShot(1800, lambda: self.copy_feedback_label.setText(""))
+
     def _on_account_picked(self, index: int) -> None:
         if self._busy or index < 0 or index >= len(self._profiles):
             return
@@ -176,6 +187,7 @@ class ChatGPTPlanCard(QWidget):
 
     def _on_worker_done(self, payload) -> None:
         action, (kind, value), status, profiles = payload
+        previous_profile = None if self._status is None else self._status.profile_id
         if action != "authorizing":
             self._busy = False
         if status is not None:
@@ -196,12 +208,18 @@ class ChatGPTPlanCard(QWidget):
             self.message_label.setText("Connected to ChatGPT.")
         elif action == "disconnect" and value is not None:
             self.message_label.setText(
-                "Disconnected." if value.remote_revocation_confirmed is not False else
-                "Remote disconnect could not be confirmed. Local credentials were removed; "
-                "you can also disconnect Lumina in ChatGPT Settings.")
+                "Unlinked locally; remote revocation confirmed."
+                if value.remote_revocation_confirmed is True else
+                "Unlinked locally; remote revocation could not be confirmed. "
+                "You can also disconnect Lumina in ChatGPT Settings."
+                if value.remote_revocation_confirmed is False else
+                "Unlinked locally; there was no remote grant to revoke.")
         elif action in ("refresh", "select"):
             self.message_label.setText(status.message if status is not None and status.message else "")
         self._render()
+        current_profile = None if self._status is None else self._status.profile_id
+        if current_profile != previous_profile:
+            self.account_changed.emit(current_profile)
 
     def _render(self) -> None:
         status = self._status
@@ -219,10 +237,12 @@ class ChatGPTPlanCard(QWidget):
         perm = None if status is None else status.plan_permission.value
         self.permission_label.setText(
             {"granted": "Plan permission: Enabled", "not_granted": "Plan permission: Not enabled"}.get(perm, ""))
-        self.code_label.setText(
-            "Enter this one-time code in your browser: " + self._pending.start_code
-            if authorizing and self._pending is not None and self._pending.start_code
-            and (status is None or status.profile_id is not None or not status.account_display) else "")
+        show_code = bool(authorizing and self._pending is not None and self._pending.start_code)
+        self.code_label.setText("ONE-TIME CODE — enter this in your browser" if show_code else "")
+        self.code_value_label.setText(self._pending.start_code if show_code else "")
+        self.copy_btn.setVisible(show_code)
+        if not show_code:
+            self.copy_feedback_label.setText("")
 
         self.account_combo.blockSignals(True)
         self.account_combo.clear()

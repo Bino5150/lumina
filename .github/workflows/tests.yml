@@ -125,10 +125,9 @@ jobs:
       - name: Run Qt-bound Palace promotion owner-approval guards (blocking)
         run: python -m pytest tests/test_palace_guard_01b4_owner_promotion_qt.py -v -rs -m "not castle_walls_evidence"
 
-      # SUBSCRIPTION-PLAN-BACKENDS-01C -- the ChatGPT sign-in card in Settings:
-      # mounted outside General's backend selector and Save, a READY session
-      # never makes the plan lane selectable, only sanitized DTO text is shown,
-      # and every session call runs off the Qt main thread. Same job, same
-      # pinned PySide6 (plus the two 01C auth pins), fail-never-skip.
+      # SUBSCRIPTION-PLAN-BACKENDS-01C/01D-B -- ChatGPT account custody and
+      # the backend-specific model controls in Settings. The account card
+      # remains outside General's Save, and session calls run off the Qt
+      # main thread. Same pinned PySide6 and fail-never-skip contract.
       - name: Run Qt-bound ChatGPT sign-in settings guards (blocking)
         run: python -m pytest tests/test_chatgpt_auth_01c_settings_qt.py tests/test_chatgpt_auth_01c_r2_qt.py -v -rs -m "not castle_walls_evidence"

@@ -40,7 +40,12 @@ def test_existing_account_never_hides_new_start_code(qapp, tmp_path, reregister)
         assert pump(qapp, card, lambda: launched and card._pending is not None
                     and card._status is not None and card._status.state is SessionState.AUTHORIZING)
         code = card._pending.start_code
-        assert code and code in card.code_label.text()
+        assert code and card.code_value_label.text() == code
+        assert "ONE-TIME CODE" in card.code_label.text()
+        assert "#FFFFFF" in card.code_value_label.styleSheet()
+        assert not card.copy_btn.isHidden()
+        card.copy_btn.click()
+        assert qapp.clipboard().text() == code
         assert card.account_label.text().startswith("Connected account:")
         assert card.confirm_btn.isHidden()
         before = len(doc_of(manager).profiles)

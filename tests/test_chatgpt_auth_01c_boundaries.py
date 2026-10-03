@@ -323,16 +323,15 @@ def test_tripwire_instrument_is_live(fake, paid_keys_and_tripwire):
     assert paid_keys_and_tripwire.foreign_requests() == ["https://api.openai.com/v1/responses"]
 
 
-def test_ready_session_does_not_make_the_plan_lane_constructible_or_selectable(tmp_path, fake, clock):
+def test_ready_session_and_01d_lane_keep_distinct_authority(tmp_path, fake, clock):
     m = ready_store(tmp_path, fake, clock)
     assert m.get_session_state().state is SessionState.READY
-    assert PLAN not in loader.BACKENDS
-    assert bi.LANES[PLAN].constructible is False
-    assert not bi.LANES[PLAN].admitted_operations
-    with pytest.raises(ReservedBackendLaneError):
-        loader.get_llm_backend(PLAN)
+    assert PLAN in loader.BACKENDS
+    assert bi.LANES[PLAN].constructible is True
+    assert bi.LANES[PLAN].admitted_operations == frozenset({bi.OperationKind.FOREGROUND_CHAT})
+    assert loader.get_llm_backend(PLAN).name == PLAN
     src = open(os.path.join(ROOT, "ui", "settings", "general_tab.py"), encoding="utf-8").read()
-    assert PLAN not in src and "chatgpt" not in src.lower()
+    assert PLAN in src
 
 
 def test_access_grant_is_bearer_material_for_the_plan_lane_only(tmp_path, fake, clock):
@@ -418,9 +417,7 @@ def _imports_of(path):
     return mods
 
 
-def test_only_the_settings_card_consumes_the_session_manager_in_01c():
-    """01D will add the plan transport; until then nothing else in product
-    code may obtain a ChatGPT bearer token."""
+def test_only_settings_card_and_plan_backend_consume_session_manager():
     users = []
     for top in ("core", "ui", "tools", "comms"):
         for dirpath, _dirs, files in os.walk(os.path.join(ROOT, top)):
@@ -432,7 +429,8 @@ def test_only_the_settings_card_consumes_the_session_manager_in_01c():
                     if any(m == "core.chatgpt_auth" or m.startswith("core.chatgpt_auth.")
                            for m in _imports_of(path)):
                         users.append(os.path.relpath(path, ROOT))
-    assert sorted(users) == ["ui/settings/chatgpt_plan_card.py"]
+    assert sorted(users) == ["core/backends/openai_chatgpt_plan.py",
+                             "ui/settings/chatgpt_plan_card.py"]
 
 
 def test_runtime_auth_http_goes_only_to_the_issuer(fake):

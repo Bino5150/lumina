@@ -140,6 +140,14 @@ def _first_utility_reasoning_field(message: dict) -> str:
 
 class BaseLLMBackend(ABC):
 
+    def supports_tool_work(self) -> bool:
+        """Whether foreground turns can use product and completion-gate tools.
+
+        Existing backends retain their established tool loop. A backend may
+        opt out only when its transport cannot offer tools in this slice.
+        """
+        return True
+
     # Endpoint ownership contract.  Provider backends are fixed by default;
     # only explicitly self-hosted/configurable subclasses opt in below.  The
     # guarded property makes that classification load-bearing at the request

@@ -107,14 +107,13 @@ def test_A_openai_and_anthropic_keep_their_existing_meaning():
     assert anthropic.transport is bi.Transport.MESSAGES_API
 
 
-def test_A_loader_registry_is_exactly_the_pre_01b_set():
-    """The persisted registry keys are unchanged: no rename, no addition, no
-    removal -- and nothing sibling-shaped crept in."""
+def test_A_loader_registry_retains_legacy_set_plus_01d_plan():
+    """01D adds exactly one fuel-isolated lane to the 01B legacy set."""
     assert set(loader.BACKENDS) == {
         "lmstudio", "ollama", "llamacpp", "vllm", "openrouter", "deepseek", "groq",
-        "openai", "anthropic", "gemini", "kimi", "qwen", "custom", "omniroute",
+        "openai", "openai_chatgpt_plan", "anthropic", "gemini", "kimi", "qwen", "custom", "omniroute",
     }
-    assert PLAN not in loader.BACKENDS
+    assert loader.BACKENDS[PLAN].name == PLAN
 
 
 def test_A_constructing_legacy_lanes_still_works_and_carries_identity(monkeypatch):
@@ -240,7 +239,9 @@ def test_registry_parity_every_backend_is_classified_and_constructible_matches()
         assert cls.name == descriptor.lane == name
         assert descriptor.quota_class is not QuotaClass.UNKNOWN
         assert descriptor.cost_class is not None
-        assert descriptor.admitted_operations == frozenset(OperationKind)
+        expected = (frozenset({OperationKind.FOREGROUND_CHAT}) if name == PLAN
+                    else frozenset(OperationKind))
+        assert descriptor.admitted_operations == expected
 
 
 def test_registry_is_read_only():
@@ -271,56 +272,42 @@ def test_lane_descriptor_normalizes_and_rejects_non_strings():
 
 
 # ---------------------------------------------------------------------------
-# Reserved plan lane: identity vocabulary exists, construction cannot
+# Plan lane: construction is separate from the API-key sibling
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("spelling", [PLAN, PLAN.upper(), "OpenAI_ChatGPT_Plan"])
-def test_reserved_lane_refuses_construction_in_every_spelling(spelling, monkeypatch):
+def test_plan_lane_constructs_without_paid_fuel_in_every_spelling(spelling, monkeypatch):
     # Populate every paid credential: a fall-through would have something to use.
     monkeypatch.setattr(config, "OPENAI_API_KEY", "sk-" + "d" * 24)
-    with pytest.raises(ReservedBackendLaneError):
-        loader.get_llm_backend(spelling)
-    with pytest.raises(ReservedBackendLaneError):
-        loader.get_llm_backend(spelling, api_key="sk-" + "e" * 24)
-    with pytest.raises(ReservedBackendLaneError):
-        loader.get_llm_backend(spelling, model="gpt-whatever")
+    assert type(loader.get_llm_backend(spelling)).__name__ == "ChatGPTPlanBackend"
+    assert type(loader.get_llm_backend(spelling, api_key="sk-" + "e" * 24)).__name__ == "ChatGPTPlanBackend"
+    assert loader.get_llm_backend(spelling, model="gpt-whatever").get_model() == "gpt-whatever"
 
 
 def test_reserved_error_is_a_valueerror_so_existing_handlers_treat_it_as_failure():
     assert issubclass(ReservedBackendLaneError, ValueError)
 
 
-def test_selected_reserved_lane_does_not_fall_through_to_another_backend(monkeypatch):
-    """config.LLM_BACKEND pointing at the reserved lane (stale/hand-edited
-    prefs) must fail construction, not land on llamacpp or openai."""
+def test_selected_plan_lane_does_not_fall_through_to_another_backend(monkeypatch):
     monkeypatch.setattr(config, "LLM_BACKEND", PLAN)
     monkeypatch.setattr(config, "OPENAI_API_KEY", "sk-" + "f" * 24)
-    with pytest.raises(ReservedBackendLaneError):
-        loader.get_llm_backend()
-    with pytest.raises(ReservedBackendLaneError):
-        loader.get_llm_backend(name=None)
-    with pytest.raises(ReservedBackendLaneError):
-        loader.get_llm_backend(name="")
+    for name in (None, ""):
+        assert type(loader.get_llm_backend(name=name)).__name__ == "ChatGPTPlanBackend"
 
 
-def test_reserved_lane_has_no_endpoint_or_configurability():
-    for fn in (loader.get_backend_endpoint, loader.endpoint_is_configurable):
-        with pytest.raises(ValueError):
-            fn(PLAN)
+def test_plan_lane_has_fixed_endpoint():
+    assert loader.get_backend_endpoint(PLAN) == "https://api.openai.com/v1"
+    assert loader.endpoint_is_configurable(PLAN) is False
 
 
-def test_reserved_lane_is_not_selectable_in_settings():
-    """The Settings selector is a literal list: the plan lane must not be in
-    it, or the owner could select a backend that cannot function."""
-    for rel in ("ui/settings/general_tab.py", "ui/settings/tts_tab.py"):
-        src = open(os.path.join(ROOT, rel), encoding="utf-8").read()
-        assert PLAN not in src, rel
-        assert "chatgpt" not in src.lower(), rel
+def test_plan_lane_is_only_in_general_backend_settings():
+    general = open(os.path.join(ROOT, "ui/settings/general_tab.py"), encoding="utf-8").read()
+    tts = open(os.path.join(ROOT, "ui/settings/tts_tab.py"), encoding="utf-8").read()
+    assert PLAN in general
+    assert PLAN not in tts
 
 
-def test_no_class_anywhere_in_backends_declares_the_reserved_or_claude_plan_lane():
-    """A reserved identity must have no class that could be built by accident.
-    The Claude-plan lane must not exist at all."""
+def test_only_chatgpt_plan_class_declares_plan_lane_and_no_claude_plan():
     import importlib
     import pkgutil
     import core.backends as pkg
@@ -331,7 +318,7 @@ def test_no_class_anywhere_in_backends_declares_the_reserved_or_claude_plan_lane
         for obj in vars(module).values():
             if isinstance(obj, type) and issubclass(obj, BaseLLMBackend):
                 declared.add(getattr(obj, "name", None))
-    assert PLAN not in declared
+    assert PLAN in declared
     assert "anthropic_claude_plan" not in declared
 
 
@@ -638,12 +625,13 @@ def test_model_equality_never_implies_lane_equality_in_the_policy():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("op", list(OperationKind))
-def test_plan_lane_admits_no_operation_in_01b(op):
-    assert bi.operation_refusal(PLAN, op) is not None
-    assert bi.operation_refusal(identity_for_lane(PLAN), op) is not None
+def test_plan_lane_admits_only_foreground_in_01d(op):
+    expected = op is not OperationKind.FOREGROUND_CHAT
+    assert (bi.operation_refusal(PLAN, op) is not None) is expected
+    assert (bi.operation_refusal(identity_for_lane(PLAN), op) is not None) is expected
 
 
-@pytest.mark.parametrize("lane", sorted(set(loader.BACKENDS)))
+@pytest.mark.parametrize("lane", sorted(set(loader.BACKENDS) - {PLAN}))
 @pytest.mark.parametrize("op", list(OperationKind))
 def test_every_legacy_lane_admits_every_operation(lane, op):
     assert bi.operation_refusal(lane, op) is None
@@ -652,6 +640,9 @@ def test_every_legacy_lane_admits_every_operation(lane, op):
 def test_operation_refusal_text_is_bounded_and_credential_free():
     for op in OperationKind:
         text = bi.operation_refusal(PLAN, op)
+        if op is OperationKind.FOREGROUND_CHAT:
+            assert text is None
+            continue
         assert text and len(text) < 300
         assert SECRET_VALUE_RE.search(text) is None
         assert "sk-" not in text
@@ -781,7 +772,7 @@ def test_F_router_ledger_text_is_redacted_and_bounded_for_denials():
 
 def test_F_placement_is_registry_derived_and_identical_to_pre_01b_for_every_lane():
     from core import vision_lane
-    for name in loader.BACKENDS:
+    for name in set(loader.BACKENDS) - {PLAN}:
         assert bi.is_local_placement(name) == (name not in _PRE_01B_CLOUD_SET), name
     assert not hasattr(vision_lane, "_CLOUD_LLM_BACKENDS")
 
@@ -1022,7 +1013,7 @@ def test_D_dispatch_guard_matrix():
     assert bi.dispatch_lane_refusal(api, api.with_model("other"), chat) is None   # model != lane
     assert bi.dispatch_lane_refusal(plan, api, chat) is not None
     assert bi.dispatch_lane_refusal(api, plan, chat) is not None
-    assert bi.dispatch_lane_refusal(plan, plan, chat) is not None        # plan admits nothing in 01B
+    assert bi.dispatch_lane_refusal(plan, plan, chat) is None            # 01D foreground only
 
 
 def test_D_dispatch_guard_with_the_plan_lane_enabled_still_forbids_leaving_it(monkeypatch):
@@ -1124,15 +1115,12 @@ def test_plan_identity_never_reads_api_key_state(monkeypatch):
     bi.subagent_lane_refusal(PLAN, "openai")
     lane_preferences.set_lane_model({}, PLAN, "m")
     stub.complete_utility("p")
-    with pytest.raises(ReservedBackendLaneError):
-        loader.get_llm_backend(PLAN)
+    assert type(loader.get_llm_backend(PLAN)).__name__ == "ChatGPTPlanBackend"
     assert touched == []
 
 
 def test_openai_api_key_is_not_inherited_by_provider_family():
-    """provider_family == "openai" is not a credential grant: the API key is
-    read by OpenAIBackend only, which is constructed only for the "openai"
-    lane. No other class in core/ references OPENAI_API_KEY."""
+    """The API key stays in the paid OpenAI transport only."""
     offenders = []
     for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "core")):
         for fname in files:
