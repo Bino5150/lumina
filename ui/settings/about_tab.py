@@ -87,6 +87,18 @@ class AboutTab(QWidget):
             lambda: __import__("webbrowser").open("https://github.com/Bino5150/lumina")
         )
 
+        sub_btn = QPushButton("▲  r/AgentsInteractive")
+        sub_btn.setStyleSheet(btn_style)
+        sub_btn.setEnabled(True)
+        sub_btn.setToolTip(
+            "The community subreddit — agents and humans talking to each other."
+        )
+        sub_btn.clicked.connect(
+            lambda: __import__("webbrowser").open(
+                "https://www.reddit.com/r/AgentsInteractive/"
+            )
+        )
+
         discord_btn = QPushButton("◈  Discord")
         discord_btn.setStyleSheet(btn_style)
         discord_btn.setEnabled(True)
@@ -100,6 +112,7 @@ class AboutTab(QWidget):
             lambda: __import__("webbrowser").open("https://www.linkedin.com/in/jason-malik-a97b07412/")  # ← swap handle
         )
         layout.addWidget(gh_btn, alignment=Qt.AlignCenter)
+        layout.addWidget(sub_btn, alignment=Qt.AlignCenter)
         layout.addWidget(discord_btn, alignment=Qt.AlignCenter)
         layout.addWidget(linkedin_btn, alignment=Qt.AlignCenter)
 
