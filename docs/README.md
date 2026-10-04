@@ -34,6 +34,7 @@ for the full model.
 - [Tools Reference](tools-reference.md) — the full built-in tool catalog
 - [Operator Commands](operator-commands.md) — the `/` slash-command cockpit
 - [Troubleshooting](troubleshooting.md) — fresh-install notes, common errors, logs
+- [Attribution](attribution.md) — canonical co-author identity for each seat, and the correction record for historical attribution errors
 
 ## What "current" means here
 
