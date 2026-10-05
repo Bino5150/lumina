@@ -339,6 +339,7 @@ def test_anthropic_utility_request_remains_structurally_valid(monkeypatch):
     assert result == "ok"
     for field in LOCAL_ONLY_UTILITY_FIELDS:
         assert field not in payloads[0]
+    assert "temperature" not in payloads[0]
     assert payloads[0]["max_tokens"] == 100
     assert [m["role"] for m in payloads[0]["messages"]] == ["user", "assistant"]
 

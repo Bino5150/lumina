@@ -31,6 +31,7 @@ Inherits BaseLLMBackend directly and implements the contract natively.
 """
 
 import json
+import re
 import requests
 from typing import Optional
 
@@ -89,6 +90,68 @@ _REASONING_MODELS = {
     "claude-sonnet-5": _SONNET_5_CAPS,
     "claude-sonnet-4-6": _SONNET_4_6_CAPS,
 }
+
+# Sampling support is independent of reasoning, vision, tools, and model discovery.
+# Anthropic documents non-default temperature rejection for these Claude families.
+_TEMPERATURE_FORBIDDEN_PREFIXES = (
+    "claude-opus-4-7",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+)
+
+
+def _is_temperature_rejection(resp) -> bool:
+    """Recognize only a field-level Anthropic rejection, never a bad value/type.
+
+    Anthropic's 400 envelope has no reliable ``param`` member. Require its
+    invalid_request_error type and explicit deprecation, unsupported-field,
+    or default-only wording about temperature instead of matching any 400
+    that happens to mention the word.
+    """
+    if getattr(resp, "status_code", None) != 400:
+        return False
+    try:
+        error = resp.json().get("error")
+    except Exception:
+        return False
+    if not isinstance(error, dict) or error.get("type") != "invalid_request_error":
+        return False
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    return any(re.search(pattern, message, re.IGNORECASE) for pattern in (
+        r"\btemperature\s+(?:is|has been)\s+deprecated\b",
+        r"\btemperature\s+(?:is|was)\s+(?:not supported|unsupported)\b",
+        r"\bsetting\s+temperature\s+to\s+a\s+non[- ]default\s+value\s+"
+        r"(?:is|was)\s+(?:not supported|unsupported)\b",
+        r"\btemperature\b.{0,100}\bonly\s+(?:the\s+)?default"
+        r"(?:\s+\([^)]*\))?\s+value\s+is\s+supported\b",
+    ))
+
+
+def _record_temperature_mismatch(model) -> None:
+    """Report stale capability metadata without affecting the request."""
+    print(
+        f"[Anthropic CAPABILITY MISMATCH] model={model!r} rejected optional "
+        "'temperature'; retried once without it -- capability metadata is stale.",
+        flush=True,
+    )
+    try:
+        from core.flight_recorder import record_machine_event
+        record_machine_event(
+            "backend.capability_mismatch",
+            severity="warning",
+            backend="anthropic",
+            model=model if isinstance(model, str) else None,
+            fields={
+                "parameter": "temperature",
+                "action": "retried_once_without_parameter",
+                "capability_metadata": "stale",
+            },
+        )
+    except Exception:
+        pass
 
 
 def classify_anthropic_error(status_code, raw_body: str) -> dict:
@@ -151,6 +214,23 @@ class AnthropicBackend(BaseLLMBackend):
     name = "anthropic"
     display_name = "Anthropic (Claude)"
     default_url = API_BASE  # not user-editable; kept for UI consistency with other backends
+
+    def _accepts_temperature(self, model: Optional[str]) -> bool:
+        """Keep unknown models capable until the provider proves otherwise."""
+        return not (model or "").startswith(_TEMPERATURE_FORBIDDEN_PREFIXES)
+
+    def _post_messages(self, payload: dict, *, stream: bool = False):
+        """Retry once only when Anthropic rejects this optional field."""
+        extra = {"stream": True} if stream else {}
+        resp = requests.post(API_BASE, headers=self.headers, json=payload,
+                             timeout=self.timeout, **extra)
+        if "temperature" not in payload or not _is_temperature_rejection(resp):
+            return resp
+        resp.close()
+        _record_temperature_mismatch(payload.get("model"))
+        retry_payload = {k: v for k, v in payload.items() if k != "temperature"}
+        return requests.post(API_BASE, headers=self.headers, json=retry_payload,
+                             timeout=self.timeout, **extra)
 
     def __init__(self, base_url: str = None, api_key: Optional[str] = None):
         # GH-ISSUE-03-REPAIR-01: routed through the inherited fixed-provider
@@ -551,10 +631,11 @@ class AnthropicBackend(BaseLLMBackend):
         payload = {
             "model": self.default_model,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "messages": self._translate_messages(convo),
             "stream": stream,
         }
+        if self._accepts_temperature(self.default_model):
+            payload["temperature"] = temperature
         if system_str:
             payload["system"] = system_str
         translated_tools = self._translate_tools(tools)
@@ -597,7 +678,7 @@ class AnthropicBackend(BaseLLMBackend):
         self.apply_reasoning(payload, effective_effort, model=self.default_model)
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
-            resp = requests.post(API_BASE, headers=self.headers, json=payload, timeout=self.timeout)
+            resp = self._post_messages(payload)
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.ConnectionError:
@@ -693,9 +774,10 @@ class AnthropicBackend(BaseLLMBackend):
         payload = {
             "model": self.default_model,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "stream": True,
         }
+        if self._accepts_temperature(self.default_model):
+            payload["temperature"] = temperature
         system_str, convo = self._split_system(messages)
         self._reject_if_vision_unsupported(convo)
         payload["messages"] = self._translate_messages(convo)
@@ -708,9 +790,7 @@ class AnthropicBackend(BaseLLMBackend):
 
         resp = None  # BACKEND-ERROR-01: bound-checkable for the HTTPError handler
         try:
-            resp = requests.post(
-                API_BASE, headers=self.headers, json=payload, timeout=self.timeout, stream=True
-            )
+            resp = self._post_messages(payload, stream=True)
             resp.raise_for_status()
         except requests.exceptions.ConnectionError:
             raise ConnectionError("Anthropic API not reachable.")
