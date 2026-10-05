@@ -1412,6 +1412,26 @@ def _tool_result_summary(name: str, result) -> str:
     return flight_recorder.bounded_repr(result)
 
 
+def _chrome_action_receipt_success(name: str, result) -> bool:
+    """A returned string is not proof that a Chrome action succeeded."""
+    try:
+        receipt = json.loads(result)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(receipt, dict) or receipt.get("ok") is not True \
+            or receipt.get("status") != "browser_local_effect_observed" \
+            or not isinstance(receipt.get("operation_id"), str) \
+            or not re.fullmatch(r"[0-9a-f]{32}:[0-9a-f]{32}", receipt["operation_id"]) \
+            or type(receipt.get("tab_id")) is not int \
+            or not isinstance(receipt.get("observed_url"), str):
+        return False
+    if name == "chrome_follow_link":
+        return (receipt.get("load_confirmed") is True
+                and isinstance(receipt.get("verified_document_id"), str)
+                and bool(receipt["verified_document_id"]))
+    return True
+
+
 def _fr_model(agent, event_type: str, text: Optional[str], *, turn_id=None,
                chat_id=None, severity: str = "info", fields: dict = None, **kwargs) -> None:
     """Fail-safe model-expression recording -- same posture as _fr_machine()
@@ -1513,7 +1533,7 @@ def _tool_call_fields(batch_ordinal: int, call_ordinal: int, name: str, args) ->
     uses), a bounded/redacted args representation for human debugging, and
     a stable args hash (flight_recorder.hash_args()) for duplicate-call
     detection across a turn's whole tool-burst -- mission section 6/12."""
-    private_chrome_action = name in {"chrome_open_owner_url", "chrome_switch_tab"}
+    private_chrome_action = name in {"chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link"}
     return {
         "batch_ordinal": batch_ordinal,
         "call_ordinal": call_ordinal,
@@ -3122,11 +3142,8 @@ class LuminaAgent:
                     print(f"[TOOL ERROR] {name}: {e}", flush=True)
                 _tool_duration = time.time() - _tool_start
                 _tool_success = not (isinstance(result, str) and result.startswith("[Tool error:"))
-                if name in {"chrome_open_owner_url", "chrome_switch_tab"}:
-                    try:
-                        _tool_success = json.loads(result).get("ok") is True
-                    except (TypeError, ValueError):
-                        _tool_success = False
+                if name in {"chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link"}:
+                    _tool_success = _chrome_action_receipt_success(name, result)
                 _fr_machine(self, "tool.result", turn_id=turn_id, chat_id=chat_id,
                             severity="info" if _tool_success else "warning",
                             fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,

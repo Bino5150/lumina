@@ -12,6 +12,8 @@ Google Chrome profile (see chrome_companion/ and core/chrome_companion_hub.py):
     chrome_get_links             bounded link list of one tab
     chrome_open_owner_url        one URL from this authenticated owner turn
     chrome_switch_tab            select an exact observed tab identity
+    chrome_follow_link           Stage 2 FINGER: open ONE link Lumina already
+                                 observed, on that exact document
 
 Deliberately NOT the Playwright lane: tools/browser.py keeps owning the
 clean, disposable, isolated browser, and no browser_* call is ever routed
@@ -49,7 +51,8 @@ CHROME_READ_TOOL_NAMES = frozenset({
     "chrome_status", "chrome_list_tabs", "chrome_get_active_tab",
     "chrome_get_url_title", "chrome_extract_visible_text", "chrome_get_links",
 })
-CHROME_ACTION_TOOL_NAMES = frozenset({"chrome_open_owner_url", "chrome_switch_tab"})
+CHROME_ACTION_TOOL_NAMES = frozenset({"chrome_open_owner_url", "chrome_switch_tab",
+                                      "chrome_follow_link"})
 CHROME_TOOL_NAMES = CHROME_READ_TOOL_NAMES | CHROME_ACTION_TOOL_NAMES
 
 PROVENANCE = {"owner": False, "trust": "external_untrusted", "source": "chrome_companion"}
@@ -93,13 +96,27 @@ def _action_failure(exc: CompanionError) -> str:
                         note="An action that may have reached Chrome is never retried automatically. " + NO_FALLBACK)
 
 
-def _action_result(result: dict) -> str:
-    return _observation(ok=result["status"] == "browser_local_effect_observed",
-                        operation_id=result["operation_id"], status=result["status"],
+def _action_result(response: dict, *, require_document: bool = False) -> str:
+    result = response["result"]
+    observed = response.get("observed") or {}
+    verified = result["status"] == "browser_local_effect_observed"
+    if require_document:
+        verified = (verified and result["load_confirmed"] is True
+                    and isinstance(observed.get("document_id"), str)
+                    and bool(observed["document_id"])
+                    and observed.get("url") == result.get("observed_url"))
+    status = result["status"] if verified or result["status"] != "browser_local_effect_observed" \
+        else "ambiguous_after_dispatch"
+    return _observation(ok=verified,
+                        operation_id=result["operation_id"], status=status,
                         tab_id=result["tab_id"], window_id=result["window_id"],
-                        observed_url=result["observed_url"],
-                        load_confirmed=result["load_confirmed"],
-                        note="A created or selected tab is a browser-local effect, not proof of a remote commit.")
+                        observed_url=result["observed_url"] if verified else None,
+                        load_confirmed=result["load_confirmed"] if verified else False,
+                        verified_document_id=observed.get("document_id") if verified else None,
+                        verified_origin=observed.get("origin") if verified else None,
+                        note="A created, selected, or navigated tab is a browser-local effect, not "
+                             "proof of a remote commit. observed_url is the URL actually read back "
+                             "from the browser, never the URL that was requested.")
 
 
 def _tab_id_arg(value, *, required: bool):
@@ -172,7 +189,7 @@ def register_chrome_companion_tools(registry, *, data_dir=None, hub=None, agent=
         info = hub.status()
         if info["connection"] is not None:
             try:
-                new_worker = info["connection"].get("extension_version") == "0.2.0"
+                new_worker = info["connection"].get("extension_version") in {"0.2.0", "0.3.0"}
                 response = hub.request("ping", args={"include_navigation": True} if new_worker else {},
                                        timeout_s=TAB_TIMEOUT_S)
                 info["round_trip"] = {"ok": True, "extension_version":
@@ -285,7 +302,7 @@ def register_chrome_companion_tools(registry, *, data_dir=None, hub=None, agent=
             try:
                 response = hub.request("open_owner_url", args={"url": owner_url},
                                        timeout_s=CONTENT_TIMEOUT_S)
-                return _action_result(response["result"])
+                return _action_result(response)
             except CompanionError as exc:
                 return _action_failure(exc)
 
@@ -300,7 +317,35 @@ def register_chrome_companion_tools(registry, *, data_dir=None, hub=None, agent=
                 response = hub.request("switch_tab", tab_id=tab_id_value,
                                        args={"window_id": window_id, "expected_url": expected_url},
                                        timeout_s=TAB_TIMEOUT_S)
-                return _action_result(response["result"])
+                return _action_result(response)
+            except CompanionError as exc:
+                return _action_failure(exc)
+
+        def chrome_follow_link(tab_id=None, window_id=None, document_id=None, text=None, href=None, **unknown):
+            # Stage 2 FINGER. The href is a CLAIM about a link Lumina already
+            # read on this exact document, never a destination to obey: the
+            # extension re-reads the live document and navigates only to what
+            # that document itself reports, only if it is the SOLE link with
+            # that exact text and destination, and only within its own origin.
+            try:
+                if unknown:
+                    raise CompanionError("invalid_args", "unknown follow_link argument")
+                tab_id_value = _tab_id_arg(tab_id, required=True)
+                if isinstance(window_id, bool) or not isinstance(window_id, int) or window_id < 0:
+                    raise CompanionError("invalid_args", "window_id must be a non-negative integer")
+                if not isinstance(document_id, str) or not document_id or len(document_id) > 128:
+                    raise CompanionError("invalid_args", "document_id must be a non-empty string")
+                if not isinstance(text, str) or len(text) > protocol.MAX_LINK_TEXT_CHARS:
+                    raise CompanionError("invalid_args", "text must be a bounded string")
+                if not isinstance(href, str) or not href or len(href) > protocol.MAX_LINK_URL_CHARS:
+                    raise CompanionError("invalid_args", "href must be a non-empty string")
+                if not policy.classify_url(href).readable:
+                    raise CompanionError("invalid_args", "href must be a readable HTTP(S) URL")
+                response = hub.request("follow_link", tab_id=tab_id_value,
+                                       args={"window_id": window_id, "document_id": document_id,
+                                             "text": text, "href": href},
+                                       timeout_s=CONTENT_TIMEOUT_S)
+                return _action_result(response, require_document=True)
             except CompanionError as exc:
                 return _action_failure(exc)
 
@@ -319,4 +364,21 @@ def register_chrome_companion_tools(registry, *, data_dir=None, hub=None, agent=
                 "window_id": {"type": "integer"},
                 "expected_url": {"type": "string"},
             }, "required": ["tab_id", "window_id", "expected_url"]})
+        registry.register(
+            "chrome_follow_link", chrome_follow_link,
+            "Open ONE link you already observed on that exact document (from chrome_get_links), "
+            "identified by its exact text and href, in Lumina's paired Chrome. The link must be "
+            "unique on the page and stay on the page's own origin. The href is checked against "
+            "the live page, never obeyed: a link that moved, vanished, or appears twice fails "
+            "without navigating anything. Requires the session Navigation Allow. Does not type, "
+            "fill forms, submit forms, or synthesize a click. A GET navigation or redirect may "
+            "still have server-side effects.",
+            {"type": "object", "properties": {
+                "tab_id": tab_arg,
+                "window_id": {"type": "integer"},
+                "document_id": {"type": "string",
+                    "description": "document_id from the chrome_get_links call that showed this link"},
+                "text": {"type": "string", "description": "That link's exact text, as returned by chrome_get_links"},
+                "href": {"type": "string", "description": "That link's exact href, as returned by chrome_get_links"},
+            }, "required": ["tab_id", "window_id", "document_id", "text", "href"]})
     return True

@@ -330,9 +330,14 @@ def test_owner_only_boundary_frozen():
     added later, by MEDIA-GENERATION-CONVERSATIONAL-RUNTIME-01 -- a real,
     deliberate expansion (the only two real-money tools in the registry),
     not drift; see core/tool_profiles.py's own comment on that addition.
-    Six Chrome read tools were added by BROWSER-COMPANION-01A and two
-    navigation tools by BC-01B-A. They reach Lumina's own Chrome profile,
-    so no non-owner path may ever hold them."""
+    Chrome read tools were added by BROWSER-COMPANION-01A, two
+    navigation tools by BC-01B-A, and one more navigation tool by
+    BROWSER-COMPANION STAGE 2 (FINGER) -- chrome_follow_link, which opens
+    a link Lumina already observed inside an owner-authorized origin. Same
+    reasoning as the two BC-01B-A actions it sits beside: it reaches
+    Lumina's own logged-in Chrome, so no non-owner path may ever hold it.
+    They reach Lumina's own Chrome profile, so no non-owner path may ever
+    hold them."""
     assert OWNER_ONLY_TOOLS == {
         "create_tool", "list_custom_tools", "delete_tool",
         "list_pending_tools", "show_pending_tool_source", "reject_pending_tool",
@@ -348,6 +353,7 @@ def test_owner_only_boundary_frozen():
         "chrome_status", "chrome_list_tabs", "chrome_get_active_tab",
         "chrome_get_url_title", "chrome_extract_visible_text", "chrome_get_links",
         "chrome_open_owner_url", "chrome_switch_tab",
+        "chrome_follow_link",
     }
     assert NEWLY_CLASSIFIED.isdisjoint(OWNER_ONLY_TOOLS)
 

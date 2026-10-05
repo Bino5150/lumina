@@ -122,7 +122,7 @@ _DISCONNECT_MESSAGES = {
     "uninstalled": "the owner uninstalled Chrome Companion",
 }
 
-ACTION_OPS = frozenset({"open_owner_url", "switch_tab"})
+ACTION_OPS = frozenset({"open_owner_url", "switch_tab", "follow_link"})
 
 
 class _Waiter:
@@ -165,6 +165,27 @@ class _Connection:
         self._send_lock = threading.Lock()
         self._in_flight: dict[str, _Waiter] = {}
         self._request_seq = 0  # last sequence number put on the wire
+        self._delivered_links: dict[int, tuple[str, set[tuple[str, str]]]] = {}
+
+    def record_delivered_links(self, tab_id: int, document_id: str, links: list[dict]) -> None:
+        """Record only a validated get_links answer accepted by this connection."""
+        with self._lock:
+            if self.closed:
+                return
+            old = self._delivered_links.get(tab_id)
+            pairs = old[1] if old is not None and old[0] == document_id else set()
+            pairs.update((link["text"], link["href"]) for link in links)
+            self._delivered_links[tab_id] = (document_id, pairs)
+
+    def has_delivered_link(self, tab_id: int, args: dict) -> bool:
+        if not isinstance(args, dict) or not isinstance(args.get("text"), str) \
+                or not isinstance(args.get("href"), str):
+            return False
+        with self._lock:
+            observed = self._delivered_links.get(tab_id)
+            return bool(not self.closed and observed
+                        and observed[0] == args.get("document_id")
+                        and (args.get("text"), args.get("href")) in observed[1])
 
     def send(self, message: dict) -> None:
         frame = protocol.encode_frame(message, protocol.MAX_TO_EXTENSION_BYTES)
@@ -675,8 +696,11 @@ class ChromeCompanionHub:
                     retired = self._retire_locked(conn, "unpaired")
                 self._finish_retirement(conn, "unpaired", retired)
                 raise CompanionError("unpaired", "Chrome Companion pairing is no longer active")
-            if conn.extension_version != "0.2.0":
-                raise CompanionError("unsupported_version", "reload the BC-01B-A Chrome extension")
+            supported = {"0.2.0", "0.3.0"} if op != "follow_link" else {"0.3.0"}
+            if conn.extension_version not in supported:
+                raise CompanionError("unsupported_version", "reload the Chrome Companion extension for this operation")
+            if op == "follow_link" and not conn.has_delivered_link(tab_id, args or {}):
+                raise CompanionError("target_not_found", "link was not delivered by get_links on this connection")
         started = time.monotonic()
         outcome, observed_origin, truncated = "error", None, None
         request_id = waiter = None
@@ -711,6 +735,9 @@ class ChromeCompanionHub:
             if op in ACTION_OPS and response["result"]["operation_id"] != f"{conn.connection_id}:{request_id}":
                 raise CompanionError("malformed_response", "Chrome returned the wrong operation identity")
             self._apply_policy(op, response)
+            if op == "get_links":
+                conn.record_delivered_links(response["tab_id"], response["observed"]["document_id"],
+                                            response["result"]["links"])
             outcome = "ok"
             return response
         except CompanionError as exc:
@@ -763,6 +790,11 @@ class ChromeCompanionHub:
             url = result["observed_url"]
             if url is not None and not policy.classify_url(url).readable:
                 raise CompanionError("restricted_surface", "Chrome returned a restricted action surface")
+            if op == "follow_link" and result["status"] == "browser_local_effect_observed":
+                observed = response["observed"]
+                if not result["load_confirmed"] or observed is None \
+                        or observed["url"] != url or not observed["document_id"]:
+                    raise CompanionError("malformed_response", "follow_link result lacks a verified document")
             if op == "switch_tab" and result["status"] == "browser_local_effect_observed" \
                     and (response["tab_id"] != result["tab_id"] or result["tab_id"] is None):
                 raise CompanionError("tab_mismatch", "Chrome switched a different tab")

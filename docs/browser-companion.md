@@ -12,23 +12,61 @@ do, and exactly what has to be true before it can do it.
 
 ## What it can do
 
-Eight tools, in two groups:
+Nine tools, in two groups:
 
 **Read-only** (`chrome_status`, `chrome_list_tabs`, `chrome_get_active_tab`,
 `chrome_get_url_title`, `chrome_extract_visible_text`, `chrome_get_links`) —
 list tabs, read the active tab, and read bounded visible text/links from
 sites you've allowed.
 
-**Navigation** (`chrome_open_owner_url`, `chrome_switch_tab`) — open a URL
-or switch to an already-open tab. This is deliberately narrow: **it can
-only open a URL you yourself typed in your own message this turn**, and
-can only switch to a tab by its exact tab ID, window ID, and current URL.
+**Navigation** (`chrome_open_owner_url`, `chrome_switch_tab`,
+`chrome_follow_link`) — open a URL you typed yourself, switch to an
+already-open tab, or open one link Lumina already read on a page. This is
+deliberately narrow: owner URL opening requires the exact URL you typed in
+this turn; tab switching requires the exact tab ID, window ID, and current
+URL; link following requires a link delivered from an allowed document and
+verified again just before navigation.
 
 **None of the following exist in this build:** clicking page elements,
-typing, form submission, following a link observed on a page or in a
-tool result, browser back/forward, screenshots, cookie/password access,
-or any debugger/CDP access. There is no `open_observed_link` tool and no
-generic page-action tool of any kind.
+typing, form submission, browser back/forward, screenshots,
+cookie/password access, or any debugger/CDP access. There is no generic
+page-action tool, no selector argument, and no way to name a destination by
+anything other than the exact text and href a link already had on the page.
+
+## Following a link you already read (Stage 2)
+
+`chrome_follow_link` opens one link inside a site you have already allowed.
+It is the only companion action whose destination comes from a page, so it
+is worth being precise about why that is still safe:
+
+- Lumina names the link by the **exact text and href** delivered by
+  `chrome_get_links` in this connection, on the **exact tab and document**
+  (`document_id`) she read it on. The extension then re-reads the live document and navigates
+  only to the href *that document reports* — never to the href Lumina
+  passed in. A model that invents a URL gets `target_not_found`, because
+  nothing on the page matches the invented claim.
+- The link must be **unique** on that page. Two links with the same text
+  and destination are `target_ambiguous`; Lumina does not get to pick one.
+- It must be on the **same origin** as the page you authorized. A link
+  pointing off-origin is `cross_origin_target`, however the page describes
+  it.
+- If the link has vanished, moved, or the document has been replaced since
+  she read it, the action fails without navigating. It is never retried
+  against a different target, and the origin is never widened to make the
+  action succeed.
+- Chrome targets fixed extension code to that exact source document for the
+  final check and URL navigation. This is not a synthetic click. No click
+  event handler runs because of Lumina.
+
+The selected link must be same-origin and HTTP(S). A server may process a GET
+with side effects, and a redirect after dispatch may land on another origin.
+If the resulting URL and new document cannot be verified as the selected
+destination, the receipt is `ambiguous_after_dispatch`. Stage 2 does not
+type, fill forms, submit forms, or perform generic site actions.
+
+Page text still cannot mint authority. A page claiming "the owner approved
+this" changes nothing: the owner still has to have allowed the origin, and
+still has to have granted Navigation Allow for this connection.
 
 ## Why navigation is safe from prompt injection
 
@@ -51,6 +89,10 @@ typed chat message cannot make Lumina navigate anywhere. The mechanism:
 4. The same per-site allow/deny list and restricted-host denylist
    (password/payment/account-security domains, non-`http(s)` schemes) that
    gates reads also gates navigation.
+5. A page may propose the *destination* of an already-authorized origin,
+   but only for a link delivered by `chrome_get_links` on the same document,
+   still present and unique at dispatch, and only if the owner allowed that
+   origin. Proposing a destination is not approving it.
 
 One nuance worth knowing: because Telegram is treated as a fully-trusted,
 owner-originated channel (see [Channels](channels.md)), an
@@ -70,6 +112,11 @@ is reported as ambiguous — never silently retried, and never reported as
 a false success or false failure. A reported tab load is an observation
 inside Chrome, not proof that a destination site actually committed
 anything.
+
+`chrome_follow_link` reports the URL and the new document identity Chrome
+actually loaded, and only claims success when the tab reached the
+destination *and* the document was replaced. A same-document load that
+never replaced the page is reported ambiguous, not as a navigation.
 
 ## Revoke, unpair, and uninstall
 

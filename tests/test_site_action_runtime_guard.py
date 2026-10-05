@@ -49,6 +49,7 @@ def scope(broker, agent, protected=True, event="event"):
     "http_request", "reddit_api", "github_create_issue", "write_file", "get_time",
     "chrome_status", "chrome_list_tabs", "chrome_get_active_tab", "chrome_get_url_title",
     "chrome_extract_visible_text", "chrome_get_links", "chrome_open_owner_url", "chrome_switch_tab",
+    "chrome_follow_link",
     "unknown_future_mutator",
 ])
 def test_N25_protected_registry_never_reaches_an_alternate_or_unknown_route(broker, tmp_path, route):

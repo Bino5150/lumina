@@ -21,12 +21,12 @@ PACKAGE = ROOT / "chrome_companion" / "site_actions"
 FILES = {"__init__.py", "model.py", "registry.py", "claims.py", "kernel.py", "owner_intent.py", "review.py", "runtime_guard.py",
          "manifests/reddit.reply.json", "manifests/reddit.create_post.json"}
 WIRE_OPS = {"ping", "list_tabs", "get_active_tab", "get_tab", "extract_text", "get_links",
-            "open_owner_url", "switch_tab"}
+            "open_owner_url", "switch_tab", "follow_link"}
 WIRE_TAB_RULES = {"ping": "none", "list_tabs": "none", "get_active_tab": "none",
                   "get_tab": "required", "extract_text": "optional", "get_links": "optional",
-                  "open_owner_url": "none", "switch_tab": "required"}
+                  "open_owner_url": "none", "switch_tab": "required", "follow_link": "required"}
 TOOLS = {"chrome_status", "chrome_list_tabs", "chrome_get_active_tab", "chrome_get_url_title",
-         "chrome_extract_visible_text", "chrome_get_links", "chrome_open_owner_url", "chrome_switch_tab"}
+         "chrome_extract_visible_text", "chrome_get_links", "chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link"}
 
 # Allowed dependency edges, not a blacklist of today's browser modules.
 IMPORTS = {
@@ -297,7 +297,7 @@ def _check_routing_broker(source):
     routes = next(n.value for n in tree.body if isinstance(n, ast.Assign)
                   and any(isinstance(t, ast.Name) and t.id == "ROUTES" for t in n.targets))
     assert ast.literal_eval(routes) == {name: "navigation" if name in {
-        "chrome_open_owner_url", "chrome_switch_tab"} else "observation" for name in TOOLS}
+        "chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link"} else "observation" for name in TOOLS}
     dispatch = methods["dispatch"]
     protected = [n for n in ast.walk(dispatch) if isinstance(n, ast.If)
                  and ast.unparse(n.test) == "origin.protected"]

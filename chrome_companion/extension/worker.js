@@ -87,10 +87,17 @@ const HEX32 = /^[0-9a-f]{32}$/;
 const REQUEST_SEQ_HEX = 12;
 const REQUEST_KEYS = ["v", "type", "connection_id", "request_id", "op", "tab_id", "deadline_ms", "args"];
 const OP_TAB_RULE = { ping: "none", list_tabs: "none", get_active_tab: "none", get_tab: "required",
-  extract_text: "optional", get_links: "optional", open_owner_url: "none", switch_tab: "required" };
+  extract_text: "optional", get_links: "optional", open_owner_url: "none", switch_tab: "required",
+  follow_link: "required" };
 const OP_ARGS = { ping: {}, list_tabs: {}, get_active_tab: {}, get_tab: {},
   extract_text: { max_chars: [1, LIMITS.MAX_TEXT_CHARS] }, get_links: { max_links: [1, LIMITS.MAX_LINKS] },
-  open_owner_url: null, switch_tab: null };
+  open_owner_url: null, switch_tab: null, follow_link: null };
+// Every op that may change what the owner's browser is showing. The
+// post-dispatch gates below key off this ONE list: an op that can move the
+// browser but is missing from ACTION_OPS would silently skip the owner's
+// navigation-allow and revoke overrides. Keep it in step with core/
+// chrome_companion_hub.py ACTION_OPS and protocol.py OPS.
+const ACTION_OPS = new Set(["open_owner_url", "switch_tab", "follow_link"]);
 const TAB_STATUS = new Set(["loading", "complete", "unloaded"]);
 // Fixed, content-free error texts. Raw Chrome error strings can embed URLs,
 // so they never cross the bridge.
@@ -110,6 +117,13 @@ const ERROR_MESSAGES = Object.freeze({
   chrome_api_error: "Chrome API call failed",
   navigation_not_allowed: "navigation is not allowed for this Companion session",
   companion_revoked: "the owner revoked this site in Lumina Companion",
+  // Stage 2 (FINGER). Content-free, like every message here: no URL, no page
+  // text, and nothing that could describe the document it was refused on.
+  stale_document: "the document Lumina identified the link on is no longer the tab's document",
+  target_not_found: "no link on this document has that exact text and destination",
+  target_ambiguous: "more than one link on this document has that exact text and destination",
+  target_changed: "the link's destination no longer matches the one Lumina observed",
+  cross_origin_target: "the link leaves the origin the owner authorized",
 });
 
 let paused = true; // fail closed until the persisted switch is read
@@ -228,7 +242,7 @@ function connect() {
     return;
   }
   const s = { port, state: "CONNECTING", connectionId: null, lastSeq: 0, closed: false,
-    navigationAllowed: false, navigationEpoch: 0, endReason: null };
+    deliveredLinks: new Map(), navigationAllowed: false, navigationEpoch: 0, endReason: null };
   session = s;
   port.onMessage.addListener((message) => onHostMessage(s, message));
   port.onDisconnect.addListener(() => onPortDisconnect(s));
@@ -363,6 +377,26 @@ function validateRequest(req) {
       && typeof req.args.expected_url === "string" && req.args.expected_url.length > 0
       && req.args.expected_url.length <= LIMITS.MAX_TAB_URL_CHARS ? null : "invalid_args";
   }
+  if (req.op === "follow_link") {
+    // A semantic CLAIM, never a destination. The href is compared against
+    // what the live document reports, so a page-supplied value can only ever
+    // be rejected -- never obeyed.
+    const keys = Object.keys(req.args).sort();
+    const wanted = ["document_id", "href", "text", "window_id"];
+    if (keys.length !== wanted.length || keys.some((k, i) => k !== wanted[i])) return "invalid_args";
+    if (!Number.isSafeInteger(req.args.window_id) || req.args.window_id < 0) return "invalid_args";
+    if (typeof req.args.href !== "string" || req.args.href.length === 0
+      || req.args.href.length > LIMITS.MAX_LINK_URL_CHARS) return "invalid_args";
+    // Same readable-HTTP(S) rule the Python mirror applies in
+    // chrome_companion/policy.py and tools/chrome_companion.py, so a claim
+    // built from a javascript:/data:/restricted URL is refused the same way
+    // on both sides instead of merely finding no match.
+    if (!LuminaPolicy.classifyUrl(req.args.href).readable) return "invalid_args";
+    if (typeof req.args.text !== "string" || req.args.text.length > LIMITS.MAX_LINK_TEXT_CHARS) return "invalid_args";
+    if (typeof req.args.document_id !== "string" || req.args.document_id.length === 0
+      || req.args.document_id.length > 128) return "invalid_args";
+    return null;
+  }
   const spec = OP_ARGS[req.op];
   for (const [name, value] of Object.entries(req.args)) {
     if (!spec[name]) return "invalid_args";
@@ -420,7 +454,7 @@ async function handleRequest(s, req) {
   // reconnect. A result from a dead session is dropped, never forwarded.
   if (!live()) return;
   if (Date.now() > req.deadline_ms) {
-    if ((req.op === "open_owner_url" || req.op === "switch_tab") && outcome.result) {
+    if (ACTION_OPS.has(req.op) && outcome.result) {
       outcome.result.status = "ambiguous_after_dispatch";
     } else {
       return fail("deadline_expired", outcome.tab_id ?? null);
@@ -450,7 +484,7 @@ async function handleRequest(s, req) {
   if (outcome.grantEpoch !== undefined && !grantHeld(outcome.grantEpoch)) {
     return fail("site_access_required", outcome.tab_id ?? null);
   }
-  if ((req.op === "open_owner_url" || req.op === "switch_tab") && outcome.result
+  if (ACTION_OPS.has(req.op) && outcome.result
     && (!s.navigationAllowed || s.navigationEpoch !== outcome.navigationEpoch
       || !grantHeld(outcome.actionGrantEpoch) || blockedSites.has(outcome.targetPattern))) {
     // A browser action may already have happened. Never report it as a
@@ -461,6 +495,15 @@ async function handleRequest(s, req) {
   }
   if (send({ ok: true, result: outcome.result, tab_id: outcome.tab_id ?? null,
     observed: outcome.observed ?? null, truncated: Boolean(outcome.truncated) })) {
+    if (req.op === "get_links" && outcome.observed && Number.isSafeInteger(outcome.tab_id)) {
+      // Only a result sent on this connection creates eligibility. Preserve
+      // multiple delivered lists for the same document without a clock TTL.
+      const previous = s.deliveredLinks.get(outcome.tab_id);
+      const pairs = previous && previous.documentId === outcome.observed.document_id
+        ? previous.pairs : new Set();
+      for (const link of outcome.result.links) pairs.add(JSON.stringify([link.text, link.href]));
+      s.deliveredLinks.set(outcome.tab_id, { documentId: outcome.observed.document_id, pairs });
+    }
     lastAction = { op: req.op, tab_id: outcome.tab_id ?? null, host: outcome.host ?? null, at: Date.now() };
     void publishStatus();
   }
@@ -591,6 +634,73 @@ function extractLinks(maxLinks) {
     out.push({ text: label, href, same_origin: url.origin === here });
   }
   return { href: location.href, links: out, total_links: total, truncated: capped || total > out.length };
+}
+
+// Stage 2 (FINGER): resolve ONE link Lumina already observed. Injected
+// read-only, exactly like extractLinks -- it queries the DOM and RETURNS
+// data. It never clicks, never dispatches an event, never runs page script.
+//
+// The model supplies a claim (text + href it saw in chrome_get_links); this
+// function supplies the destination. That inversion is the whole security
+// property of Stage 2: a page can make a claim FAIL, never make one SUCCEED
+// somewhere else. Normalization mirrors extractLinks exactly, so a link the
+// model observed resolves here to the same string -- and a link the page
+// mutated since the observation stops matching at all.
+//
+// Uniqueness is counted over ELEMENTS, not destinations. Two anchors with
+// one href are still two statements by the page about where this link goes,
+// and Stage 2 fails closed rather than guessing which was meant.
+function resolveLinkTarget(claim) {
+  const here = location.origin;
+  const out = { href: location.href, matches: 0, resolved_href: null, same_origin: false };
+  const label = (anchor) => (anchor.innerText || anchor.getAttribute("aria-label")
+    || anchor.getAttribute("title") || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  let scanned = 0;
+  for (const anchor of document.querySelectorAll("a[href], area[href]")) {
+    if (++scanned > 5000) break;
+    let url;
+    try {
+      url = new URL(anchor.getAttribute("href"), document.baseURI);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+    url.username = "";
+    url.password = "";
+    if (url.href !== claim.href) continue;
+    if (label(anchor) !== claim.text) continue;
+    out.matches += 1;
+    if (out.matches === 1) {
+      out.resolved_href = url.href;
+      out.same_origin = url.origin === here;
+    }
+  }
+  return out;
+}
+
+// Fixed extension-owned actuator. Chrome dispatches it only into the source
+// document; it resolves the target again and never runs page-supplied code.
+function dispatchVerifiedLink(claim) {
+  if (location.href !== claim.source_url) return { status: "refused" };
+  const label = (anchor) => (anchor.innerText || anchor.getAttribute("aria-label")
+    || anchor.getAttribute("title") || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  let count = 0;
+  let selected = null;
+  let scanned = 0;
+  for (const anchor of document.querySelectorAll("a[href], area[href]")) {
+    if (++scanned > 5000) return { status: "refused" };
+    let url;
+    try { url = new URL(anchor.getAttribute("href"), document.baseURI); } catch { continue; }
+    if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+    url.username = "";
+    url.password = "";
+    if (url.href !== claim.href || label(anchor) !== claim.text) continue;
+    count += 1;
+    selected = url;
+  }
+  if (count !== 1 || !selected || selected.origin !== location.origin) return { status: "refused" };
+  location.assign(selected.href);
+  return { status: "dispatched" };
 }
 
 // Chrome's identity for the document now in the tab's main frame
@@ -761,6 +871,30 @@ async function settleCreatedTab(tabId, req, s, navEpoch, grantEpoch, live) {
   return null;
 }
 
+// Stage 2 (FINGER): observe the tab we just navigated until the destination
+// is actually there AND is a genuinely NEW document. Same bounded-observation
+// discipline as settleCreatedTab -- never a second navigation, never a retry
+// against a different destination. A same-URL reload does not prove
+// navigation happened: only a different documentId does.
+async function settleNavigatedTab(tabId, expectedWindow, req, s, navEpoch, grantEpoch,
+                                  priorDocumentId, expectedUrl, live) {
+  for (let attempt = 0; attempt < 25; attempt++) {
+    if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
+      || grantRevocations !== grantEpoch || Date.now() >= req.deadline_ms) return null;
+    const tab = await safeActionTab(tabId, expectedWindow);
+    if (tab && tab.url === expectedUrl && tab.status === "complete") {
+      const doc = await mainDocument(tabId);
+      const finalTab = doc ? await safeActionTab(tabId, expectedWindow) : null;
+      if (finalTab && finalTab.url === expectedUrl && finalTab.status === "complete"
+        && doc.url === expectedUrl && doc.documentId && doc.documentId !== priorDocumentId) {
+        return { tab: finalTab, doc };
+      }
+    }
+    if (attempt < 24) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
+
 const OPERATIONS = Object.freeze({
   async ping(req) {
     const result = { extension_version: chrome.runtime.getManifest().version };
@@ -856,6 +990,88 @@ const OPERATIONS = Object.freeze({
     return { result: actionReceipt(req, "browser_local_effect_observed", current,
       current.url, loaded), tab_id: current.id, navigationEpoch: navEpoch,
       actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+  },
+
+  // Stage 2 (FINGER). Owner-authorized origin + current eligible document +
+  // uniquely identified semantic link = ONE bounded navigation.
+  async follow_link(req, live) {
+    const s = session;
+    const before = await safeActionTab(req.tab_id, req.args.window_id);
+    if (!before) throw new CompanionFailure("navigated_during_request", req.tab_id);
+    const delivered = s.deliveredLinks.get(req.tab_id);
+    if (delivered && delivered.documentId !== req.args.document_id) {
+      throw new CompanionFailure("stale_document", req.tab_id);
+    }
+    if (!delivered || !delivered.pairs.has(JSON.stringify([req.args.text, req.args.href]))) {
+      throw new CompanionFailure("target_not_found", req.tab_id);
+    }
+    if (Date.now() > req.deadline_ms) throw new CompanionFailure("deadline_expired", req.tab_id);
+    // The destination is NEVER the tool argument. readPage re-reads the live
+    // document under the same grant / document-identity / PAUSE / revoke
+    // machinery as every other read, and hands back what THIS document says.
+    const { tabId, page, observed, grantEpoch } = await readPage(
+      req, resolveLinkTarget, { href: req.args.href, text: req.args.text }, live);
+    if (tabId !== req.tab_id) throw new CompanionFailure("navigated_during_request", tabId);
+    // Lumina must be acting on the document she actually read.
+    if (observed.document_id !== req.args.document_id) throw new CompanionFailure("stale_document", tabId);
+    if (!Number.isSafeInteger(page.matches) || page.matches < 1) {
+      throw new CompanionFailure("target_not_found", tabId);
+    }
+    if (page.matches !== 1) throw new CompanionFailure("target_ambiguous", tabId);
+    const destination = page.resolved_href;
+    if (typeof destination !== "string" || destination !== req.args.href) {
+      throw new CompanionFailure("target_changed", tabId);
+    }
+    // Same-origin only. Stage 2 is a finger inside one authorized origin,
+    // not a way to be walked somewhere new.
+    if (page.same_origin !== true) throw new CompanionFailure("cross_origin_target", tabId);
+    const verdict = navigationVerdict(s, destination, live);
+    if (verdict.origin !== observed.origin) throw new CompanionFailure("cross_origin_target", tabId);
+    const navEpoch = s.navigationEpoch;
+    if (Date.now() > req.deadline_ms) throw new CompanionFailure("deadline_expired", tabId);
+    // tabs.update cannot bind to a source document. Recheck tab, requested
+    // window and document, then dispatch fixed code through documentIds.
+    const current = await safeActionTab(tabId, req.args.window_id);
+    const source = current ? await mainDocument(tabId) : null;
+    const dispatchTab = source ? await safeActionTab(tabId, req.args.window_id) : null;
+    if (!current || current.url !== observed.url || !dispatchTab
+      || dispatchTab.url !== observed.url || !source
+      || source.documentId !== observed.document_id || source.url !== observed.url) {
+      throw new CompanionFailure("stale_document", tabId);
+    }
+    if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
+      || !grantHeld(grantEpoch) || blockedSites.has(verdict.pattern)
+      || Date.now() > req.deadline_ms) throw new CompanionFailure("navigation_not_allowed", tabId);
+    let injection;
+    req._actionDispatched = true;
+    try {
+      [injection] = await chrome.scripting.executeScript({
+        target: { tabId, documentIds: [observed.document_id] },
+        world: "ISOLATED", func: dispatchVerifiedLink,
+        args: [{ source_url: observed.url, text: req.args.text, href: req.args.href }],
+      });
+    } catch {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch"),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
+    if (!injection || injection.documentId !== observed.document_id || !injection.result) {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch"),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
+    if (injection.result.status !== "dispatched") return { error: "target_changed", tab_id: tabId };
+    const settled = await settleNavigatedTab(tabId, req.args.window_id, req, s, navEpoch, grantEpoch,
+      observed.document_id, destination, live);
+    if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
+      || grantRevocations !== grantEpoch || blockedSites.has(verdict.pattern) || !settled) {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch"),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
+    return { result: actionReceipt(req, "browser_local_effect_observed", settled.tab, settled.tab.url, true),
+      tab_id: tabId,
+      // The verified RESULTING document, so the receipt can say what happened
+      // rather than only what was asked.
+      observed: { url: settled.tab.url, origin: verdict.origin, document_id: settled.doc.documentId },
+      navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
   },
 
   async switch_tab(req, live) {

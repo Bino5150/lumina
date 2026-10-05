@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Lumina Chrome Companion",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Companion for owner-granted site reading and session navigation in this Chrome profile. PAUSE LUMINA stops it.",
   "minimum_chrome_version": "120",
   "incognito": "not_allowed",

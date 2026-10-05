@@ -40,6 +40,8 @@ import re
 import secrets
 import struct
 
+from chrome_companion import policy
+
 PROTOCOL_VERSION = 1
 HOST_NAME = "org.lumina.chrome_companion"
 HOST_VERSION = "1"
@@ -74,9 +76,9 @@ REQUEST_SEQ_HEX = 12
 MAX_REQUEST_SEQ = 16 ** REQUEST_SEQ_HEX - 1
 
 OPS = frozenset({"ping", "list_tabs", "get_active_tab", "get_tab", "extract_text", "get_links",
-                 "open_owner_url", "switch_tab"})
+                 "open_owner_url", "switch_tab", "follow_link"})
 # tab_id rules per op: required, optional (null = the active tab), or absent.
-OPS_TAB_REQUIRED = frozenset({"get_tab", "switch_tab"})
+OPS_TAB_REQUIRED = frozenset({"get_tab", "switch_tab", "follow_link"})
 OPS_TAB_OPTIONAL = frozenset({"extract_text", "get_links"})
 OPS_TAB_NONE = frozenset({"ping", "list_tabs", "get_active_tab", "open_owner_url"})
 OP_ARGS = {
@@ -90,6 +92,10 @@ OP_ARGS = {
     # identities, not the bounded integer arguments of the 01A read ops.
     "open_owner_url": {},
     "switch_tab": {},
+    # Stage 2 (FINGER). A semantic CLAIM about one already-observed link.
+    # ``href`` is never a destination here: the extension re-reads the live
+    # document and navigates only to what that document itself reports.
+    "follow_link": {},
 }
 
 EXTENSION_TO_HUB_TYPES = frozenset({"response", "bye"})
@@ -371,6 +377,22 @@ def validate_request(message: dict) -> dict:
                 or not args["expected_url"]:
             raise ProtocolError("invalid_args", "tab identity")
         return message
+    if op == "follow_link":
+        if set(args) != {"window_id", "text", "href", "document_id"} \
+                or not _is_int(args.get("window_id")) or args.get("window_id", -1) < 0 \
+                or not _bounded_str(args.get("text"), MAX_LINK_TEXT_CHARS) \
+                or not _bounded_str(args.get("href"), MAX_LINK_URL_CHARS) \
+                or not args["href"] \
+                or not _bounded_str(args.get("document_id"), 128) \
+                or not args["document_id"]:
+            raise ProtocolError("invalid_args", "link identity")
+        # Mirror of the extension's own refusal (worker.js validateRequest):
+        # a claim built from a javascript:/data:/restricted URL is not a link
+        # this companion will ever follow. Both sides agree, so neither can
+        # drift into accepting what the other refuses.
+        if not policy.classify_url(args["href"]).readable:
+            raise ProtocolError("invalid_args", "link identity")
+        return message
     spec = OP_ARGS[op]
     if set(args) - set(spec):
         raise ProtocolError("invalid_args", "unknown arg")
@@ -465,7 +487,7 @@ def validate_result(op: str, result):
         if "navigation_allowed" in result and not _is_bool(result["navigation_allowed"]):
             raise ProtocolError("bad_result", "navigation_allowed")
         return result
-    if op in {"open_owner_url", "switch_tab"}:
+    if op in {"open_owner_url", "switch_tab", "follow_link"}:
         if not isinstance(result, dict):
             raise ProtocolError("bad_result", "action")
         _require_exact_keys(result, {"operation_id", "status", "tab_id", "window_id",

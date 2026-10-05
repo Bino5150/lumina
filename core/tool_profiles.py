@@ -117,6 +117,9 @@ TOOL_TIERS = {
     "chrome_get_active_tab": "read_only", "chrome_get_url_title": "read_only",
     "chrome_extract_visible_text": "read_only", "chrome_get_links": "read_only",
     "chrome_open_owner_url": "outbound_action", "chrome_switch_tab": "execute",
+    # Stage 2 FINGER: navigate inside ONE already-authorized origin to a link
+    # that document itself reports. Owner-only like every companion action.
+    "chrome_follow_link": "execute",
     "diff_texts": "read_only", "diff_files": "read_only", "submit_pin": "read_only",
     "get_active_project": "read_only",
     # TOOL-TIER-CLASSIFICATION-01: explicit read_only classification for
@@ -271,6 +274,11 @@ OWNER_ONLY_TOOLS = {
     "chrome_status", "chrome_list_tabs", "chrome_get_active_tab",
     "chrome_get_url_title", "chrome_extract_visible_text", "chrome_get_links",
     "chrome_open_owner_url", "chrome_switch_tab",
+    # Stage 2 (FINGER): a companion ACTION like the two above. It navigates
+    # Lumina's logged-in browser inside an owner-authorized origin, so it is
+    # stripped from every non-owner path on this axis too -- tier alone does
+    # not keep a browsing action away from a subagent.
+    "chrome_follow_link",
     # CODING-02B-A1: create_project also calls save_project_binding()
     # directly (tools/projects.py) -- it writes the exact same
     # DATA_DIR/projects/<name>/binding.json as set_project_root, so it must

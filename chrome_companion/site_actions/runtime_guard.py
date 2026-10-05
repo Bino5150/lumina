@@ -33,6 +33,7 @@ ROUTES = {
     "chrome_get_links": "observation",
     "chrome_open_owner_url": "navigation",
     "chrome_switch_tab": "navigation",
+    "chrome_follow_link": "navigation",
 }
 
 

@@ -7,9 +7,10 @@ disposable Playwright browser.
 - Lists tabs (URL, title), finds the active tab.
 - Reads bounded visible text and links from sites **you** have allowed.
 - With a separate, temporary **Navigation Allow** in the popup, opens one URL
-  explicitly supplied in the current owner command or switches to an observed
-  tab. Navigation Allow ends when the Companion disconnects or PAUSE is used.
-- Cannot click page elements, type, submit, follow observed links, use browser
+  explicitly supplied in the current owner command, switches to an observed
+  tab, or follows one verified same-origin link delivered by `get_links`.
+  Navigation Allow ends when the Companion disconnects or PAUSE is used.
+- Cannot click page elements, type, fill or submit forms, use browser
   back/forward, take screenshots, or read cookies or passwords. Those
   capabilities do not exist in this version.
 - Never touches Firefox or any other browser.
@@ -69,14 +70,24 @@ your tabs
   popup, or PAUSE.)
 - **Navigation Allow is separate from Read Allow.** It is a grant for the
   current Companion connection only, and must be clicked again after PAUSE,
-  disconnect, extension restart, or Lumina restart. It does not let a page
-  select a destination. To open a URL, begin a fresh owner message with
+  disconnect, extension restart, or Lumina restart. A page can only propose
+  a same-origin link already delivered by `get_links`; it cannot grant
+  navigation. To open a URL, begin a fresh owner message with
   `open`, `visit`, `go to`, or `navigate to` followed by the URL (for example,
   `open https://github.com/example`). Lumina may dispatch that exact URL once
   for that owner event. Replaying the same owner event cannot open it again.
   `switch_tab` needs the tab ID, window ID, and exact current URL; Chrome
-  checks them again before selecting the tab. Neither action falls back to
-  Playwright.
+  checks them again before selecting the tab. `follow_link` opens one link
+  inside an origin you have already allowed: Lumina names it by the exact
+  text and href `get_links` delivered in this connection on that exact document, and
+  Chrome re-reads the live document and navigates only to the href that
+  document itself reports. The link must be unique on the page and must
+  stay on that page's origin; a link that moved, vanished, or appears twice
+  fails without navigating, and it is never retried against a different
+  target. The page cannot widen this: proposing a destination is not
+  approving it. A GET can have server-side effects, and a server redirect
+  may cross origin after dispatch; such an unverified result is reported as
+  ambiguous. None of these actions falls back to Playwright.
 - Revoke in the popup also hides that site's URL and title from Companion
   tab listings. An opaque tab ID may remain visible. It refuses navigation
   to or selection of a revoked site until the owner clicks Allow for that

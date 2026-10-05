@@ -10,7 +10,7 @@ import pytest
 
 from chrome_companion import installer, state
 from chrome_companion.navigation import begin_turn, claim_owner_url, end_turn
-from chrome_companion_testkit import (EXT_ID, error_response, connect_ready, make_hub,
+from chrome_companion_testkit import (EXT_ID, error_response, ok_response, connect_ready, make_hub,
                                       setup_companion, short_tmpdir, wait_until)
 from core.agent import _tool_call_fields
 from core.agent import LuminaAgent
@@ -140,6 +140,69 @@ def test_worker_pre_dispatch_rejection_and_timeout_have_distinct_receipts(action
         action_hub.hub.request("open_owner_url", args={"url": "https://github.com/"}, timeout_s=2)
     assert rejected.value.executed is False
     assert rejected.value.operation_id is not None
+
+
+def test_old_navigation_worker_cannot_receive_follow_link(action_hub):
+    # 0.2.0 still serves its old operations, but it has no Stage-2 vocabulary.
+    action_hub.host.serve(lambda req: error_response(req, "navigation_not_allowed"))
+    with pytest.raises(CompanionError) as unsupported:
+        action_hub.hub.request("follow_link", tab_id=7,
+            args={"window_id": 1, "document_id": "doc", "text": "", "href": "https://github.com/"})
+    assert unsupported.value.code == "unsupported_version"
+    assert unsupported.value.executed is False
+    assert action_hub.host.requests == []
+    with pytest.raises(CompanionError) as old_op:
+        action_hub.hub.request("open_owner_url", args={"url": "https://github.com/"}, timeout_s=2)
+    assert old_op.value.code == "navigation_not_allowed", "old operation reached the old worker"
+
+
+def test_unknown_action_version_fails_before_wire_dispatch(action_hub):
+    action_hub.hub._current.extension_version = "0.4.0"
+    with pytest.raises(CompanionError) as unsupported:
+        action_hub.hub.request("switch_tab", tab_id=7,
+            args={"window_id": 1, "expected_url": "https://github.com/"})
+    assert unsupported.value.code == "unsupported_version"
+    assert unsupported.value.executed is False
+    assert action_hub.host.requests == []
+
+
+def test_new_connection_requires_a_validated_delivered_link_before_follow(tmp_path):
+    with short_tmpdir() as sdir:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        socket_path = setup_companion(data_dir, sdir)
+        hub = make_hub(data_dir)
+        hub.start()
+        host, _ = connect_ready(hub, socket_path, extension_version="0.3.0")
+        href = "https://www.reddit.com/r/AgentsInteractive/comments/1/"
+        source = "https://www.reddit.com/r/AgentsInteractive/"
+        args = {"window_id": 1, "document_id": "doc-1", "text": "Post", "href": href}
+        try:
+            def answer(req):
+                if req["op"] == "get_links":
+                    return ok_response(req, {"links": [{"text": "Post", "href": href,
+                        "same_origin": True}], "total_links": 1}, tab_id=7,
+                        observed={"url": source, "origin": "https://www.reddit.com",
+                                  "document_id": "doc-1"})
+                if req["op"] == "follow_link":
+                    return ok_response(req, {"operation_id": f"{req['connection_id']}:{req['request_id']}",
+                        "status": "browser_local_effect_observed", "tab_id": 7, "window_id": 1,
+                        "observed_url": href, "load_confirmed": True}, tab_id=7,
+                        observed={"url": href, "origin": "https://www.reddit.com",
+                                  "document_id": "doc-2"})
+                return error_response(req, "unknown_op")
+            host.serve(answer)
+            with pytest.raises(CompanionError) as unseen:
+                hub.request("follow_link", tab_id=7, args=args)
+            assert unseen.value.code == "target_not_found"
+            assert host.requests == []
+            assert hub.request("get_links", tab_id=7, args={})["ok"] is True
+            followed = hub.request("follow_link", tab_id=7, args=args)
+            assert followed["result"]["status"] == "browser_local_effect_observed"
+            assert [req["op"] for req in host.requests] == ["get_links", "follow_link"]
+        finally:
+            hub.stop()
+            host.close()
 
 
 def test_action_tool_accepts_only_the_current_owner_url_and_preserves_receipt(tmp_path):

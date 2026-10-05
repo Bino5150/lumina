@@ -82,7 +82,7 @@ def set_idle_callback(fn):
     
 def _log_tool_call(channel_id):
         def _fn(name, args):
-            shown = "[arguments withheld]" if name in {"chrome_open_owner_url", "chrome_switch_tab"} else args
+            shown = "[arguments withheld]" if name in {"chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link"} else args
             print(f"[HEADLESS:{channel_id}] TOOL CALL → {name}({shown})", flush=True)
         return _fn
 

@@ -104,6 +104,7 @@ separate from Browser Companion below — neither falls back to the other.
 | `chrome_get_links` | Enumerate links on an allowed site. |
 | `chrome_open_owner_url` | Open a URL *you* typed this turn — see [Browser Companion](browser-companion.md). |
 | `chrome_switch_tab` | Switch to an already-open tab by exact identity. |
+| `chrome_follow_link` | Follow one link delivered by `chrome_get_links` on that exact document and verified again before navigation — see [Browser Companion](browser-companion.md). |
 
 ## Memory
 
