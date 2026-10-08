@@ -2,8 +2,10 @@
 Web Tools — search, fetch, wikipedia.
 Uses duckduckgo-search library (pip install ddgs).
 Falls back to direct HTML scraping if library unavailable.
+Set LUMINA_WEB_SEARCH=youcom to opt into You.com as the first provider instead.
 """
 
+import json
 import requests
 import re
 import warnings
@@ -19,6 +21,14 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_se
 PDF_EXTENSIONS = ('.pdf', '.PDF')
 SKIP_DOMAINS = ('twitter.com', 'x.com', 'facebook.com', 'instagram.com')
 
+# ── Optional You.com search provider ───────────────────────────────────────
+# Opt in with LUMINA_WEB_SEARCH=youcom; anything else (or unset) keeps the
+# DuckDuckGo chain exactly as before. The free MCP profile is keyless — the
+# same zero-setup property as the DDG paths below — and the minimal MCP
+# streamable-HTTP flow is spoken over plain requests, so no new dependency.
+
+YOUCOM_MCP_URL = "https://api.you.com/mcp?profile=free"
+
 
 def _is_pdf(url: str) -> bool:
     return any(url.split('?')[0].endswith(ext) for ext in PDF_EXTENSIONS)
@@ -29,8 +39,89 @@ def _arxiv_abstract(url: str) -> str:
     return url.replace('/pdf/', '/abs/').replace('.pdf', '')
 
 
+def _mcp_sse_result(text: str) -> dict | None:
+    """Return the last JSON-RPC result/error object embedded in an MCP SSE body."""
+    found = None
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            try:
+                payload = json.loads(line[len("data:"):].strip())
+            except ValueError:
+                continue
+            if "result" in payload or "error" in payload:
+                found = payload
+    return found
+
+
+def _youcom_search(query: str, max_results: int = 5) -> str:
+    """Search the web via You.com's keyless free MCP profile.
+
+    Speaks the minimal MCP streamable-HTTP flow (initialize ->
+    notifications/initialized -> tools/call you-search) over plain requests.
+    Raises on any failure so web_search can fall back to the DDG chain.
+    """
+    headers = {"Accept": "application/json, text/event-stream"}
+
+    init = requests.post(
+        YOUCOM_MCP_URL,
+        json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "lumina", "version": "1.0"}}},
+        headers=headers, timeout=15,
+    )
+    init.raise_for_status()
+    session_id = init.headers.get("mcp-session-id", "")
+    if session_id:
+        headers["mcp-session-id"] = session_id
+
+    # Stateless server: sent for protocol correctness, response is ignored.
+    requests.post(
+        YOUCOM_MCP_URL,
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        headers=headers, timeout=15,
+    )
+
+    call = requests.post(
+        YOUCOM_MCP_URL,
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": "you-search", "arguments": {"query": query}}},
+        headers=headers, timeout=30,
+    )
+    call.raise_for_status()
+    # SSE body is UTF-8 JSON; without an explicit charset in Content-Type,
+    # requests may decode it as latin-1 and mojibake non-ASCII titles.
+    call.encoding = "utf-8"
+
+    envelope = _mcp_sse_result(call.text)
+    if not envelope or "error" in envelope:
+        raise ValueError(f"you-search MCP call failed: {envelope}")
+    content = envelope.get("result", {}).get("content", [])
+    text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+    data = json.loads(text)
+    web = (data or {}).get("results", {}).get("web", [])
+    if not web:
+        raise ValueError("you-search returned no web results")
+    return _format_results([
+        {
+            "title": r.get("title", "No title"),
+            "href": r.get("url", ""),
+            "body": r.get("description", ""),
+        }
+        for r in web[:max_results]
+    ])
+
+
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web. Returns titles, URLs, and snippets. Use get_website to read a specific result."""
+    # Optional You.com provider (opt-in via LUMINA_WEB_SEARCH=youcom).
+    # Any failure falls through to the DuckDuckGo chain below, so the
+    # default paths are untouched.
+    if os.environ.get("LUMINA_WEB_SEARCH", "").strip().lower() == "youcom":
+        try:
+            return _youcom_search(query, max_results)
+        except Exception:
+            pass
+
     # Try ddgs library first
     try:
         from ddgs import DDGS

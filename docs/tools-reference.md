@@ -75,6 +75,8 @@ There is no copy, move, rename, or delete-file tool in the registry.
 | `get_website` | Lightweight HTTP fetch of a static page (requests + BeautifulSoup). |
 | `get_wikipedia` | Wikipedia lookup. |
 
+`web_search` defaults to the DuckDuckGo chain (ddgs → legacy duckduckgo_search → DDG HTML scrape). Set LUMINA_WEB_SEARCH=youcom to try You.com's keyless free MCP profile (https://api.you.com/mcp?profile=free) first instead — no API key, same zero-setup property as the DDG paths — with any You.com failure falling back to the DuckDuckGo chain.
+
 ## Browser Automation (Playwright)
 
 | Tool | Purpose |
