@@ -102,6 +102,7 @@ class ContextManager:
         self._compacting = False        # prevents overlapping background compaction jobs
         self._last_usage_snapshot = None  # last request-shaped accounting for the operator UI
         self.turn_seq = 0  # CASTLE-WALLS-REPAIR-01 -- monotonic count of top-level turn admissions
+        self._plan_bound_without_chat = False  # no-ID foreground Plan lane custody
         self._turn_seq_lock = threading.Lock()  # headless per-channel agents can race concurrent chat() calls
 
     def mark_untrusted_seen(self):
@@ -461,6 +462,7 @@ class ContextManager:
     def clear(self):
         self.history = []
         self._last_usage_snapshot = None
+        self._plan_bound_without_chat = False
 
     def update_system_prompt(self, new_prompt: str):
         self.system_prompt = new_prompt

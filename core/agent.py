@@ -1385,11 +1385,27 @@ def _dispatch_refusal(agent, operation_kind) -> Optional[str]:
     that must surface, not silently disable the guard. Every legacy lane
     admits every operation and legacy<->legacy swaps are grandfathered, so
     this is a no-op for them (see core/backend_identity.py)."""
-    return dispatch_lane_refusal(
+    live_identity = identity_of_backend(getattr(agent, "llm", None))
+    refusal = dispatch_lane_refusal(
         getattr(agent, "_turn_dispatch_identity", None),
-        identity_of_backend(getattr(agent, "llm", None)),
+        live_identity,
         operation_kind,
     )
+    if refusal is not None:
+        return refusal
+    if operation_kind is OperationKind.FOREGROUND_CHAT:
+        from core.chatgpt_plan_chat_binding import bound_chat_refuses_lane
+        chat_id = getattr(agent, "_current_chat_id", None)
+        ctx = getattr(agent, "ctx", None)
+        if chat_id is None and ctx is not None:
+            if (getattr(ctx, "_plan_bound_without_chat", False)
+                    and live_identity.backend_lane != "openai_chatgpt_plan"):
+                return "ChatGPT Plan conversation is bound to its original lane. Start a new chat."
+            if live_identity.backend_lane == "openai_chatgpt_plan":
+                ctx._plan_bound_without_chat = True
+        if bound_chat_refuses_lane(chat_id, live_identity.backend_lane):
+            return "ChatGPT Plan chat is bound to its original account, lane and model. Start a new chat."
+    return None
 
 
 def _record_dispatch_refusal(agent, refusal: str, *, turn_id=None, chat_id=None) -> None:
@@ -2136,6 +2152,10 @@ class LuminaAgent:
         turn_cancellation = getattr(self, "turn_cancellation", None)
         if turn_cancellation is not None:
             turn_cancellation._set(cancel_event)
+        # Keep the exact backend that admitted this turn: Settings may replace
+        # self.llm before finally, while this instance still owns opaque Plan
+        # continuation items that must be retired.
+        turn_backend = getattr(self, "llm", None)
         turn_id = flight_recorder.new_turn_id()
         turn_telemetry = _new_turn_telemetry()
         # CASTLE-WALLS-REPAIR-04 / CANNON-11 -- mint a fresh event identity
@@ -2272,6 +2292,17 @@ class LuminaAgent:
                                     **_turn_telemetry_fields(turn_telemetry)})
                 raise
             finally:
+                # Subscription Responses reasoning is an in-memory,
+                # turn-bounded continuation artifact. Retire it on success,
+                # refusal, cancellation and unexpected failure alike.
+                clear_tool_turn_state = getattr(turn_backend, "clear_tool_turn_state", None)
+                if callable(clear_tool_turn_state):
+                    clear_tool_turn_state()
+                current_backend = getattr(self, "llm", None)
+                if current_backend is not turn_backend:
+                    clear_tool_turn_state = getattr(current_backend, "clear_tool_turn_state", None)
+                    if callable(clear_tool_turn_state):
+                        clear_tool_turn_state()
                 end_chrome_navigation_turn(chrome_navigation_token)
                 if turn_cancellation is not None:
                     turn_cancellation._set(None)
@@ -2292,6 +2323,9 @@ class LuminaAgent:
         # below dispatches through _dispatch_refusal(), which compares the
         # live backend to this record.
         self._turn_dispatch_identity = identity_of_backend(getattr(self, "llm", None))
+        set_chat_context = getattr(getattr(self, "llm", None), "set_chat_context", None)
+        if callable(set_chat_context):
+            set_chat_context(chat_id)
         tools_used_this_turn = set()
         think_step = [0]
         tool_batch_ordinal = 0  # AGENT-FLIGHT-RECORDER-01A1 -- per-turn, incremented once per tool-bearing WORK round

@@ -231,6 +231,8 @@ class AccessGrant:
     generation: int
     access_token: str = dataclasses.field(repr=False)
     expires_at: float
+    # Verified ID-token identity, not the editable account label. Never log it.
+    account_identity: tuple[str, str] = dataclasses.field(repr=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -852,7 +854,8 @@ class ChatGPTSessionManager:
             raise TemporaryAuthError("refresh_incomplete")
         return AccessGrant(profile_id=profile.profile_id, generation=profile.generation,
                            access_token=profile.credentials.access_token,
-                           expires_at=profile.credentials.expires_at)
+                           expires_at=profile.credentials.expires_at,
+                           account_identity=(profile.issuer, profile.subject))
 
     def get_valid_access_token(self, profile_id: Optional[str] = None) -> AccessGrant:
         """A bearer token for the given (default: active) profile, refreshing

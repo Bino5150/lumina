@@ -117,6 +117,9 @@ def test_first_registration_uses_bootstrap_flow_and_persists_issued_client(tmp_p
     assert profile.client_id == "oaiapp_test1"           # issued, never the bootstrap ID
     assert profile.subject == "user-sub-A"
     assert profile.issuer == fake.issuer
+    grant = m.get_valid_access_token()
+    assert grant.account_identity == (fake.issuer, "user-sub-A")
+    assert "user-sub-A" not in repr(grant)
     assert doc.pending_registrations == []
     assert doc.active_profile_id == profile.profile_id
     # The token endpoint never saw the bootstrap client ID.

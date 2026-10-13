@@ -39,7 +39,7 @@ ship out of the box:
 
 **Cloud, native**
 - Anthropic (Claude), Google (Gemini), OpenAI, Moonshot (Kimi), Alibaba (Qwen/DashScope)
-- ChatGPT Plan — foreground text chat using a connected ChatGPT account, separate from the OpenAI API-key backend
+- ChatGPT Plan — foreground text chat and enabled local tools using a connected ChatGPT account, separate from the OpenAI API-key backend
 
 **Cloud, OpenAI-compatible**
 - OpenRouter, DeepSeek, Groq, and any other OpenAI-compatible endpoint via the generic Custom slot
@@ -107,12 +107,27 @@ outcome is unknown, including a post-send 5xx or lost response. This is the
 current no-resend policy pending a clear vendor answer on rotating-token
 retries after an ambiguous delivery.
 
-In this version the ChatGPT Plan backend handles foreground text chat only.
-It cannot use tools, vision, utilities, Reforge, subagents or scheduled work.
+The ChatGPT Plan backend offers enabled local tools during foreground text chat
+through the native-tool WORK path and Responses function calls. This path is
+enabled by default, including for ordinary text messages, and may use
+additional provider rounds before completion. The full WORK-loop answer may
+arrive after the work and completion gate finish instead of streaming to the
+screen immediately. You can choose a smaller tool profile when it suits the
+task. The effects of profile size and WORK rounds on latency and allowance
+use have not yet been measured quantitatively. Tool profiles, PIN checks, owner-only tools,
+Browser Companion grants, cancellation and emergency stop still apply. The
+selected model and account must accept the function-tool request; a refused or
+incomplete response does not run a tool. Vision, utilities, Reforge, subagents
+and scheduled work remain unavailable on this lane.
+After a ChatGPT Plan chat starts, it stays bound to that verified account,
+backend and model. Start a new chat to use another account, backend or model;
+an older chat with unbound history also needs a fresh chat for this path.
 Requests use the connected account's OAuth session, never an OpenAI API key,
 and do not automatically fall back to another backend. Plan or enabled
-ChatGPT credits may be consumed; check ChatGPT Settings → Usage for the
-account's allowance. **Save All Settings** saves backend and model choices
+ChatGPT credits may be consumed from the account's applicable shared usage
+allowances; this integration does not inherit separate accounting for ordinary
+ChatGPT conversations. Check ChatGPT Settings → Usage for the account's
+allowance. **Save All Settings** saves backend and model choices
 but never starts, renews or ends a ChatGPT sign-in.
 
 **Unlink Account** stops use, asks OpenAI to end the renewable session, and

@@ -39,7 +39,12 @@ class FakeManager:
 
     def get_valid_access_token(self):
         self.calls.append("grant")
-        return types.SimpleNamespace(profile_id=self.profile, access_token="synthetic-oauth-token")
+        return types.SimpleNamespace(profile_id=self.profile, generation=1,
+                                     account_identity=("issuer", self.profile),
+                                     access_token="synthetic-oauth-token")
+
+    def get_active_profile(self):
+        return types.SimpleNamespace(profile_id=self.profile)
 
     def is_grant_current(self, grant):
         self.calls.append("current")
@@ -92,7 +97,7 @@ def test_plan_lane_constructible_only_for_foreground(monkeypatch, tmp_path):
     assert isinstance(backend, ChatGPTPlanBackend)
     assert not hasattr(backend, "api_key") and not hasattr(backend, "headers")
     assert "OPENAI_API_KEY" not in inspect.getsource(ChatGPTPlanBackend)
-    assert backend.supports_tool_work() is False
+    assert backend.supports_tool_work() is True
     assert BaseLLMBackend.supports_tool_work(backend) is True
     assert bi.operation_refusal(backend.backend_identity(), bi.OperationKind.FOREGROUND_CHAT) is None
     for kind in bi.OperationKind:
@@ -132,9 +137,9 @@ def test_exact_wire_and_completed_stream(transport):
     assert "synthetic-oauth-token" not in json.dumps(kwargs["json"])
 
 
-def test_no_tools_vision_or_missing_model_substitution(transport):
+def test_malformed_tools_vision_or_missing_model_substitution(transport):
     backend, _manager, calls, catalog, _events = transport
-    with pytest.raises(ValueError, match="tool work"):
+    with pytest.raises(ValueError, match="tool schema"):
         backend.chat([{"role": "user", "content": "hi"}], tools=[{"type": "function"}])
     with pytest.raises(ValueError, match="text-only"):
         list(backend.chat_stream([{"role": "user", "content": [
@@ -195,11 +200,12 @@ def test_tool_free_agent_branch_avoids_registry_and_gate(monkeypatch):
 
 
 def _real_plan_agent(backend, monkeypatch, tmp_path):
-    """Use the real agent branch and final streamer with synthetic transport."""
+    """Exercise the retained tool-free agent branch with the plan stream."""
     import core.agent as agent_module
     from core.agent import LuminaAgent
     from core.flight_recorder import FlightRecorder
     history, visible = [], []
+    monkeypatch.setattr(backend, "supports_tool_work", lambda: False)
     ctx = types.SimpleNamespace(
         history=history, turn_seq=0,
         add_user=lambda text, source="OWNER_DIRECT": history.append(
