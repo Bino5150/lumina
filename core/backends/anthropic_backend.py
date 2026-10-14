@@ -33,6 +33,7 @@ Inherits BaseLLMBackend directly and implements the contract natively.
 import json
 import re
 import requests
+from enum import Enum
 from typing import Optional
 
 import config
@@ -86,19 +87,98 @@ _SONNET_4_6_CAPS = ReasoningCapabilities(
     default_effort="high",
 )
 
+# ANTHROPIC-MODEL-CAPABILITY-REFRESH-01 -- Claude Haiku 5.5, per Anthropic's
+# Haiku 5.5 migration guide: adaptive thinking only (on by default), effort
+# low..max with a provider default of "medium" (not "high"). Offline,
+# documented truth; a successful Models API discovery outranks it (see
+# _parse_effort_capabilities()).
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+_HAIKU_5_5_CAPS = ReasoningCapabilities(
+    efforts=_EFFORT_LEVELS,
+    default_effort="medium",
+)
+
 _REASONING_MODELS = {
     "claude-sonnet-5": _SONNET_5_CAPS,
     "claude-sonnet-4-6": _SONNET_4_6_CAPS,
+    "claude-haiku-5-5": _HAIKU_5_5_CAPS,
 }
 
-# Sampling support is independent of reasoning, vision, tools, and model discovery.
-# Anthropic documents non-default temperature rejection for these Claude families.
-_TEMPERATURE_FORBIDDEN_PREFIXES = (
-    "claude-opus-4-7",
-    "claude-opus-5",
-    "claude-sonnet-5",
-    "claude-fable-5",
+
+# ANTHROPIC-MODEL-CAPABILITY-REFRESH-01 -- sampling policy.
+#
+# Sampling support is independent of reasoning, vision, tools, and model
+# discovery. The Models API capability tree reports thinking, effort, vision
+# and similar features but nothing about sampling parameters, so this policy
+# can only come from Anthropic's per-model documentation -- it is never
+# inferred from a catalog listing.
+#
+# Behavior is driven by the closed, historically fixed set of families
+# documented to ACCEPT `temperature`. Every other model -- documented as
+# rejecting it, or simply unknown to this build -- gets no sampling
+# parameter at all and runs at the provider's own default. Since Opus 4.7,
+# every new Claude family has rejected non-default sampling, so "unknown"
+# almost always means "newer", and sending the field would fail the whole
+# request. Lumina has no owner-facing temperature setting (callers pass fixed
+# 0.7/0.3 defaults), so omission discards no owner choice. top_p/top_k are
+# never sent by this backend on any path.
+class SamplingSupport(str, Enum):
+    DOCUMENTED_ACCEPTS = "documented_accepts"
+    DOCUMENTED_REJECTS = "documented_rejects"
+    UNKNOWN = "unknown"
+
+
+# Matched against the model id with any trailing -YYYYMMDD snapshot date
+# removed, either exactly or as a prefix followed by "-".
+_SAMPLING_ACCEPTED_FAMILIES = (
+    "claude-3",            # every Claude 3 / 3.5 / 3.7 variant
+    "claude-opus-4-0", "claude-sonnet-4-0",
+    "claude-opus-4-1",
+    "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5",
+    "claude-opus-4-6", "claude-sonnet-4-6",
 )
+# The Claude 4.0 snapshots are named without a minor version
+# (claude-opus-4-20250514), so their families only match exactly --
+# "claude-opus-4" as a prefix would also swallow claude-opus-4-7.
+_SAMPLING_ACCEPTED_EXACT = ("claude-opus-4", "claude-sonnet-4")
+# Documented as removing sampling or rejecting non-default values. Not needed
+# for the decision (unknown is treated the same way); kept so the policy can
+# say which models it positively knows about.
+_SAMPLING_REJECTED_FAMILIES = (
+    "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+    "claude-sonnet-5", "claude-fable-5", "claude-mythos-5",
+    "claude-haiku-5-5",
+)
+_SNAPSHOT_DATE = re.compile(r"-\d{8}$")
+
+
+def _model_family(model) -> Optional[str]:
+    if not isinstance(model, str) or not model.strip():
+        return None
+    return _SNAPSHOT_DATE.sub("", model.strip().lower())
+
+
+def _in_families(family: str, families) -> bool:
+    return any(family == f or family.startswith(f + "-") for f in families)
+
+
+def sampling_support(model) -> SamplingSupport:
+    """Documented sampling support for ``model``. Pure; never does I/O."""
+    family = _model_family(model)
+    if family is None:
+        return SamplingSupport.UNKNOWN
+    if _in_families(family, _SAMPLING_REJECTED_FAMILIES):
+        return SamplingSupport.DOCUMENTED_REJECTS
+    if family in _SAMPLING_ACCEPTED_EXACT or _in_families(family, _SAMPLING_ACCEPTED_FAMILIES):
+        return SamplingSupport.DOCUMENTED_ACCEPTS
+    return SamplingSupport.UNKNOWN
+
+
+# The provider quotes field names in its messages (observed live on Claude
+# Haiku 5.5: "`temperature` is deprecated for this model."), so the field
+# name may be wrapped in a backtick or straight quote.
+_TEMPERATURE_FIELD = r"[`'\"]?\btemperature\b[`'\"]?"
 
 
 def _is_temperature_rejection(resp) -> bool:
@@ -121,13 +201,48 @@ def _is_temperature_rejection(resp) -> bool:
     if not isinstance(message, str):
         return False
     return any(re.search(pattern, message, re.IGNORECASE) for pattern in (
-        r"\btemperature\s+(?:is|has been)\s+deprecated\b",
-        r"\btemperature\s+(?:is|was)\s+(?:not supported|unsupported)\b",
-        r"\bsetting\s+temperature\s+to\s+a\s+non[- ]default\s+value\s+"
+        _TEMPERATURE_FIELD + r"\s+(?:is|has been)\s+deprecated\b",
+        _TEMPERATURE_FIELD + r"\s+(?:is|was)\s+(?:not supported|unsupported)\b",
+        r"\bsetting\s+" + _TEMPERATURE_FIELD + r"\s+to\s+a\s+non[- ]default\s+value\s+"
         r"(?:is|was)\s+(?:not supported|unsupported)\b",
-        r"\btemperature\b.{0,100}\bonly\s+(?:the\s+)?default"
+        _TEMPERATURE_FIELD + r".{0,100}\bonly\s+(?:the\s+)?default"
         r"(?:\s+\([^)]*\))?\s+value\s+is\s+supported\b",
     ))
+
+
+def _parse_effort_capabilities(entry, documented: Optional[ReasoningCapabilities]):
+    """Read one Models API entry's ``capabilities.effort`` tree.
+
+    Returns None when the provider said nothing usable (missing or malformed
+    metadata -- the caller falls back to documented data), NO_REASONING_CONTROL
+    when the provider positively reports effort as unsupported, or the
+    advertised levels in canonical order. Only literal ``True`` flags count,
+    and labels outside _EFFORT_LEVELS are ignored rather than surfaced. The
+    Models API reports no default level, so ``default_effort`` comes only from
+    documentation for the same model id, and only when the provider still
+    advertises that level.
+    """
+    caps = entry.get("capabilities")
+    if not isinstance(caps, dict):
+        return None
+    effort = caps.get("effort")
+    if not isinstance(effort, dict):
+        return None
+    if effort.get("supported") is False:
+        return NO_REASONING_CONTROL
+    if effort.get("supported") is not True:
+        return None
+    levels = tuple(
+        level for level in _EFFORT_LEVELS
+        if isinstance(effort.get(level), dict) and effort[level].get("supported") is True
+    )
+    if not levels:
+        return None
+    default = documented.default_effort if documented is not None else None
+    return ReasoningCapabilities(
+        efforts=levels,
+        default_effort=default if default in levels else None,
+    )
 
 
 def _record_temperature_mismatch(model) -> None:
@@ -216,8 +331,11 @@ class AnthropicBackend(BaseLLMBackend):
     default_url = API_BASE  # not user-editable; kept for UI consistency with other backends
 
     def _accepts_temperature(self, model: Optional[str]) -> bool:
-        """Keep unknown models capable until the provider proves otherwise."""
-        return not (model or "").startswith(_TEMPERATURE_FORBIDDEN_PREFIXES)
+        """The one sampling decision both request builders consult: send
+        `temperature` only to families documented to accept it (see
+        sampling_support()). Documented-rejecting and unknown models run at
+        the provider's own default."""
+        return sampling_support(model) is SamplingSupport.DOCUMENTED_ACCEPTS
 
     def _post_messages(self, payload: dict, *, stream: bool = False):
         """Retry once only when Anthropic rejects this optional field."""
@@ -288,6 +406,7 @@ class AnthropicBackend(BaseLLMBackend):
                 and entry["id"].strip()
             )
         except Exception as exc:
+            self._last_discovery_succeeded = False
             status = getattr(locals().get("resp"), "status_code", None)
             suffix = f" (HTTP {status})" if isinstance(status, int) else ""
             return ModelDiscoveryResult(
@@ -298,6 +417,24 @@ class AnthropicBackend(BaseLLMBackend):
                     f"({type(exc).__name__})."
                 ),
             )
+        # ANTHROPIC-MODEL-CAPABILITY-REFRESH-01 -- same response, no second
+        # fetch. Built in a local and swapped in whole (a full replace, never
+        # a merge), each entry isolated so one malformed capability tree
+        # can't spoil its siblings -- the OpenRouter discovery cache's rules.
+        discovered = {}
+        for entry in payload["data"]:
+            try:
+                model_id = entry.get("id") if isinstance(entry, dict) else None
+                if not isinstance(model_id, str) or not model_id.strip():
+                    continue
+                caps = _parse_effort_capabilities(entry, _REASONING_MODELS.get(model_id))
+                if caps is not None:
+                    discovered[model_id] = caps
+            except Exception:
+                continue
+        self._discovered_reasoning = discovered
+        self._reasoning_discovery_succeeded = True
+        self._last_discovery_succeeded = True
         if not models:
             return ModelDiscoveryResult(
                 ModelDiscoveryOutcome.EMPTY,
@@ -331,18 +468,36 @@ class AnthropicBackend(BaseLLMBackend):
 
     def reasoning_capabilities(self, model=None) -> ReasoningCapabilities:
         """
-        See the _REASONING_MODELS module-level comment above: both
-        "claude-sonnet-5" and "claude-sonnet-4-6" are confirmed, distinct
-        entries with different effort matrices (claude-sonnet-4-6 does not
-        support "xhigh"). `model=None` always falls through to
-        NO_REASONING_CONTROL, matching the base class's documented
-        contract (get_model() is not consulted here even though it would
-        be side-effect-free for this backend, to keep the contract
+        Pure cache read, zero I/O. Provider-reported effort from this
+        instance's last successful Models API discovery outranks the
+        documented _REASONING_MODELS table (see the module-level comments
+        above); a model the provider reported nothing usable for falls back
+        to that table, and anything else to NO_REASONING_CONTROL -- no
+        capability is ever inferred from a model name. `model=None` always
+        falls through to NO_REASONING_CONTROL, matching the base class's
+        documented contract (get_model() is not consulted here even though it
+        would be side-effect-free for this backend, to keep the contract
         uniform across backends where it isn't).
         """
         if model is None:
             return NO_REASONING_CONTROL
+        discovered = getattr(self, "_discovered_reasoning", {}).get(model)
+        if discovered is not None:
+            return discovered
         return _REASONING_MODELS.get(model, NO_REASONING_CONTROL)
+
+    def reasoning_capabilities_ready(self, model=None) -> bool:
+        """Documented models are ready offline; any other model waits for one
+        successful discovery, so Settings/preference restoration perform one
+        bounded refresh through the existing seams instead of every turn."""
+        if model is None or model in _REASONING_MODELS:
+            return True
+        return bool(getattr(self, "_reasoning_discovery_succeeded", False))
+
+    def refresh_reasoning_capabilities(self) -> bool:
+        """Explicit, opt-in discovery; reports whether THIS attempt succeeded."""
+        self.discover_models()
+        return bool(getattr(self, "_last_discovery_succeeded", False))
 
     def _apply_reasoning_override(self, payload: dict, effort: str, model=None) -> None:
         """
@@ -357,7 +512,8 @@ class AnthropicBackend(BaseLLMBackend):
         (extended thinking) -- effort is independent of that per the Part
         2A spec, and this backend doesn't enable extended thinking by
         default today anyway (see chat()'s disable_thinking comment).
-        "adaptive" is never a member of either Sonnet capability's efforts, so it can
+        "adaptive" is never a member of any capability's efforts (documented
+        or discovered -- both only ever hold _EFFORT_LEVELS labels), so it can
         never reach here via the validated `effort` param.
         """
         output_config = payload.setdefault("output_config", {})
@@ -739,8 +895,21 @@ class AnthropicBackend(BaseLLMBackend):
     # for this contract (a clean stop, and truncation) -- stop_sequence,
     # pause_turn, refusal, and anything unrecognized fall through to
     # UNKNOWN rather than a guessed classification.
+    # ANTHROPIC-MODEL-CAPABILITY-REFRESH-01: model_context_window_exceeded is
+    # Anthropic's documented truncation at the context window -- the same
+    # "cut off before the model chose to stop" meaning as max_tokens.
     _COMPLETE_STOP_REASONS = frozenset({"end_turn", "tool_use"})
-    _INCOMPLETE_STOP_REASONS = frozenset({"max_tokens"})
+    _INCOMPLETE_STOP_REASONS = frozenset({"max_tokens", "model_context_window_exceeded"})
+
+    # A stream ending on one of these is not a Final answer, whatever text
+    # arrived before it. Raised as RuntimeError so core/agent.py's
+    # _stream_final() renders its "[Stream error: ...]" error response
+    # (ERROR_RESPONSE_PREFIXES) instead of persisting a clean Final.
+    _STREAM_FAILED_STOP_REASONS = {
+        "refusal": "the provider declined to complete this response",
+        "max_tokens": "the response was cut off at the output token limit",
+        "model_context_window_exceeded": "the response was cut off at the model's context window",
+    }
 
     def extract_termination(self, response) -> TerminationStatus:
         stop_reason = response.get("stop_reason") if isinstance(response, dict) else None
@@ -816,6 +985,9 @@ class AnthropicBackend(BaseLLMBackend):
             raise RuntimeError(format_anthropic_error(resp.status_code, resp.text, str(e)))
 
         thinking_open = False
+        stop_reason = None
+        stop_details = None
+        stream_failure = None
 
         for raw_line in resp.iter_lines():
             if not raw_line:
@@ -856,9 +1028,35 @@ class AnthropicBackend(BaseLLMBackend):
                     yield "__THINK_END__"
                     thinking_open = False
 
+            elif etype == "message_delta":
+                delta = event.get("delta")
+                if isinstance(delta, dict):
+                    stop_reason = delta.get("stop_reason") or stop_reason
+                    stop_details = delta.get("stop_details") or stop_details
+
+            elif etype == "error":
+                # A mid-stream provider error (e.g. overloaded_error) arrives
+                # as an SSE event on an HTTP 200 response.
+                info = classify_anthropic_error(None, json.dumps(event))
+                stream_failure = (f"Anthropic error ({info['kind']}, mid-stream): "
+                                  f"{info['message'] or 'unspecified stream error'}")
+                break
+
             elif etype == "message_stop":
                 break
 
         # safety net: close an unterminated thinking block if the stream ended mid-block
         if thinking_open:
             yield "__THINK_END__"
+
+        if stream_failure is None and stop_reason in self._STREAM_FAILED_STOP_REASONS:
+            category = stop_details.get("category") if isinstance(stop_details, dict) else None
+            suffix = f", category={category}" if isinstance(category, str) and category else ""
+            stream_failure = (f"Anthropic stream ended without a complete answer "
+                              f"(stop_reason={stop_reason}{suffix}): "
+                              f"{self._STREAM_FAILED_STOP_REASONS[stop_reason]}.")
+        if stream_failure is not None:
+            close = getattr(resp, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeError(stream_failure)

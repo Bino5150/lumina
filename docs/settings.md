@@ -61,8 +61,11 @@ whether a token budget is supported instead of a named level. The combo
 box in Settings has to handle six distinct states depending on what's
 currently known about the selected model — a static list of efforts, a
 model with no reasoning control at all, a model where reasoning is
-mandatory, or an OpenRouter model whose capabilities haven't been
-discovered yet.
+mandatory, or an OpenRouter or Anthropic model whose capabilities haven't
+been discovered yet. For Anthropic, efforts the provider's model list
+reports outrank Lumina's built-in table; models in that table work offline,
+and any other Claude model shows its efforts after one successful
+discovery.
 
 If a backend doesn't declare any reasoning capability, the default is
 **no override at all** — Lumina simply doesn't send a reasoning parameter,

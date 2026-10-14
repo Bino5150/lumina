@@ -15,6 +15,11 @@ from core.backends.reasoning import NO_REASONING_CONTROL
 
 
 _MESSAGES = [{"role": "user", "content": "hello"}]
+# ANTHROPIC-MODEL-CAPABILITY-REFRESH-01: unknown models no longer receive
+# temperature at all, so the bounded recovery is exercised through its one
+# remaining trigger -- a family documented to accept temperature whose
+# capability data has gone stale.
+_STALE_MODEL = "claude-sonnet-4-6"
 _OK_BODY = {"content": [{"type": "text", "text": "SUMMARY: done"}]}
 
 
@@ -131,11 +136,11 @@ def test_utility_on_forbidden_model_has_exact_valid_wire_shape(wire):
     }
 
 
-def test_unknown_model_retry_removes_only_temperature_and_records_event(wire, events):
+def test_stale_model_retry_removes_only_temperature_and_records_event(wire, events):
     sent, queue = wire
     rejected = _error()
     queue.extend((rejected, _Response()))
-    backend = _backend("claude-future-9")
+    backend = _backend(_STALE_MODEL)
     response = backend.chat(
         [{"role": "system", "content": "brief"}, *_MESSAGES],
         tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
@@ -148,17 +153,17 @@ def test_unknown_model_retry_removes_only_temperature_and_records_event(wire, ev
     assert second == {k: v for k, v in first.items() if k != "temperature"}
     assert rejected.closed
     assert events == [("backend.capability_mismatch", {
-        "severity": "warning", "backend": "anthropic", "model": "claude-future-9",
+        "severity": "warning", "backend": "anthropic", "model": "claude-sonnet-4-6",
         "fields": {"parameter": "temperature", "action": "retried_once_without_parameter",
                    "capability_metadata": "stale"},
     })]
 
 
-def test_stream_unknown_model_retries_once_without_temperature(wire, events):
+def test_stream_stale_model_retries_once_without_temperature(wire, events):
     sent, queue = wire
     rejected = _error(message="temperature is not supported with this model")
     queue.extend((rejected, _Response(lines=(b'data: {"type":"message_stop"}',))))
-    assert list(_backend("claude-future-9").chat_stream(_MESSAGES)) == []
+    assert list(_backend(_STALE_MODEL).chat_stream(_MESSAGES)) == []
     assert len(sent) == 2
     assert all(call[1]["stream"] is True for call in sent)
     assert sent[1][1]["json"] == {k: v for k, v in sent[0][1]["json"].items()
@@ -190,7 +195,7 @@ def test_unrelated_errors_are_never_retried(first, wire, events):
     sent, queue = wire
     queue.append(first)
     with pytest.raises(RuntimeError):
-        _backend("claude-future-9").chat(_MESSAGES)
+        _backend(_STALE_MODEL).chat(_MESSAGES)
     assert len(sent) == 1
     assert not first.closed
     assert events == []
@@ -209,7 +214,7 @@ def test_retry_failure_keeps_existing_error_and_never_tries_third_time(wire, eve
     sent, queue = wire
     queue.extend((_error(), _error(message="max_tokens is invalid")))
     with pytest.raises(RuntimeError, match="max_tokens is invalid"):
-        _backend("claude-future-9").chat(_MESSAGES)
+        _backend(_STALE_MODEL).chat(_MESSAGES)
     assert len(sent) == 2
     assert len(events) == 1
 
@@ -223,17 +228,19 @@ def test_telemetry_failure_does_not_break_retry(wire, monkeypatch):
         raise RuntimeError("telemetry unavailable")
 
     monkeypatch.setattr(recorder, "record_machine_event", fail)
-    assert _backend("claude-future-9").chat(_MESSAGES) == _OK_BODY
+    assert _backend(_STALE_MODEL).chat(_MESSAGES) == _OK_BODY
     assert len(sent) == 2
 
 
 def test_temperature_membership_grants_no_other_capability(monkeypatch):
     model = "claude-2-temperature-only"
     monkeypatch.setattr(
-        anthropic_backend, "_TEMPERATURE_FORBIDDEN_PREFIXES",
-        anthropic_backend._TEMPERATURE_FORBIDDEN_PREFIXES + (model,),
+        anthropic_backend, "_SAMPLING_REJECTED_FAMILIES",
+        anthropic_backend._SAMPLING_REJECTED_FAMILIES + (model,),
     )
     backend = _backend(model)
+    assert anthropic_backend.sampling_support(model) is \
+        anthropic_backend.SamplingSupport.DOCUMENTED_REJECTS
     assert backend._accepts_temperature(model) is False
     assert backend.reasoning_capabilities(model) is NO_REASONING_CONTROL
     assert backend.supports_vision(model) is False
