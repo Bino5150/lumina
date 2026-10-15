@@ -215,13 +215,17 @@ function createWorld(pageSpec, doc, navigate) {
   return world;
 }
 
-// Run an injected function in the page's persistent isolated world.
-function runInDomPage(func, args, page, navigate) {
+// Run an injected function in the page's persistent isolated world. A
+// harness that models Chrome's document identity passes a ``holder`` -- one
+// per (tab, documentId) -- so each document gets its OWN isolated world, as in
+// Chrome; without one, the page keeps a single world (direct calls in tests).
+function runInDomPage(func, args, page, navigate, holder = null) {
   if (!page.dom) page.dom = createDocument(page);
   page.navigateHook = navigate;
-  if (!page.world) page.world = createWorld(page, page.dom, (url) => page.navigateHook(url));
-  page.world.args = args;
-  return vm.runInContext(`(${func.toString()}).apply(null, args)`, page.world);
+  const owner = holder || page;
+  if (!owner.world) owner.world = createWorld(page, page.dom, (url) => page.navigateHook(url));
+  owner.world.args = args;
+  return vm.runInContext(`(${func.toString()}).apply(null, args)`, owner.world);
 }
 
 // Attach a new node (built from a spec) under ``parent`` -- e.g. a framework

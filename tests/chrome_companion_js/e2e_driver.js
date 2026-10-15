@@ -114,16 +114,26 @@ function navigateTab(tabId, url) {
   pages[String(tabId)] = target ? JSON.parse(JSON.stringify(target)) : undefined;
 }
 
-function runInPage(func, args, page, navigate = () => {}) {
-  if (page.nodes) return runInDomPage(func, args, page, navigate);
+const worlds = new Map(); // one isolated world per (tab, document), like Chrome's
+function worldFor(tabId) {
+  const key = `${tabId}|${documentId(tabId)}`;
+  if (!worlds.has(key)) worlds.set(key, {});
+  return worlds.get(key);
+}
+
+function runInPage(func, args, page, navigate = () => {}, holder = null) {
+  if (page.nodes) return runInDomPage(func, args, page, navigate, holder);
   const anchors = (page.anchors || []).map((a) => ({
     getAttribute: (name) => (name === "href" ? a.href : null),
     innerText: a.text || "",
   }));
   const document = { body: { innerText: page.text || "" }, documentElement: { textContent: page.text || "" },
     title: page.title || "", baseURI: page.href, querySelectorAll: () => anchors };
-  const location = { href: page.href, origin: new URL(page.href).origin };
-  return vm.runInNewContext(`(${func.toString()}).apply(null, args)`, { document, location, URL, args });
+  const location = { href: page.href, origin: new URL(page.href).origin, assign: navigate };
+  if (!holder) return vm.runInNewContext(`(${func.toString()}).apply(null, args)`, { document, location, URL, args, crypto: webcrypto });
+  if (!holder.world) holder.world = vm.createContext({ URL, crypto: webcrypto });
+  Object.assign(holder.world, { document, location, args });
+  return vm.runInContext(`(${func.toString()}).apply(null, args)`, holder.world);
 }
 
 const chrome = {
@@ -218,7 +228,7 @@ const chrome = {
       const page = pages[String(tabId)];
       if (!page) throw new Error("Cannot access contents of the page");
       return [{ documentId: current, frameId: 0,
-        result: runInPage(details.func, details.args, page, (url) => navigateTab(tabId, url)) }];
+        result: runInPage(details.func, details.args, page, (url) => navigateTab(tabId, url), worldFor(tabId)) }];
     },
   },
 };

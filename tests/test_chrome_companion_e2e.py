@@ -231,6 +231,28 @@ def test_slice1_generic_observe_and_navigate_through_worker_host_and_hub(world):
     assert landed["observed"]["document_id"] == "doc-21-navigated"
 
 
+def test_finger_through_the_real_chain_keeps_document_identity_private(world):
+    """FINGER-STALE-DOC: get_links -> follow_link through the real worker, host
+    and hub. The worker's private per-document identity never reaches the hub
+    (whose strict validator would refuse any extra key), and a claim from the
+    replaced document is refused before dispatch."""
+    href = "https://www.reddit.com/r/AgentsInteractive/comments/abc"
+    # The destination is a readable page too, so the replay is judged on document identity.
+    chrome = world.launch(pages=dict(PAGES, **{"11": {"href": href, "title": "A post", "text": "post body",
+                                                      "anchors": [{"href": href, "text": "A post"}]}}))
+    _ready(world.hub)
+    links = world.hub.request("get_links", tab_id=7, args={}, timeout_s=5)
+    assert set(links["result"]) == {"links", "total_links"}
+    claim = {"window_id": 1, "document_id": "doc-7", "text": "A post", "href": href}
+    chrome.command(cmd="navigation", allowed=True)
+    moved = world.hub.request("follow_link", tab_id=7, args=claim, timeout_s=10)
+    assert moved["result"]["status"] == "browser_local_effect_observed"
+    assert moved["observed"]["document_id"] == "doc-7-navigated"
+    with pytest.raises(CompanionError) as stale:
+        world.hub.request("follow_link", tab_id=7, args=claim, timeout_s=5)
+    assert stale.value.code == "stale_document" and stale.value.executed is False
+
+
 def test_pause_and_resume_through_the_real_chain(world):
     chrome = world.launch()
     cid = _ready(world.hub)

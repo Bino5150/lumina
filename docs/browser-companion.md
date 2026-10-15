@@ -65,6 +65,12 @@ is worth being precise about why that is still safe:
 - Chrome targets fixed extension code to that exact source document for the
   final check and URL navigation. This is not a synthetic click. No click
   event handler runs because of Lumina.
+- That targeting is not trusted on its own: in testing, Chrome 155 ran such
+  code in the tab's *newer* document after it had navigated away (even back
+  to the same address). So the extension also gives every page it reads a
+  private identity of its own, and the final check and navigation refuse in
+  any page other than the one Lumina actually read. The same identity binds
+  `chrome_navigate`'s element references.
 
 The selected link must be same-origin and HTTP(S). A server may process a GET
 with side effects, and a redirect after dispatch may land on another origin.

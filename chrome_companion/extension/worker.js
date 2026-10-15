@@ -566,22 +566,25 @@ async function handleRequest(s, req) {
     if (req.op === "get_links" && outcome.observed && Number.isSafeInteger(outcome.tab_id)) {
       // Only a result sent on this connection creates eligibility. Preserve
       // multiple delivered lists for the same document without a clock TTL.
+      // The document identity nonce stays here (FINGER-STALE-DOC): never sent
+      // to the hub or the model. A different identity starts a fresh set.
       const previous = s.deliveredLinks.get(outcome.tab_id);
       const pairs = previous && previous.documentId === outcome.observed.document_id
-        ? previous.pairs : new Set();
+        && previous.nonce === outcome.documentNonce ? previous.pairs : new Set();
       for (const link of outcome.result.links) pairs.add(JSON.stringify([link.text, link.href]));
-      s.deliveredLinks.set(outcome.tab_id, { documentId: outcome.observed.document_id, pairs });
+      s.deliveredLinks.set(outcome.tab_id, { documentId: outcome.observed.document_id,
+        nonce: outcome.documentNonce, pairs });
     }
     if (req.op === "observe" && outcome.observed && Number.isSafeInteger(outcome.tab_id)) {
       // Slice 1: same eligibility rule for element references. Only a
       // reference sent on THIS connection, for THIS document, can be acted on.
-      // The registry nonce stays here: it never crosses to the hub or the model.
+      // The document identity nonce stays here: it never crosses to the hub or the model.
       const previous = s.deliveredRefs.get(outcome.tab_id);
       const same = previous && previous.documentId === outcome.observed.document_id
-        && previous.registry === outcome.registry;
+        && previous.nonce === outcome.documentNonce;
       const refs = same ? previous.refs : new Set();
       for (const element of outcome.result.elements) refs.add(element.ref);
-      s.deliveredRefs.set(outcome.tab_id, { documentId: outcome.observed.document_id, registry: outcome.registry, refs });
+      s.deliveredRefs.set(outcome.tab_id, { documentId: outcome.observed.document_id, nonce: outcome.documentNonce, refs });
     }
     lastAction = { op: req.op, tab_id: outcome.tab_id ?? null, host: outcome.host ?? null, at: Date.now() };
     void publishStatus();
@@ -683,6 +686,15 @@ function extractVisibleText(maxChars) {
 
 // Injected into the page's ISOLATED world; must be self-contained.
 function extractLinks(maxLinks) {
+  // The ONE per-document identity (FINGER-STALE-DOC): minted on first use in
+  // this extension's isolated world for this document, frozen, shared by
+  // element references and FINGER links. Page scripts cannot read or set it.
+  const DOC_KEY = "__luminaCompanionDocument_v1";
+  if (!globalThis[DOC_KEY]) {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    globalThis[DOC_KEY] = Object.freeze({ nonce: Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("") });
+  }
   const out = [];
   const seen = new Set();
   let total = 0;
@@ -712,7 +724,8 @@ function extractLinks(maxLinks) {
       .replace(/\s+/g, " ").trim().slice(0, 200);
     out.push({ text: label, href, same_origin: url.origin === here });
   }
-  return { href: location.href, links: out, total_links: total, truncated: capped || total > out.length };
+  return { href: location.href, links: out, total_links: total, truncated: capped || total > out.length,
+    document_nonce: globalThis[DOC_KEY].nonce };
 }
 
 // Stage 2 (FINGER): resolve ONE link Lumina already observed. Injected
@@ -732,6 +745,11 @@ function extractLinks(maxLinks) {
 function resolveLinkTarget(claim) {
   const here = location.origin;
   const out = { href: location.href, matches: 0, resolved_href: null, same_origin: false };
+  // Only the document get_links delivered from (FINGER-STALE-DOC). Chrome 155
+  // may run a stale-targeted script in the tab's NEW document; a same-URL one
+  // would otherwise pass every check below.
+  const doc = globalThis.__luminaCompanionDocument_v1;
+  if (!doc || doc.nonce !== claim.document_nonce) return Object.assign(out, { other_document: true });
   const label = (anchor) => (anchor.innerText || anchor.getAttribute("aria-label")
     || anchor.getAttribute("title") || "").replace(/\s+/g, " ").trim().slice(0, 200);
   let scanned = 0;
@@ -760,6 +778,8 @@ function resolveLinkTarget(claim) {
 // Fixed extension-owned actuator. Chrome dispatches it only into the source
 // document; it resolves the target again and never runs page-supplied code.
 function dispatchVerifiedLink(claim) {
+  const doc = globalThis.__luminaCompanionDocument_v1;
+  if (!doc || doc.nonce !== claim.document_nonce) return { status: "refused" }; // FINGER-STALE-DOC
   if (location.href !== claim.source_url) return { status: "refused" };
   const label = (anchor) => (anchor.innerText || anchor.getAttribute("aria-label")
     || anchor.getAttribute("title") || "").replace(/\s+/g, " ").trim().slice(0, 200);
@@ -803,6 +823,15 @@ function dispatchVerifiedLink(claim) {
 // arises on that replacement fallback, and there it fails closed.
 // ---------------------------------------------------------------------------
 function observePage(spec) {
+  // The ONE per-document identity (FINGER-STALE-DOC): minted on first use in
+  // this extension's isolated world for this document, frozen, shared by
+  // element references and FINGER links. Page scripts cannot read or set it.
+  const DOC_KEY = "__luminaCompanionDocument_v1";
+  if (!globalThis[DOC_KEY]) {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    globalThis[DOC_KEY] = Object.freeze({ nonce: Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("") });
+  }
   const KEY = "__luminaCompanionRegistry_v1";
   let reg = globalThis[KEY];
   if (!reg) {
@@ -1026,15 +1055,13 @@ function observePage(spec) {
     // a REPLACEMENT element must match uniquely.
     const identity = (d, el) => [d.role, d.name, d.href || "", tagOf(el)].join("\u0001");
     const fingerprint = (d, el) => `${identity(d, el)}\u0001${d.context}`;
-    // A random identity for THIS registry (so for this document). Chrome 155
-    // was observed (real-Chrome evidence, Slice 1) running a script targeted at
-    // a stale documentId in the tab's NEW document after a cross-document
-    // navigation; refs restart at e1 per document, so a ref is only ever
-    // resolved against the registry whose nonce the worker was shown.
-    const nonceBytes = new Uint8Array(16);
-    crypto.getRandomValues(nonceBytes);
+    // The registry carries this document's identity. Chrome 155 was observed
+    // (real-Chrome evidence, Slice 1) running a script targeted at a stale
+    // documentId in the tab's NEW document after a cross-document navigation;
+    // refs restart at e1 per document, so a ref is only ever resolved against
+    // the document identity the worker was shown.
     reg = {
-      nonce: Array.from(nonceBytes, (b) => b.toString(16).padStart(2, "0")).join(""),
+      nonce: globalThis[DOC_KEY].nonce,
       gen: 0, next: 1, byEl: new WeakMap(), byRef: new Map(), limits: L,
       cut, attr, tagOf, textOf, visible, collect, describe, identity, fingerprint, nameOf, linkUrl, sensitiveOf,
       valueOf, stateOf, HEADING,
@@ -1190,7 +1217,7 @@ function observePage(spec) {
     dialog = reg.cut(label || "dialog", reg.limits.name);
   }
   return { href: location.href, title: reg.cut(document.title || "", 300), gen, elements: out,
-    total_elements: total, removed, headings, viewport: metrics(), dialog, scrolled, registry: reg.nonce };
+    total_elements: total, removed, headings, viewport: metrics(), dialog, scrolled, document_nonce: reg.nonce };
 }
 
 // Resolve ONE delivered reference to the live link it names (read-only).
@@ -1198,7 +1225,7 @@ function resolveRefTarget(claim) {
   const out = { href: location.href, status: "not_found", resolved_href: null };
   const reg = globalThis.__luminaCompanionRegistry_v1;
   if (!reg || typeof reg.resolve !== "function") return out;
-  if (reg.nonce !== claim.registry) {
+  if (reg.nonce !== claim.document_nonce) {
     out.status = "other_document";
     return out;
   }
@@ -1221,7 +1248,7 @@ function resolveRefTarget(claim) {
 function dispatchRefLink(claim) {
   if (location.href !== claim.source_url) return { status: "refused" };
   const reg = globalThis.__luminaCompanionRegistry_v1;
-  if (!reg || typeof reg.resolve !== "function" || reg.nonce !== claim.registry) return { status: "refused" };
+  if (!reg || typeof reg.resolve !== "function" || reg.nonce !== claim.document_nonce) return { status: "refused" };
   const hit = reg.resolve(claim.ref);
   if (hit.status !== "ok") return { status: "refused" };
   const url = reg.linkUrl(hit.el);
@@ -1589,7 +1616,7 @@ const NAVIGATE = Object.freeze({
     if (!delivered || !delivered.refs.has(req.args.ref)) throw new CompanionFailure("target_not_found", req.tab_id);
     if (!(await safeActionTab(req.tab_id, req.args.window_id))) throw new CompanionFailure("navigated_during_request", req.tab_id);
     const { tabId, page, observed, grantEpoch } = await readPage(req, resolveRefTarget,
-      { ref: req.args.ref, registry: delivered.registry }, live);
+      { ref: req.args.ref, document_nonce: delivered.nonce }, live);
     if (tabId !== req.tab_id) throw new CompanionFailure("navigated_during_request", tabId);
     if (observed.document_id !== req.args.document_id) throw new CompanionFailure("stale_document", tabId);
     const refusal = { not_found: "target_not_found", stale: "stale_target", ambiguous: "target_ambiguous",
@@ -1617,15 +1644,20 @@ const NAVIGATE = Object.freeze({
     try {
       [injection] = await chrome.scripting.executeScript({
         target: { tabId, documentIds: [observed.document_id] }, world: "ISOLATED", func: dispatchRefLink,
-        args: [{ source_url: observed.url, ref: req.args.ref, href: destination, registry: delivered.registry }],
+        args: [{ source_url: observed.url, ref: req.args.ref, href: destination, document_nonce: delivered.nonce }],
       });
     } catch {
       return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, null, verdict.pattern);
     }
-    if (!injection || injection.documentId !== observed.document_id || !injection.result) {
+    if (!injection || !injection.result) {
       return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, null, verdict.pattern);
     }
-    if (injection.result.status !== "dispatched") return { error: "target_changed", tab_id: tabId };
+    if (injection.result.status !== "dispatched") {
+      return { error: injection.documentId === observed.document_id ? "target_changed" : "stale_document", tab_id: tabId };
+    }
+    if (injection.documentId !== observed.document_id) {
+      return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, null, verdict.pattern);
+    }
     const settled = await settleNewDocument(tabId, req.args.window_id, req, s, navEpoch, grantEpoch,
       observed.document_id, live);
     return navigateReceipt(req, s, navEpoch, grantEpoch, live, settled, current, verdict.pattern);
@@ -1713,7 +1745,8 @@ const OPERATIONS = Object.freeze({
   async get_links(req, live) {
     const maxLinks = Math.min(req.args.max_links ?? LIMITS.DEFAULT_LINKS, LIMITS.MAX_LINKS);
     const { tabId, page, host, observed, grantEpoch } = await readPage(req, extractLinks, maxLinks, live);
-    if (!Array.isArray(page.links) || !Number.isSafeInteger(page.total_links)) {
+    if (!Array.isArray(page.links) || !Number.isSafeInteger(page.total_links)
+      || typeof page.document_nonce !== "string" || !HEX32.test(page.document_nonce)) {
       throw new CompanionFailure("injection_failed", tabId);
     }
     const links = [];
@@ -1725,7 +1758,7 @@ const OPERATIONS = Object.freeze({
     }
     return {
       result: { links, total_links: Math.max(page.total_links, links.length) },
-      tab_id: tabId, observed, host, grantEpoch,
+      tab_id: tabId, observed, host, grantEpoch, documentNonce: page.document_nonce,
       truncated: Boolean(page.truncated) || links.length < page.links.length,
     };
   },
@@ -1738,10 +1771,10 @@ const OPERATIONS = Object.freeze({
       since_gen: req.args.since_gen ?? null, scroll: req.args.scroll ?? null };
     const { tabId, page, host, observed, grantEpoch } = await readPage(req, observePage, spec, live);
     const result = sanitizeObservation(page, spec.max_items);
-    if (!result || typeof page.registry !== "string" || !HEX32.test(page.registry)) {
+    if (!result || typeof page.document_nonce !== "string" || !HEX32.test(page.document_nonce)) {
       throw new CompanionFailure("injection_failed", tabId);
     }
-    return { result, tab_id: tabId, observed, host, grantEpoch, registry: page.registry,
+    return { result, tab_id: tabId, observed, host, grantEpoch, documentNonce: page.document_nonce,
       truncated: result.total_elements > result.elements.length };
   },
 
@@ -1801,10 +1834,13 @@ const OPERATIONS = Object.freeze({
     // document under the same grant / document-identity / PAUSE / revoke
     // machinery as every other read, and hands back what THIS document says.
     const { tabId, page, observed, grantEpoch } = await readPage(
-      req, resolveLinkTarget, { href: req.args.href, text: req.args.text }, live);
+      req, resolveLinkTarget, { href: req.args.href, text: req.args.text, document_nonce: delivered.nonce }, live);
     if (tabId !== req.tab_id) throw new CompanionFailure("navigated_during_request", tabId);
-    // Lumina must be acting on the document she actually read.
-    if (observed.document_id !== req.args.document_id) throw new CompanionFailure("stale_document", tabId);
+    // Lumina must be acting on the document she actually read -- by Chrome's
+    // documentId AND by the extension's own per-document identity.
+    if (observed.document_id !== req.args.document_id || page.other_document === true) {
+      throw new CompanionFailure("stale_document", tabId);
+    }
     if (!Number.isSafeInteger(page.matches) || page.matches < 1) {
       throw new CompanionFailure("target_not_found", tabId);
     }
@@ -1839,17 +1875,26 @@ const OPERATIONS = Object.freeze({
       [injection] = await chrome.scripting.executeScript({
         target: { tabId, documentIds: [observed.document_id] },
         world: "ISOLATED", func: dispatchVerifiedLink,
-        args: [{ source_url: observed.url, text: req.args.text, href: req.args.href }],
+        args: [{ source_url: observed.url, text: req.args.text, href: req.args.href, document_nonce: delivered.nonce }],
       });
     } catch {
       return { result: actionReceipt(req, "ambiguous_after_dispatch"),
         navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
     }
-    if (!injection || injection.documentId !== observed.document_id || !injection.result) {
+    if (!injection || !injection.result) {
       return { result: actionReceipt(req, "ambiguous_after_dispatch"),
         navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
     }
-    if (injection.result.status !== "dispatched") return { error: "target_changed", tab_id: tabId };
+    // The fixed actuator refused: it navigated nothing, in whichever document
+    // Chrome ran it (FINGER-STALE-DOC). Anything else in the wrong document
+    // stays ambiguous, never verified.
+    if (injection.result.status !== "dispatched") {
+      return { error: injection.documentId === observed.document_id ? "target_changed" : "stale_document", tab_id: tabId };
+    }
+    if (injection.documentId !== observed.document_id) {
+      return { result: actionReceipt(req, "ambiguous_after_dispatch"),
+        navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern: verdict.pattern };
+    }
     const settled = await settleNavigatedTab(tabId, req.args.window_id, req, s, navEpoch, grantEpoch,
       observed.document_id, destination, live);
     if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch

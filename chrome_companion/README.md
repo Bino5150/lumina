@@ -89,7 +89,10 @@ your tabs
   inside an origin you have already allowed: Lumina names it by the exact
   text and href `get_links` delivered in this connection on that exact document, and
   Chrome re-reads the live document and navigates only to the href that
-  document itself reports. The link must be unique on the page and must
+  document itself reports -- only in the very document `get_links` read,
+  confirmed by an identity the extension keeps privately for each page it
+  reads (Chrome's own document targeting was seen running code in a newer
+  document after a navigation, so it is not relied on alone). The link must be unique on the page and must
   stay on that page's origin; a link that moved, vanished, or appears twice
   fails without navigating, and it is never retried against a different
   target. The page cannot widen this: proposing a destination is not

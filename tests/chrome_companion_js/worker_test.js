@@ -69,10 +69,10 @@ const PAGES = () => ({
 
 const { runInDomPage, appendSpec } = require("./fake_dom.js");
 
-function runInPage(func, args, page, navigate = () => {}) {
+function runInPage(func, args, page, navigate = () => {}, holder = null) {
   // Slice 1 pages carry a DOM spec: run in that document's persistent
-  // isolated world (fake_dom.js). Older anchor-only pages are unchanged.
-  if (page.nodes) return runInDomPage(func, args, page, navigate);
+  // isolated world (fake_dom.js).
+  if (page.nodes) return runInDomPage(func, args, page, navigate, holder);
   const anchors = (page.anchors || []).map((a) => ({
     getAttribute: (name) => (name === "href" ? a.href : name === "aria-label" ? a.ariaLabel ?? null
       : name === "title" ? a.title ?? null : null),
@@ -87,7 +87,12 @@ function runInPage(func, args, page, navigate = () => {}) {
   };
   const location = { href: page.locationHref || page.href, origin: new URL(page.href).origin,
     assign: navigate };
-  return vm.runInNewContext(`(${func.toString()}).apply(null, args)`, { document, location, URL, args });
+  if (!holder) return vm.runInNewContext(`(${func.toString()}).apply(null, args)`, { document, location, URL, args, crypto: webcrypto });
+  // FINGER-STALE-DOC: with a holder, the extension's isolated-world globals
+  // persist for this document only (Chrome semantics), across injections.
+  if (!holder.world) holder.world = vm.createContext({ URL, crypto: webcrypto });
+  Object.assign(holder.world, { document, location, args });
+  return vm.runInContext(`(${func.toString()}).apply(null, args)`, holder.world);
 }
 
 function makeEnv(opts = {}) {
@@ -117,6 +122,13 @@ function makeEnv(opts = {}) {
     // its id across navigations, a document does not. Replace an entry to
     // model a new document in that tab (e.g. a same-URL reload).
     documents: {},
+    // One isolated world per (tab, document), like Chrome's (FINGER-STALE-DOC).
+    worlds: new Map(),
+    worldFor(tabId, documentId) {
+      const key = `${tabId}|${documentId}`;
+      if (!this.worlds.has(key)) this.worlds.set(key, {});
+      return this.worlds.get(key);
+    },
     frameHook: null,
     frameCalls: [],
     containsHook: null,
@@ -296,7 +308,7 @@ function makeEnv(opts = {}) {
           return undefined;
         };
         return [{ documentId: sourceDocumentId, frameId: 0,
-          result: runInPage(details.func, details.args, page, navigate) }];
+          result: runInPage(details.func, details.args, page, navigate, env.worldFor(tabId, sourceDocumentId)) }];
       },
     },
   };
@@ -2849,6 +2861,115 @@ test("FINGER: a link Lumina already observed opens, and the receipt names the RE
   assert.equal(env.navigationCalls.length, 1);
 });
 
+// FINGER-STALE-DOC. Real Chrome 155 (evidence: FINGER-STALE-DOC receipt) runs
+// executeScript({documentIds:[STALE]}) in the tab's NEW document after a
+// cross-document navigation (frameId 7). If that new document has the SAME URL
+// (A -> B -> A), location.href still matches source_url and the link may still
+// be unique: the dispatch must refuse in any document whose isolated-world
+// identity is not the one get_links delivered from.
+const SAME_URL_OTHER_DOC = "doc-finger-A3";
+const landInOtherSameUrlDocument = (env, funcName) => async (details) => {
+  if (details.func.name !== funcName) return undefined;
+  const navigate = (url) => { env.navigationCalls.push({ tabId: 7, url, sourceDocumentId: SAME_URL_OTHER_DOC }); };
+  return [{ documentId: SAME_URL_OTHER_DOC, frameId: 7,
+    result: runInPage(details.func, details.args, env.pages[7], navigate, env.worldFor(7, SAME_URL_OTHER_DOC)) }];
+};
+
+test("FINGER-STALE-DOC: a stale-targeted dispatch landing in a same-URL unread document never moves the browser", async () => {
+  const env = fingerEnv();
+  const port = await toReady(env);
+  await observeLinks(port);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  env.injectionHook = landInOtherSameUrlDocument(env, "dispatchVerifiedLink");
+  const answer = await single(port, followReq());
+  assert.equal(env.navigationCalls.length, 0, "no navigation from a document Lumina never read");
+  assert.equal(answer.ok, false, "never reported as a verified navigation");
+  assert.equal(answer.error.code, "stale_document");
+});
+
+test("FINGER-STALE-DOC: a resolver landing in a same-URL unread document is refused, nothing dispatched", async () => {
+  const env = fingerEnv();
+  const port = await toReady(env);
+  await observeLinks(port);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  // Even with the injection's documentId reported as the expected one (worst
+  // case), the resolver's own document identity refuses.
+  env.injectionHook = async (details) => {
+    if (details.func.name !== "resolveLinkTarget") return undefined;
+    return [{ documentId: FINGER_DOC, frameId: 0,
+      result: runInPage(details.func, details.args, env.pages[7], () => {}, env.worldFor(7, SAME_URL_OTHER_DOC)) }];
+  };
+  const answer = await single(port, followReq());
+  assert.equal(answer.error.code, "stale_document");
+  assert.equal(env.navigationCalls.length, 0);
+  assert.ok(!env.injections.some((i) => i.func.name === "dispatchVerifiedLink"), "nothing dispatched");
+});
+
+test("FINGER-STALE-DOC: the document identity never crosses the bridge", async () => {
+  const env = fingerEnv();
+  const port = await toReady(env);
+  await observeLinks(port);
+  const world = env.worldFor(7, FINGER_DOC).world;
+  const nonce = vm.runInContext("globalThis.__luminaCompanionDocument_v1.nonce", world);
+  assert.match(nonce, /^[0-9a-f]{32}$/);
+  const wire = JSON.stringify(port.sent);
+  assert.ok(!wire.includes(nonce), "never in any message to the host/hub");
+  assert.ok(!wire.includes("document_nonce"));
+});
+
+test("FINGER-STALE-DOC: refs and links share ONE identity per document (no competing mechanism)", async () => {
+  const env = fingerEnv();
+  env.pages[7] = Object.assign(genericPage(), { href: "https://www.reddit.com/r/AgentsInteractive/" });
+  env.pages[7].nodes.push({ tag: "a", attrs: { href: FINGER_HREF }, text: FINGER_TEXT, rect: { top: 120, left: 600 } });
+  const port = await toReady(env);
+  assert.equal((await single(port, request("observe", { tab_id: 7, args: {} }))).ok, true);
+  await observeLinks(port);
+  const holder = env.worldFor(7, FINGER_DOC);
+  const docNonce = vm.runInContext("globalThis.__luminaCompanionDocument_v1.nonce", holder.world);
+  const regNonce = vm.runInContext("globalThis.__luminaCompanionRegistry_v1.nonce", holder.world);
+  assert.equal(regNonce, docNonce, "the element registry adopts the document identity");
+  assert.equal(env.peek("session.deliveredLinks.get(7).nonce"), env.peek("session.deliveredRefs.get(7).nonce"));
+  await env.popup({ kind: "set_navigation", allowed: true });
+  const answer = await single(port, followReq());
+  assert.equal(answer.ok, true, JSON.stringify(answer.error));
+});
+
+test("FINGER-STALE-DOC: an actuator reporting 'dispatched' from the wrong document is ambiguous, never verified", async () => {
+  const env = fingerEnv();
+  const port = await toReady(env);
+  await observeLinks(port);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  // Worst case: the wrong document really navigates the tab to the claimed
+  // destination, so the settle step WOULD see the expected URL and a new
+  // document. Only the documentId mismatch keeps this from being "verified".
+  env.injectionHook = async (details) => {
+    if (details.func.name !== "dispatchVerifiedLink") return undefined;
+    const tab = env.tabs.find((t) => t.id === 7);
+    tab.url = FINGER_HREF; tab.status = "complete";
+    env.documents[7] = "doc-7-from-unread-document";
+    return [{ documentId: SAME_URL_OTHER_DOC, frameId: 7, result: { status: "dispatched" } }];
+  };
+  const answer = await single(port, followReq());
+  assert.equal(answer.ok, true);
+  assert.equal(answer.result.status, "ambiguous_after_dispatch");
+  assert.equal(answer.result.observed_url, null);
+  assert.equal(answer.result.load_confirmed, false);
+});
+
+test("FINGER-STALE-DOC: a get_links answer without a document identity is refused", async () => {
+  const env = fingerEnv();
+  const port = await toReady(env);
+  env.injectionHook = async (details) => {
+    if (details.func.name !== "extractLinks") return undefined;
+    const real = runInPage(details.func, details.args, env.pages[7], () => {}, env.worldFor(7, FINGER_DOC));
+    delete real.document_nonce;
+    return [{ documentId: FINGER_DOC, frameId: 0, result: real }];
+  };
+  const answer = await single(port, request("get_links", { tab_id: 7, args: {} }));
+  assert.equal(answer.error.code, "injection_failed");
+  assert.equal(env.peek("session.deliveredLinks.has(7)"), false, "nothing became eligible");
+});
+
 test("FINGER: navigation stays off until the owner allows this exact connection", async () => {
   const env = fingerEnv();
   const port = await toReady(env);
@@ -3351,6 +3472,23 @@ test("SLICE1 navigate(ref): a stale-targeted injection landing in another docume
   const answer = await drive(env, port, refNav(next.ref));
   assert.deepEqual(worlds, ["other"]);
   assert.equal(answer.error.code, "stale_document", "same ref number, different registry: refused");
+  assert.equal(env.navigationCalls.length, 0);
+});
+
+test("SLICE1/FINGER-STALE-DOC navigate(ref): a dispatch landing in another document is refused, never moves", async () => {
+  const { env, port } = await genericReady();
+  const observed = await single(port, observeReq());
+  const next = el(observed, "Next", 0);
+  const other = genericPage();
+  const otherHolder = {};
+  env.injectionHook = async (details) => {
+    if (details.func.name !== "dispatchRefLink") return undefined;
+    runInDomPage(env.peek("observePage"), [{ max_items: 40, query: null, since_gen: null, scroll: null }], other, () => {}, otherHolder);
+    const navigate = (url) => { env.navigationCalls.push({ tabId: 7, url, sourceDocumentId: "doc-other" }); };
+    return [{ documentId: "doc-other", frameId: 7, result: runInDomPage(details.func, details.args, other, navigate, otherHolder) }];
+  };
+  const answer = await drive(env, port, refNav(next.ref));
+  assert.equal(answer.error.code, "stale_document");
   assert.equal(env.navigationCalls.length, 0);
 });
 
