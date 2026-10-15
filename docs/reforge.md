@@ -8,6 +8,15 @@
 *Shipped surface: Desktop-owner-only `/context rebuild`*
 *Historical engineering codename: Ox Alpha*
 
+**Current command naming:** use `/context reforge` for owner-triggered
+reconstruction. `/context rebuild` remains a backward-compatible alias for
+the same trusted coordinator, with the same admission, cancellation,
+checkpoint, and transactional protections. `/context` lists both forms;
+`/context status` remains read-only, and `/stop` cancels either form at the
+existing safe boundaries. See [Operator Commands](operator-commands.md).
+The v1.0 reference below retains its original `/context rebuild` wording,
+release provenance, and historical measurements.
+
 ## Transactional Context Reconstruction for Long-Lived Agent Sessions
 
 > **Clean the workbench. Keep the blueprint.**

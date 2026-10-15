@@ -7,7 +7,7 @@ itself against a neutral _FakeGenerationOwner, no Qt at all). This file
 proves the things that live only in ui/main_window.py and the surrounding
 codebase:
 
-1. /context, /context status, /context rebuild are desktop-owner-only --
+1. /context, /context status, /context reforge (alias rebuild) are desktop-owner-only --
    never reachable from a Telegram-relayed dispatch, a malformed/unknown
    command form, or (structurally) any model/tool/headless path.
 2. /context status is truly read-only.
@@ -25,9 +25,11 @@ via types.MethodType onto a types.SimpleNamespace shaped like enough of a
 real window -- no QApplication/real LuminaWindow construction needed.
 """
 import inspect
+import json
 import os
 import threading
 import types
+from dataclasses import replace
 
 import pytest
 
@@ -41,6 +43,7 @@ import tools.memory as memory
 import tools.palace as palace
 import ui.main_window as main_window
 from core import emergency_stop
+from core.context import ContextManager
 from core.context_transaction import ContextGeneration
 from core.operator_commands import parse_operator_command
 from ui.main_window import LuminaWindow
@@ -116,6 +119,7 @@ def _fake_window(chat_id=None, ctx=None, telegram_active=None, worker=None):
         "current_chat_id", "current_generation", "bump", "live_ctx",
         "_dispatch_operator_command", "_command_context", "_command_context_status",
         "_command_context_rebuild", "_context_rebuild_eligibility", "_on_context_rebuild_finished",
+        "_command_stop",
     ):
         setattr(fake, name, types.MethodType(getattr(LuminaWindow, name), fake))
     return fake
@@ -123,7 +127,7 @@ def _fake_window(chat_id=None, ctx=None, telegram_active=None, worker=None):
 
 # ── Authority: desktop-only, never Telegram ──────────────────────────────
 
-@pytest.mark.parametrize("argument", ["", "status", "rebuild"])
+@pytest.mark.parametrize("argument", ["", "status", "reforge", "rebuild"])
 def test_context_family_rejected_when_telegram_dispatch_active(argument, monkeypatch):
     spy_calls = []
     monkeypatch.setattr(
@@ -140,11 +144,12 @@ def test_context_family_rejected_when_telegram_dispatch_active(argument, monkeyp
     assert fake._context_rebuild_thread is None
 
 
-def test_context_rebuild_via_full_dispatch_from_telegram_never_starts_thread(monkeypatch):
+@pytest.mark.parametrize("subcommand", ["reforge", "rebuild"])
+def test_context_rebuild_via_full_dispatch_from_telegram_never_starts_thread(subcommand, monkeypatch):
     """End-to-end through _dispatch_operator_command(), exactly the path a
     Telegram-relayed '/context rebuild' would take per _on_user_message()."""
     fake = _fake_window(chat_id=_seed_chat([("user", "u1")]), telegram_active=object())
-    command = parse_operator_command("/context rebuild")
+    command = parse_operator_command(f"/context {subcommand}")
     assert command.known
 
     fake._dispatch_operator_command(command)
@@ -170,6 +175,8 @@ def test_context_family_admitted_from_desktop_dispatch(monkeypatch):
 
 @pytest.mark.parametrize("text", [
     "/context foo", "/context rebuild now", "/context --force", "/context Rebuild Now",
+    "/context reforge now", "/context ReFoRgE --force", "/context reforge status",
+    "/context reforge\nnow", "/context reforged", "/context status now",
 ])
 def test_context_malformed_subcommand_never_starts_rebuild(text, monkeypatch):
     spy_calls = []
@@ -211,7 +218,7 @@ def test_unknown_command_dispatch_never_reaches_context_handler(monkeypatch):
 
 _BANNED_TOOL_NAMES = {
     "rebuild_context", "context_gc", "context_reconstruct",
-    "flush_context", "optimize_context",
+    "flush_context", "optimize_context", "reforge_context", "context_reforge",
 }
 
 
@@ -222,6 +229,7 @@ def test_no_model_facing_context_rebuild_tool_registered():
     assert not (names & _BANNED_TOOL_NAMES)
     assert not any("rebuild" in n.lower() and "context" in n.lower() for n in names)
     assert not any("reconstruct" in n.lower() for n in names)
+    assert not any("reforge" in n.lower() for n in names)
 
 
 def _imported_module_names(module):
@@ -347,7 +355,8 @@ def test_status_reports_latched_emergency_stop():
     (lambda fake: setattr(fake, "_manual_compaction_thread", object()), "compact"),
     (lambda fake: setattr(fake, "_context_rebuild_thread", object()), "already in progress"),
 ])
-def test_rebuild_rejected_synchronously_when_ineligible_never_starts_thread(setup, expected_fragment, monkeypatch):
+@pytest.mark.parametrize("subcommand", ["reforge", "rebuild"])
+def test_rebuild_rejected_synchronously_when_ineligible_never_starts_thread(setup, expected_fragment, subcommand, monkeypatch):
     spy_calls = []
     monkeypatch.setattr(
         context_rebuild_module, "run_rebuild",
@@ -357,7 +366,7 @@ def test_rebuild_rejected_synchronously_when_ineligible_never_starts_thread(setu
     fake = _fake_window(chat_id=chat_id)
     setup(fake)
 
-    fake._command_context_rebuild()
+    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"))
 
     assert not spy_calls
     notice = fake.chat_widget.notices[-1]
@@ -365,12 +374,13 @@ def test_rebuild_rejected_synchronously_when_ineligible_never_starts_thread(setu
     assert expected_fragment in notice.lower()
 
 
-def test_rebuild_rejected_while_latched():
+@pytest.mark.parametrize("subcommand", ["reforge", "rebuild"])
+def test_rebuild_rejected_while_latched(subcommand):
     chat_id = _seed_chat([("user", "u1")])
     fake = _fake_window(chat_id=chat_id)
     emergency_stop.latch(source="test", reason="test")
 
-    fake._command_context_rebuild()
+    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"))
 
     notice = fake.chat_widget.notices[-1]
     assert notice.startswith("Rebuild rejected:")
@@ -380,7 +390,8 @@ def test_rebuild_rejected_while_latched():
 
 # ── Eligible rebuild: full spawn -> coordinator -> signal pipeline ───────
 
-def test_eligible_rebuild_spawns_thread_calls_coordinator_and_emits_receipt(monkeypatch):
+@pytest.mark.parametrize("subcommand", ["reforge", "rebuild", "ReFoRgE"])
+def test_eligible_rebuild_spawns_thread_calls_coordinator_and_emits_receipt(subcommand, monkeypatch):
     chat_id = _seed_chat([("user", "u1")])
     ctx = _Ctx(history=[{"role": "user", "content": "u1"}])
     fake = _fake_window(chat_id=chat_id, ctx=ctx)
@@ -401,7 +412,7 @@ def test_eligible_rebuild_spawns_thread_calls_coordinator_and_emits_receipt(monk
 
     monkeypatch.setattr(context_rebuild_module, "run_rebuild", _fake_run_rebuild)
 
-    fake._command_context_rebuild()
+    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"))
     assert fake._context_rebuild_thread is not None
     fake._context_rebuild_thread.join(timeout=5)
 
@@ -409,9 +420,12 @@ def test_eligible_rebuild_spawns_thread_calls_coordinator_and_emits_receipt(monk
     assert captured["generation_owner"] is fake
     assert captured["backend"] is fake.agent.llm
     assert captured["ephemeral_history"] == [{"role": "user", "content": "u1"}]
+    assert captured["ephemeral_history"] is not ctx.history
     assert "cancel_event" in captured["kwargs"]
     assert isinstance(captured["kwargs"]["cancel_event"], threading.Event)
-    assert "expected_epoch" in captured["kwargs"]
+    assert captured["kwargs"]["cancel_event"] is fake._context_rebuild_cancel
+    assert captured["kwargs"]["expected_epoch"] == emergency_stop.current_epoch()
+    assert captured["kwargs"]["project_context"] is None
 
     assert len(fake.signals.emitted) == 1
     assert fake.signals.emitted[0].status == context_rebuild_module.STATUS_SUCCESS
@@ -473,7 +487,7 @@ def test_on_finished_failure_renders_reason_verbatim_and_resets_bookkeeping():
     fake._on_context_rebuild_finished(receipt)
 
     assert fake._context_rebuild_thread is None
-    assert fake.chat_widget.notices[-1] == "/context rebuild: Rebuild cancelled. Live context unchanged."
+    assert fake.chat_widget.notices[-1] == "/context reforge: Rebuild cancelled. Live context unchanged."
 
 
 def test_on_finished_for_a_chat_no_longer_active_does_not_touch_current_chat_display():
@@ -491,3 +505,137 @@ def test_on_finished_for_a_chat_no_longer_active_does_not_touch_current_chat_dis
     notice = fake.chat_widget.notices[-1]
     assert "no longer the active chat" in notice
     assert "durable transcript unchanged" in notice
+
+
+def test_context_help_lists_canonical_command_and_alias_without_starting_work(monkeypatch):
+    chat_id = _seed_chat([("user", "u1")])
+    fake = _fake_window(chat_id=chat_id)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("help must not compile or reconstruct")
+
+    monkeypatch.setattr(context_rebuild_module, "run_rebuild", _boom)
+    fake._dispatch_operator_command(parse_operator_command("/context"))
+
+    notice = fake.chat_widget.notices[-1]
+    assert "/context reforge" in notice
+    assert "(/context rebuild is an alias)" in notice
+    assert fake._context_rebuild_thread is None
+    assert cc.list_checkpoints(chat_id) == []
+
+
+class _OfflineContinuityBackend:
+    def __init__(self, during_compile=None):
+        self.calls = 0
+        self.during_compile = during_compile
+
+    def complete_utility_content_only(self, prompt, **kwargs):
+        self.calls += 1
+        if self.during_compile is not None:
+            self.during_compile()
+        return json.dumps({
+            "reported": [{"category": "objective", "statement": "finish the thing",
+                          "evidence_refs": [], "status": "unresolved"}],
+            "inferred": [],
+        })
+
+
+def test_both_commands_reconstruct_equivalently_with_fresh_exact_checkpoints():
+    """Real coordinator/compiler/transaction, offline backend and scratch DB.
+
+    Equal inputs yield equal histories and receipts except for the fresh
+    checkpoint ID. This checks behavior past dispatch, not just a spy call.
+    """
+    chat_id = _seed_chat([("user", "u1"), ("assistant", "a1")])
+    durable_before = memory.load_chat_messages(chat_id)
+    outcomes = []
+    for subcommand in ("reforge", "rebuild"):
+        ctx = ContextManager()
+        ctx.history = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "tc-1", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "tc-1", "content": "disposable tool result"},
+        ]
+        fake = _fake_window(chat_id=chat_id, ctx=ctx)
+        backend = _OfflineContinuityBackend()
+        fake.agent.llm = backend
+        fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"))
+        thread = fake._context_rebuild_thread
+        assert thread is not None
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert len(fake.signals.emitted) == 1
+        receipt = fake.signals.emitted[0]
+        assert receipt.status == context_rebuild_module.STATUS_SUCCESS
+        assert backend.calls == 1
+        assert receipt.checkpoint_id == cc.get_latest_usable_checkpoint(chat_id).id
+        assert fake.current_generation() == 1
+        assert receipt.pre_history_count == 4 and receipt.post_history_count == 3
+        assert not any(m.get("role") == "tool" or m.get("tool_calls") for m in ctx.history)
+        assert "not an instruction" in ctx.history[-1]["content"]
+        assert memory.load_chat_messages(chat_id) == durable_before
+        fake._on_context_rebuild_finished(receipt)
+        assert fake.chat_widget.notices[-1].startswith("/context reforge finished")
+        outcomes.append((list(ctx.history), receipt))
+
+    (first_history, first), (second_history, second) = outcomes
+    assert second.checkpoint_id != first.checkpoint_id
+    assert first_history == second_history
+    assert first == replace(second, checkpoint_id=first.checkpoint_id)
+
+
+@pytest.mark.parametrize("first,second", [
+    ("reforge", "rebuild"), ("rebuild", "reforge"),
+    ("reforge", "reforge"), ("rebuild", "rebuild"),
+])
+def test_aliases_share_single_flight_and_stop_cancels_real_operation(first, second):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _hold_compile():
+        entered.set()
+        assert release.wait(timeout=5)
+
+    chat_id = _seed_chat([("user", "u1")])
+    ctx = ContextManager()
+    ctx.history = [{"role": "user", "content": "u1"}]
+    history_before = list(ctx.history)
+    durable_before = memory.load_chat_messages(chat_id)
+    fake = _fake_window(chat_id=chat_id, ctx=ctx)
+    backend = _OfflineContinuityBackend(during_compile=_hold_compile)
+    fake.agent.llm = backend
+    fake._dispatch_operator_command(parse_operator_command(f"/context {first}"))
+    thread = fake._context_rebuild_thread
+    assert thread is not None
+    try:
+        assert entered.wait(timeout=5)
+        fake._dispatch_operator_command(parse_operator_command(f"/context {second}"))
+        assert fake._context_rebuild_thread is thread
+        assert "already in progress" in fake.chat_widget.notices[-1]
+        fake._dispatch_operator_command(parse_operator_command("/stop"))
+        assert fake._context_rebuild_cancel.is_set()
+        assert "requested for /context reforge" in fake.chat_widget.notices[-1]
+        fake._dispatch_operator_command(parse_operator_command("/stop"))
+        assert "already requested" in fake.chat_widget.notices[-1]
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert backend.calls == 1
+    assert len(fake.signals.emitted) == 1
+    receipt = fake.signals.emitted[0]
+    assert receipt.status == context_rebuild_module.STATUS_CANCELLED
+    assert ctx.history == history_before
+    assert memory.load_chat_messages(chat_id) == durable_before
+    assert fake.current_generation() == 0
+    # A finished thread remains single-flight until its receipt is handled.
+    fake._dispatch_operator_command(parse_operator_command(f"/context {second}"))
+    assert fake._context_rebuild_thread is thread
+    assert "already in progress" in fake.chat_widget.notices[-1]
+    fake._on_context_rebuild_finished(receipt)
+    assert fake._context_rebuild_thread is None
+    assert "Live context unchanged" in fake.chat_widget.notices[-1]
