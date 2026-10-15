@@ -53,6 +53,7 @@ from tools.projects import register_projects_tools, init_projects
 from tools.diff import register_diff_tools
 from tools.browser import register_browser_tools, browser_manager
 from tools.chrome_companion import (
+    CHROME_ACTION_TOOL_NAMES as CHROME_COMPANION_ACTION_TOOL_NAMES,
     CHROME_TOOL_NAMES as CHROME_COMPANION_TOOL_NAMES,
     register_chrome_companion_tools,
     telemetry_result_summary as chrome_companion_telemetry_summary,
@@ -1441,7 +1442,7 @@ def _chrome_action_receipt_success(name: str, result) -> bool:
             or type(receipt.get("tab_id")) is not int \
             or not isinstance(receipt.get("observed_url"), str):
         return False
-    if name == "chrome_follow_link":
+    if name in {"chrome_follow_link", "chrome_navigate"}:
         return (receipt.get("load_confirmed") is True
                 and isinstance(receipt.get("verified_document_id"), str)
                 and bool(receipt["verified_document_id"]))
@@ -1549,7 +1550,7 @@ def _tool_call_fields(batch_ordinal: int, call_ordinal: int, name: str, args) ->
     uses), a bounded/redacted args representation for human debugging, and
     a stable args hash (flight_recorder.hash_args()) for duplicate-call
     detection across a turn's whole tool-burst -- mission section 6/12."""
-    private_chrome_action = name in {"chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link"}
+    private_chrome_action = name in CHROME_COMPANION_ACTION_TOOL_NAMES
     return {
         "batch_ordinal": batch_ordinal,
         "call_ordinal": call_ordinal,
@@ -2186,6 +2187,14 @@ class LuminaAgent:
                 user_input, source=source, owner=getattr(self, "owner", False),
                 event_id=approval_event_id,
             )
+            # BROWSER-COMPANION-COMPLETION-01 Slice 1: the owner's browsing
+            # mission for this turn (observe + navigate only), minted from the
+            # same authenticated ingress event and retired in the same finally.
+            from chrome_companion import mission as chrome_mission
+            chrome_mission_token = chrome_mission.begin_turn(
+                user_input, source=source, owner=getattr(self, "owner", False),
+                event_id=approval_event_id,
+            )
             # CASTLE-WALLS-REPAIR-01 R2 -- set as early as possible, before any
             # of chat()'s three add_user()-reaching branches, so a per-agent-
             # bound tool closure reading self._current_chat_id mid-turn always
@@ -2304,6 +2313,7 @@ class LuminaAgent:
                     if callable(clear_tool_turn_state):
                         clear_tool_turn_state()
                 end_chrome_navigation_turn(chrome_navigation_token)
+                chrome_mission.end_turn(chrome_mission_token)
                 if turn_cancellation is not None:
                     turn_cancellation._set(None)
 
@@ -3176,7 +3186,7 @@ class LuminaAgent:
                     print(f"[TOOL ERROR] {name}: {e}", flush=True)
                 _tool_duration = time.time() - _tool_start
                 _tool_success = not (isinstance(result, str) and result.startswith("[Tool error:"))
-                if name in {"chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link"}:
+                if name in CHROME_COMPANION_ACTION_TOOL_NAMES:
                     _tool_success = _chrome_action_receipt_success(name, result)
                 _fr_machine(self, "tool.result", turn_id=turn_id, chat_id=chat_id,
                             severity="info" if _tool_success else "warning",

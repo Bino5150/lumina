@@ -122,7 +122,32 @@ _DISCONNECT_MESSAGES = {
     "uninstalled": "the owner uninstalled Chrome Companion",
 }
 
-ACTION_OPS = frozenset({"open_owner_url", "switch_tab", "follow_link"})
+ACTION_OPS = frozenset({"open_owner_url", "switch_tab", "follow_link", "navigate"})
+
+# Extension versions this hub KNOWS. Fail closed: a version not listed here --
+# including a newer one -- is never sent an action or a newer-vocabulary op,
+# because its semantics have not been reviewed against this hub.
+KNOWN_EXTENSION_VERSIONS = ((0, 2, 0), (0, 3, 0), (0, 4, 0))
+# The oldest known version that speaks each op's vocabulary. An op not
+# listed is a 01A read every paired version serves. A newer known version
+# keeps serving every older op; an older one is refused the newer ops up
+# front, never sent a request it cannot parse.
+OP_MIN_EXTENSION_VERSION = {
+    "open_owner_url": (0, 2, 0), "switch_tab": (0, 2, 0),
+    "follow_link": (0, 3, 0),
+    "observe": (0, 4, 0), "navigate": (0, 4, 0),
+}
+
+
+def extension_version_at_least(version, minimum: tuple[int, int, int]) -> bool:
+    """True only for a KNOWN extension version that is >= ``minimum``."""
+    if not isinstance(version, str):
+        return False
+    parts = version.split(".")
+    if len(parts) != 3 or not all(p.isdigit() and len(p) <= 6 for p in parts):
+        return False
+    parsed = tuple(int(p) for p in parts)
+    return parsed in KNOWN_EXTENSION_VERSIONS and parsed >= minimum
 
 
 class _Waiter:
@@ -166,6 +191,23 @@ class _Connection:
         self._in_flight: dict[str, _Waiter] = {}
         self._request_seq = 0  # last sequence number put on the wire
         self._delivered_links: dict[int, tuple[str, set[tuple[str, str]]]] = {}
+        self._delivered_refs: dict[int, tuple[str, set[str]]] = {}
+
+    def record_delivered_refs(self, tab_id: int, document_id: str, elements: list[dict]) -> None:
+        """Slice 1: element references become actionable only once a validated
+        observe answer on THIS connection delivered them for THIS document."""
+        with self._lock:
+            if self.closed:
+                return
+            old = self._delivered_refs.get(tab_id)
+            refs = old[1] if old is not None and old[0] == document_id else set()
+            refs.update(element["ref"] for element in elements)
+            self._delivered_refs[tab_id] = (document_id, refs)
+
+    def has_delivered_ref(self, tab_id: int, document_id, ref) -> bool:
+        with self._lock:
+            observed = self._delivered_refs.get(tab_id)
+            return bool(not self.closed and observed and observed[0] == document_id and ref in observed[1])
 
     def record_delivered_links(self, tab_id: int, document_id: str, links: list[dict]) -> None:
         """Record only a validated get_links answer accepted by this connection."""
@@ -690,17 +732,21 @@ class ChromeCompanionHub:
             self._record("chrome_companion.request", severity="warning", op=op, tab_id=tab_id,
                          result=error.code)
             raise error
+        if op in ACTION_OPS and self._authorize({"origin": conn.origin, "instance_id": conn.instance_id}) is not None:
+            with self._lock:
+                retired = self._retire_locked(conn, "unpaired")
+            self._finish_retirement(conn, "unpaired", retired)
+            raise CompanionError("unpaired", "Chrome Companion pairing is no longer active")
+        if op in OP_MIN_EXTENSION_VERSION \
+                and not extension_version_at_least(conn.extension_version, OP_MIN_EXTENSION_VERSION[op]):
+            raise CompanionError("unsupported_version", "reload the Chrome Companion extension for this operation")
         if op in ACTION_OPS:
-            if self._authorize({"origin": conn.origin, "instance_id": conn.instance_id}) is not None:
-                with self._lock:
-                    retired = self._retire_locked(conn, "unpaired")
-                self._finish_retirement(conn, "unpaired", retired)
-                raise CompanionError("unpaired", "Chrome Companion pairing is no longer active")
-            supported = {"0.2.0", "0.3.0"} if op != "follow_link" else {"0.3.0"}
-            if conn.extension_version not in supported:
-                raise CompanionError("unsupported_version", "reload the Chrome Companion extension for this operation")
             if op == "follow_link" and not conn.has_delivered_link(tab_id, args or {}):
                 raise CompanionError("target_not_found", "link was not delivered by get_links on this connection")
+            if op == "navigate" and (args or {}).get("kind") == "ref" \
+                    and not conn.has_delivered_ref(tab_id, args.get("document_id"), args.get("ref")):
+                raise CompanionError("target_not_found",
+                                     "element reference was not delivered by observe on this connection")
         started = time.monotonic()
         outcome, observed_origin, truncated = "error", None, None
         request_id = waiter = None
@@ -738,6 +784,9 @@ class ChromeCompanionHub:
             if op == "get_links":
                 conn.record_delivered_links(response["tab_id"], response["observed"]["document_id"],
                                             response["result"]["links"])
+            if op == "observe":
+                conn.record_delivered_refs(response["tab_id"], response["observed"]["document_id"],
+                                           response["result"]["elements"])
             outcome = "ok"
             return response
         except CompanionError as exc:
@@ -779,18 +828,18 @@ class ChromeCompanionHub:
             if op == "get_tab" and filtered is None:
                 raise CompanionError("tab_not_found", "no readable tab with that id")
             response["result"] = filtered
-        elif op in {"extract_text", "get_links"}:
+        elif op in {"extract_text", "get_links", "observe"}:
             observed = response["observed"]
             verdict = policy.classify_url(observed["url"] if observed else None)
             if observed is None or not verdict.readable or observed["origin"] != verdict.origin \
-                    or response["tab_id"] is None:
+                    or response["tab_id"] is None or (op == "observe" and not observed["document_id"]):
                 raise CompanionError("restricted_surface",
                                      "Chrome returned content for a restricted or unverifiable surface; discarded")
         elif op in ACTION_OPS:
             url = result["observed_url"]
             if url is not None and not policy.classify_url(url).readable:
                 raise CompanionError("restricted_surface", "Chrome returned a restricted action surface")
-            if op == "follow_link" and result["status"] == "browser_local_effect_observed":
+            if op in {"follow_link", "navigate"} and result["status"] == "browser_local_effect_observed":
                 observed = response["observed"]
                 if not result["load_confirmed"] or observed is None \
                         or observed["url"] != url or not observed["document_id"]:

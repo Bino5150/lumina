@@ -49,11 +49,11 @@
   },
   {
     "title": "Web browsing -- three different mechanisms",
-    "content": "Lumina can reach the web three distinct ways: a lightweight fetch stack (web_search, get_website, get_wikipedia) for static pages without needing a real browser; a full Playwright-driven Chromium session (browser_navigate, browser_click, browser_type, and more) for interactive sites; and the separate Browser Companion, which reads (and, for an owner-typed URL, opens) tabs in the owner's own already-signed-in Chrome profile. The Playwright browser and Browser Companion are unrelated modules -- neither ever falls back to the other."
+    "content": "Lumina can reach the web three distinct ways: a lightweight fetch stack (web_search, get_website, get_wikipedia) for static pages without needing a real browser; a full Playwright-driven Chromium session (browser_navigate, browser_click, browser_type, and more) for interactive sites; and the separate Browser Companion, which observes and reads tabs in the owner's own already-signed-in Chrome profile and navigates there only within the owner's own request and allowed sites. The Playwright browser and Browser Companion are unrelated modules -- neither ever falls back to the other."
   },
   {
     "title": "Browser Companion -- what it can do",
-    "content": "Browser Companion lets Lumina see tabs in the owner's own signed-in Chrome profile: list tabs, read the active tab, and read bounded visible text/links from sites the owner has explicitly allowed -- plus, since a later update, open a URL the owner typed in their own message this turn, or switch to an already-open tab by its exact identity. It cannot click, type, submit forms, follow a link merely observed on a page, take screenshots, or access cookies or passwords -- those capabilities do not exist in this build."
+    "content": "Browser Companion lets Lumina see tabs in the owner's own signed-in Chrome profile: list tabs, read the active tab, read bounded visible text/links, and observe a page's visible links, buttons, fields and toggles (chrome_observe, with a stable reference for each) on sites the owner has explicitly allowed. It can open a URL the owner typed in their own message this turn, switch to an already-open tab by its exact identity, follow a link it observed on that exact page (verified against the live page before moving), and -- while carrying out the owner's own request -- navigate among the sites the owner allowed in the extension popup or named by address in that request, including back/forward (chrome_navigate). It works the same on any website; no site-specific support is needed. It cannot click buttons or other controls, type, fill or submit forms, post or send anything, take screenshots, or access cookies or passwords -- those capabilities do not exist in this build."
   },
   {
     "title": "Browser Companion -- Revoke",
@@ -61,7 +61,7 @@
   },
   {
     "title": "Browser Companion authorization",
-    "content": "Every Browser Companion result -- reads and the newer open/switch actions alike -- is tagged as coming from outside the owner (owner: false, external/untrusted), exactly like content from any other outside source. Opening a URL requires a grant that can only be created by the owner's own typed chat message starting with a phrase like 'open <url>', scoped to that single turn, plus a separate toggle only a human can flip inside the Chrome extension's own popup -- nothing reachable from a tool call, a web page, or model output can trigger navigation on its own."
+    "content": "Every Browser Companion result -- reads, observations and navigation alike -- is tagged as coming from outside the owner (owner: false, external/untrusted), exactly like content from any other outside source. Opening a URL requires a grant that can only be created by the owner's own typed chat message starting with a phrase like 'open <url>', scoped to that single turn, plus a separate toggle only a human can flip inside the Chrome extension's own popup -- nothing reachable from a tool call, a web page, or model output can trigger navigation on its own. Generic navigation (chrome_navigate) additionally exists only during the owner's own direct request, covers looking and navigating only, and is limited to sites the owner allowed in the popup or named by address in that request; page text can never add a site."
   },
   {
     "title": "Reasoning Control",

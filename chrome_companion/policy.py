@@ -115,3 +115,32 @@ def classify_url(url) -> UrlClass:
     if port is not None and port != default_port:
         origin += f":{port}"
     return UrlClass(True, None, origin, f"{scheme}://{host_for_origin}/*")
+
+
+# BROWSER-COMPANION-COMPLETION-01 Slice 1. Generic navigation (chrome_navigate)
+# may go to a model-chosen URL inside an owner mission, so a GET that is
+# conventionally an ACCOUNT ACTION is refused before dispatch. This is a
+# heuristic tripwire over path segments, not a proof that a URL is harmless:
+# a site can put a side effect behind any GET. Mirror of
+# sensitiveNavigation() in extension/policy.js (parity-tested).
+SENSITIVE_PATH_WORDS = frozenset({
+    "logout", "logoff", "signout", "signoff", "unsubscribe", "deactivate",
+    "deleteaccount", "closeaccount", "removeaccount",
+})
+SENSITIVE_PATH_SEGMENTS = frozenset({"delete", "destroy"})
+_ASCII_ESCAPE = re.compile(r"%([0-7][0-9a-fA-F])")
+
+
+def sensitive_navigation(url) -> str | None:
+    """'sensitive_path' if a readable URL's path looks like an account action,
+    else None. Unreadable URLs are classify_url()'s business, not this one's.
+    ASCII percent-escapes are decoded first (/%6Cogout is /logout to the
+    server), with the same rule as the JS side so both agree byte for byte."""
+    if not classify_url(url).readable:
+        return None
+    path = _ASCII_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), urlsplit(url).path).lower()
+    for segment in path.split("/"):
+        squashed = segment.replace("-", "").replace("_", "")
+        if segment in SENSITIVE_PATH_SEGMENTS or any(word in squashed for word in SENSITIVE_PATH_WORDS):
+            return "sensitive_path"
+    return None

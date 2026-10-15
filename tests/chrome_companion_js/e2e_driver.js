@@ -97,7 +97,25 @@ function nativePort(name) {
   };
 }
 
-function runInPage(func, args, page) {
+// BROWSER-COMPANION-COMPLETION-01 Slice 1 (re-implemented from the Goblin
+// Stage 2 candidate's harness idea, not merged from it): Chrome's document
+// identity per tab, a navigation that mints a NEW document, and Slice 1
+// pages that carry a DOM spec run in a persistent isolated world.
+const { runInDomPage } = require("./fake_dom.js");
+const documents = new Map();
+const documentId = (tabId) => documents.get(tabId) || `doc-${tabId}`;
+function navigateTab(tabId, url) {
+  const tab = tabs.find((t) => t.id === tabId);
+  const next = `${documentId(tabId)}-navigated`;
+  tab.url = url;
+  tab.status = "complete";
+  documents.set(tabId, next);
+  const target = Object.values(pages).find((p) => p.href === url);
+  pages[String(tabId)] = target ? JSON.parse(JSON.stringify(target)) : undefined;
+}
+
+function runInPage(func, args, page, navigate = () => {}) {
+  if (page.nodes) return runInDomPage(func, args, page, navigate);
   const anchors = (page.anchors || []).map((a) => ({
     getAttribute: (name) => (name === "href" ? a.href : null),
     innerText: a.text || "",
@@ -181,7 +199,7 @@ const chrome = {
     async getFrame({ tabId, frameId }) {
       const tab = tabs.find((t) => t.id === tabId);
       if (!tab || frameId !== 0) return null;
-      return { documentId: `doc-${tabId}`, documentLifecycle: "active", frameType: "outermost_frame", url: tab.url };
+      return { documentId: documentId(tabId), documentLifecycle: "active", frameType: "outermost_frame", url: tab.url };
     },
   },
   scripting: {
@@ -192,9 +210,15 @@ const chrome = {
         emit({ event: "held", tab: details.target.tabId });
         await hold.promise;
       }
-      const page = pages[String(details.target.tabId)];
+      const tabId = details.target.tabId;
+      const current = documentId(tabId);
+      if (details.target.documentIds && !details.target.documentIds.includes(current)) {
+        throw new Error(`No document with id ${details.target.documentIds[0]} in tab with id ${tabId}`);
+      }
+      const page = pages[String(tabId)];
       if (!page) throw new Error("Cannot access contents of the page");
-      return [{ documentId: `doc-${details.target.tabId}`, frameId: 0, result: runInPage(details.func, details.args, page) }];
+      return [{ documentId: current, frameId: 0,
+        result: runInPage(details.func, details.args, page, (url) => navigateTab(tabId, url)) }];
     },
   },
 };

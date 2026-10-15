@@ -34,6 +34,8 @@ ROUTES = {
     "chrome_open_owner_url": "navigation",
     "chrome_switch_tab": "navigation",
     "chrome_follow_link": "navigation",
+    "chrome_observe": "observation",
+    "chrome_navigate": "navigation",
 }
 
 

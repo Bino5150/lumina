@@ -354,6 +354,8 @@ def test_owner_only_boundary_frozen():
         "chrome_get_url_title", "chrome_extract_visible_text", "chrome_get_links",
         "chrome_open_owner_url", "chrome_switch_tab",
         "chrome_follow_link",
+        # BROWSER-COMPANION-COMPLETION-01 Slice 1 (generic observe/navigate).
+        "chrome_observe", "chrome_navigate",
     }
     assert NEWLY_CLASSIFIED.isdisjoint(OWNER_ONLY_TOOLS)
 

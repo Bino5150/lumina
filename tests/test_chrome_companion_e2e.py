@@ -180,6 +180,57 @@ def test_owner_granted_navigation_through_worker_host_and_hub(world):
     assert revoked.value.code == "companion_revoked" and revoked.value.executed is False
 
 
+FORUM = "https://forum.example.test/threads/42"
+FORUM_PAGES = {
+    "21": {"href": FORUM, "title": "Thread 42", "viewport": {"height": 600, "width": 1000}, "nodes": [
+        {"tag": "h1", "text": "Thread 42", "rect": {"top": 20}},
+        {"tag": "nav", "attrs": {"aria-label": "Pagination"}, "children": [
+            {"tag": "a", "attrs": {"href": "/threads/42?page=2"}, "text": "Next", "rect": {"top": 60}}]},
+        {"tag": "a", "attrs": {"href": "https://partner.example.org/x"}, "text": "Partner site", "rect": {"top": 100}},
+        {"tag": "a", "attrs": {"href": "/logout"}, "text": "Sign out", "rect": {"top": 140}},
+        {"tag": "input", "attrs": {"type": "password", "name": "pass"}, "value": "hunter2", "rect": {"top": 180}},
+    ]},
+    "99": {"href": FORUM + "?page=2", "title": "Thread 42 page 2", "nodes": [
+        {"tag": "h1", "text": "Page 2", "rect": {"top": 20}},
+        {"tag": "a", "attrs": {"href": "/threads/42"}, "text": "Previous", "rect": {"top": 60}}]},
+}
+
+
+def test_slice1_generic_observe_and_navigate_through_worker_host_and_hub(world):
+    """BROWSER-COMPANION-COMPLETION-01 Slice 1: an unfamiliar site, no adapter.
+    The real worker, host and hub agree on the new wire ops end to end."""
+    tabs = TABS + [{"id": 21, "windowId": 1, "active": False, "incognito": False, "status": "complete",
+                    "url": FORUM, "title": "Thread 42"}]
+    chrome = world.launch(tabs=tabs, pages=dict(PAGES, **FORUM_PAGES),
+                          granted=[f"{REDDIT.split('/r/')[0]}/*", "https://forum.example.test/*"])
+    _ready(world.hub)
+    seen = world.hub.request("observe", tab_id=21, args={}, timeout_s=5)
+    assert seen["observed"]["document_id"] == "doc-21"
+    elements = {e["name"]: e for e in seen["result"]["elements"]}
+    assert {"Next", "Partner site", "Sign out"} <= set(elements)
+    assert "hunter2" not in json.dumps(seen), "a credential value never crosses the real bridge"
+    nav = {"kind": "ref", "ref": elements["Next"]["ref"], "scope": [], "window_id": 1, "document_id": "doc-21"}
+    with pytest.raises(CompanionError) as off:
+        world.hub.request("navigate", tab_id=21, args=nav, timeout_s=5)
+    assert off.value.code == "navigation_not_allowed" and off.value.executed is False
+    chrome.command(cmd="navigation", allowed=True)
+    for name, code in (("Partner site", "outside_mission_scope"), ("Sign out", "sensitive_navigation")):
+        with pytest.raises(CompanionError) as refused:
+            world.hub.request("navigate", tab_id=21, args=dict(nav, ref=elements[name]["ref"]), timeout_s=5)
+        assert refused.value.code == code and refused.value.executed is False
+    moved = world.hub.request("navigate", tab_id=21, args=nav, timeout_s=10)
+    assert moved["result"]["status"] == "browser_local_effect_observed"
+    assert moved["result"]["observed_url"] == FORUM + "?page=2"
+    assert moved["observed"]["document_id"] == "doc-21-navigated", "a new document, verified"
+    with pytest.raises(CompanionError) as stale:
+        world.hub.request("navigate", tab_id=21, args=nav, timeout_s=5)
+    assert stale.value.code == "stale_document", "a ref from the old document is dead"
+    assert stale.value.executed is False, "refused before any dispatch"
+    landed = world.hub.request("observe", tab_id=21, args={}, timeout_s=5)
+    assert [e["name"] for e in landed["result"]["elements"]] == ["Previous"]
+    assert landed["observed"]["document_id"] == "doc-21-navigated"
+
+
 def test_pause_and_resume_through_the_real_chain(world):
     chrome = world.launch()
     cid = _ready(world.hub)

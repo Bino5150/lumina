@@ -63,5 +63,27 @@ globalThis.LuminaPolicy = (() => {
     return { readable: true, reason: null, origin: `${scheme}://${host}${port}`, pattern: `${scheme}://${host}/*` };
   }
 
-  return Object.freeze({ READABLE_SCHEMES, RESTRICTED_HOSTS, canonicalHost, classifyUrl });
+  // BROWSER-COMPANION-COMPLETION-01 Slice 1. Mirror of sensitive_navigation()
+  // in chrome_companion/policy.py: a heuristic tripwire refusing generic
+  // navigation to a GET that is conventionally an account action. Not a proof
+  // that any other URL is harmless.
+  const SENSITIVE_PATH_WORDS = Object.freeze(["logout", "logoff", "signout", "signoff", "unsubscribe",
+    "deactivate", "deleteaccount", "closeaccount", "removeaccount"]);
+  const SENSITIVE_PATH_SEGMENTS = Object.freeze(["delete", "destroy"]);
+
+  function sensitiveNavigation(raw) {
+    if (!classifyUrl(raw).readable) return null;
+    // ASCII percent-escapes decoded first, same rule as policy.py.
+    const path = new URL(raw).pathname
+      .replace(/%([0-7][0-9a-fA-F])/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))).toLowerCase();
+    for (const segment of path.split("/")) {
+      const squashed = segment.replace(/[-_]/g, "");
+      if (SENSITIVE_PATH_SEGMENTS.includes(segment)
+        || SENSITIVE_PATH_WORDS.some((word) => squashed.includes(word))) return "sensitive_path";
+    }
+    return null;
+  }
+
+  return Object.freeze({ READABLE_SCHEMES, RESTRICTED_HOSTS, SENSITIVE_PATH_WORDS, SENSITIVE_PATH_SEGMENTS,
+    canonicalHost, classifyUrl, sensitiveNavigation });
 })();

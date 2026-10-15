@@ -20,7 +20,9 @@ Telegram bridge (because Telegram is itself locked to your own chat ID —
 see [Channels](channels.md)). Discord is hardcoded `owner=False` with no
 code path to `True` at all.
 
-Browser Companion exposes only reads and owner-granted navigation. Its
+Browser Companion exposes only reads, page observation, and owner-granted
+navigation (generic navigation is scoped to the owner's own current request
+and sites; it cannot click, type or submit). Its
 internal site-action authority and review infrastructure is dormant: it
 does not provide a posting or replying workflow. A protected Companion
 task cannot borrow Playwright, API, terminal or delegation routes, and

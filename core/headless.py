@@ -12,6 +12,7 @@ import time
 from core.agent import LuminaAgent
 from core.reasoning_preferences import resolve_reasoning_effort
 from tools.chrome_companion import (
+    CHROME_ACTION_TOOL_NAMES as CHROME_COMPANION_ACTION_TOOL_NAMES,
     CHROME_TOOL_NAMES as CHROME_COMPANION_TOOL_NAMES,
     telemetry_result_summary as chrome_companion_telemetry_summary,
 )
@@ -82,7 +83,7 @@ def set_idle_callback(fn):
     
 def _log_tool_call(channel_id):
         def _fn(name, args):
-            shown = "[arguments withheld]" if name in {"chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link"} else args
+            shown = "[arguments withheld]" if name in CHROME_COMPANION_ACTION_TOOL_NAMES else args
             print(f"[HEADLESS:{channel_id}] TOOL CALL → {name}({shown})", flush=True)
         return _fn
 

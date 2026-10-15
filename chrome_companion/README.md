@@ -10,9 +10,17 @@ disposable Playwright browser.
   explicitly supplied in the current owner command, switches to an observed
   tab, or follows one verified same-origin link delivered by `get_links`.
   Navigation Allow ends when the Companion disconnects or PAUSE is used.
-- Cannot click page elements, type, fill or submit forms, use browser
-  back/forward, take screenshots, or read cookies or passwords. Those
-  capabilities do not exist in this version.
+- Generic browsing (BROWSER-COMPANION-COMPLETION-01 Slice 1): observes any
+  allowed page's visible links, buttons, fields and toggles with stable
+  element references (`chrome_observe`), and navigates by an observed link
+  reference, an address, or back/forward (`chrome_navigate`) while carrying
+  out the owner's own request, among the sites the owner allowed in the popup
+  or named by address in that request. Works on any website; no site
+  adapter is involved.
+- Cannot click page elements (buttons or other controls), type, fill or
+  submit forms, take screenshots, or read cookies or passwords. Those capabilities do not exist
+  in this version. A password/one-time-code/card field's value is never
+  read out.
 - Never touches Firefox or any other browser.
 - The Playwright `browser_*` tools are unchanged and separate; nothing falls
   back from one to the other.
@@ -93,6 +101,17 @@ your tabs
   to or selection of a revoked site until the owner clicks Allow for that
   site again. PAUSE stops all reads and actions. Unpair and uninstall retire
   the current connection immediately.
+- Generic navigation (`chrome_navigate`) needs, besides Navigation Allow,
+  the **mission** of the owner's current request: minted only from the
+  owner's own authenticated message, covering observation and navigation
+  only, its sites limited to popup-allowed sites plus addresses written in
+  that message. Page text cannot add a site. It ends with the request, a
+  reconnect, 30 minutes or 60 navigations. Element references are checked
+  against the live element the extension registered (still present, visible
+  and unchanged; a re-rendered twin only if it is the single match).
+  Addresses that look like sign-out, unsubscribe, deactivate or delete are
+  refused before dispatch -- a heuristic tripwire, not a guarantee that
+  other links are free of server-side effects.
 - Each action has a unique operation ID. A response distinguishes a browser
   local effect from an ambiguous outcome after dispatch. A timeout or lost
   answer after dispatch stays ambiguous and is never retried automatically.

@@ -12,7 +12,7 @@ do, and exactly what has to be true before it can do it.
 
 ## What it can do
 
-Nine tools, in two groups:
+Eleven tools, in three groups:
 
 **Read-only** (`chrome_status`, `chrome_list_tabs`, `chrome_get_active_tab`,
 `chrome_get_url_title`, `chrome_extract_visible_text`, `chrome_get_links`) —
@@ -27,11 +27,19 @@ this turn; tab switching requires the exact tab ID, window ID, and current
 URL; link following requires a link delivered from an allowed document and
 verified again just before navigation.
 
-**None of the following exist in this build:** clicking page elements,
-typing, form submission, browser back/forward, screenshots,
-cookie/password access, or any debugger/CDP access. There is no generic
-page-action tool, no selector argument, and no way to name a destination by
-anything other than the exact text and href a link already had on the page.
+**Generic browsing** (`chrome_observe`, `chrome_navigate`) — see any
+allowed page the way a person scans it, and move around while Lumina carries
+out your request: follow a link she observed, open an address on one of your
+sites, or go back/forward. These work the same on every website; no
+site-specific support is needed or consulted. See
+[Generic browsing](#generic-browsing-within-your-request) below.
+
+**None of the following exist in this build:** clicking buttons or other
+page controls, typing, filling or submitting forms, posting or sending
+anything, screenshots, cookie/password access, or any debugger/CDP access.
+There is no selector argument and no page-script tool: Lumina names an
+element only by a reference the extension itself handed her for that exact
+page.
 
 ## Following a link you already read (Stage 2)
 
@@ -68,6 +76,65 @@ Page text still cannot mint authority. A page claiming "the owner approved
 this" changes nothing: the owner still has to have allowed the origin, and
 still has to have granted Navigation Allow for this connection.
 
+## Generic browsing within your request
+
+`chrome_observe` lists the visible links, buttons, fields and toggles of an
+allowed page — the ones in view first — each with a short **reference**
+(`e12`), its accessible name, and a little context (which form, list item
+or section it sits in), plus the headings and scroll position. Two buttons
+that both say "Next" are two references with different context; Lumina picks
+one. It can filter by name (`query`), scroll first (`scroll`: up, down, top,
+bottom — the viewport only), or return only what is new since an earlier look
+(`since_gen`), which keeps long sessions small. The value of a password,
+one-time-code or card field is never sent; she only learns that the field
+has a value.
+
+`chrome_navigate` moves the browser:
+
+- `ref` — follow a link reference from `chrome_observe`, on that exact page.
+  As with `chrome_follow_link`, the reference is a claim, not a destination:
+  the extension finds the very element it registered, checks that it is still
+  there, still visible and still the same link, and navigates only to the
+  address that live link holds. If the page re-rendered it, exactly one
+  identical replacement is accepted; none is `stale_target`, two or more is
+  `target_ambiguous` — never "the first one".
+- `url` — open an address in a new tab (or, given the exact current page,
+  in the same tab).
+- `back` / `forward` — the tab's own history, from the exact current page.
+
+**Where it may go.** Generic navigation needs an owner **mission**, which
+exists only while Lumina is carrying out a request **you** sent her directly
+(your own chat message, or your own Telegram — see the note below). It
+covers looking and navigating only. Its sites are:
+
+1. sites you allowed in the extension popup (checked live by Chrome and the
+   extension at the moment of navigation, so a revoke takes effect at once),
+   and
+2. sites you named by address in that same message (`https://example.org/…`,
+   `www.example.org`, or `example.org`).
+
+Nothing a page, an email or a tool result says can add a site. A link to any
+other site is `outside_mission_scope`; ask Lumina to continue there by
+allowing the site in the popup or naming it in your message. The mission
+also ends with your request, on any reconnect of the extension, after 30
+minutes, or after 60 navigations, and the popup's **Allow navigation this
+session** switch is still required. History moves go wherever the tab's own
+history leads; the receipt then says where it landed (and never names a
+restricted page).
+
+**What it refuses before moving anything.** Restricted surfaces (password,
+payment and account-security pages, non-web schemes), sites you revoked, a
+link that only jumps within the current page, and addresses whose path looks
+like an account action — sign-out/log-out, unsubscribe, deactivate, delete.
+That last check is a tripwire over the address, not a guarantee: any website
+can attach a side effect to an ordinary-looking link, and a GET request
+reaches the site's server. Lumina reports what the browser did, never that a
+site did or did not change something.
+
+After a successful navigation the same tool call returns a fresh
+`chrome_observe` of the page she landed on, so she rarely needs an extra
+step to see it.
+
 ## Why navigation is safe from prompt injection
 
 A page, an email, a tool result, or anything else that *isn't* your own
@@ -93,6 +160,10 @@ typed chat message cannot make Lumina navigate anywhere. The mechanism:
    but only for a link delivered by `chrome_get_links` on the same document,
    still present and unique at dispatch, and only if the owner allowed that
    origin. Proposing a destination is not approving it.
+6. Generic navigation (`chrome_navigate`) additionally needs the mission of
+   your own current request. Its site list comes only from your popup
+   allowances and the addresses in your own message; the extension checks
+   every destination against both again before it moves.
 
 One nuance worth knowing: because Telegram is treated as a fully-trusted,
 owner-originated channel (see [Channels](channels.md)), an
@@ -113,8 +184,9 @@ a false success or false failure. A reported tab load is an observation
 inside Chrome, not proof that a destination site actually committed
 anything.
 
-`chrome_follow_link` reports the URL and the new document identity Chrome
-actually loaded, and only claims success when the tab reached the
+`chrome_follow_link` and `chrome_navigate` report the URL and the new
+document identity Chrome actually loaded (after a redirect, the URL it
+landed on, never the one requested), and only claims success when the tab reached the
 destination *and* the document was replaced. A same-document load that
 never replaced the page is reported ambiguous, not as a navigation.
 

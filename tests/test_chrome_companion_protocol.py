@@ -113,7 +113,9 @@ def test_unknown_operation_rejected():
     with pytest.raises(ProtocolError) as exc:
         protocol.validate_request(_request(op="click"))
     assert exc.value.code == "unknown_op"
-    for action_op in ("type", "press_key", "navigate", "submit", "screenshot", "debugger"):
+    # "navigate" (generic, mission-scoped) became a reviewed op in
+    # BROWSER-COMPANION-COMPLETION-01 Slice 1; input/submission ops did not.
+    for action_op in ("type", "press_key", "submit", "screenshot", "debugger", "fill", "act"):
         assert action_op not in protocol.OPS
 
 

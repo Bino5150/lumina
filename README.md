@@ -15,7 +15,7 @@ Companion, Security).
 - 🧠 Multi-tier persistent memory, including Dreaming — [docs](docs/memory.md)
 - 🗣️ Voice cloning & local TTS — [docs](docs/multimodal.md)
 - 👁️ Vision and image generation, with a spend-gated confirm step — [docs](docs/multimodal.md)
-- 🌐 Browser Companion for your own logged-in Chrome: allowed-site reading and narrow owner-granted navigation — [docs](docs/browser-companion.md)
+- 🌐 Browser Companion for your own logged-in Chrome: allowed-site reading, generic page observation, and navigation scoped to your own request and sites — [docs](docs/browser-companion.md)
 - 🎭 Swappable AI personas
 - 🔧 Agentic tool framework — ~90 built-in tools out of the box, up to 105 with every optional feature (Subagents, Background Tasks, Browser Companion) enabled — [full catalog](docs/tools-reference.md)
 - 💻 Sandboxed code execution
@@ -110,7 +110,7 @@ Full model, including tool tiers, guardrails, PIN gating, and Flight Recorder fo
 
 ## Comms — Reach Her From Anywhere
 
-Two remote channels, sharing the security model above but sitting at very different trust levels — **Telegram** (full trust, locked to your own chat ID) and **Discord** (sandboxed, hardcoded non-owner, a 7-tool public-safe profile). See **[Channels](docs/channels.md)** for the details, and **[Browser Companion](docs/browser-companion.md)** for the Chrome bridge that lets Lumina read allowed sites, open an owner-supplied URL, switch observed tabs, and follow one verified same-origin link in your signed-in browser profile.
+Two remote channels, sharing the security model above but sitting at very different trust levels — **Telegram** (full trust, locked to your own chat ID) and **Discord** (sandboxed, hardcoded non-owner, a 7-tool public-safe profile). See **[Channels](docs/channels.md)** for the details, and **[Browser Companion](docs/browser-companion.md)** for the Chrome bridge that lets Lumina read and observe allowed sites, open an owner-supplied URL, switch observed tabs, follow verified links, and navigate among your sites while carrying out your request in your signed-in browser profile.
 
 ## Memory
 

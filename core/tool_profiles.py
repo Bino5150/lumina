@@ -120,6 +120,11 @@ TOOL_TIERS = {
     # Stage 2 FINGER: navigate inside ONE already-authorized origin to a link
     # that document itself reports. Owner-only like every companion action.
     "chrome_follow_link": "execute",
+    # BROWSER-COMPANION-COMPLETION-01 Slice 1. chrome_observe is an
+    # isolated-world DOM read like chrome_get_links; its optional scroll moves
+    # only that page's viewport. chrome_navigate moves the owner's browser
+    # inside an owner-turn mission, like chrome_follow_link. Owner-only.
+    "chrome_observe": "read_only", "chrome_navigate": "execute",
     "diff_texts": "read_only", "diff_files": "read_only", "submit_pin": "read_only",
     "get_active_project": "read_only",
     # TOOL-TIER-CLASSIFICATION-01: explicit read_only classification for
@@ -279,6 +284,11 @@ OWNER_ONLY_TOOLS = {
     # stripped from every non-owner path on this axis too -- tier alone does
     # not keep a browsing action away from a subagent.
     "chrome_follow_link",
+    # BROWSER-COMPANION-COMPLETION-01 Slice 1: the generic observation and
+    # navigation tools reach the same logged-in browser. A subagent never
+    # carries the owner's mission either (it is bound to the owner turn's own
+    # execution context), but this axis does not rely on that.
+    "chrome_observe", "chrome_navigate",
     # CODING-02B-A1: create_project also calls save_project_binding()
     # directly (tools/projects.py) -- it writes the exact same
     # DATA_DIR/projects/<name>/binding.json as set_project_root, so it must

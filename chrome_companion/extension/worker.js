@@ -80,7 +80,24 @@ const LIMITS = Object.freeze({
   MAX_LINK_URL_CHARS: 2048,
   MAX_TITLE_CHARS: 300,
   MAX_LINK_TEXT_CHARS: 200,
+  // BROWSER-COMPANION-COMPLETION-01 Slice 1 (mirror of protocol.py).
+  DEFAULT_OBSERVE_ITEMS: 40,
+  MAX_OBSERVE_ITEMS: 120,
+  MAX_QUERY_CHARS: 100,
+  MAX_ELEMENT_NAME_CHARS: 120,
+  MAX_ELEMENT_CONTEXT_CHARS: 160,
+  MAX_ELEMENT_HREF_CHARS: 512,
+  MAX_ELEMENT_VALUE_CHARS: 80,
+  MAX_ROLE_CHARS: 32,
+  MAX_HEADINGS: 12,
+  MAX_NAVIGATE_SCOPE: 16,
+  NAVIGATE_SETTLE_POLLS: 100,
 });
+const REF_RE = /^e[1-9][0-9]{0,6}$/;
+const ELEMENT_KINDS = new Set(["link", "button", "field", "toggle", "option", "other"]);
+const ELEMENT_STATES = new Set(["disabled", "checked", "unchecked", "mixed", "expanded", "collapsed",
+  "selected", "pressed", "required", "readonly", "has_value"]);
+const SCROLL_VALUES = new Set(["up", "down", "top", "bottom"]);
 const HEX32 = /^[0-9a-f]{32}$/;
 // The hub numbers the requests of each connection in wire order: the first
 // 12 hex digits of request_id (chrome_companion/protocol.py, R2 / P1).
@@ -88,16 +105,18 @@ const REQUEST_SEQ_HEX = 12;
 const REQUEST_KEYS = ["v", "type", "connection_id", "request_id", "op", "tab_id", "deadline_ms", "args"];
 const OP_TAB_RULE = { ping: "none", list_tabs: "none", get_active_tab: "none", get_tab: "required",
   extract_text: "optional", get_links: "optional", open_owner_url: "none", switch_tab: "required",
-  follow_link: "required" };
+  follow_link: "required", observe: "optional", navigate: "optional" };
 const OP_ARGS = { ping: {}, list_tabs: {}, get_active_tab: {}, get_tab: {},
   extract_text: { max_chars: [1, LIMITS.MAX_TEXT_CHARS] }, get_links: { max_links: [1, LIMITS.MAX_LINKS] },
-  open_owner_url: null, switch_tab: null, follow_link: null };
-// Every op that may change what the owner's browser is showing. The
+  open_owner_url: null, switch_tab: null, follow_link: null, observe: null, navigate: null };
+// Every op that may move the owner's browser to another document or tab. The
 // post-dispatch gates below key off this ONE list: an op that can move the
 // browser but is missing from ACTION_OPS would silently skip the owner's
 // navigation-allow and revoke overrides. Keep it in step with core/
-// chrome_companion_hub.py ACTION_OPS and protocol.py OPS.
-const ACTION_OPS = new Set(["open_owner_url", "switch_tab", "follow_link"]);
+// chrome_companion_hub.py ACTION_OPS and protocol.py OPS. (observe's optional
+// scroll changes only the viewport of the document it reads, under the same
+// read grant, PAUSE and revoke gates as every read; it is not an action.)
+const ACTION_OPS = new Set(["open_owner_url", "switch_tab", "follow_link", "navigate"]);
 const TAB_STATUS = new Set(["loading", "complete", "unloaded"]);
 // Fixed, content-free error texts. Raw Chrome error strings can embed URLs,
 // so they never cross the bridge.
@@ -124,6 +143,14 @@ const ERROR_MESSAGES = Object.freeze({
   target_ambiguous: "more than one link on this document has that exact text and destination",
   target_changed: "the link's destination no longer matches the one Lumina observed",
   cross_origin_target: "the link leaves the origin the owner authorized",
+  // Slice 1 (generic observation and navigation). Content-free as above.
+  stale_target: "the element Lumina observed is gone and no single element replaces it",
+  not_interactable: "the element Lumina observed is no longer visible",
+  not_a_link: "the element Lumina observed is not a link to a web page",
+  same_document_link: "the link only moves within the current page; scroll or observe instead",
+  outside_mission_scope: "the destination is neither a site the owner allowed nor one the owner named this turn",
+  sensitive_navigation: "the destination looks like an account action (sign-out, delete, unsubscribe)",
+  no_history_entry: "there is no page in that direction of this tab's history",
 });
 
 let paused = true; // fail closed until the persisted switch is read
@@ -242,7 +269,8 @@ function connect() {
     return;
   }
   const s = { port, state: "CONNECTING", connectionId: null, lastSeq: 0, closed: false,
-    deliveredLinks: new Map(), navigationAllowed: false, navigationEpoch: 0, endReason: null };
+    deliveredLinks: new Map(), deliveredRefs: new Map(), navigationAllowed: false, navigationEpoch: 0,
+    endReason: null };
   session = s;
   port.onMessage.addListener((message) => onHostMessage(s, message));
   port.onDisconnect.addListener(() => onPortDisconnect(s));
@@ -397,11 +425,51 @@ function validateRequest(req) {
       || req.args.document_id.length > 128) return "invalid_args";
     return null;
   }
+  if (req.op === "observe") return validateObserveArgs(req.args);
+  if (req.op === "navigate") return validateNavigateArgs(req.tab_id, req.args);
   const spec = OP_ARGS[req.op];
   for (const [name, value] of Object.entries(req.args)) {
     if (!spec[name]) return "invalid_args";
     const [low, high] = spec[name];
     if (!Number.isSafeInteger(value) || value < low || value > high) return "invalid_args";
+  }
+  return null;
+}
+
+// Slice 1. Mirrors of protocol.py _validate_observe_args/_validate_navigate_args.
+function validateObserveArgs(args) {
+  const allowed = ["max_items", "query", "since_gen", "scroll"];
+  if (Object.keys(args).some((k) => !allowed.includes(k))) return "invalid_args";
+  if ("max_items" in args && !(Number.isSafeInteger(args.max_items) && args.max_items >= 1
+    && args.max_items <= LIMITS.MAX_OBSERVE_ITEMS)) return "invalid_args";
+  if ("query" in args && !(typeof args.query === "string" && args.query.length > 0
+    && args.query.length <= LIMITS.MAX_QUERY_CHARS)) return "invalid_args";
+  if ("since_gen" in args && !(Number.isSafeInteger(args.since_gen) && args.since_gen >= 0)) return "invalid_args";
+  if ("scroll" in args && !SCROLL_VALUES.has(args.scroll)) return "invalid_args";
+  return null;
+}
+
+function validateNavigateArgs(tabId, args) {
+  const kind = args.kind;
+  if (!["url", "ref", "back", "forward"].includes(kind)) return "invalid_args";
+  const bound = ["window_id", "document_id"];
+  let required;
+  if (kind === "url") required = ["kind", "url", "scope", ...(tabId !== null ? bound : [])];
+  else if (kind === "ref") required = ["kind", "ref", "scope", ...bound];
+  else required = ["kind", ...bound];
+  const keys = Object.keys(args);
+  if (keys.length !== required.length || !required.every((k) => keys.includes(k))) return "invalid_args";
+  if (kind !== "url" && tabId === null) return "invalid_args";
+  if ("window_id" in args && !(Number.isSafeInteger(args.window_id) && args.window_id >= 0)) return "invalid_args";
+  if ("document_id" in args && !(typeof args.document_id === "string" && args.document_id.length > 0
+    && args.document_id.length <= 128)) return "invalid_args";
+  if (kind === "url" && !(typeof args.url === "string" && args.url.length <= LIMITS.MAX_TAB_URL_CHARS
+    && LuminaPolicy.classifyUrl(args.url).readable)) return "invalid_args";
+  if (kind === "ref" && !(typeof args.ref === "string" && REF_RE.test(args.ref))) return "invalid_args";
+  if ("scope" in args) {
+    const scope = args.scope;
+    if (!Array.isArray(scope) || scope.length > LIMITS.MAX_NAVIGATE_SCOPE || !scope.every(isSitePattern)
+      || new Set(scope).size !== scope.length) return "invalid_args";
   }
   return null;
 }
@@ -503,6 +571,17 @@ async function handleRequest(s, req) {
         ? previous.pairs : new Set();
       for (const link of outcome.result.links) pairs.add(JSON.stringify([link.text, link.href]));
       s.deliveredLinks.set(outcome.tab_id, { documentId: outcome.observed.document_id, pairs });
+    }
+    if (req.op === "observe" && outcome.observed && Number.isSafeInteger(outcome.tab_id)) {
+      // Slice 1: same eligibility rule for element references. Only a
+      // reference sent on THIS connection, for THIS document, can be acted on.
+      // The registry nonce stays here: it never crosses to the hub or the model.
+      const previous = s.deliveredRefs.get(outcome.tab_id);
+      const same = previous && previous.documentId === outcome.observed.document_id
+        && previous.registry === outcome.registry;
+      const refs = same ? previous.refs : new Set();
+      for (const element of outcome.result.elements) refs.add(element.ref);
+      s.deliveredRefs.set(outcome.tab_id, { documentId: outcome.observed.document_id, registry: outcome.registry, refs });
     }
     lastAction = { op: req.op, tab_id: outcome.tab_id ?? null, host: outcome.host ?? null, at: Date.now() };
     void publishStatus();
@@ -703,6 +782,454 @@ function dispatchVerifiedLink(claim) {
   return { status: "dispatched" };
 }
 
+// ---------------------------------------------------------------------------
+// Slice 1 (BROWSER-COMPANION-COMPLETION-01): generic observation and element
+// references. Injected into the page's ISOLATED world; self-contained.
+//
+// observePage registers every element it reports in a registry kept in this
+// extension's isolated-world global (page scripts and other extensions cannot
+// read or write it; it dies with the document). A reference ("e12") is the
+// same element for the document's life: re-observing does not rename it.
+// Later injections (resolveRefTarget, dispatchRefLink) resolve a reference
+// through the registry's OWN helpers, so a reference is checked against the
+// live element with the very rules that described it.
+//
+// Resolution never guesses. The registered element itself, still connected,
+// still visible, still described the same way, is the target. If the page
+// replaced it (frameworks re-render), exactly ONE live element with the same
+// description is accepted as its replacement; zero is stale, two or more is
+// ambiguous -- never "the first one". Two legitimate "Next" buttons are two
+// references with different context, so the model picks one; ambiguity only
+// arises on that replacement fallback, and there it fails closed.
+// ---------------------------------------------------------------------------
+function observePage(spec) {
+  const KEY = "__luminaCompanionRegistry_v1";
+  let reg = globalThis[KEY];
+  if (!reg) {
+    const L = { name: 120, context: 160, href: 512, value: 80, scan: 6000, shadowDepth: 8, registry: 4000 };
+    const SELECTOR = "a[href],area[href],button,input:not([type=hidden]),select,textarea,summary,"
+      + "[contenteditable=''],[contenteditable='true'],[role=button],[role=link],[role=checkbox],[role=radio],"
+      + "[role=switch],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=option],"
+      + "[role=combobox],[role=textbox],[role=searchbox],[role=slider],[role=spinbutton],[role=treeitem]";
+    const squash = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+    const cut = (s, n) => {
+      const t = squash(s);
+      if (t.length <= n) return t;
+      let c = t.slice(0, n - 1);
+      const last = c.charCodeAt(c.length - 1);
+      if (last >= 0xd800 && last <= 0xdbff) c = c.slice(0, -1);
+      return `${c}…`;
+    };
+    const attr = (el, name) => (el.getAttribute ? el.getAttribute(name) : null);
+    const tagOf = (el) => String(el.tagName || "").toLowerCase();
+    const textOf = (el) => squash(typeof el.innerText === "string" ? el.innerText : el.textContent);
+    // closest() that climbs out of (open) shadow roots.
+    const closestAcross = (el, selector) => {
+      let node = el;
+      for (let i = 0; node && i < 64; i++) {
+        const hit = node.closest ? node.closest(selector) : null;
+        if (hit) return hit;
+        const root = node.getRootNode ? node.getRootNode() : null;
+        node = root && root.host ? root.host : null;
+      }
+      return null;
+    };
+    const roleOf = (el) => {
+      const explicit = squash(attr(el, "role")).split(" ")[0].toLowerCase();
+      if (explicit) return explicit.slice(0, 32);
+      const tag = tagOf(el);
+      if (tag === "a" || tag === "area") return el.hasAttribute("href") ? "link" : "generic";
+      if (tag === "button" || tag === "summary") return "button";
+      if (tag === "select") return el.multiple ? "listbox" : "combobox";
+      if (tag === "textarea") return "textbox";
+      if (tag === "input") {
+        const type = squash(attr(el, "type") || "text").toLowerCase();
+        return ({ checkbox: "checkbox", radio: "radio", range: "slider", number: "spinbutton", search: "searchbox",
+          button: "button", submit: "button", reset: "button", image: "button", file: "button" })[type] || "textbox";
+      }
+      if (el.isContentEditable) return "textbox";
+      return "generic";
+    };
+    const kindOf = (role) => (role === "link" ? "link"
+      : ["textbox", "searchbox", "combobox", "listbox", "slider", "spinbutton"].includes(role) ? "field"
+        : ["checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio"].includes(role) ? "toggle"
+          : ["option", "treeitem"].includes(role) ? "option"
+            : ["button", "tab", "menuitem"].includes(role) ? "button" : "other");
+    const isFormField = (el) => ["input", "select", "textarea"].includes(tagOf(el));
+    const nameOf = (el) => {
+      let name = "";
+      const ids = attr(el, "aria-labelledby");
+      if (ids) {
+        const root = el.getRootNode ? el.getRootNode() : document;
+        name = squash(ids).split(" ").map((id) => {
+          const node = root && root.getElementById ? root.getElementById(id) : document.getElementById(id);
+          return node ? textOf(node) : "";
+        }).join(" ");
+      }
+      if (!squash(name)) name = attr(el, "aria-label") || "";
+      if (!squash(name) && isFormField(el)) {
+        if (el.labels && el.labels.length) name = textOf(el.labels[0]);
+        const type = squash(attr(el, "type")).toLowerCase();
+        if (!squash(name) && ["submit", "button", "reset"].includes(type)) name = el.value || type;
+        if (!squash(name) && type === "image") name = attr(el, "alt") || "";
+        if (!squash(name)) name = attr(el, "placeholder") || "";
+      }
+      if (!squash(name) && !isFormField(el)) name = textOf(el);
+      if (!squash(name) && el.querySelector) {
+        const img = el.querySelector("img[alt],svg[aria-label],[aria-label]");
+        if (img) name = attr(img, "alt") || attr(img, "aria-label") || "";
+      }
+      if (!squash(name)) name = attr(el, "title") || "";
+      return cut(name, L.name);
+    };
+    // Credential/payment surfaces stay human: their values never leave the page.
+    const sensitiveOf = (el) => {
+      if (!isFormField(el) && !el.isContentEditable) return false;
+      if (squash(attr(el, "type")).toLowerCase() === "password") return true;
+      const hints = [attr(el, "autocomplete"), attr(el, "name"), el.id, attr(el, "aria-label"),
+        attr(el, "placeholder")].join(" ");
+      return /password|passwd|pwd|one-time-code|otp|cc-|cvv|cvc|card.?number|security.?code|secret|token/i.test(hints);
+    };
+    const valueOf = (el, kind) => {
+      if (kind !== "field") return "";
+      const tag = tagOf(el);
+      if (tag === "select") {
+        const option = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+        return option ? textOf(option) : "";
+      }
+      if (tag === "input" || tag === "textarea") return typeof el.value === "string" ? el.value : "";
+      return el.isContentEditable ? textOf(el) : "";
+    };
+    const stateOf = (el, role) => {
+      const out = [];
+      const aria = (n) => attr(el, n);
+      if (el.disabled === true || aria("aria-disabled") === "true" || closestAcross(el, "fieldset[disabled]")) {
+        out.push("disabled");
+      }
+      if (["checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio"].includes(role)) {
+        const checked = aria("aria-checked");
+        if (checked === "mixed" || el.indeterminate === true) out.push("mixed");
+        else out.push(el.checked === true || checked === "true" ? "checked" : "unchecked");
+      }
+      const expanded = aria("aria-expanded");
+      if (expanded === "true") out.push("expanded");
+      else if (expanded === "false") out.push("collapsed");
+      if (aria("aria-selected") === "true" || (tagOf(el) === "option" && el.selected === true)) out.push("selected");
+      if (aria("aria-pressed") === "true") out.push("pressed");
+      if (el.required === true || aria("aria-required") === "true") out.push("required");
+      if (el.readOnly === true || aria("aria-readonly") === "true") out.push("readonly");
+      return out;
+    };
+    const HEADING = "h1,h2,h3,h4,h5,h6,[role=heading]";
+    const isHeading = (n) => n && n.nodeType === 1 && (/^h[1-6]$/.test(tagOf(n)) || attr(n, "role") === "heading");
+    const headingBefore = (el) => {
+      let node = el;
+      for (let steps = 0; node && steps < 80; steps++) {
+        const sib = node.previousElementSibling;
+        if (sib) {
+          if (isHeading(sib)) return sib;
+          const inner = sib.querySelectorAll ? sib.querySelectorAll(HEADING) : [];
+          if (inner.length) return inner[inner.length - 1];
+          node = sib;
+        } else {
+          node = node.parentElement;
+          if (isHeading(node)) return node;
+        }
+      }
+      return null;
+    };
+    const labelOfRegion = (region) => {
+      const label = attr(region, "aria-label");
+      if (label) return label;
+      const heading = region.querySelector ? region.querySelector("h1,h2,h3,legend,[role=heading]") : null;
+      return heading ? textOf(heading) : "";
+    };
+    const contextOf = (el, name) => {
+      const parts = [];
+      const dialog = closestAcross(el, "dialog,[role=dialog],[role=alertdialog]");
+      if (dialog) parts.push(`dialog "${cut(labelOfRegion(dialog), 40)}"`);
+      const region = closestAcross(el, "form,[role=form],[role=search],nav,[role=navigation],header,[role=banner],"
+        + "footer,[role=contentinfo],aside,[role=complementary]");
+      if (region) {
+        const kind = attr(region, "role") || tagOf(region);
+        const label = cut(labelOfRegion(region), 40);
+        parts.push(label ? `${kind} "${label}"` : kind);
+      }
+      // A repeated control ("Reply" under every comment) is told apart by the
+      // item it belongs to.
+      const item = closestAcross(el, "article,[role=article],li,[role=listitem],tr,[role=row]");
+      if (item && item !== el) {
+        let text = textOf(item);
+        if (name && text.startsWith(name)) text = text.slice(name.length);
+        text = cut(text, 70);
+        if (text) parts.push(`${tagOf(item) === "tr" ? "row" : "item"} "${text}"`);
+      }
+      const heading = headingBefore(el);
+      if (heading) parts.push(`under "${cut(textOf(heading), 50)}"`);
+      return cut(parts.join(" › "), L.context);
+    };
+    const linkUrl = (el) => {
+      const tag = tagOf(el);
+      if ((tag !== "a" && tag !== "area") || !el.hasAttribute("href")) return null;
+      let url;
+      try { url = new URL(attr(el, "href"), document.baseURI); } catch { return null; }
+      if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+      url.username = "";
+      url.password = "";
+      return url;
+    };
+    const visible = (el) => {
+      if (!el.isConnected || !el.getBoundingClientRect) return null;
+      const rect = el.getBoundingClientRect();
+      if (!(rect.width >= 1 && rect.height >= 1)) return null;
+      if (typeof el.checkVisibility === "function") {
+        if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) {
+          // Styled checkboxes/radios are commonly opacity:0 under a visible label.
+          const type = squash(attr(el, "type")).toLowerCase();
+          if (!(tagOf(el) === "input" && (type === "checkbox" || type === "radio"))) return null;
+        }
+      } else {
+        const style = getComputedStyle(el);
+        if (style.display === "none" || style.visibility !== "visible" || Number(style.opacity) === 0) return null;
+      }
+      if (closestAcross(el, "[aria-hidden=true],[inert]")) return null;
+      return rect;
+    };
+    const collect = () => {
+      const found = new Set();
+      let scanned = 0;
+      let capped = false;
+      const walk = (root, depth) => {
+        for (const el of root.querySelectorAll(SELECTOR)) {
+          if (++scanned > L.scan) { capped = true; return; }
+          found.add(el);
+        }
+        if (depth >= L.shadowDepth) return;
+        for (const host of root.querySelectorAll("*")) {
+          if (host.shadowRoot) {
+            walk(host.shadowRoot, depth + 1);
+            if (capped) return;
+          }
+        }
+      };
+      walk(document, 0);
+      return { elements: [...found], capped };
+    };
+    const describe = (el) => {
+      const role = roleOf(el);
+      const name = nameOf(el);
+      const url = linkUrl(el);
+      return { role, name, kind: kindOf(role), href: url ? url.href : null, context: contextOf(el, name) };
+    };
+    // identity: what the control IS (the same registered element must still
+    // say this). fingerprint: identity plus where it sits -- the stricter key
+    // a REPLACEMENT element must match uniquely.
+    const identity = (d, el) => [d.role, d.name, d.href || "", tagOf(el)].join("\u0001");
+    const fingerprint = (d, el) => `${identity(d, el)}\u0001${d.context}`;
+    // A random identity for THIS registry (so for this document). Chrome 155
+    // was observed (real-Chrome evidence, Slice 1) running a script targeted at
+    // a stale documentId in the tab's NEW document after a cross-document
+    // navigation; refs restart at e1 per document, so a ref is only ever
+    // resolved against the registry whose nonce the worker was shown.
+    const nonceBytes = new Uint8Array(16);
+    crypto.getRandomValues(nonceBytes);
+    reg = {
+      nonce: Array.from(nonceBytes, (b) => b.toString(16).padStart(2, "0")).join(""),
+      gen: 0, next: 1, byEl: new WeakMap(), byRef: new Map(), limits: L,
+      cut, attr, tagOf, textOf, visible, collect, describe, identity, fingerprint, nameOf, linkUrl, sensitiveOf,
+      valueOf, stateOf, HEADING,
+      // The ONE resolution rule (see the comment above observePage).
+      resolve(ref) {
+        const entry = reg.byRef.get(ref);
+        if (!entry) return { status: "not_found" };
+        const el = entry.w.deref();
+        if (el && el.isConnected) {
+          const d = describe(el);
+          if (identity(d, el) !== entry.id) return { status: "changed" };
+          if (!visible(el)) return { status: "not_visible" };
+          return { status: "ok", el, d };
+        }
+        let match = null;
+        let count = 0;
+        for (const candidate of collect().elements) {
+          if (!visible(candidate)) continue;
+          const d = describe(candidate);
+          if (fingerprint(d, candidate) !== entry.fp) continue;
+          count += 1;
+          match = { el: candidate, d };
+          if (count > 1) return { status: "ambiguous" };
+        }
+        if (!match) return { status: "stale" };
+        entry.w = new WeakRef(match.el);
+        reg.byEl.set(match.el, ref);
+        return { status: "ok", el: match.el, d: match.d };
+      },
+    };
+    globalThis[KEY] = reg;
+  }
+
+  // Optional scroll first (viewport only). The window if it scrolls, else the
+  // largest visible scrollable region (inbox-style apps scroll an inner pane).
+  const scroller = (() => {
+    const docEl = document.documentElement;
+    if (docEl && docEl.scrollHeight > innerHeight + 10) return null; // the window
+    let best = null;
+    let bestArea = 0;
+    let scanned = 0;
+    for (const el of document.querySelectorAll("*")) {
+      if (++scanned > reg.limits.scan) break;
+      if (!(el.scrollHeight > el.clientHeight + 10)) continue;
+      const overflow = getComputedStyle(el).overflowY;
+      if (overflow !== "auto" && overflow !== "scroll") continue;
+      const rect = reg.visible(el);
+      if (!rect) continue;
+      const area = rect.width * rect.height;
+      if (area > bestArea) { best = el; bestArea = area; }
+    }
+    return best;
+  })();
+  const metrics = () => (scroller
+    ? { scroll_y: Math.max(0, Math.round(scroller.scrollTop)), scroll_height: Math.round(scroller.scrollHeight),
+      viewport_height: Math.round(scroller.clientHeight) }
+    : { scroll_y: Math.max(0, Math.round(scrollY)),
+      scroll_height: Math.round(document.documentElement ? document.documentElement.scrollHeight : 0),
+      viewport_height: Math.round(innerHeight) });
+  let scrolled = false;
+  if (spec.scroll) {
+    const before = metrics().scroll_y;
+    const step = Math.round(metrics().viewport_height * 0.85);
+    const to = { down: before + step, up: Math.max(0, before - step), top: 0, bottom: metrics().scroll_height }[spec.scroll];
+    if (scroller) scroller.scrollTop = to;
+    else scrollTo(0, to);
+    scrolled = metrics().scroll_y !== before;
+  }
+
+  reg.gen += 1;
+  const gen = reg.gen;
+  const { elements: all } = reg.collect();
+  const query = typeof spec.query === "string" ? spec.query.toLowerCase() : null;
+  const candidates = [];
+  for (const el of all) {
+    const rect = reg.visible(el);
+    if (!rect) continue;
+    const known = reg.byEl.get(el);
+    if (known && reg.byRef.has(known)) reg.byRef.get(known).lastSeen = gen;
+    candidates.push({ el, rect, inView: rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth });
+  }
+  // In view first (reading order), then below the fold nearest first, then above.
+  const rank = (c) => (c.inView ? [0, c.rect.top, c.rect.left]
+    : c.rect.top >= innerHeight ? [1, c.rect.top, c.rect.left] : [2, -c.rect.bottom, c.rect.left]);
+  candidates.sort((a, b) => {
+    const x = rank(a);
+    const y = rank(b);
+    return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+  });
+  const out = [];
+  let total = 0;
+  for (const c of candidates) {
+    let ref = reg.byEl.get(c.el);
+    let entry = ref ? reg.byRef.get(ref) : null;
+    if (spec.since_gen != null && entry && entry.firstGen <= spec.since_gen) continue; // delta: only new
+    if (query) {
+      const link = reg.linkUrl(c.el);
+      if (!(reg.nameOf(c.el).toLowerCase().includes(query) || (link && link.href.toLowerCase().includes(query)))) continue;
+    }
+    total += 1;
+    if (out.length >= spec.max_items) continue;
+    const d = reg.describe(c.el);
+    const id = reg.identity(d, c.el);
+    const fp = reg.fingerprint(d, c.el);
+    if (!entry) {
+      ref = `e${reg.next++}`;
+      entry = { w: new WeakRef(c.el), id, fp, firstGen: gen, lastSeen: gen };
+      reg.byRef.set(ref, entry);
+      reg.byEl.set(c.el, ref);
+    } else {
+      // The element is the reference. What it now says is what Lumina was
+      // just shown, so resolution checks against this description from here on.
+      entry.id = id;
+      entry.fp = fp;
+      entry.lastSeen = gen;
+    }
+    const sensitive = reg.sensitiveOf(c.el);
+    const value = sensitive ? "" : reg.valueOf(c.el, d.kind);
+    const state = reg.stateOf(c.el, d.role);
+    if (sensitive && reg.valueOf(c.el, "field")) state.push("has_value");
+    const url = d.href ? new URL(d.href) : null;
+    out.push({ ref, role: d.role, name: d.name, kind: d.kind, context: d.context,
+      href: url ? reg.cut(url.href, reg.limits.href) : null, same_origin: url ? url.origin === location.origin : null,
+      state, value: value ? reg.cut(value, reg.limits.value) : null, sensitive, in_viewport: c.inView });
+  }
+  const removed = [];
+  if (spec.since_gen != null) {
+    for (const [ref, entry] of reg.byRef) {
+      if (entry.lastSeen >= spec.since_gen && entry.lastSeen < gen && removed.length < 120) removed.push(ref);
+    }
+  }
+  if (reg.byRef.size > reg.limits.registry) {
+    for (const [ref, entry] of reg.byRef) {
+      const el = entry.w.deref();
+      if (!el || !el.isConnected) reg.byRef.delete(ref);
+    }
+  }
+  const headings = [];
+  for (const h of document.querySelectorAll(reg.HEADING)) {
+    if (headings.length >= 12) break;
+    if (!reg.visible(h)) continue;
+    const text = reg.cut(reg.textOf(h), reg.limits.name);
+    if (!text) continue;
+    const level = /^h[1-6]$/.test(reg.tagOf(h)) ? Number(reg.tagOf(h)[1])
+      : Math.min(6, Math.max(1, Number(reg.attr(h, "aria-level")) || 2));
+    headings.push({ level, text });
+  }
+  let dialog = null;
+  for (const d of document.querySelectorAll("dialog[open],[role=dialog],[role=alertdialog]")) {
+    if (!reg.visible(d)) continue;
+    const label = reg.attr(d, "aria-label") || (d.querySelector("h1,h2,h3,[role=heading]")
+      ? reg.textOf(d.querySelector("h1,h2,h3,[role=heading]")) : "");
+    dialog = reg.cut(label || "dialog", reg.limits.name);
+  }
+  return { href: location.href, title: reg.cut(document.title || "", 300), gen, elements: out,
+    total_elements: total, removed, headings, viewport: metrics(), dialog, scrolled, registry: reg.nonce };
+}
+
+// Resolve ONE delivered reference to the live link it names (read-only).
+function resolveRefTarget(claim) {
+  const out = { href: location.href, status: "not_found", resolved_href: null };
+  const reg = globalThis.__luminaCompanionRegistry_v1;
+  if (!reg || typeof reg.resolve !== "function") return out;
+  if (reg.nonce !== claim.registry) {
+    out.status = "other_document";
+    return out;
+  }
+  const hit = reg.resolve(claim.ref);
+  out.status = hit.status;
+  if (hit.status !== "ok") return out;
+  const url = reg.linkUrl(hit.el);
+  if (!url) {
+    out.status = "not_a_link";
+    return out;
+  }
+  out.resolved_href = url.href;
+  return out;
+}
+
+// Fixed extension-owned actuator for chrome_navigate(kind=ref). Chrome
+// dispatches it only into the source document; it resolves the reference
+// again by the same rule and navigates only if the live link still points
+// exactly where the checked destination does. Never runs page-supplied code.
+function dispatchRefLink(claim) {
+  if (location.href !== claim.source_url) return { status: "refused" };
+  const reg = globalThis.__luminaCompanionRegistry_v1;
+  if (!reg || typeof reg.resolve !== "function" || reg.nonce !== claim.registry) return { status: "refused" };
+  const hit = reg.resolve(claim.ref);
+  if (hit.status !== "ok") return { status: "refused" };
+  const url = reg.linkUrl(hit.el);
+  if (!url || url.href !== claim.href) return { status: "refused" };
+  location.assign(url.href);
+  return { status: "dispatched" };
+}
+
 // Chrome's identity for the document now in the tab's main frame
 // (webNavigation.getFrame, Chrome 106+): a browser-assigned UUID that changes
 // whenever the frame loads a new document -- a same-URL reload included --
@@ -779,8 +1306,12 @@ async function readPage(req, func, funcArg, live) {
   if (!grantHeld(grantEpoch)) throw new CompanionFailure("site_access_required", tabId);
   let injection;
   try {
-    // Targeted by document, not frame: Chrome refuses outright if this
-    // document is no longer in the tab ("No document with id ...").
+    // Targeted by document, not frame. Chrome refuses a stale id after a
+    // same-URL reload ("No document with id ..."), but Chrome 155 was observed
+    // (BROWSER-COMPANION-COMPLETION-01 real-Chrome evidence) running a script
+    // targeted at a stale id in the tab's NEW document after a cross-document
+    // navigation. So the target alone proves nothing: the injection's own
+    // documentId and the after-check below are what bind the read.
     [injection] = await chrome.scripting.executeScript({
       target: { tabId, documentIds: [start.documentId] },
       world: "ISOLATED",
@@ -895,6 +1426,246 @@ async function settleNavigatedTab(tabId, expectedWindow, req, s, navEpoch, grant
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Slice 1 helpers (generic observation and navigation)
+// ---------------------------------------------------------------------------
+
+// Re-check, field by field, everything the page function returned. Page-side
+// code ran in an isolated world, but it read page-controlled DOM, so its
+// output is bounded and typed again here before it can cross the bridge.
+function sanitizeObservation(page, maxItems) {
+  const bounded = (value, limit) => (typeof value === "string" ? safeSlice(value, limit) : "");
+  if (!isPlainObject(page) || !Number.isSafeInteger(page.gen) || page.gen < 1 || !Array.isArray(page.elements)
+    || !Number.isSafeInteger(page.total_elements) || !Array.isArray(page.removed) || !Array.isArray(page.headings)
+    || !isPlainObject(page.viewport)) return null;
+  const elements = [];
+  const seen = new Set();
+  for (const e of page.elements.slice(0, maxItems)) {
+    if (!isPlainObject(e) || typeof e.ref !== "string" || !REF_RE.test(e.ref) || seen.has(e.ref)) continue;
+    if (!ELEMENT_KINDS.has(e.kind)) continue;
+    seen.add(e.ref);
+    const href = typeof e.href === "string" && /^https?:\/\//i.test(e.href) && e.href.length <= LIMITS.MAX_ELEMENT_HREF_CHARS
+      ? e.href : null;
+    const sensitive = e.sensitive === true;
+    const state = Array.isArray(e.state) ? [...new Set(e.state.filter((x) => ELEMENT_STATES.has(x)))] : [];
+    elements.push({ ref: e.ref, role: bounded(e.role, LIMITS.MAX_ROLE_CHARS), name: bounded(e.name, LIMITS.MAX_ELEMENT_NAME_CHARS),
+      kind: e.kind, context: bounded(e.context, LIMITS.MAX_ELEMENT_CONTEXT_CHARS), href,
+      same_origin: href === null ? null : e.same_origin === true, state,
+      // A credential/payment field's value never crosses the bridge.
+      value: sensitive || typeof e.value !== "string" ? null : safeSlice(e.value, LIMITS.MAX_ELEMENT_VALUE_CHARS),
+      sensitive, in_viewport: e.in_viewport === true });
+  }
+  const removed = page.removed.filter((r) => typeof r === "string" && REF_RE.test(r)).slice(0, LIMITS.MAX_OBSERVE_ITEMS);
+  const headings = [];
+  for (const h of page.headings.slice(0, LIMITS.MAX_HEADINGS)) {
+    if (!isPlainObject(h) || !Number.isSafeInteger(h.level) || h.level < 1 || h.level > 6) continue;
+    headings.push({ level: h.level, text: bounded(h.text, LIMITS.MAX_ELEMENT_NAME_CHARS) });
+  }
+  const metric = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : 0);
+  return { gen: page.gen, title: bounded(page.title, LIMITS.MAX_TITLE_CHARS), elements,
+    total_elements: Math.max(page.total_elements, elements.length), removed, headings,
+    viewport: { scroll_y: metric(page.viewport.scroll_y), scroll_height: metric(page.viewport.scroll_height),
+      viewport_height: metric(page.viewport.viewport_height) },
+    dialog: typeof page.dialog === "string" ? safeSlice(page.dialog, LIMITS.MAX_ELEMENT_NAME_CHARS) : null,
+    scrolled: page.scrolled === true };
+}
+
+// Generic navigation's own gate (Slice 1). Like navigationVerdict, but a
+// fragment is allowed (the page moved to, not the fragment, is what is
+// checked), and a conventional account-action path is refused.
+function genericNavigationVerdict(s, url, live) {
+  if (!live() || !s.navigationAllowed) throw new CompanionFailure("navigation_not_allowed");
+  let parsed;
+  try { parsed = new URL(url); } catch { throw new CompanionFailure("invalid_args"); }
+  if (parsed.username || parsed.password || parsed.href.length > LIMITS.MAX_TAB_URL_CHARS) {
+    throw new CompanionFailure("invalid_args");
+  }
+  const verdict = LuminaPolicy.classifyUrl(parsed.href);
+  if (!verdict.readable) throw new CompanionFailure("restricted_surface");
+  if (blockedSites.has(verdict.pattern) || revocationsPending) throw new CompanionFailure("companion_revoked");
+  if (LuminaPolicy.sensitiveNavigation(parsed.href)) throw new CompanionFailure("sensitive_navigation");
+  return verdict;
+}
+
+// Mission scope, enforced HERE as well as in the hub: a destination is in
+// scope if the owner named its site in this turn (scope, from the hub's
+// owner-ingress mission) or granted it in this popup (Chrome's grant AND not
+// companion-revoked -- siteAccess). Nothing a page says can add to either.
+async function inMissionScope(verdict, scope) {
+  return scope.includes(verdict.pattern) || (await siteAccess(verdict)) === "granted";
+}
+
+function withoutHash(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
+// Observe a tab after a generic navigation until it shows a NEW document,
+// fully loaded. Unlike settleNavigatedTab, a redirect is fine: the receipt
+// reports the URL actually read back, never the one requested. A landing on
+// a restricted or companion-revoked surface ends observation at once and is
+// reported without a URL. Bounded; never a second navigation.
+async function settleNewDocument(tabId, expectedWindow, req, s, navEpoch, grantEpoch, priorDocumentId, live) {
+  for (let attempt = 0; attempt < LIMITS.NAVIGATE_SETTLE_POLLS; attempt++) {
+    if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
+      || grantRevocations !== grantEpoch || Date.now() >= req.deadline_ms) return null;
+    let raw;
+    try { raw = await chrome.tabs.get(tabId); } catch { return null; }
+    if (!raw || raw.incognito || (expectedWindow !== null && raw.windowId !== expectedWindow)) return null;
+    if (raw.status === "complete" && typeof raw.url === "string" && raw.url && raw.url !== "about:blank") {
+      const verdict = LuminaPolicy.classifyUrl(raw.url);
+      if (!verdict.readable || blockedSites.has(verdict.pattern)) return { restricted: true, tab: raw };
+      const doc = await mainDocument(tabId);
+      const again = doc ? await safeActionTab(tabId, expectedWindow) : null;
+      if (doc && again && again.status === "complete" && again.url === raw.url && doc.url === raw.url
+        && doc.documentId !== priorDocumentId) {
+        return { tab: again, doc, verdict };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return null;
+}
+
+// The single receipt builder for chrome_navigate, after dispatch.
+function navigateReceipt(req, s, navEpoch, grantEpoch, live, settled, fallbackTab, targetPattern) {
+  const base = { navigationEpoch: navEpoch, actionGrantEpoch: grantEpoch, targetPattern };
+  if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch || grantRevocations !== grantEpoch
+    || !settled || settled.restricted) {
+    // Tab identity only: never a URL that was not verified (or is restricted).
+    return { result: actionReceipt(req, "ambiguous_after_dispatch", fallbackTab), ...base };
+  }
+  return { result: actionReceipt(req, "browser_local_effect_observed", settled.tab, settled.tab.url, true),
+    tab_id: settled.tab.id,
+    observed: { url: settled.tab.url, origin: settled.verdict.origin, document_id: settled.doc.documentId },
+    ...base, targetPattern: settled.verdict.pattern };
+}
+
+// The tab and EXACT document a bound navigation starts from.
+async function boundSource(req) {
+  const tab = await safeActionTab(req.tab_id, req.args.window_id);
+  const doc = tab ? await mainDocument(req.tab_id) : null;
+  if (!tab || !doc || doc.documentId !== req.args.document_id || doc.url !== tab.url) {
+    throw new CompanionFailure("stale_document", req.tab_id);
+  }
+  return { tab, doc };
+}
+
+const NAVIGATE = Object.freeze({
+  async url(req, s, live) {
+    const verdict = genericNavigationVerdict(s, req.args.url, live);
+    if (!(await inMissionScope(verdict, req.args.scope))) throw new CompanionFailure("outside_mission_scope", req.tab_id);
+    let priorDocumentId = null;
+    if (req.tab_id !== null) priorDocumentId = (await boundSource(req)).doc.documentId;
+    const navEpoch = s.navigationEpoch;
+    const grantEpoch = grantRevocations;
+    if (!live() || !s.navigationAllowed || !grantHeld(grantEpoch) || blockedSites.has(verdict.pattern)
+      || Date.now() > req.deadline_ms) throw new CompanionFailure("navigation_not_allowed", req.tab_id);
+    // Dispatch boundary: from here on, a failure or lost answer is ambiguous.
+    req._actionDispatched = true;
+    let tab;
+    try {
+      tab = req.tab_id === null ? await chrome.tabs.create({ url: req.args.url, active: true })
+        : await chrome.tabs.update(req.tab_id, { url: req.args.url });
+    } catch {
+      return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, null, verdict.pattern);
+    }
+    if (!tab || !isTabId(tab.id)) return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, null, verdict.pattern);
+    const settled = await settleNewDocument(tab.id, req.tab_id === null ? null : req.args.window_id, req, s, navEpoch,
+      grantEpoch, priorDocumentId, live);
+    return navigateReceipt(req, s, navEpoch, grantEpoch, live, settled, tab, verdict.pattern);
+  },
+
+  // Generalized Stage 2: the model names an element reference it was shown on
+  // this exact document; the live document supplies the destination.
+  async ref(req, s, live) {
+    const delivered = s.deliveredRefs.get(req.tab_id);
+    if (delivered && delivered.documentId !== req.args.document_id) throw new CompanionFailure("stale_document", req.tab_id);
+    if (!delivered || !delivered.refs.has(req.args.ref)) throw new CompanionFailure("target_not_found", req.tab_id);
+    if (!(await safeActionTab(req.tab_id, req.args.window_id))) throw new CompanionFailure("navigated_during_request", req.tab_id);
+    const { tabId, page, observed, grantEpoch } = await readPage(req, resolveRefTarget,
+      { ref: req.args.ref, registry: delivered.registry }, live);
+    if (tabId !== req.tab_id) throw new CompanionFailure("navigated_during_request", tabId);
+    if (observed.document_id !== req.args.document_id) throw new CompanionFailure("stale_document", tabId);
+    const refusal = { not_found: "target_not_found", stale: "stale_target", ambiguous: "target_ambiguous",
+      changed: "target_changed", not_visible: "not_interactable", not_a_link: "not_a_link",
+      other_document: "stale_document" }[page.status];
+    if (page.status !== "ok") throw new CompanionFailure(refusal || "target_not_found", tabId);
+    const destination = page.resolved_href;
+    if (typeof destination !== "string") throw new CompanionFailure("target_not_found", tabId);
+    if (withoutHash(destination) === withoutHash(observed.url)) throw new CompanionFailure("same_document_link", tabId);
+    const verdict = genericNavigationVerdict(s, destination, live);
+    if (!(await inMissionScope(verdict, req.args.scope))) throw new CompanionFailure("outside_mission_scope", tabId);
+    const navEpoch = s.navigationEpoch;
+    // tabs.update cannot bind to a source document: recheck tab, window and
+    // document, then dispatch fixed code through documentIds (as FINGER does).
+    const current = await safeActionTab(tabId, req.args.window_id);
+    const source = current ? await mainDocument(tabId) : null;
+    if (!current || current.url !== observed.url || !source || source.documentId !== observed.document_id
+      || source.url !== observed.url) throw new CompanionFailure("stale_document", tabId);
+    if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch || !grantHeld(grantEpoch)
+      || blockedSites.has(verdict.pattern) || Date.now() > req.deadline_ms) {
+      throw new CompanionFailure("navigation_not_allowed", tabId);
+    }
+    req._actionDispatched = true;
+    let injection;
+    try {
+      [injection] = await chrome.scripting.executeScript({
+        target: { tabId, documentIds: [observed.document_id] }, world: "ISOLATED", func: dispatchRefLink,
+        args: [{ source_url: observed.url, ref: req.args.ref, href: destination, registry: delivered.registry }],
+      });
+    } catch {
+      return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, null, verdict.pattern);
+    }
+    if (!injection || injection.documentId !== observed.document_id || !injection.result) {
+      return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, null, verdict.pattern);
+    }
+    if (injection.result.status !== "dispatched") return { error: "target_changed", tab_id: tabId };
+    const settled = await settleNewDocument(tabId, req.args.window_id, req, s, navEpoch, grantEpoch,
+      observed.document_id, live);
+    return navigateReceipt(req, s, navEpoch, grantEpoch, live, settled, current, verdict.pattern);
+  },
+
+  async back(req, s, live) { return navigateHistory(req, s, live, "goBack"); },
+  async forward(req, s, live) { return navigateHistory(req, s, live, "goForward"); },
+});
+
+// Browser history. The destination is the tab's own history (created by the
+// owner's or Lumina's earlier navigations), not anything a page supplies; it
+// cannot be checked before dispatch, so the receipt reports where the tab
+// actually landed, and a restricted landing is reported without a URL.
+async function navigateHistory(req, s, live, method) {
+  if (!live() || !s.navigationAllowed) throw new CompanionFailure("navigation_not_allowed", req.tab_id);
+  const { tab, doc } = await boundSource(req);
+  const sourcePattern = LuminaPolicy.classifyUrl(tab.url).pattern;
+  const navEpoch = s.navigationEpoch;
+  const grantEpoch = grantRevocations;
+  if (!grantHeld(grantEpoch) || revocationsPending || Date.now() > req.deadline_ms) {
+    throw new CompanionFailure("navigation_not_allowed", req.tab_id);
+  }
+  req._actionDispatched = true;
+  try {
+    await chrome.tabs[method](req.tab_id);
+  } catch {
+    // Chrome refuses outright when there is no such entry. Only when the very
+    // same document is still there is that proof nothing was dispatched.
+    const now = await mainDocument(req.tab_id);
+    if (now && now.documentId === doc.documentId) {
+      req._actionDispatched = false;
+      throw new CompanionFailure("no_history_entry", req.tab_id);
+    }
+    return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, tab, sourcePattern);
+  }
+  const settled = await settleNewDocument(req.tab_id, req.args.window_id, req, s, navEpoch, grantEpoch,
+    doc.documentId, live);
+  return navigateReceipt(req, s, navEpoch, grantEpoch, live, settled, tab, sourcePattern);
+}
+
 const OPERATIONS = Object.freeze({
   async ping(req) {
     const result = { extension_version: chrome.runtime.getManifest().version };
@@ -957,6 +1728,26 @@ const OPERATIONS = Object.freeze({
       tab_id: tabId, observed, host, grantEpoch,
       truncated: Boolean(page.truncated) || links.length < page.links.length,
     };
+  },
+
+  // Slice 1: generic observation. A read like extract_text -- same document
+  // binding, grant, PAUSE and revoke gates (readPage) -- whose optional
+  // scroll moves only that document's viewport.
+  async observe(req, live) {
+    const spec = { max_items: req.args.max_items ?? LIMITS.DEFAULT_OBSERVE_ITEMS, query: req.args.query ?? null,
+      since_gen: req.args.since_gen ?? null, scroll: req.args.scroll ?? null };
+    const { tabId, page, host, observed, grantEpoch } = await readPage(req, observePage, spec, live);
+    const result = sanitizeObservation(page, spec.max_items);
+    if (!result || typeof page.registry !== "string" || !HEX32.test(page.registry)) {
+      throw new CompanionFailure("injection_failed", tabId);
+    }
+    return { result, tab_id: tabId, observed, host, grantEpoch, registry: page.registry,
+      truncated: result.total_elements > result.elements.length };
+  },
+
+  // Slice 1: generic navigation inside an owner mission.
+  async navigate(req, live) {
+    return NAVIGATE[req.args.kind](req, session, live);
   },
 
   async open_owner_url(req, live) {

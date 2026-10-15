@@ -105,6 +105,8 @@ separate from Browser Companion below — neither falls back to the other.
 | `chrome_open_owner_url` | Open a URL *you* typed this turn — see [Browser Companion](browser-companion.md). |
 | `chrome_switch_tab` | Switch to an already-open tab by exact identity. |
 | `chrome_follow_link` | Follow one link delivered by `chrome_get_links` on that exact document and verified again before navigation — see [Browser Companion](browser-companion.md). |
+| `chrome_observe` | See an allowed page's visible links, buttons, fields and toggles with stable references, headings and scroll position; optional name filter, scroll, and "only new since" — works on any site. |
+| `chrome_navigate` | Follow an observed link reference, open an address, or go back/forward while carrying out your own request, within the sites you allowed or named — see [Browser Companion](browser-companion.md#generic-browsing-within-your-request). |
 
 ## Memory
 

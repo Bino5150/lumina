@@ -157,7 +157,9 @@ def test_old_navigation_worker_cannot_receive_follow_link(action_hub):
 
 
 def test_unknown_action_version_fails_before_wire_dispatch(action_hub):
-    action_hub.hub._current.extension_version = "0.4.0"
+    # 0.4.0 became a known version in BROWSER-COMPANION-COMPLETION-01 Slice 1;
+    # the next, unreviewed one must still fail closed.
+    action_hub.hub._current.extension_version = "0.5.0"
     with pytest.raises(CompanionError) as unsupported:
         action_hub.hub.request("switch_tab", tab_id=7,
             args={"window_id": 1, "expected_url": "https://github.com/"})

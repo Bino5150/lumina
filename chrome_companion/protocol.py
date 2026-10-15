@@ -65,6 +65,28 @@ MAX_LINK_TEXT_CHARS = 200
 MAX_ERROR_MESSAGE_CHARS = 500
 MAX_IN_FLIGHT = 8
 
+# BROWSER-COMPANION-COMPLETION-01 Slice 1: generic observation. An element
+# reference ("e12") names one element the extension registered in its
+# isolated world for ONE document; it is a claim to be re-verified, never a
+# selector. Everything the page supplies is bounded here and re-checked by
+# the hub.
+DEFAULT_OBSERVE_ITEMS = 40
+MAX_OBSERVE_ITEMS = 120
+MAX_QUERY_CHARS = 100
+MAX_ELEMENT_NAME_CHARS = 120
+MAX_ELEMENT_CONTEXT_CHARS = 160
+MAX_ELEMENT_HREF_CHARS = 512
+MAX_ELEMENT_VALUE_CHARS = 80
+MAX_ROLE_CHARS = 32
+MAX_HEADINGS = 12
+MAX_NAVIGATE_SCOPE = 16
+SCROLL_VALUES = frozenset({"up", "down", "top", "bottom"})
+ELEMENT_KINDS = frozenset({"link", "button", "field", "toggle", "option", "other"})
+ELEMENT_STATES = frozenset({"disabled", "checked", "unchecked", "mixed", "expanded", "collapsed",
+                            "selected", "pressed", "required", "readonly", "has_value"})
+NAVIGATE_KINDS = frozenset({"url", "ref", "back", "forward"})
+_REF = re.compile(r"^e[1-9][0-9]{0,6}$")
+
 # Request ids (BROWSER-COMPANION-01A-R2 / P1). The first REQUEST_SEQ_HEX hex
 # digits of a request_id are its sequence number on its connection, assigned
 # by the hub in wire order starting at 1; the rest is random. The extension
@@ -76,10 +98,11 @@ REQUEST_SEQ_HEX = 12
 MAX_REQUEST_SEQ = 16 ** REQUEST_SEQ_HEX - 1
 
 OPS = frozenset({"ping", "list_tabs", "get_active_tab", "get_tab", "extract_text", "get_links",
-                 "open_owner_url", "switch_tab", "follow_link"})
+                 "open_owner_url", "switch_tab", "follow_link", "observe", "navigate"})
 # tab_id rules per op: required, optional (null = the active tab), or absent.
+# navigate: per kind (validate_request) -- only kind "url" may omit it (new tab).
 OPS_TAB_REQUIRED = frozenset({"get_tab", "switch_tab", "follow_link"})
-OPS_TAB_OPTIONAL = frozenset({"extract_text", "get_links"})
+OPS_TAB_OPTIONAL = frozenset({"extract_text", "get_links", "observe", "navigate"})
 OPS_TAB_NONE = frozenset({"ping", "list_tabs", "get_active_tab", "open_owner_url"})
 OP_ARGS = {
     "ping": {},
@@ -96,7 +119,64 @@ OP_ARGS = {
     # ``href`` is never a destination here: the extension re-reads the live
     # document and navigates only to what that document itself reports.
     "follow_link": {},
+    # Slice 1 generic ops; checked separately below.
+    "observe": {},
+    "navigate": {},
 }
+
+
+def is_ref(value) -> bool:
+    return isinstance(value, str) and bool(_REF.match(value))
+
+
+def is_site_pattern(value) -> bool:
+    """A Chrome host-permission pattern exactly as classify_url derives one."""
+    return (isinstance(value, str) and len(value) <= 300 and value.endswith("/*")
+            and policy.classify_url(value[:-1]).pattern == value)
+
+
+def _validate_observe_args(args: dict) -> None:
+    if set(args) - {"max_items", "query", "since_gen", "scroll"}:
+        raise ProtocolError("invalid_args", "unknown observe arg")
+    if "max_items" in args and not (_is_int(args["max_items"]) and 1 <= args["max_items"] <= MAX_OBSERVE_ITEMS):
+        raise ProtocolError("invalid_args", "max_items")
+    if "query" in args and not (_bounded_str(args["query"], MAX_QUERY_CHARS) and args["query"]):
+        raise ProtocolError("invalid_args", "query")
+    if "since_gen" in args and not (_is_int(args["since_gen"]) and args["since_gen"] >= 0):
+        raise ProtocolError("invalid_args", "since_gen")
+    if "scroll" in args and args["scroll"] not in SCROLL_VALUES:
+        raise ProtocolError("invalid_args", "scroll")
+
+
+def _validate_navigate_args(tab_id, args: dict) -> None:
+    kind = args.get("kind")
+    if kind not in NAVIGATE_KINDS:
+        raise ProtocolError("invalid_args", "navigate kind")
+    bound = {"window_id", "document_id"}  # the exact document being navigated FROM
+    if kind == "url":
+        required = {"kind", "url", "scope"} | (bound if tab_id is not None else set())
+    elif kind == "ref":
+        required = {"kind", "ref", "scope"} | bound
+    else:
+        required = {"kind"} | bound
+    if set(args) != required:
+        raise ProtocolError("invalid_args", "navigate shape")
+    if kind != "url" and tab_id is None:
+        raise ProtocolError("invalid_args", "tab_id required")
+    if "window_id" in args and not (_is_int(args["window_id"]) and args["window_id"] >= 0):
+        raise ProtocolError("invalid_args", "window_id")
+    if "document_id" in args and not (_bounded_str(args["document_id"], 128) and args["document_id"]):
+        raise ProtocolError("invalid_args", "document_id")
+    if kind == "url" and not (_bounded_str(args["url"], MAX_TAB_URL_CHARS)
+                              and policy.classify_url(args["url"]).readable):
+        raise ProtocolError("invalid_args", "url")
+    if kind == "ref" and not is_ref(args["ref"]):
+        raise ProtocolError("invalid_args", "ref")
+    if "scope" in args:
+        scope = args["scope"]
+        if not isinstance(scope, list) or len(scope) > MAX_NAVIGATE_SCOPE \
+                or not all(is_site_pattern(p) for p in scope) or len(set(scope)) != len(scope):
+            raise ProtocolError("invalid_args", "scope")
 
 EXTENSION_TO_HUB_TYPES = frozenset({"response", "bye"})
 HUB_TO_EXTENSION_TYPES = frozenset({"welcome", "reject", "request"})
@@ -393,6 +473,12 @@ def validate_request(message: dict) -> dict:
         if not policy.classify_url(args["href"]).readable:
             raise ProtocolError("invalid_args", "link identity")
         return message
+    if op == "observe":
+        _validate_observe_args(args)
+        return message
+    if op == "navigate":
+        _validate_navigate_args(tab_id, args)
+        return message
     spec = OP_ARGS[op]
     if set(args) - set(spec):
         raise ProtocolError("invalid_args", "unknown arg")
@@ -476,6 +562,80 @@ def _validate_tab(tab) -> dict:
     return tab
 
 
+def _validate_element(element) -> dict:
+    if not isinstance(element, dict):
+        raise ProtocolError("bad_result", "element")
+    _require_exact_keys(element, {"ref", "role", "name", "kind", "context", "href", "same_origin",
+                                  "state", "value", "sensitive", "in_viewport"})
+    if not is_ref(element["ref"]):
+        raise ProtocolError("bad_result", "element.ref")
+    if not _bounded_str(element["role"], MAX_ROLE_CHARS) or element["kind"] not in ELEMENT_KINDS:
+        raise ProtocolError("bad_result", "element.role")
+    if not _bounded_str(element["name"], MAX_ELEMENT_NAME_CHARS) \
+            or not _bounded_str(element["context"], MAX_ELEMENT_CONTEXT_CHARS):
+        raise ProtocolError("bad_result", "element.text")
+    if element["href"] is None:
+        if element["same_origin"] is not None:
+            raise ProtocolError("bad_result", "element.same_origin")
+    elif not (_bounded_str(element["href"], MAX_ELEMENT_HREF_CHARS) and element["href"]
+              and _is_bool(element["same_origin"])):
+        raise ProtocolError("bad_result", "element.href")
+    state = element["state"]
+    if not isinstance(state, list) or len(state) > len(ELEMENT_STATES) \
+            or not all(s in ELEMENT_STATES for s in state) or len(set(state)) != len(state):
+        raise ProtocolError("bad_result", "element.state")
+    if not _is_bool(element["sensitive"]) or not _is_bool(element["in_viewport"]):
+        raise ProtocolError("bad_result", "element flags")
+    # A credential/payment field's value never crosses the bridge.
+    if not _bounded_str(element["value"], MAX_ELEMENT_VALUE_CHARS, allow_none=True) \
+            or (element["sensitive"] and element["value"] is not None):
+        raise ProtocolError("bad_result", "element.value")
+    return element
+
+
+def _validate_observation(result) -> dict:
+    if not isinstance(result, dict):
+        raise ProtocolError("bad_result", "observe")
+    _require_exact_keys(result, {"gen", "title", "elements", "total_elements", "removed", "headings",
+                                 "viewport", "dialog", "scrolled"})
+    if not (_is_int(result["gen"]) and result["gen"] >= 1):
+        raise ProtocolError("bad_result", "gen")
+    if not _bounded_str(result["title"], MAX_TITLE_CHARS):
+        raise ProtocolError("bad_result", "title")
+    elements = result["elements"]
+    if not isinstance(elements, list) or len(elements) > MAX_OBSERVE_ITEMS:
+        raise ProtocolError("bad_result", "elements")
+    for element in elements:
+        _validate_element(element)
+    if len({e["ref"] for e in elements}) != len(elements):
+        raise ProtocolError("bad_result", "duplicate ref")
+    if not (_is_int(result["total_elements"]) and result["total_elements"] >= len(elements)):
+        raise ProtocolError("bad_result", "total_elements")
+    removed = result["removed"]
+    if not isinstance(removed, list) or len(removed) > MAX_OBSERVE_ITEMS or not all(is_ref(r) for r in removed):
+        raise ProtocolError("bad_result", "removed")
+    headings = result["headings"]
+    if not isinstance(headings, list) or len(headings) > MAX_HEADINGS:
+        raise ProtocolError("bad_result", "headings")
+    for heading in headings:
+        if not isinstance(heading, dict):
+            raise ProtocolError("bad_result", "heading")
+        _require_exact_keys(heading, {"level", "text"})
+        if not (_is_int(heading["level"]) and 1 <= heading["level"] <= 6) \
+                or not _bounded_str(heading["text"], MAX_ELEMENT_NAME_CHARS):
+            raise ProtocolError("bad_result", "heading")
+    viewport = result["viewport"]
+    if not isinstance(viewport, dict):
+        raise ProtocolError("bad_result", "viewport")
+    _require_exact_keys(viewport, {"scroll_y", "scroll_height", "viewport_height"})
+    if not all(_is_int(viewport[k]) and viewport[k] >= 0 for k in viewport):
+        raise ProtocolError("bad_result", "viewport")
+    if not _bounded_str(result["dialog"], MAX_ELEMENT_NAME_CHARS, allow_none=True) \
+            or not _is_bool(result["scrolled"]):
+        raise ProtocolError("bad_result", "dialog/scrolled")
+    return result
+
+
 def validate_result(op: str, result):
     """Typed, bounded validation of a successful response's ``result``."""
     if op == "ping":
@@ -487,7 +647,9 @@ def validate_result(op: str, result):
         if "navigation_allowed" in result and not _is_bool(result["navigation_allowed"]):
             raise ProtocolError("bad_result", "navigation_allowed")
         return result
-    if op in {"open_owner_url", "switch_tab", "follow_link"}:
+    if op == "observe":
+        return _validate_observation(result)
+    if op in {"open_owner_url", "switch_tab", "follow_link", "navigate"}:
         if not isinstance(result, dict):
             raise ProtocolError("bad_result", "action")
         _require_exact_keys(result, {"operation_id", "status", "tab_id", "window_id",

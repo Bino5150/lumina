@@ -369,9 +369,11 @@ def test_stage_two_added_no_typing_or_submission_capability():
                       "post_comment", "click_at", "evaluate_js"):
         assert forbidden not in worker
         assert forbidden not in protocol.OPS
+    # BROWSER-COMPANION-COMPLETION-01 Slice 1 added generic observe and
+    # navigate (reviewed there); still no typing, filling or submitting op.
     assert set(protocol.OPS) == {"ping", "list_tabs", "get_active_tab", "get_tab",
                                  "extract_text", "get_links", "open_owner_url",
-                                 "switch_tab", "follow_link"}
+                                 "switch_tab", "follow_link", "observe", "navigate"}
 
 
 def test_the_extension_still_never_executes_page_code_for_a_navigation():
