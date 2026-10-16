@@ -92,6 +92,11 @@ const LIMITS = Object.freeze({
   MAX_HEADINGS: 12,
   MAX_NAVIGATE_SCOPE: 16,
   NAVIGATE_SETTLE_POLLS: 100,
+  // BROWSER-COMPANION-HARDENING-01: confirmation polling (observation only)
+  // runs until the request's own deadline minus this margin, so the answer --
+  // confirmed or honestly ambiguous -- reaches the hub before it stops waiting.
+  SETTLE_POLL_MS: 150,
+  SETTLE_ANSWER_MARGIN_MS: 1500,
 });
 const REF_RE = /^e[1-9][0-9]{0,6}$/;
 const ELEMENT_KINDS = new Set(["link", "button", "field", "toggle", "option", "other"]);
@@ -560,6 +565,15 @@ async function handleRequest(s, req) {
     outcome.result.status = "ambiguous_after_dispatch";
     outcome.result.observed_url = null;
     outcome.result.load_confirmed = false;
+  }
+  // HARDENING-01: an ambiguous action receipt still concerns the tab the
+  // action was dispatched to (or the tab Chrome created for it). Name it, on
+  // EVERY ambiguous path (exception, deadline, owner control, settle), so the
+  // hub never mistakes honest ambiguity for a different tab's answer.
+  if (ACTION_OPS.has(req.op) && outcome.result && outcome.result.status === "ambiguous_after_dispatch"
+    && !Number.isSafeInteger(outcome.tab_id)) {
+    outcome.tab_id = Number.isSafeInteger(req.tab_id) ? req.tab_id
+      : Number.isSafeInteger(outcome.result.tab_id) ? outcome.result.tab_id : null;
   }
   if (send({ ok: true, result: outcome.result, tab_id: outcome.tab_id ?? null,
     observed: outcome.observed ?? null, truncated: Boolean(outcome.truncated) })) {
@@ -1415,18 +1429,32 @@ async function safeActionTab(tabId, expectedWindow = null) {
   return tab;
 }
 
+// The last moment confirmation polling may run: the request's deadline minus
+// an answer margin, so the reply still reaches the hub (HARDENING-01).
+function settleDeadline(req) {
+  return req.deadline_ms - LIMITS.SETTLE_ANSWER_MARGIN_MS;
+}
+
 async function settleCreatedTab(tabId, req, s, navEpoch, grantEpoch, live) {
   // tabs.create can answer with an ID before Chrome publishes its URL in
-  // tabs.get. Observe that same tab briefly; never issue a second create or
-  // navigation. A control change or deadline ends observation immediately.
-  for (let attempt = 0; attempt < 20; attempt++) {
+  // tabs.get, and a real page can take seconds to commit and load. Observe
+  // that same tab until it shows a readable URL AND has finished loading, or
+  // until settleDeadline -- then report what was seen (a readable URL still
+  // loading is a local effect with load_confirmed false). OBSERVATION ONLY:
+  // never a second create or navigation. A control change ends it at once.
+  let seen = null;
+  for (let attempt = 0; attempt < LIMITS.NAVIGATE_SETTLE_POLLS; attempt++) {
     if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
-      || grantRevocations !== grantEpoch || Date.now() >= req.deadline_ms) return null;
+      || grantRevocations !== grantEpoch) return null;
+    if (Date.now() >= settleDeadline(req)) return seen;
     const tab = await safeActionTab(tabId);
-    if (tab) return tab;
-    if (attempt < 19) await new Promise((resolve) => setTimeout(resolve, 100));
+    if (tab) {
+      seen = tab;
+      if (tab.status === "complete") return tab;
+    }
+    await new Promise((resolve) => setTimeout(resolve, LIMITS.SETTLE_POLL_MS));
   }
-  return null;
+  return seen;
 }
 
 // Stage 2 (FINGER): observe the tab we just navigated until the destination
@@ -1436,9 +1464,11 @@ async function settleCreatedTab(tabId, req, s, navEpoch, grantEpoch, live) {
 // navigation happened: only a different documentId does.
 async function settleNavigatedTab(tabId, expectedWindow, req, s, navEpoch, grantEpoch,
                                   priorDocumentId, expectedUrl, live) {
-  for (let attempt = 0; attempt < 25; attempt++) {
+  // Bounded by settleDeadline, not a fixed 2.5 s (HARDENING-01): a slow real
+  // page is confirmed rather than reported ambiguous. Observation only.
+  for (let attempt = 0; attempt < LIMITS.NAVIGATE_SETTLE_POLLS; attempt++) {
     if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
-      || grantRevocations !== grantEpoch || Date.now() >= req.deadline_ms) return null;
+      || grantRevocations !== grantEpoch || Date.now() >= settleDeadline(req)) return null;
     const tab = await safeActionTab(tabId, expectedWindow);
     if (tab && tab.url === expectedUrl && tab.status === "complete") {
       const doc = await mainDocument(tabId);
@@ -1448,7 +1478,7 @@ async function settleNavigatedTab(tabId, expectedWindow, req, s, navEpoch, grant
         return { tab: finalTab, doc };
       }
     }
-    if (attempt < 24) await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, LIMITS.SETTLE_POLL_MS));
   }
   return null;
 }
@@ -1540,7 +1570,7 @@ function withoutHash(url) {
 async function settleNewDocument(tabId, expectedWindow, req, s, navEpoch, grantEpoch, priorDocumentId, live) {
   for (let attempt = 0; attempt < LIMITS.NAVIGATE_SETTLE_POLLS; attempt++) {
     if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
-      || grantRevocations !== grantEpoch || Date.now() >= req.deadline_ms) return null;
+      || grantRevocations !== grantEpoch || Date.now() >= settleDeadline(req)) return null;
     let raw;
     try { raw = await chrome.tabs.get(tabId); } catch { return null; }
     if (!raw || raw.incognito || (expectedWindow !== null && raw.windowId !== expectedWindow)) return null;
@@ -1554,7 +1584,7 @@ async function settleNewDocument(tabId, expectedWindow, req, s, navEpoch, grantE
         return { tab: again, doc, verdict };
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, LIMITS.SETTLE_POLL_MS));
   }
   return null;
 }

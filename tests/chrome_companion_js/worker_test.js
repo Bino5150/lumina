@@ -2791,7 +2791,7 @@ test("FINGER H2: a window move after dispatch is never reported verified", async
   const req = followReq();
   port.deliver(req);
   await settle();
-  for (let i = 0; i < 30; i++) { env.runTimers(); await settle(16); }
+  for (let i = 0; i < 130; i++) { env.runTimers(); await settle(16); } // HARDENING-01: covers the deadline-bounded confirmation (NAVIGATE_SETTLE_POLLS)
   const answers = port.sent.filter((m) => m.request_id === req.request_id);
   assert.equal(answers.length, 1);
   assert.equal(answers[0].result.status, "ambiguous_after_dispatch");
@@ -2822,7 +2822,7 @@ test("FINGER H8: a same-origin selected link redirecting off-origin stays ambigu
   const req = followReq();
   port.deliver(req);
   await settle();
-  for (let i = 0; i < 30; i++) { env.runTimers(); await settle(16); }
+  for (let i = 0; i < 130; i++) { env.runTimers(); await settle(16); } // HARDENING-01: covers the deadline-bounded confirmation (NAVIGATE_SETTLE_POLLS)
   const answers = port.sent.filter((m) => m.request_id === req.request_id);
   assert.equal(answers.length, 1);
   assert.equal(answers[0].result.status, "ambiguous_after_dispatch");
@@ -3176,7 +3176,7 @@ test("FINGER: a dispatch that never lands reports ambiguity, never success", asy
   const req = followReq();
   port.deliver(req);
   await settle();
-  for (let i = 0; i < 40; i++) { env.runTimers(); await settle(16); }
+  for (let i = 0; i < 130; i++) { env.runTimers(); await settle(16); } // HARDENING-01: covers the deadline-bounded confirmation (NAVIGATE_SETTLE_POLLS)
   const answers = port.sent.filter((m) => m.request_id === req.request_id);
   assert.equal(answers.length, 1, "one receipt, not a retry loop");
   assert.equal(answers[0].result.status, "ambiguous_after_dispatch");
@@ -3201,7 +3201,7 @@ test("FINGER: the tab reaching the URL without a NEW document is not proof of na
   const req = followReq();
   port.deliver(req);
   await settle();
-  for (let i = 0; i < 40; i++) { env.runTimers(); await settle(16); }
+  for (let i = 0; i < 130; i++) { env.runTimers(); await settle(16); } // HARDENING-01: covers the deadline-bounded confirmation (NAVIGATE_SETTLE_POLLS)
   const answers = port.sent.filter((m) => m.request_id === req.request_id);
   assert.equal(answers.length, 1, "one receipt, not a retry loop");
   assert.equal(answers[0].result.status, "ambiguous_after_dispatch",
@@ -3703,6 +3703,124 @@ test("SLICE1 navigate(back): history moves are bound to the observed document an
   const restricted = await drive(env, port, back({ document_id: "doc-forum-index" }));
   assert.equal(restricted.result.status, "ambiguous_after_dispatch");
   assert.equal(restricted.result.observed_url, null, "a restricted landing is never named");
+});
+
+// ── BROWSER-COMPANION-HARDENING-01 ────────────────────────────────────────
+// H-SETTLE: confirmation polling is bounded by the request's own deadline (with
+// an answer margin), not by a fixed 2.0 s / 2.5 s, so a slow real page is
+// confirmed instead of reported ambiguous -- and it is OBSERVATION ONLY: never
+// a second create/navigation. H-TAB: an ambiguous receipt still names the tab
+// the action was dispatched to, so the hub cannot mistake it for a different
+// tab's answer. (Live evidence 2026-10-15: GitHub took longer than both windows.)
+
+// tabs.get answers `slowFor` polls with the tab's "before" state, then commits.
+function commitAfterPolls(env, tabId, slowFor, commit) {
+  let polls = 0;
+  env.tabsGetHook = async (id) => {
+    if (id !== tabId) return undefined;
+    polls += 1;
+    if (polls === slowFor) commit(env.tabs.find((t) => t.id === tabId));
+    return undefined;
+  };
+  return () => polls;
+}
+
+test("HARDEN H-SETTLE: a new tab whose URL commits after 2 s of polling is confirmed, created once", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  const url = "https://github.com/Bino5150/lumina";
+  env.createHook = async (details) => {
+    const id = 99;
+    env.tabs.push({ id, windowId: 1, active: true, incognito: false, status: "loading", url: "", title: "" });
+    return { id, windowId: 1, active: true, url: "", pendingUrl: details.url, status: "loading" };
+  };
+  commitAfterPolls(env, 99, 30, (tab) => { tab.url = url; tab.status = "complete"; });
+  const answer = await drive(env, port, request("open_owner_url", { args: { url } }), 120);
+  assert.equal(answer.result.status, "browser_local_effect_observed", JSON.stringify(answer.result));
+  assert.equal(answer.result.observed_url, url);
+  assert.equal(answer.result.load_confirmed, true);
+  assert.equal(env.createCalls.length, 1, "observation only: never a second create");
+});
+
+test("HARDEN H-SETTLE: an owner URL that commits first and finishes loading later is load-confirmed", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  const url = "https://github.com/Bino5150/lumina";
+  env.createHook = async (details) => {
+    env.tabs.push({ id: 98, windowId: 1, active: true, incognito: false, status: "loading", url: details.url, title: "" });
+    return { id: 98, windowId: 1, active: true, url: details.url, status: "loading" };
+  };
+  commitAfterPolls(env, 98, 25, (tab) => { tab.status = "complete"; }); // URL readable at once, load ends later
+  const answer = await drive(env, port, request("open_owner_url", { args: { url } }), 120);
+  assert.equal(answer.result.status, "browser_local_effect_observed");
+  assert.equal(answer.result.load_confirmed, true, "watched until the page finished, not just until the URL appeared");
+  assert.equal(env.createCalls.length, 1);
+});
+
+test("HARDEN H-SETTLE: a FINGER navigation whose page completes after 2.5 s is confirmed, dispatched once", async () => {
+  const env = fingerEnv();
+  const port = await toReady(env);
+  await observeLinks(port);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  env.navigationHook = (id, url) => {
+    const tab = env.tabs.find((t) => t.id === id);
+    tab.url = url; tab.status = "loading";
+    env.documents[id] = "doc-7-slow";
+    commitAfterPolls(env, 7, 40, (t) => { t.status = "complete"; });
+  };
+  const answer = await drive(env, port, followReq(), 120);
+  assert.equal(answer.result.status, "browser_local_effect_observed", JSON.stringify(answer.result));
+  assert.equal(answer.result.load_confirmed, true);
+  assert.equal(answer.observed.document_id, "doc-7-slow");
+  assert.equal(env.navigationCalls.length, 1, "observation only: never a second navigation");
+});
+
+test("HARDEN H-SETTLE/H-TAB: a page that never completes is ambiguous, dispatched once, and names its tab", async () => {
+  const env = fingerEnv();
+  const port = await toReady(env);
+  await observeLinks(port);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  env.navigationHook = (id, url) => {
+    const tab = env.tabs.find((t) => t.id === id);
+    tab.url = url; tab.status = "loading"; // forever
+    env.documents[id] = "doc-7-never";
+  };
+  const answer = await drive(env, port, followReq(), 160);
+  assert.equal(answer.result.status, "ambiguous_after_dispatch");
+  assert.equal(answer.result.observed_url, null, "an unverified destination is never named");
+  assert.equal(answer.tab_id, 7, "the answer concerns the tab the action was dispatched to");
+  assert.equal(env.navigationCalls.length, 1, "never retried");
+});
+
+test("HARDEN H-SETTLE: confirmation stops early enough to answer before the hub stops waiting", async () => {
+  const env = makeEnv();
+  const margin = env.peek("LIMITS.SETTLE_ANSWER_MARGIN_MS");
+  assert.ok(Number.isSafeInteger(margin) && margin >= 1000, "a real margin");
+  assert.equal(env.peek("settleDeadline")({ deadline_ms: 50_000 }), 50_000 - margin);
+});
+
+test("HARDEN H-TAB: an ambiguous switch_tab names its tab", async () => {
+  const env = makeEnv();
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  env.updateHook = async (id) => ({ ...env.tabs.find((t) => t.id === id), active: false }); // never seen active
+  env.tabsGetHook = async (id) => (id === 10 && env.updateCalls.length ? { ...env.tabs.find((t) => t.id === 10), active: false } : undefined);
+  const answer = await single(port, request("switch_tab", { tab_id: 10,
+    args: { window_id: 1, expected_url: "https://github.com/" } }));
+  assert.equal(answer.result.status, "ambiguous_after_dispatch");
+  assert.equal(answer.tab_id, 10);
+});
+
+test("HARDEN H-TAB: an ambiguous chrome_navigate(ref) names its tab", async () => {
+  const { env, port } = await genericReady();
+  const observed = await single(port, observeReq());
+  env.navigationHook = (id, url) => { const tab = env.tabs.find((t) => t.id === id); tab.url = url; tab.status = "loading"; };
+  const answer = await drive(env, port, refNav(el(observed, "Next", 0).ref), 160);
+  assert.equal(answer.result.status, "ambiguous_after_dispatch");
+  assert.equal(answer.tab_id, 7);
+  assert.equal(env.navigationCalls.length, 1);
 });
 
 let running = null;

@@ -127,7 +127,7 @@ ACTION_OPS = frozenset({"open_owner_url", "switch_tab", "follow_link", "navigate
 # Extension versions this hub KNOWS. Fail closed: a version not listed here --
 # including a newer one -- is never sent an action or a newer-vocabulary op,
 # because its semantics have not been reviewed against this hub.
-KNOWN_EXTENSION_VERSIONS = ((0, 2, 0), (0, 3, 0), (0, 4, 0))
+KNOWN_EXTENSION_VERSIONS = ((0, 2, 0), (0, 3, 0), (0, 4, 0), (0, 4, 1))
 # The oldest known version that speaks each op's vocabulary. An op not
 # listed is a 01A read every paired version serves. A newer known version
 # keeps serving every older op; an older one is refused the newer ops up
@@ -772,7 +772,8 @@ class ChromeCompanionHub:
                 error = response["error"]
                 worker_rejected = True  # worker action errors occur before its dispatch boundary
                 raise CompanionError(error["code"], error["message"])
-            if tab_id is not None and response["tab_id"] != tab_id:
+            if tab_id is not None and response["tab_id"] != tab_id \
+                    and not self._untargeted_ambiguous_receipt(op, response):
                 raise CompanionError("tab_mismatch", "Chrome answered for a different tab")
             try:
                 response["result"] = protocol.validate_result(op, response["result"])
@@ -805,6 +806,18 @@ class ChromeCompanionHub:
                          origin_hash=origin_hash(observed_origin), truncated=truncated,
                          response_bytes=waiter.size if waiter is not None else 0,
                          duration_ms=round((time.monotonic() - started) * 1000, 1))
+
+    @staticmethod
+    def _untargeted_ambiguous_receipt(op: str, response: dict) -> bool:
+        """BROWSER-COMPANION-HARDENING-01: an action answer that names NO tab
+        and reports only ambiguity is not 'a different tab's answer' -- it is the
+        honest receipt an extension (the pinned v0.3.0 included) sends when it
+        could not confirm the outcome. Carry it through as ambiguous instead of
+        relabelling it tab_mismatch. Anything that names a DIFFERENT tab, and
+        any claimed success without a tab, is still refused."""
+        result = response.get("result")
+        return (op in ACTION_OPS and response["tab_id"] is None and isinstance(result, dict)
+                and result.get("status") == "ambiguous_after_dispatch")
 
     @staticmethod
     def _filter_tab(tab):

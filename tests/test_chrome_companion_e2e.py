@@ -118,10 +118,46 @@ def _ready(hub, previous=None, timeout=12.0):
     return hub.current_connection_id()
 
 
+def _extension_ready(chrome, timeout=10.0):
+    """The worker's own READY, observed over the driver channel.
+
+    BROWSER-COMPANION-HARDENING-01: _ready() proves the HUB published the
+    connection, which happens once the welcome is WRITTEN. The worker becomes
+    READY when it has PROCESSED that welcome, one host hop later. The driver's
+    status channel is not ordered with that hop, so a test must wait for READY
+    rather than assume it (the wire itself is ordered: no request can overtake
+    the welcome -- see test_handshake_hold_*)."""
+    assert wait_until(lambda: chrome.command(cmd="status")["state"] == "READY", timeout=timeout), \
+        chrome.command(cmd="status")
+
+
+def test_handshake_hold_reproduces_the_publish_before_ready_window_and_keeps_wire_order(world):
+    """Deterministic reproduction of the full-suite race (previously seen only
+    under CPU load: 2/20 and 3/20), and proof of the real contract."""
+    chrome = world.launch(handshakeHoldMs=1500)
+    _ready(world.hub)
+    assert chrome.command(cmd="status")["state"] in {"CONNECTING", "IDENTIFIED"}, \
+        "the hub publishes before the worker has processed the welcome"
+    # A request issued inside that window queues BEHIND the welcome on the
+    # ordered wire, so the worker is READY before it sees the request.
+    tabs = world.hub.request("list_tabs", timeout_s=6)["result"]["tabs"]
+    assert any(t["tab_id"] == 7 for t in tabs)
+    _extension_ready(chrome)
+
+
+def test_extension_ready_helper_actually_waits_for_the_worker(world):
+    """Guard on the helper itself: with the handshake held, the worker is not
+    READY when the hub publishes; _extension_ready must wait until it is."""
+    chrome = world.launch(handshakeHoldMs=1500)
+    _ready(world.hub)
+    _extension_ready(chrome)
+    assert chrome.command(cmd="status")["state"] == "READY"
+
+
 def test_full_read_path_through_real_worker_host_and_hub(world):
     chrome = world.launch()
     cid = _ready(world.hub)
-    assert chrome.command(cmd="status")["state"] == "READY"
+    _extension_ready(chrome)
 
     tabs = world.hub.request("list_tabs", timeout_s=5)["result"]["tabs"]
     by_id = {t["tab_id"]: t for t in tabs}
@@ -256,6 +292,9 @@ def test_finger_through_the_real_chain_keeps_document_identity_private(world):
 def test_pause_and_resume_through_the_real_chain(world):
     chrome = world.launch()
     cid = _ready(world.hub)
+    # The worker sends bye(reason=paused) only once READY (it needs the welcome's
+    # connection_id); asserting the hub's "paused" reason needs a READY worker.
+    _extension_ready(chrome)
     assert chrome.command(cmd="pause")["result"] == {"ok": True, "paused": True}
     assert wait_until(lambda: world.hub.current_connection_id() is None)
     assert wait_until(lambda: (world.hub.status()["last_disconnect"] or {}).get("reason") == "paused")

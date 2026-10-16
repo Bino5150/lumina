@@ -190,6 +190,14 @@ a false success or false failure. A reported tab load is an observation
 inside Chrome, not proof that a destination site actually committed
 anything.
 
+After an action is sent, the companion watches the tab for the outcome for
+as long as the request allows (it stops a moment early so its answer still
+arrives in time). A page that is simply slow to load is therefore confirmed
+rather than reported as uncertain, and watching never repeats the action. A
+page that still hasn't finished by then is reported as ambiguous — and the
+receipt still names the tab the action went to, so it is never mistaken for
+another tab's answer.
+
 `chrome_follow_link` and `chrome_navigate` report the URL and the new
 document identity Chrome actually loaded (after a redirect, the URL it
 landed on, never the one requested), and only claims success when the tab reached the

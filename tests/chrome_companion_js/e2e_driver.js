@@ -57,6 +57,17 @@ function nativePort(name) {
   const handlers = { message: [], disconnect: [] };
   let closed = false;
   let buffer = Buffer.alloc(0);
+  // BROWSER-COMPANION-HARDENING-01: cfg.handshakeHoldMs holds every host ->
+  // worker frame of a new connection for that long, then delivers them IN
+  // ORDER -- a deterministic, wire-faithful model of a slow Chrome IPC hop.
+  // The hub publishes a connection once its welcome is WRITTEN; the worker is
+  // READY only once it has PROCESSED it. Ordering is never changed.
+  const releaseAt = Date.now() + (cfg.handshakeHoldMs || 0);
+  const held = [];
+  const deliver = (message) => { if (!closed) handlers.message.forEach((fn) => fn(message)); };
+  if (cfg.handshakeHoldMs) {
+    setTimeout(() => { while (held.length) deliver(held.shift()); }, cfg.handshakeHoldMs);
+  }
   child.stdout.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
     while (buffer.length >= 4) {
@@ -64,7 +75,8 @@ function nativePort(name) {
       if (buffer.length < 4 + size) break;
       const message = JSON.parse(buffer.subarray(4, 4 + size).toString("utf8"));
       buffer = buffer.subarray(4 + size);
-      if (!closed) handlers.message.forEach((fn) => fn(message));
+      if (held.length || Date.now() < releaseAt) held.push(message);
+      else deliver(message);
     }
   });
   // Host stderr is Chrome's log; with cfg.hostLog set, tests can audit it.

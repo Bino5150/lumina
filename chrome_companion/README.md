@@ -118,6 +118,11 @@ your tabs
 - Each action has a unique operation ID. A response distinguishes a browser
   local effect from an ambiguous outcome after dispatch. A timeout or lost
   answer after dispatch stays ambiguous and is never retried automatically.
+  After dispatching, the companion keeps watching the tab for the result for
+  as long as the request allows -- stopping early enough to answer in time --
+  so a slow page is confirmed instead of reported ambiguous; watching never
+  sends the action again. An ambiguous receipt still names the tab the action
+  was sent to.
   A reported tab load is an observation inside Chrome, not proof of any
   remote site's commit or resulting account change.
 - Restricted surfaces are never read: every non-`http(s)` scheme
