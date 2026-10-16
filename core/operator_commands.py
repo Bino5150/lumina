@@ -28,7 +28,8 @@ def parse_operator_command(text: str):
 def command_help() -> str:
     return (
         "Available operator commands: /status · /btw <question> · /compact · "
-        "/stop · /stop all · /context · /context status · /context rebuild"
+        "/stop · /stop all · /context · /context status · /context reforge "
+        "(/context rebuild is an alias)"
     )
 
 

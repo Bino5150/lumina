@@ -16,4 +16,5 @@ by the agent/tool layer at all.
 | `/stop all` | Cancel the current turn **and** trigger the Emergency Interlock (see [Security & Authority](security.md#emergency-interlock)). |
 | `/context` | Usage help for the context family. |
 | `/context status` | Show the current context-checkpoint state. |
-| `/context rebuild` | Run a continuity-checkpoint reconstruction — see [`/context rebuild`](memory.md#context-rebuild). |
+| `/context reforge` | Run Reforge, a continuity-checkpoint reconstruction — see [`/context reforge`](memory.md#context-reforge). |
+| `/context rebuild` | Backward-compatible alias for `/context reforge`; runs the same operation with the same protections. |

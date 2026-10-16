@@ -23,8 +23,8 @@ for the full model.
 
 - [Getting Started](getting-started.md) — install, configure, launch, first-run notice
 - [Settings](settings.md) — every Settings tab, backend switching, reasoning control
-- [Memory](memory.md) — MemPalace, Dreaming, My Human, Context Compaction, `/context rebuild`, Chat History, Knowledge Base, Backup
-- [Reforge](reforge.md) — the transactional context-reconstruction architecture behind `/context rebuild`, including empirical validation results
+- [Memory](memory.md) — MemPalace, Dreaming, My Human, Context Compaction, `/context reforge`, Chat History, Knowledge Base, Backup
+- [Reforge](reforge.md) — the transactional context-reconstruction architecture behind `/context reforge` (alias `/context rebuild`), including empirical validation results
 - [Multimodal](multimodal.md) — Voice (TTS), Speech Input (STT), Vision, Image Generation
 - [Browser Companion](browser-companion.md) — the Chrome bridge's authorization model
 - [Channels](channels.md) — Telegram and Discord

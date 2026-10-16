@@ -139,7 +139,7 @@ def test_stop_can_cancel_context_rebuild_at_its_existing_safe_boundary():
     LuminaWindow._command_stop(fake, "")
 
     assert fake._context_rebuild_cancel.is_set()
-    assert "requested for /context rebuild" in fake.chat_widget.notices[-1]
+    assert "requested for /context reforge" in fake.chat_widget.notices[-1]
 
 
 def test_stop_does_not_claim_a_finalizing_context_rebuild_was_cancelled():

@@ -149,7 +149,13 @@ stamp existed can't be verified, so they're ignored: reopening such a chat
 reloads its fuller history into context, nothing is lost, and running
 `/compact` again writes a fresh, trusted checkpoint.
 
-## `/context rebuild`
+<a id="context-rebuild"></a>
+
+## `/context reforge`
+
+`/context reforge` is the canonical command. `/context rebuild` remains a
+backward-compatible alias: both invoke the same reconstruction coordinator,
+share the same single-flight guard, and can be cancelled with `/stop`.
 
 A separate, owner-facing operator command (see [Operator
 Commands](operator-commands.md)) that does something more deliberate than

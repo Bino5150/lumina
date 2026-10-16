@@ -1702,19 +1702,19 @@ class LuminaWindow(QMainWindow):
         if rebuild_thread is not None:
             if not rebuild_thread.is_alive():
                 self.chat_widget.add_operator_message(
-                    "/context rebuild is already finalizing; no safe cancellation boundary remains."
+                    "/context reforge is already finalizing; no safe cancellation boundary remains."
                 )
                 return
             cancel_event = self._context_rebuild_cancel
             if cancel_event is None:
-                self.chat_widget.add_operator_message("/context rebuild has no active cancellation handle.")
+                self.chat_widget.add_operator_message("/context reforge has no active cancellation handle.")
                 return
             if cancel_event.is_set():
-                self.chat_widget.add_operator_message("/stop is already requested for /context rebuild.")
+                self.chat_widget.add_operator_message("/stop is already requested for /context reforge.")
                 return
             cancel_event.set()
             self.chat_widget.add_operator_message(
-                "/stop requested for /context rebuild · it will cancel before the next safe boundary · "
+                "/stop requested for /context reforge · it will cancel before the next safe boundary · "
                 "live context unchanged if it hasn't swapped yet."
             )
             return
@@ -1786,16 +1786,18 @@ class LuminaWindow(QMainWindow):
         argument = (argument or "").strip().lower()
         if argument == "":
             self.chat_widget.add_operator_message(
-                "Usage: /context · /context status · /context rebuild"
+                "Usage: /context · /context status · /context reforge "
+                "(/context rebuild is an alias)"
             )
         elif argument == "status":
             self._command_context_status()
-        elif argument == "rebuild":
+        elif argument in ("reforge", "rebuild"):
             self._command_context_rebuild()
         else:
             self.chat_widget.add_operator_message(
                 f"Unknown /context subcommand '{argument}'. "
-                "Usage: /context · /context status · /context rebuild"
+                "Usage: /context · /context status · /context reforge "
+                "(/context rebuild is an alias)"
             )
 
     def _context_rebuild_eligibility(self) -> tuple:
@@ -1887,7 +1889,7 @@ class LuminaWindow(QMainWindow):
         self._context_rebuild_cancel = cancel_event
         self._context_rebuild_started_at = time.time()
         self.chat_widget.add_operator_message(
-            "/context rebuild started · compiling a fresh continuity checkpoint · "
+            "/context reforge started · compiling a fresh continuity checkpoint · "
             "persisted transcript remains untouched"
         )
 
@@ -1922,12 +1924,12 @@ class LuminaWindow(QMainWindow):
             QTimer.singleShot(0, drain_telegram)
 
         if receipt.status != context_rebuild.STATUS_SUCCESS:
-            self.chat_widget.add_operator_message(f"/context rebuild: {receipt.reason}")
+            self.chat_widget.add_operator_message(f"/context reforge: {receipt.reason}")
             return
 
         if receipt.chat_id != self._current_chat_id:
             self.chat_widget.add_operator_message(
-                f"/context rebuild finished for chat {receipt.chat_id}, which is no longer the "
+                f"/context reforge finished for chat {receipt.chat_id}, which is no longer the "
                 "active chat · nothing changed for the chat now open · durable transcript unchanged"
             )
             return
@@ -1942,7 +1944,7 @@ class LuminaWindow(QMainWindow):
             context_now = ""
 
         self.chat_widget.add_operator_message(
-            f"/context rebuild finished · checkpoint #{receipt.checkpoint_id} · "
+            f"/context reforge finished · checkpoint #{receipt.checkpoint_id} · "
             f"live entries {receipt.pre_history_count} → {receipt.post_history_count} · "
             f"estimated tokens ~{format_tokens(receipt.pre_estimated_tokens)} → "
             f"~{format_tokens(receipt.post_estimated_tokens)}{context_now} · "

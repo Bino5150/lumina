@@ -24,8 +24,8 @@
     "content": "As Lumina's active context fills up, an optional (off-by-default) mechanism can summarize the oldest messages being dropped and write that summary into MemPalace Layer 2 instead of losing them outright. The full, uncompressed chat history is always kept and remains searchable regardless of whether compaction is on."
   },
   {
-    "title": "Reforge -- /context rebuild",
-    "content": "Reforge is the architecture behind the owner-only `/context rebuild` command: instead of trimming old messages, it compiles a fresh, validated continuity checkpoint from the durable chat history plus recent tool activity, and -- only if that checkpoint is still valid for the exact current chat -- atomically swaps the live working context for a much leaner reconstruction. It never rewrites the durable transcript, never treats reconstructed content as owner authority, and in live tests has cut active context by roughly 60-90% while preserving conversational continuity. It is desktop-owner-only; no channel or tool call can trigger it."
+    "title": "Reforge -- /context reforge",
+    "content": "Reforge is the architecture behind the owner-only `/context reforge` command. `/context rebuild` is a backward-compatible alias for the same coordinator, single-flight guard and cancellation behavior. Instead of trimming old messages, it compiles a fresh, validated continuity checkpoint from the durable chat history plus recent tool activity, and -- only if that checkpoint is still valid for the exact current chat -- atomically swaps the live working context for a much leaner reconstruction. It never rewrites the durable transcript, never treats reconstructed content as owner authority, and in live tests has cut active context by roughly 60-90% while preserving conversational continuity. It is desktop-owner-only; no channel or tool call can trigger it."
   },
   {
     "title": "Chat History Search",
@@ -89,7 +89,7 @@
   },
   {
     "title": "Slash commands",
-    "content": "A small set of owner-only commands, typed directly into chat: /status, /btw <question>, /compact, /stop (and /stop all, which also triggers the Emergency Interlock), /context, /context status, and /context rebuild (see Reforge). None of this command family is reachable from Telegram, Discord, or any tool call."
+    "content": "A small set of owner-only commands, typed directly into chat: /status, /btw <question>, /compact, /stop (and /stop all, which also triggers the Emergency Interlock), /context, /context status (read-only), and /context reforge (canonical; /context rebuild is a backward-compatible alias for the same operation -- see Reforge). None of this command family is reachable from Telegram, Discord, or any tool call."
   },
   {
     "title": "Information is not authority",
