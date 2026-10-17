@@ -96,6 +96,7 @@ class ContextManager:
         self.reserve = config.RESPONSE_RESERVE_TOKENS
         self._ephemeral = ""   # per-turn injection, cleared after build_messages()
         self._ephemeral_messages = []  # SEPT-AC-R1-F03/F04 -- see push_ephemeral_assistant()
+        self._ephemeral_reference_messages = []  # GATLING-TRIGGER-GUARD-01 -- see push_ephemeral_assistant_reference()
         self._untrusted_content_seen = False  # sticky once True — stays for the rest of the session
         self.owner = owner  # gates passive context injection below — see _build_system_prompt()
         self._pending_compaction = []   # messages captured off the trim loop, awaiting summarization
@@ -407,6 +408,8 @@ class ContextManager:
         self._ephemeral = ""   # consumed — clear for next turn
         ephemeral_messages = self._ephemeral_messages
         self._ephemeral_messages = []  # consumed — clear for next turn (SEPT-AC-R1-F03)
+        reference_messages = self._ephemeral_reference_messages
+        self._ephemeral_reference_messages = []  # consumed -- same one-shot lifetime
         history_copy, system_tokens = self._fit_history_to_budget(
             system_prompt, tool_budget=tool_budget, capture_compaction=True
         )
@@ -420,7 +423,8 @@ class ContextManager:
         # bypass trimming by design (SEPT-AC-R1-F03/F04), this only fixes
         # the number reported for what's really on the wire.
         self._last_usage_snapshot = self._make_usage_snapshot(
-            system_tokens, history_copy + list(ephemeral_messages), tool_budget, chat_id
+            system_tokens, history_copy + list(reference_messages) + list(ephemeral_messages),
+            tool_budget, chat_id
         )
 
         # F-61 fix: self.history itself used to grow unbounded — only the
@@ -447,6 +451,13 @@ class ContextManager:
                 msg = dict(msg)
                 msg["content"] = _strip_image_blocks(msg["content"])
             sanitized.append(msg)
+        # GATLING-TRIGGER-GUARD-01 -- lower-trust reference material sits
+        # immediately BEFORE the current user turn (the last user message),
+        # never after it: see push_ephemeral_assistant_reference().
+        if reference_messages:
+            user_positions = [i for i, m in enumerate(sanitized) if m.get("role") == "user"]
+            at = user_positions[-1] if user_positions else 0
+            sanitized[at:at] = list(reference_messages)
         # SEPT-AC-R1-F03/F04 -- ephemeral ASSISTANT-role messages
         # (reconciliation source material) land AFTER real history, never
         # merged into the role="system" entry above -- and never at any
@@ -481,6 +492,27 @@ class ContextManager:
         worded or escaped. Use push_ephemeral_assistant() for that instead
         (SEPT-AC-R1-F03/F04)."""
         self._ephemeral = block
+        self._last_usage_snapshot = None
+
+    def append_ephemeral(self, block: str):
+        """Like push_ephemeral() (same trusted system channel, same one-turn
+        lifetime) but ADDS to whatever is already queued instead of
+        replacing it -- for mid-turn harness notices (budget warnings, the
+        skill reminder) that must not clobber each other."""
+        self._ephemeral = f"{self._ephemeral}\n\n{block}" if self._ephemeral else block
+        self._last_usage_snapshot = None
+
+    def add_refused_tool_result(self, tool_call_id: str, name: str, content: str):
+        """Close a model-emitted tool call Lumina refused or stopped before
+        running it (GATLING-TRIGGER-GUARD-01: an over-limit or cut-off
+        batch, or a turn budget reached mid-batch). Same trusted-control-
+        state reasoning as add_cancelled_tool_result(): nothing was executed
+        or returned, so this is not TOOL_OUTPUT and never sets the untrusted
+        flag. `content` is Lumina's own notice, never model or tool text."""
+        self.history.append({
+            "role": "tool", "tool_call_id": tool_call_id, "name": name,
+            "content": content,
+        })
         self._last_usage_snapshot = None
 
     def push_ephemeral_assistant(self, content: str):
@@ -521,6 +553,30 @@ class ContextManager:
         it does not survive past the next build_messages() call and is
         never durable."""
         self._ephemeral_messages.append({"role": "assistant", "content": content})
+        self._last_usage_snapshot = None
+
+    def push_ephemeral_assistant_reference(self, content: str):
+        """Queue one-turn, ASSISTANT-role REFERENCE material (user-authored
+        skills) placed immediately BEFORE the current user turn --
+        GATLING-TRIGGER-GUARD-01.
+
+        Same trust contract as push_ephemeral_assistant() (lower-trust
+        content never reaches role="system"; no role parameter), different
+        position. push_ephemeral_assistant() appends AFTER real history, so
+        on its own it makes the request end on an assistant message -- an
+        assistant PREFILL. Reconciliation always closes it with
+        push_ephemeral_reconciliation_request(); the user-skills block used
+        to have no such close. Live and replayed 2026-10-16: GLM-5.3-flash
+        on some OpenRouter serving stacks continued that prefill without
+        its thinking phase and emitted thousands of tool calls (2,076 and
+        5,551 in production; 7/8 on Fireworks in replay, 0/8 with the block
+        moved before the user turn). Reference material is not the model's
+        own in-progress answer, so it goes before the user message the
+        model is answering.
+
+        Consumed and cleared by build_messages(), never written to
+        self.history -- same lifetime as the other ephemeral channels."""
+        self._ephemeral_reference_messages.append({"role": "assistant", "content": content})
         self._last_usage_snapshot = None
 
     def push_ephemeral_reconciliation_request(self):

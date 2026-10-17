@@ -120,6 +120,9 @@ def _fake_agent(llm, tool_result="ok"):
             {"role": "tool", "tool_call_id": tool_call_id, "name": name,
              "content": "[Cancelled by operator before execution.]"}),
         push_ephemeral=lambda block: calls["ephemeral"].append(block),
+        # GATLING-TRIGGER-GUARD-01 -- mid-turn harness notices (skill
+        # reminder, budget warnings) now append rather than overwrite.
+        append_ephemeral=lambda block: calls["ephemeral"].append(block),
         build_messages=lambda tool_budget=0, chat_id=None: [],
     )
     registry = types.SimpleNamespace(

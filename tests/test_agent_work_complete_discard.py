@@ -205,7 +205,22 @@ def _fake_agent(llm, tool_result="ok", flight_recorder_path=None):
     ns._finalize_with_reconciliation = types.MethodType(LuminaAgent._finalize_with_reconciliation, ns)
     if flight_recorder_path is not None:
         ns.flight_recorder = FlightRecorder(db_path=str(flight_recorder_path))
+        _OPEN_RECORDERS.append(ns.flight_recorder)
     return ns, calls
+
+
+# Recorders built above own a real SQLite connection. Close them at test end:
+# left to garbage collection, the "unclosed database" ResourceWarning fires
+# inside whatever test happens to be running when collection occurs (seen in
+# tests/test_backend_endpoint_contract.py's zero-warning assertions).
+_OPEN_RECORDERS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_flight_recorders():
+    yield
+    while _OPEN_RECORDERS:
+        _OPEN_RECORDERS.pop().close()
 
 
 def _events(ns):

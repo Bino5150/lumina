@@ -278,8 +278,13 @@ class GeneralTab(QWidget):
         row2 = QHBoxLayout()
         row2.setSpacing(16)
         iter_col = QVBoxLayout()
-        iter_col.addWidget(_lbl("Max Tool Iterations", self.c))
+        iter_col.addWidget(_lbl("Max Agent Rounds", self.c))
         self.iter_spin = _spin(config.MAX_TOOL_ITERATIONS, 1, 100, 1, self.c)
+        self.iter_spin.setToolTip(
+            "Model responses per turn that may request tools. Not a tool-call "
+            "limit: one response can request many calls (see the tool-call "
+            "limits below)."
+        )
         iter_col.addWidget(self.iter_spin)
         self.response_tokens_widget = QWidget()
         resp_col = QVBoxLayout(self.response_tokens_widget)
@@ -290,6 +295,39 @@ class GeneralTab(QWidget):
         row2.addLayout(iter_col)
         row2.addWidget(self.response_tokens_widget)
         layout.addLayout(row2)
+
+        # GATLING-TRIGGER-GUARD-01 -- tool execution budgets, independent of
+        # Max Agent Rounds above (see config.py).
+        row_budget = QHBoxLayout()
+        row_budget.setSpacing(16)
+        per_response_col = QVBoxLayout()
+        per_response_col.addWidget(_lbl("Max Tool Calls per Response", self.c))
+        self.calls_per_response_spin = _spin(config.MAX_TOOL_CALLS_PER_RESPONSE, 1, 10000, 16, self.c)
+        self.calls_per_response_spin.setToolTip(
+            "A model response requesting more tool calls than this is refused "
+            "whole: none of its calls run, and the model is told to re-plan."
+        )
+        per_response_col.addWidget(self.calls_per_response_spin)
+        per_turn_col = QVBoxLayout()
+        per_turn_col.addWidget(_lbl("Max Tool Calls per Turn", self.c))
+        self.calls_per_turn_spin = _spin(config.MAX_TOOL_CALLS_PER_TURN, 1, 100000, 32, self.c)
+        self.calls_per_turn_spin.setToolTip(
+            "Tool calls one turn may run in total. The model is warned at 80%; "
+            "at the limit the turn stops and your next message continues."
+        )
+        per_turn_col.addWidget(self.calls_per_turn_spin)
+        minutes_col = QVBoxLayout()
+        minutes_col.addWidget(_lbl("Max Turn Minutes", self.c))
+        self.turn_minutes_spin = _spin(config.MAX_TURN_MINUTES, 1, 1440, 5, self.c)
+        self.turn_minutes_spin.setToolTip(
+            "Wall-clock time one turn may run. The model is warned at 75%; at "
+            "the limit the turn stops before its next request or tool call."
+        )
+        minutes_col.addWidget(self.turn_minutes_spin)
+        row_budget.addLayout(per_response_col)
+        row_budget.addLayout(per_turn_col)
+        row_budget.addLayout(minutes_col)
+        layout.addLayout(row_budget)
         self.response_tokens_widget.setVisible(config.LLM_BACKEND != self.PLAN_BACKEND)
 
         row_compaction = QHBoxLayout()
@@ -551,8 +589,9 @@ class GeneralTab(QWidget):
         """Recall this backend's saved Max Context Tokens / Memory Inject
         Limit / Tool Result Max Chars, or fall back to
         config.BACKEND_CONTEXT_DEFAULTS if this backend has never been saved
-        before. Only these three are per-backend — Max Tool Iterations and
-        Response Tokens stay global (set once below, not touched here)."""
+        before. Only these three are per-backend — Max Agent Rounds, the
+        tool-call budgets and Response Tokens stay global (set once below,
+        not touched here)."""
         prefs = persistence.load()
         saved = prefs.get("backend_context", {}).get(backend, {})
         default = config.BACKEND_CONTEXT_DEFAULTS.get(backend, config.BACKEND_CONTEXT_DEFAULTS["llamacpp"])
@@ -895,6 +934,9 @@ class GeneralTab(QWidget):
         config.MEMORY_INJECT_LIMIT = self.mem_spin.value()
         config.TOOL_RESULT_MAX_CHARS = self.result_spin.value()
         config.MAX_TOOL_ITERATIONS = self.iter_spin.value()
+        config.MAX_TOOL_CALLS_PER_RESPONSE = self.calls_per_response_spin.value()
+        config.MAX_TOOL_CALLS_PER_TURN = self.calls_per_turn_spin.value()
+        config.MAX_TURN_MINUTES = self.turn_minutes_spin.value()
         config.RESPONSE_RESERVE_TOKENS = self.resp_spin.value()
         config.CONTEXT_COMPACTION_ENABLED = self.compaction_enabled_cb.isChecked()
         config.CONTEXT_COMPACTION_BATCH_TOKENS = self.compaction_batch_spin.value()
@@ -941,12 +983,15 @@ class GeneralTab(QWidget):
         prefs["backend_endpoints"] = backend_endpoints
         prefs["backend_endpoints_migrated"] = True
 
-        # Context/memory settings — max_tool_iterations and
-        # response_reserve_tokens are global; max_context_tokens,
+        # Context/memory settings — max_tool_iterations, the tool-call
+        # budgets and response_reserve_tokens are global; max_context_tokens,
         # memory_inject_limit, and tool_result_max_chars are saved per-backend
         # so switching backends recalls each one's own values instead of
         # clobbering the other.
         prefs["max_tool_iterations"] = config.MAX_TOOL_ITERATIONS
+        prefs["max_tool_calls_per_response"] = config.MAX_TOOL_CALLS_PER_RESPONSE
+        prefs["max_tool_calls_per_turn"] = config.MAX_TOOL_CALLS_PER_TURN
+        prefs["max_turn_minutes"] = config.MAX_TURN_MINUTES
         prefs["response_reserve_tokens"] = config.RESPONSE_RESERVE_TOKENS
         prefs["context_compaction_enabled"] = config.CONTEXT_COMPACTION_ENABLED
         prefs["context_compaction_batch_tokens"] = config.CONTEXT_COMPACTION_BATCH_TOKENS

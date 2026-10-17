@@ -137,7 +137,22 @@ def _fake_agent(llm, tmp_path, tool_result="ok", flight_recorder=True):
     ns._finalize_completion_candidate = types.MethodType(LuminaAgent._finalize_completion_candidate, ns)
     if flight_recorder:
         ns.flight_recorder = FlightRecorder(db_path=str(tmp_path / "fr.db"))
+        _OPEN_RECORDERS.append(ns.flight_recorder)
     return ns
+
+
+# Recorders built here own a real SQLite connection. Close them at test end:
+# left to garbage collection, the "unclosed database" ResourceWarning fires
+# inside whatever test happens to be running when collection occurs (seen in
+# tests/test_backend_endpoint_contract.py's zero-warning assertions).
+_OPEN_RECORDERS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_flight_recorders():
+    yield
+    while _OPEN_RECORDERS:
+        _OPEN_RECORDERS.pop().close()
 
 
 def _events(ns):
@@ -419,6 +434,7 @@ def test_real_luminaagent_construction_gets_a_working_recorder(tmp_path, monkeyp
     against an explicit isolated instance (never the real DATA_DIR
     singleton) via the flight_recorder_instance override."""
     fr = FlightRecorder(db_path=str(tmp_path / "real_agent_fr.db"))
+    _OPEN_RECORDERS.append(fr)
     agent = LuminaAgent(owner=False, channel_id="fr-construction-test",
                          flight_recorder_instance=fr)
     assert agent.flight_recorder is fr

@@ -660,14 +660,48 @@ class BaseLLMBackend(ABC):
         and normalization elsewhere in this class deliberately does not
         carry it forward."""
         try:
-            finish_reason = response["choices"][0].get("finish_reason")
-        except (KeyError, IndexError, TypeError):
+            choice = response["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            native_finish_reason = choice.get("native_finish_reason")
+        except (KeyError, IndexError, TypeError, AttributeError):
             return TerminationStatus.UNKNOWN
+        # GATLING-TRIGGER-GUARD-01 -- a router (OpenRouter) may normalize a
+        # response the serving provider cut off at max_tokens to
+        # finish_reason "tool_calls"; the provider's own native_finish_reason
+        # ("length") is the truth. An incomplete native reason always wins.
+        if native_finish_reason in self._OAI_INCOMPLETE_FINISH_REASONS:
+            return TerminationStatus.INCOMPLETE
         if finish_reason in self._OAI_COMPLETE_FINISH_REASONS:
             return TerminationStatus.COMPLETE
         if finish_reason in self._OAI_INCOMPLETE_FINISH_REASONS:
             return TerminationStatus.INCOMPLETE
         return TerminationStatus.UNKNOWN
+
+    def extract_response_identity(self, response: dict) -> dict:
+        """GATLING-TRIGGER-GUARD-01 -- passive read of who actually served
+        one chat() response, for the Flight Recorder: the routed provider
+        and resolved model (OpenRouter reports both; other providers report
+        a model at most), plus the raw and native finish reasons. Missing
+        fields are None, never guessed. Never raises."""
+        out = {"provider_name": None, "response_model": None,
+               "finish_reason": None, "native_finish_reason": None,
+               "tool_call_count": None}
+        if not isinstance(response, dict):
+            return out
+        if isinstance(response.get("provider"), str):
+            out["provider_name"] = response["provider"]
+        if isinstance(response.get("model"), str):
+            out["response_model"] = response["model"]
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            for key in ("finish_reason", "native_finish_reason"):
+                if isinstance(choices[0].get(key), str):
+                    out[key] = choices[0][key]
+            message = choices[0].get("message")
+            if isinstance(message, dict):
+                calls = message.get("tool_calls")
+                out["tool_call_count"] = len(calls) if isinstance(calls, list) else 0
+        return out
 
     def extract_reasoning(self, response: dict) -> Optional[str]:
         """

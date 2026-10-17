@@ -4,7 +4,7 @@ Settings is a tabbed panel (`ui/settings/panel.py`). Current tabs, in order:
 
 | Tab | Covers |
 |---|---|
-| ⚙ General | Backend selection, reasoning effort, context compaction, dreaming toggles, global agent behavior prompt, and the backend-specific **ChatGPT Plan** account and model controls (see below) |
+| ⚙ General | Backend selection, reasoning effort, context limits, agent rounds and tool-call limits (see below), context compaction, dreaming toggles, global agent behavior prompt, and the backend-specific **ChatGPT Plan** account and model controls (see below) |
 | 👤 User Profile | Your own bio and Lumina's curated notes about you — see [My Human](memory.md#my-human) |
 | 🎭 Personas | Create/edit/import/export personas — see [Personas & Skills](personas-and-skills.md) |
 | 📡 Communications | Telegram, Discord, and your public bio — see [Channels](channels.md) |
@@ -21,6 +21,30 @@ Settings is a tabbed panel (`ui/settings/panel.py`). Current tabs, in order:
 `MultimodalTab` — it grew from a TTS-only tab into the home for
 Voice/STT/Vision/Image-Gen and hasn't been renamed yet. Functionally it's
 one tab.)
+
+## Agent rounds and tool-call limits
+
+Four controls in **Settings → General** bound how much tool work one turn
+can do. They are independent: hitting one never relaxes another.
+
+| Setting | Default | What it limits |
+|---|---|---|
+| **Max Agent Rounds** | 20 | Model responses per turn that may request tools. Not a tool-call limit — one response can request many calls. (Called "Max Tool Iterations" before.) |
+| **Max Tool Calls per Response** | 256 | A response requesting more calls than this is refused **whole**: none of its calls run, and the model is told to re-plan. |
+| **Max Tool Calls per Turn** | 512 | Calls one turn may run in total. The model gets a one-time warning at 80%; at the limit the turn stops before the next call. |
+| **Max Turn Minutes** | 60 | Wall-clock time per turn, checked before every model request and every tool call. Warning at 75%; a call already running finishes under its own timeout. |
+
+Separately from these numbers, a response that was **cut off at its output
+limit** (Response Tokens) while requesting tools is refused whole too — a
+truncated batch is not the batch the model finished planning. A first
+refusal is recoverable (the model gets its next round); a second refusal in
+the same turn ends it. When any limit ends a turn, you see a short notice
+and nothing continues on its own: your next message starts a fresh turn.
+
+Every refusal, warning and stop is recorded in the Flight Recorder
+(`tool.batch_refused`, `turn.budget_warning`, `turn.budget_exhausted`), and
+each model response records which provider served it and how it ended
+(`provider.response`), so a bad run can be traced to its source.
 
 ## Backend Abstraction
 

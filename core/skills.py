@@ -253,36 +253,39 @@ def search_skills(query: str, limit: int = None) -> list[dict]:
         return []
 
     conn = get_db()
-
-    # FTS5 needs keywords joined with OR — strip stopwords, split, rejoin
-    _stopwords = {'how', 'do', 'i', 'a', 'an', 'the', 'to', 'and', 'or',
-                  'in', 'on', 'at', 'is', 'it', 'of', 'for', 'with', 'my'}
-    words = [w for w in re.split(r'\W+', query.lower()) if w and w not in _stopwords]
-    fts_query = " OR ".join(words) if words else query.strip()
-
-    # FTS5 search
+    # Closed on every path: a failing query (e.g. a missing or damaged
+    # skills table) used to leave this connection to the garbage collector.
     try:
-        rows = conn.execute("""
-            SELECT s.name, s.description, s.path, s.origin
-            FROM skills_fts f
-            JOIN skills s ON s.id = f.rowid
-            WHERE skills_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-        """, (fts_query, limit)).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
+        # FTS5 needs keywords joined with OR — strip stopwords, split, rejoin
+        _stopwords = {'how', 'do', 'i', 'a', 'an', 'the', 'to', 'and', 'or',
+                      'in', 'on', 'at', 'is', 'it', 'of', 'for', 'with', 'my'}
+        words = [w for w in re.split(r'\W+', query.lower()) if w and w not in _stopwords]
+        fts_query = " OR ".join(words) if words else query.strip()
 
-    # Fallback: LIKE search on name + description
-    if not rows:
-        pattern = f"%{query.strip()}%"
-        rows = conn.execute("""
-            SELECT name, description, path, origin FROM skills
-            WHERE name LIKE ? OR description LIKE ?
-            LIMIT ?
-        """, (pattern, pattern, limit)).fetchall()
+        # FTS5 search
+        try:
+            rows = conn.execute("""
+                SELECT s.name, s.description, s.path, s.origin
+                FROM skills_fts f
+                JOIN skills s ON s.id = f.rowid
+                WHERE skills_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (fts_query, limit)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
 
-    conn.close()
+        # Fallback: LIKE search on name + description
+        if not rows:
+            pattern = f"%{query.strip()}%"
+            rows = conn.execute("""
+                SELECT name, description, path, origin FROM skills
+                WHERE name LIKE ? OR description LIKE ?
+                LIMIT ?
+            """, (pattern, pattern, limit)).fetchall()
+
+    finally:
+        conn.close()
     return [dict(r) for r in rows]
 
 

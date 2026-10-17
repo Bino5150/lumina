@@ -680,6 +680,14 @@ class LMStudioBackend(BaseLLMBackend):
         terminal_seen = False
         terminal_at = None
         saw_any_frame = False
+        # GATLING-TRIGGER-GUARD-01 -- OpenRouter-style routing identity and
+        # the serving provider's own finish reason. OpenRouter normalizes a
+        # tool-bearing response cut off at max_tokens to finish_reason
+        # "tool_calls" and keeps the truth in native_finish_reason
+        # ("length"); dropping it here made a truncated batch read COMPLETE.
+        native_finish_reason = None
+        routed_provider = None
+        routed_model = None
 
         for line in _iter_lines_safe(resp):
             if not line:
@@ -707,11 +715,20 @@ class LMStudioBackend(BaseLLMBackend):
             if isinstance(frame_usage, dict):
                 usage = frame_usage
                 saw_any_frame = True
+            if routed_provider is None and isinstance(chunk.get("provider"), str):
+                routed_provider = chunk["provider"]
+            if routed_model is None and isinstance(chunk.get("model"), str):
+                routed_model = chunk["model"]
+
+            choices = chunk.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                frame_native = choices[0].get("native_finish_reason")
+                if isinstance(frame_native, str) and frame_native:
+                    native_finish_reason = frame_native
 
             if terminal_seen:
                 continue
 
-            choices = chunk.get("choices") or []
             if not choices:
                 continue
             choice = choices[0]
@@ -783,6 +800,12 @@ class LMStudioBackend(BaseLLMBackend):
             message["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
 
         body = {"choices": [{"message": message, "finish_reason": finish_reason}]}
+        if native_finish_reason is not None:
+            body["choices"][0]["native_finish_reason"] = native_finish_reason
+        if routed_provider is not None:
+            body["provider"] = routed_provider
+        if routed_model is not None:
+            body["model"] = routed_model
         if isinstance(usage, dict):
             body["usage"] = usage
         body["_lumina_telemetry"] = timing.snapshot(

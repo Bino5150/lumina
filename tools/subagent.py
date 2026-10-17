@@ -89,13 +89,13 @@ subagent reads mid-run), and it's untouched by this change. See
 tests/test_subagent.py's test_subagent_tool_results_still_tagged_tool_output
 for the live-traced confirmation.
 
-Known cross-cutting note, not a v1 blocker: MB-08 (this session) flagged
-that MAX_TOOL_ITERATIONS caps outer tool-loop rounds but not tool calls
-*within* one inner iteration -- a chatty backend can already fire many calls
-per round today. A subagent runs through this exact same tool loop, so it
-inherits that same unguarded behavior. Sequential-only v1 subagents don't
-compound this into anything new; worth remembering the day parallel
-subagents or deeper delegation chains get discussed.
+Known cross-cutting note: MB-08 flagged that MAX_TOOL_ITERATIONS caps outer
+tool-loop rounds but not tool calls *within* one round. GATLING-TRIGGER-
+GUARD-01 added independent execution budgets to that same loop (calls per
+response, calls per turn, turn wall-clock -- see core/agent.py), and a
+subagent runs through the exact same loop, so it inherits them per subagent
+turn. They are not pooled with the parent's turn -- worth revisiting the day
+parallel subagents or deeper delegation chains get discussed.
 """
 import uuid
 from typing import Callable, Optional

@@ -183,6 +183,18 @@ TOOL_RESULT_MAX_CHARS = _backend_ctx.get("tool_result_max_chars", _ctx_default["
 TOOL_BUDGET_TOKENS      = _p.get("tool_budget_tokens", 11000)
 RESPONSE_RESERVE_TOKENS = _p.get("response_reserve_tokens", 4096)
 MAX_TOOL_ITERATIONS     = _p.get("max_tool_iterations", 20)
+# GATLING-TRIGGER-GUARD-01 -- tool EXECUTION budgets, separate from
+# MAX_TOOL_ITERATIONS above (which counts WORK rounds -- model responses --
+# never the calls inside one; Settings shows it as "Max Agent Rounds").
+#   per response: a larger batch is refused whole, before any call runs
+#   per turn:     the turn stops before the call that would exceed it
+#   turn minutes: wall-clock, checked before every request and every call
+# Provisional defaults: largest legitimate batch retained is 22, largest
+# reported productive turns 74 and 94 calls; two runaway responses carried
+# 5,551 and 2,076 calls.
+MAX_TOOL_CALLS_PER_RESPONSE = _p.get("max_tool_calls_per_response", 256)
+MAX_TOOL_CALLS_PER_TURN     = _p.get("max_tool_calls_per_turn", 512)
+MAX_TURN_MINUTES            = _p.get("max_turn_minutes", 60)
 
 # S41 fix: cloud API keys/models saved via Settings UI used to only live in
 # the running config module (setattr in ui/settings.py._save()) and silently

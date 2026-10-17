@@ -38,6 +38,35 @@ narration, so if a tool call's behavior is ambiguous, that's the first
 place to look rather than trusting either the model's account or your own
 memory of the session.
 
+## "Stopped" notices and refused tool calls
+
+A few short notices mean one of the tool-call limits in [Settings →
+General](settings.md#agent-rounds-and-tool-call-limits) ended a turn. None
+of them is a crash, and nothing continues on its own afterward — send a new
+message to carry on:
+
+- *"stopped after the model again produced a tool batch that could not be
+  run safely"* — the model twice asked for more tool calls in one response
+  than **Max Tool Calls per Response**, or twice produced a tool batch that
+  was cut off at its output limit. None of those calls ran.
+- *"this turn reached its tool-call limit"* — the turn used **Max Tool Calls
+  per Turn**.
+- *"this turn reached its time limit"* — the turn ran for **Max Turn
+  Minutes**.
+
+Inside a turn you may also see tool results reading *"Refused by Lumina
+before execution"*. That is the first, recoverable refusal: the calls did
+not run and the model was asked to re-plan.
+
+An error reading *"an internal request ended on an assistant message and
+was not sent"* means an internal safety check stopped a malformed request
+before it reached the model provider. It should never happen in normal
+use; the Flight Recorder (`provider.dispatch_refused`) has the details.
+
+If a model keeps hitting these limits on one provider, look at
+`provider.response` in the Flight Recorder: it names the serving provider
+(for OpenRouter, the actual upstream provider) and how each response ended.
+
 ## Telegram setup
 
 [Telegram Setup](telegram-setup.md) has the full step-by-step walkthrough
