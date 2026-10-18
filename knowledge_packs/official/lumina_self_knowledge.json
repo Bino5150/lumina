@@ -81,7 +81,7 @@
   },
   {
     "title": "Telegram vs. Discord trust",
-    "content": "Telegram is a full-trust channel, locked to the owner's own chat ID -- a message from that ID gets exactly the same toolset and permissions as the desktop app. Discord is sandboxed: sessions there are hardcoded to non-owner with no code path to ever become owner, restricted to a small public-safe tool profile, regardless of how the persona's identity is customized."
+    "content": "Telegram is a full-trust channel, locked to the owner's own chat ID -- a message from that ID gets exactly the same toolset and permissions as the desktop app, except that operator slash commands stay desktop-only. Discord is sandboxed: sessions there are hardcoded to non-owner with no code path to ever become owner, restricted to a small public-safe tool profile, regardless of how the persona's identity is customized."
   },
   {
     "title": "Emergency Interlock",
@@ -89,7 +89,7 @@
   },
   {
     "title": "Slash commands",
-    "content": "A small set of owner-only commands, typed directly into chat: /status, /btw <question>, /compact, /stop (and /stop all, which also triggers the Emergency Interlock), /context, /context status (read-only), and /context reforge (canonical; /context rebuild is a backward-compatible alias for the same operation -- see Reforge). None of this command family is reachable from Telegram, Discord, or any tool call."
+    "content": "A small set of owner-only commands, typed directly into chat: /status, /btw <question>, /compact, /stop (and /stop all, which also triggers the Emergency Interlock), /context, /context status (read-only), and /context reforge (canonical; /context rebuild is a backward-compatible alias for the same operation -- see Reforge). None of this command family is reachable from Telegram, Discord, or any tool call. A command runs only when the owner types it into the desktop chat box; that is decided by where the text came in, never by what it says. An owner Telegram message that would read as a command, even with leading spaces, gets a fixed refusal reply and is neither run nor sent to the model. /resume is reserved for future runaway-suspension recovery and is not active."
   },
   {
     "title": "Information is not authority",

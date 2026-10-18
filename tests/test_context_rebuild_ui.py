@@ -46,6 +46,11 @@ from core import emergency_stop
 from core.context import ContextManager
 from core.context_transaction import ContextGeneration
 from core.operator_commands import parse_operator_command
+from core.operator_ingress import local_text_submission
+
+# OPERATOR-INGRESS-PROVENANCE-01 -- the dispatcher requires the local
+# text-submission envelope; these tests drive the owner-typed path.
+LOCAL_TYPED = local_text_submission()
 from ui.main_window import LuminaWindow
 
 
@@ -146,13 +151,16 @@ def test_context_family_rejected_when_telegram_dispatch_active(argument, monkeyp
 
 @pytest.mark.parametrize("subcommand", ["reforge", "rebuild"])
 def test_context_rebuild_via_full_dispatch_from_telegram_never_starts_thread(subcommand, monkeypatch):
-    """End-to-end through _dispatch_operator_command(), exactly the path a
-    Telegram-relayed '/context rebuild' would take per _on_user_message()."""
+    """End-to-end through _dispatch_operator_command() while a Telegram relay
+    is active. Since OPERATOR-INGRESS-PROVENANCE-01 relayed text never reaches
+    the dispatcher at all (test_operator_ingress_provenance_01_qt.py); this
+    pins the /context handler's own desktop-only guard as defense in depth,
+    even with a local envelope."""
     fake = _fake_window(chat_id=_seed_chat([("user", "u1")]), telegram_active=object())
     command = parse_operator_command(f"/context {subcommand}")
     assert command.known
 
-    fake._dispatch_operator_command(command)
+    fake._dispatch_operator_command(command, ingress=LOCAL_TYPED)
 
     assert fake._context_rebuild_thread is None
     assert fake.chat_widget.notices
@@ -165,7 +173,7 @@ def test_context_family_admitted_from_desktop_dispatch(monkeypatch):
     fake = _fake_window(chat_id=_seed_chat([("user", "u1")]), telegram_active=None)
     command = parse_operator_command("/context status")
 
-    fake._dispatch_operator_command(command)
+    fake._dispatch_operator_command(command, ingress=LOCAL_TYPED)
 
     assert fake.chat_widget.notices
     assert "desktop-only" not in fake.chat_widget.notices[-1]
@@ -188,7 +196,7 @@ def test_context_malformed_subcommand_never_starts_rebuild(text, monkeypatch):
     command = parse_operator_command(text)
     assert command.known  # "context" itself is known; the subcommand is what's malformed
 
-    fake._dispatch_operator_command(command)
+    fake._dispatch_operator_command(command, ingress=LOCAL_TYPED)
 
     assert not spy_calls
     assert fake._context_rebuild_thread is None
@@ -208,7 +216,7 @@ def test_unknown_command_dispatch_never_reaches_context_handler(monkeypatch):
     )
     command = parse_operator_command("/reconstruct")
 
-    fake._dispatch_operator_command(command)
+    fake._dispatch_operator_command(command, ingress=LOCAL_TYPED)
 
     assert not calls
     assert "Unknown command" in fake.chat_widget.notices[-1]
@@ -366,7 +374,7 @@ def test_rebuild_rejected_synchronously_when_ineligible_never_starts_thread(setu
     fake = _fake_window(chat_id=chat_id)
     setup(fake)
 
-    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"))
+    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"), ingress=LOCAL_TYPED)
 
     assert not spy_calls
     notice = fake.chat_widget.notices[-1]
@@ -380,7 +388,7 @@ def test_rebuild_rejected_while_latched(subcommand):
     fake = _fake_window(chat_id=chat_id)
     emergency_stop.latch(source="test", reason="test")
 
-    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"))
+    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"), ingress=LOCAL_TYPED)
 
     notice = fake.chat_widget.notices[-1]
     assert notice.startswith("Rebuild rejected:")
@@ -412,7 +420,7 @@ def test_eligible_rebuild_spawns_thread_calls_coordinator_and_emits_receipt(subc
 
     monkeypatch.setattr(context_rebuild_module, "run_rebuild", _fake_run_rebuild)
 
-    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"))
+    fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"), ingress=LOCAL_TYPED)
     assert fake._context_rebuild_thread is not None
     fake._context_rebuild_thread.join(timeout=5)
 
@@ -515,7 +523,7 @@ def test_context_help_lists_canonical_command_and_alias_without_starting_work(mo
         raise AssertionError("help must not compile or reconstruct")
 
     monkeypatch.setattr(context_rebuild_module, "run_rebuild", _boom)
-    fake._dispatch_operator_command(parse_operator_command("/context"))
+    fake._dispatch_operator_command(parse_operator_command("/context"), ingress=LOCAL_TYPED)
 
     notice = fake.chat_widget.notices[-1]
     assert "/context reforge" in notice
@@ -563,7 +571,7 @@ def test_both_commands_reconstruct_equivalently_with_fresh_exact_checkpoints():
         fake = _fake_window(chat_id=chat_id, ctx=ctx)
         backend = _OfflineContinuityBackend()
         fake.agent.llm = backend
-        fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"))
+        fake._dispatch_operator_command(parse_operator_command(f"/context {subcommand}"), ingress=LOCAL_TYPED)
         thread = fake._context_rebuild_thread
         assert thread is not None
         thread.join(timeout=5)
@@ -608,18 +616,18 @@ def test_aliases_share_single_flight_and_stop_cancels_real_operation(first, seco
     fake = _fake_window(chat_id=chat_id, ctx=ctx)
     backend = _OfflineContinuityBackend(during_compile=_hold_compile)
     fake.agent.llm = backend
-    fake._dispatch_operator_command(parse_operator_command(f"/context {first}"))
+    fake._dispatch_operator_command(parse_operator_command(f"/context {first}"), ingress=LOCAL_TYPED)
     thread = fake._context_rebuild_thread
     assert thread is not None
     try:
         assert entered.wait(timeout=5)
-        fake._dispatch_operator_command(parse_operator_command(f"/context {second}"))
+        fake._dispatch_operator_command(parse_operator_command(f"/context {second}"), ingress=LOCAL_TYPED)
         assert fake._context_rebuild_thread is thread
         assert "already in progress" in fake.chat_widget.notices[-1]
-        fake._dispatch_operator_command(parse_operator_command("/stop"))
+        fake._dispatch_operator_command(parse_operator_command("/stop"), ingress=LOCAL_TYPED)
         assert fake._context_rebuild_cancel.is_set()
         assert "requested for /context reforge" in fake.chat_widget.notices[-1]
-        fake._dispatch_operator_command(parse_operator_command("/stop"))
+        fake._dispatch_operator_command(parse_operator_command("/stop"), ingress=LOCAL_TYPED)
         assert "already requested" in fake.chat_widget.notices[-1]
     finally:
         release.set()
@@ -633,7 +641,7 @@ def test_aliases_share_single_flight_and_stop_cancels_real_operation(first, seco
     assert memory.load_chat_messages(chat_id) == durable_before
     assert fake.current_generation() == 0
     # A finished thread remains single-flight until its receipt is handled.
-    fake._dispatch_operator_command(parse_operator_command(f"/context {second}"))
+    fake._dispatch_operator_command(parse_operator_command(f"/context {second}"), ingress=LOCAL_TYPED)
     assert fake._context_rebuild_thread is thread
     assert "already in progress" in fake.chat_widget.notices[-1]
     fake._on_context_rebuild_finished(receipt)

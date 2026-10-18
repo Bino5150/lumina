@@ -7,6 +7,18 @@ by design** — none of it is reachable from Telegram, Discord, or any
 tool-call path; the code that dispatches these commands is never imported
 by the agent/tool layer at all.
 
+A command runs only when you type it into this window's chat box. Lumina
+records where every message came in, and only text typed here counts.
+What a message says never decides that.
+
+- **Telegram:** a message that would read as a command, including one with
+  leading spaces, gets a short fixed reply saying commands are
+  desktop-only. It isn't run and isn't sent to the model. If it was a reply
+  to a desktop chat, that chat also shows a notice that a command-like
+  message was refused. Your ordinary Telegram messages work as before.
+- **`/resume`** is reserved for recovery from a future runaway-suspension
+  feature. It isn't active yet, and nothing in this table uses it.
+
 | Command | Does |
 |---|---|
 | `/status` | Live operator status. |

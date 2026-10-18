@@ -20,6 +20,17 @@ Telegram bridge (because Telegram is itself locked to your own chat ID —
 see [Channels](channels.md)). Discord is hardcoded `owner=False` with no
 code path to `True` at all.
 
+Owner status is not the same as desktop authority. [Operator
+commands](operator-commands.md), including `/stop all`, which triggers the
+Emergency Interlock, run only from text typed into the desktop chat box.
+
+- **Where text came from decides it.** Lumina records that when the message
+  arrives. The message's words, a source label, an event ID, or a flag set
+  by a model can never stand in for it.
+- **Owner Telegram text is never a command.** It is relayed into the
+  desktop as an ordinary turn. A message that would read as a command gets
+  a fixed refusal before it reaches the model.
+
 Browser Companion exposes only reads, page observation, and owner-granted
 navigation (generic navigation is scoped to the owner's own current request
 and sites; it cannot click, type or submit). Its

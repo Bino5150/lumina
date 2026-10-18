@@ -12,15 +12,17 @@ import asyncio
 import logging
 import threading
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 import config
 from comms import telegram_origin_routing as origin_routing
+from comms import telegram_recovery
 from core.headless import (
     headless_result_delivery_text,
     mark_headless_result_presented,
     run_headless_turn,
 )
+from core.operator_ingress import RELAYED_COMMAND_REFUSAL, looks_like_operator_command
 from core.secrets import get_secret
 from core.persistence import load as load_prefs
 
@@ -75,6 +77,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text
     if not text:
+        return
+
+    # OPERATOR-INGRESS-PROVENANCE-01 -- operator commands are desktop
+    # authority. `~filters.COMMAND` (see _register_handlers) only excludes
+    # text with a bot_command entity at offset 0, so a whitespace-prefixed or
+    # entity-less " /btw" gets here. Anything the desktop parser would read
+    # as a command gets a fixed refusal: no origin routing, no headless turn,
+    # no model.
+    if looks_like_operator_command(text):
+        log.info("[TELEGRAM] Refused owner text that parses as an operator command.")
+        await update.message.reply_text(RELAYED_COMMAND_REFUSAL)
         return
 
     # CASTLE-WALLS-REPAIR-04 / CANNON-11 -- a stable identity for THIS
@@ -150,13 +163,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_headless_result_presented(result, channel_id=CHANNEL_ID)
 
 
+def _register_handlers(application) -> None:
+    """Every inbound handler, in one place. /resume is the recovery-handler
+    skeleton (comms/telegram_recovery.py, not active yet): new messages only,
+    never edits. Every other slash command stays unhandled (dropped), as
+    before; ordinary text goes to handle_message."""
+    application.add_handler(CommandHandler(
+        telegram_recovery.RECOVERY_COMMAND, telegram_recovery.handle_recovery_command,
+        filters=filters.UpdateType.MESSAGE,
+    ))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+
 async def _run_until_stopped(stop_event: threading.Event, token: str):
     """Non-blocking-equivalent polling loop, stoppable from another thread.
     This is what run_polling() does internally, broken apart so we can
     check stop_event between initialize/start/updater.start_polling and
     the eventual clean shutdown, instead of blocking forever."""
     application = Application.builder().token(token).build()
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    _register_handlers(application)
 
     await application.initialize()
     await application.start()

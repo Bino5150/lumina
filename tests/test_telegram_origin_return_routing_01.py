@@ -271,7 +271,12 @@ def test_10_busy_origin_queues_and_starts_only_after_foreground_is_idle(monkeypa
         def isRunning(self):
             return True
 
-    def _start(text, approval_event_id=None):
+    def _start(text, approval_event_id=None, ingress=None):
+        # OPERATOR-INGRESS-PROVENANCE-01 -- a relayed turn carries the
+        # relayed-text envelope, never local command authority.
+        from core.operator_ingress import IngressKind, may_dispatch_operator_command
+        assert ingress.kind is IngressKind.TELEGRAM_RELAYED_TEXT
+        assert not may_dispatch_operator_command(ingress)
         started.append(text)
         fake.worker = _Busy()
 

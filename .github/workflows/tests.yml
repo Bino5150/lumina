@@ -131,3 +131,13 @@ jobs:
       # main thread. Same pinned PySide6 and fail-never-skip contract.
       - name: Run Qt-bound ChatGPT sign-in settings guards (blocking)
         run: python -m pytest tests/test_chatgpt_auth_01c_settings_qt.py tests/test_chatgpt_auth_01c_r2_qt.py -v -rs -m "not castle_walls_evidence"
+
+      # OPERATOR-INGRESS-PROVENANCE-01 -- operator commands are desktop
+      # authority. The real LuminaWindow is driven through its real chat
+      # input (Enter key) and its real Telegram origin queue, so only Qt can
+      # prove relayed text never dispatches a command -- and that the owner's
+      # Telegram remote control still reaches the same Prime conversation and
+      # returns replies and files to the phone. Same pinned PySide6 and
+      # fail-never-skip contract.
+      - name: Run Qt-bound operator ingress provenance guards (blocking)
+        run: python -m pytest tests/test_operator_ingress_provenance_01_qt.py tests/test_telegram_prime_continuity_qt.py -v -rs -m "not castle_walls_evidence"

@@ -37,6 +37,10 @@ from core.operator_commands import (
     command_help, compaction_cut_index, format_duration, format_tokens,
     parse_operator_command, unwrap_background_result,
 )
+from core.operator_ingress import (
+    RELAYED_COMMAND_REFUSAL, IngressKind, local_runtime_action, local_text_submission,
+    may_dispatch_operator_command, telegram_relayed_text,
+)
 from core.personas import list_personas, load_persona
 from core import persistence
 from core import dreaming 
@@ -797,7 +801,9 @@ class LuminaWindow(QMainWindow):
         container.setLayout(main)
         root.addWidget(container, 1)
 
-        self.chat_widget.message_submitted.connect(self._on_user_message)
+        # OPERATOR-INGRESS-PROVENANCE-01 -- the one local text-submission
+        # ingress: only text arriving here may dispatch operator commands.
+        self.chat_widget.message_submitted.connect(self._on_local_text_submitted)
         self.chat_widget.files_dropped.connect(self._on_files_dropped)
         self.chat_widget.audio_preview_cancelled.connect(lambda: setattr(self, '_pending_audio', None))
         self.chat_widget.attachment_previews_cancelled.connect(
@@ -1480,8 +1486,26 @@ class LuminaWindow(QMainWindow):
         )
         self._refresh_emergency_control()
 
-    def _dispatch_operator_command(self, command):
-        """Single dispatch point for owner-facing slash commands."""
+    def _refuse_operator_command(self, ingress):
+        """OPERATOR-INGRESS-PROVENANCE-01 -- command-shaped text that did not
+        arrive as a local text submission. Nothing runs. A relayed Telegram
+        request is completed with the fixed refusal, so the bridge replies
+        with it and never falls back to a headless turn."""
+        self.chat_widget.add_operator_message(
+            "A message that looked like an operator command did not come from this "
+            "chat window, so it was refused. Operator commands only run when typed here."
+        )
+        if (getattr(ingress, "kind", None) is IngressKind.TELEGRAM_RELAYED_TEXT
+                and self._telegram_active_dispatch is not None):
+            self._complete_telegram_origin(RELAYED_COMMAND_REFUSAL)
+
+    def _dispatch_operator_command(self, command, *, ingress):
+        """Single dispatch point for owner-facing slash commands. Requires a
+        local text-submission envelope (core/operator_ingress.py); anything
+        else is refused here as well as in _on_user_message()."""
+        if not may_dispatch_operator_command(ingress):
+            self._refuse_operator_command(ingress)
+            return
         if not command.known:
             self.chat_widget.add_operator_message(
                 f"Unknown command /{command.name or '?'}. {command_help()}"
@@ -2241,7 +2265,8 @@ class LuminaWindow(QMainWindow):
 
         self._telegram_active_dispatch = request
         try:
-            self._on_user_message(request.text, approval_event_id=request.approval_event_id)
+            self._on_user_message(request.text, approval_event_id=request.approval_event_id,
+                                  ingress=telegram_relayed_text(request.approval_event_id))
         except Exception:
             self._telegram_active_dispatch = None
             if not request.future.done():
@@ -2270,13 +2295,23 @@ class LuminaWindow(QMainWindow):
             request.future.set_result(response)
         QTimer.singleShot(0, self._drain_telegram_origin_queue)
 
-    def _on_user_message(self, text: str, approval_event_id: str = None):
+    def _on_local_text_submitted(self, text: str):
+        """The chat input's submit signal: the only local text-submission ingress."""
+        self._on_user_message(text, ingress=local_text_submission())
+
+    def _on_user_message(self, text: str, approval_event_id: str = None, ingress=None):
         if not text.strip():
             return
 
         command = parse_operator_command(text)
         if command is not None:
-            self._dispatch_operator_command(command)
+            # OPERATOR-INGRESS-PROVENANCE-01 -- authority comes from where the
+            # text entered (ingress), never from the text itself. A caller
+            # with no envelope fails closed.
+            if may_dispatch_operator_command(ingress):
+                self._dispatch_operator_command(command, ingress=ingress)
+            else:
+                self._refuse_operator_command(ingress)
             return
 
         if emergency_stop.is_latched():
@@ -2670,7 +2705,8 @@ class LuminaWindow(QMainWindow):
             return
         if self.worker is not None and self.worker.isRunning():
             return  # a turn is already in flight; the owner can just wait or type
-        self._on_user_message("[Owner approved via button]")
+        self._on_user_message("[Owner approved via button]",
+                              ingress=local_runtime_action("image_approval_button"))
 
     def _on_think_start(self, step: int):
         self._mark_operator_progress("thinking")

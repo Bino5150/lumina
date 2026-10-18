@@ -74,6 +74,19 @@ You should get a real response back within a few seconds. If you don't hear back
 double check Step 4 and that the toggle actually shows "Running" — a missing token,
 unset chat ID, or a bridge that's still off is the most common cause.
 
+### Slash commands over Telegram
+
+Lumina's [operator commands](operator-commands.md) (`/status`, `/btw`, `/compact`,
+`/stop`, `/context`, …) are desktop-only. Over Telegram:
+
+- **A message that would read as one of them** (it starts with `/`, even after spaces)
+  gets a short fixed reply saying so. Nothing runs, and the message isn't sent to the
+  model.
+- **Telegram's own bot commands**, such as `/start`, are still ignored.
+- **`/resume`** is reserved for a future runaway-suspension recovery feature. From your
+  own private chat it currently replies that it isn't active and changes nothing. From
+  anywhere else, or as a forwarded or edited message, it's ignored.
+
 ---
 
 ## Stopping the bridge
