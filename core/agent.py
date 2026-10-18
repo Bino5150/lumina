@@ -18,6 +18,7 @@ import config
 import core.coding_checkpoint as checkpoint_store
 from core import emergency_stop
 from core import flight_recorder
+from core import progress_breaker
 from core.backend_identity import (
     LaneFuelViolation,
     OperationKind,
@@ -684,6 +685,52 @@ def _end_turn_on_budget(agent, notice: str, kind: str, *, turn_id=None, chat_id=
     if callable(on_response_token):
         on_response_token(notice)
     return notice
+
+
+def _progress_fields(obs) -> dict:
+    """AGENT-NO-PROGRESS-BREAKER-01 -- the content-free breaker fields every
+    tool.result carries: keyed per-turn digests (comparable within the turn
+    only) plus the breaker's own verdict, for replay and tuning."""
+    return {"progress": obs.progress, "stale_streak": obs.stale_streak,
+            "write_stale_streak": obs.write_stale_streak,
+            "result_hash": obs.result_hash, "result_norm_hash": obs.result_norm_hash}
+
+
+def _act_on_progress(agent, ledger, obs, unrun_tool_calls: list, *, admitted_tool_calls: int,
+                     turn_id=None, chat_id=None) -> Optional[str]:
+    """AGENT-NO-PROGRESS-BREAKER-01 -- after an executed call: on a trip, end
+    the turn before the next call (every unrun id gets a trusted "stopped"
+    row, breaker.tripped records the evidence, the owner sees the notice,
+    nothing continues on its own) and return the notice; on a warning, queue
+    the trusted model-facing notice for the next request."""
+    thresholds = ledger.thresholds
+    if obs.trip:
+        _close_budget_stopped_tool_calls(agent, unrun_tool_calls, NO_PROGRESS_NOTICE)
+        _fr_machine(agent, "breaker.tripped", turn_id=turn_id, chat_id=chat_id, severity="warning",
+                    fields={"trip_kind": obs.trip_kind, "stale_streak": obs.stale_streak,
+                            "write_stale_streak": obs.write_stale_streak,
+                            "read_only_trip": thresholds.read_only_trip,
+                            "write_trip": thresholds.write_trip,
+                            "executed_calls": ledger.observed_calls,
+                            "admitted_tool_calls": admitted_tool_calls,
+                            "distinct_fingerprints": ledger.distinct_fingerprints,
+                            "unrun_in_batch": len(unrun_tool_calls),
+                            "repeated_tool_names": ledger.repeated_names()})
+        print(f"[AGENT] no-progress breaker tripped ({obs.trip_kind}, {obs.stale_streak} stale "
+              f"calls in a row) — turn stopped", flush=True)
+        on_response_token = getattr(agent, "on_response_token", None)
+        if callable(on_response_token):
+            on_response_token(NO_PROGRESS_NOTICE)
+        return NO_PROGRESS_NOTICE
+    if obs.warn:
+        agent.ctx.append_ephemeral(ledger.warning_notice())
+        _fr_machine(agent, "breaker.warning", turn_id=turn_id, chat_id=chat_id, severity="warning",
+                    fields={"warn_kind": obs.warn_kind, "stale_streak": obs.stale_streak,
+                            "write_stale_streak": obs.write_stale_streak,
+                            "executed_calls": ledger.observed_calls,
+                            "repeated_tool_names": ledger.repeated_names()})
+        print(f"[AGENT] no-progress warning sent to the model ({obs.warn_kind})", flush=True)
+    return None
 
 
 def _record_provider_response(agent, response, chat_kwargs: dict, phase: str, *,
@@ -1843,6 +1890,12 @@ def _effective_tool_budgets(agent) -> dict:
     out["tool_calls_per_response_limit"] = _tool_calls_per_response_limit()
     out["tool_calls_per_turn_limit"] = _tool_calls_per_turn_limit()
     out["turn_time_limit_s"] = _turn_time_limit_s()
+    # AGENT-NO-PROGRESS-BREAKER-01 -- the effective (bounds-clamped) thresholds.
+    breaker = progress_breaker.thresholds_from_config(config)
+    out["no_progress_read_only_warn"] = breaker.read_only_warn
+    out["no_progress_read_only_trip"] = breaker.read_only_trip
+    out["no_progress_write_warn"] = breaker.write_warn
+    out["no_progress_write_trip"] = breaker.write_trip
     try:
         out["tool_schema_budget"] = config.TOOL_BUDGET_TOKENS
     except Exception:
@@ -1898,6 +1951,14 @@ TURN_TIME_BUDGET_NOTICE = (
     "[Lumina: stopped — this turn reached its time limit. Send a new message "
     "to continue.]"
 )
+# AGENT-NO-PROGRESS-BREAKER-01 -- the turn ended because its recent tool
+# calls stopped producing anything new (see core/progress_breaker.py).
+NO_PROGRESS_NOTICE = (
+    "[Lumina: stopped — the recent tool calls in this turn made no progress "
+    "(they repeated calls whose results were already known, or failed). Send a "
+    "new message to continue; if this chat now carries many repeated results, "
+    "/context reforge may help.]"
+)
 
 # These machine-authored non-success notices use the historical
 # "[Lumina: ...]" form, which is also used for ordinary capability notices.
@@ -1909,6 +1970,7 @@ ERROR_RESPONSE_EXACT = frozenset({
     TOOL_BATCH_LIMIT_NOTICE,
     TOOL_CALL_BUDGET_NOTICE,
     TURN_TIME_BUDGET_NOTICE,
+    NO_PROGRESS_NOTICE,
 })
 
 # A third failure sentinel — a tool call succeeds, then the *next* provider
@@ -2624,6 +2686,9 @@ class LuminaAgent:
         budget_clock_start = _budget_clock()
         tool_calls_per_turn = _tool_calls_per_turn_limit()
         turn_time_limit_s = _turn_time_limit_s()
+        # AGENT-NO-PROGRESS-BREAKER-01 -- this turn's progress ledger: every
+        # executed call below (skipped ones included) is observed exactly once.
+        progress_ledger = progress_breaker.ProgressLedger(progress_breaker.thresholds_from_config(config))
 
         # VISION-TOOL-INTEROP-01 -- per-turn, not per-WORK-round: once the
         # capability notice has fired for this turn, later WORK rounds
@@ -3541,16 +3606,23 @@ class LuminaAgent:
                 if "web_search" in tools_used_this_turn and name in CHAIN_BLOCKED_AFTER_SEARCH:
                     result = "[Skipped: summarize from search results already provided.]"
                     self.ctx.add_tool_result(tool_id, name, result)
+                    progress = progress_ledger.observe(name, args, result, success=True)
                     _fr_machine(self, "tool.call", turn_id=turn_id, chat_id=chat_id,
                                 fields=_tool_call_fields(tool_batch_ordinal, index, name, args))
                     _fr_machine(self, "tool.result", turn_id=turn_id, chat_id=chat_id,
                                 fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,
                                         "tool_name": name, "success": True, "skipped": True,
                                         "duration_s": 0.0,
-                                        "result_summary": flight_recorder.bounded_repr(result)})
+                                        "result_summary": flight_recorder.bounded_repr(result),
+                                        **_progress_fields(progress)})
                     if _cancel_requested(cancel_event):
                         _close_cancelled_tool_calls(self, tool_calls[index + 1:])
                         raise TurnCancelled()
+                    stop = _act_on_progress(self, progress_ledger, progress, tool_calls[index + 1:],
+                                            admitted_tool_calls=admitted_tool_calls,
+                                            turn_id=turn_id, chat_id=chat_id)
+                    if stop is not None:
+                        return stop
                     continue
 
                 self.on_tool_call(name, args)
@@ -3569,12 +3641,14 @@ class LuminaAgent:
                 _tool_success = not (isinstance(result, str) and result.startswith("[Tool error:"))
                 if name in CHROME_COMPANION_ACTION_TOOL_NAMES:
                     _tool_success = _chrome_action_receipt_success(name, result)
+                progress = progress_ledger.observe(name, args, result, success=_tool_success)
                 _fr_machine(self, "tool.result", turn_id=turn_id, chat_id=chat_id,
                             severity="info" if _tool_success else "warning",
                             fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,
                                     "tool_name": name, "success": _tool_success, "skipped": False,
                                     "duration_s": _tool_duration,
-                                    "result_summary": _tool_result_summary(name, result)})
+                                    "result_summary": _tool_result_summary(name, result),
+                                    **_progress_fields(progress)})
                 self.on_tool_result(name, result)
                 tools_used_this_turn.add(name)
                 self.ctx.add_tool_result(tool_id, name, result)
@@ -3583,6 +3657,12 @@ class LuminaAgent:
                 if _cancel_requested(cancel_event):
                     _close_cancelled_tool_calls(self, tool_calls[index + 1:])
                     raise TurnCancelled()
+
+                stop = _act_on_progress(self, progress_ledger, progress, tool_calls[index + 1:],
+                                        admitted_tool_calls=admitted_tool_calls,
+                                        turn_id=turn_id, chat_id=chat_id)
+                if stop is not None:
+                    return stop
 
                 # Nudge skill creation after threshold — once per session.
                 # FE-26: this used to be ctx.add_user(...), which injected a

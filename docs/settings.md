@@ -41,10 +41,41 @@ refusal is recoverable (the model gets its next round); a second refusal in
 the same turn ends it. When any limit ends a turn, you see a short notice
 and nothing continues on its own: your next message starts a fresh turn.
 
+### No-progress breaker
+
+The limits above count calls. A separate breaker watches whether the calls
+are still getting anywhere. A call makes **no progress** when it repeats a
+call this turn already made and gets back a result already seen, or when it
+fails (an unknown tool, bad arguments, an error). Any call that brings back
+something new resets the count.
+
+| Consecutive no-progress calls | Warning to the model | Turn stops |
+|---|---|---|
+| Any tools | 10 | 20 |
+| Tools that can change things (anything not read-only) | 3 | 5 |
+
+The warning tells the model to stop repeating itself. When the turn stops,
+you see a notice, and calls the model asked for but that never ran are
+marked as stopped. Nothing continues on its own.
+
+The breaker ignores numbers, timestamps and IDs when comparing results, so
+a clock or counter changing doesn't count as new information. Real browsing
+(scroll, then read new content), editing and re-reading a file, and watching
+a process whose output grows are all progress.
+
+These four numbers have no Settings fields. They can be changed in
+`prefs.json` (`no_progress_read_only_warn`, `no_progress_read_only_trip`,
+`no_progress_write_warn`, `no_progress_write_trip`; restart to apply).
+Lumina keeps each one within fixed bounds: read-only trip 5–64, write trip
+2–16, and each warning below its trip. A value outside the bounds is pulled
+back inside, and a value that isn't a number is ignored, so the breaker
+can't be turned off.
+
 Every refusal, warning and stop is recorded in the Flight Recorder
-(`tool.batch_refused`, `turn.budget_warning`, `turn.budget_exhausted`), and
-each model response records which provider served it and how it ended
-(`provider.response`), so a bad run can be traced to its source.
+(`tool.batch_refused`, `turn.budget_warning`, `turn.budget_exhausted`,
+`breaker.warning`, `breaker.tripped`), and each model response records
+which provider served it and how it ended (`provider.response`), so a bad
+run can be traced to its source.
 
 ## Backend Abstraction
 

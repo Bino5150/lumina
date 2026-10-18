@@ -53,6 +53,34 @@ message to carry on:
   per Turn**.
 - *"this turn reached its time limit"* — the turn ran for **Max Turn
   Minutes**.
+- *"the recent tool calls in this turn made no progress"* — the
+  [no-progress breaker](settings.md#no-progress-breaker) stopped a run of
+  calls that kept repeating calls with results already known, or kept
+  failing.
+
+### If the no-progress breaker stopped a turn that was doing real work
+
+The breaker can be wrong in one known way. When comparing results it
+ignores numbers, timestamps and IDs, so a result whose **only** change is a
+number, such as a progress percentage or a byte count, looks like nothing
+new. Twenty such checks in a row (five for a tool that can change things)
+stop the turn.
+
+To recover:
+
+1. **Send a new message.** Every turn starts with a clean slate, so the
+   model can carry on. It helps to say how: "check less often", "wait, then
+   check once", or "use the result you already have".
+2. **If it keeps happening for a workflow you trust**, raise the thresholds
+   in `prefs.json` (see [Settings](settings.md#no-progress-breaker)) and
+   restart. They can't go past their fixed maximums.
+3. **If the chat now carries many repeated tool results**, `/context
+   reforge` may help: it can shrink what every later request re-sends. It's
+   optional and not guaranteed to fix anything.
+
+`breaker.tripped` in the Flight Recorder shows which tools repeated, how
+many calls ran and how long the streak was. Each `tool.result` records
+whether that call counted as progress.
 
 Inside a turn you may also see tool results reading *"Refused by Lumina
 before execution"*. That is the first, recoverable refusal: the calls did

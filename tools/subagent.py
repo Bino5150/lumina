@@ -94,7 +94,8 @@ tool-loop rounds but not tool calls *within* one round. GATLING-TRIGGER-
 GUARD-01 added independent execution budgets to that same loop (calls per
 response, calls per turn, turn wall-clock -- see core/agent.py), and a
 subagent runs through the exact same loop, so it inherits them per subagent
-turn. They are not pooled with the parent's turn -- worth revisiting the day
+turn. The same holds for AGENT-NO-PROGRESS-BREAKER-01's progress ledger
+(core/progress_breaker.py): one ledger per subagent turn. They are not pooled with the parent's turn -- worth revisiting the day
 parallel subagents or deeper delegation chains get discussed.
 """
 import uuid

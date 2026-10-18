@@ -382,7 +382,12 @@ def test_first_refusal_is_recoverable_and_the_model_can_continue(fr):
 
 @pytest.mark.parametrize("size", [1, 22, 256])
 def test_legitimate_batches_at_or_under_the_limit_run_normally(fr, size):
-    llm = _ScriptedLLM([_tools(size), _answer("ok"),
+    # Distinct calls: a batch of `size` IDENTICAL calls is the no-progress
+    # pattern AGENT-NO-PROGRESS-BREAKER-01 stops after 21 calls, so it is not
+    # a legitimate batch (that path is covered in its own test module).
+    batch = {"message": {"role": "assistant", "content": "",
+                         "tool_calls": [_tc(i, args=json.dumps({"limit": i})) for i in range(size)]}}
+    llm = _ScriptedLLM([batch, _answer("ok"),
                         {"message": {"role": "assistant", "content": "",
                                      "tool_calls": [_tc(0, name=agent_module.FINISH_TOOL_WORK_NAME)]}}])
     fake, _, executed = _agent(llm)

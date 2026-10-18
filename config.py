@@ -195,6 +195,16 @@ MAX_TOOL_ITERATIONS     = _p.get("max_tool_iterations", 20)
 MAX_TOOL_CALLS_PER_RESPONSE = _p.get("max_tool_calls_per_response", 256)
 MAX_TOOL_CALLS_PER_TURN     = _p.get("max_tool_calls_per_turn", 512)
 MAX_TURN_MINUTES            = _p.get("max_turn_minutes", 60)
+# AGENT-NO-PROGRESS-BREAKER-01 -- no-progress circuit breaker (core/
+# progress_breaker.py): consecutive calls that produce nothing new this turn
+# (a repeated call with an already-seen result, or a failed call). Prefs
+# only, no Settings fields; every value is clamped to hard bounds in code
+# (read-only trip 5-64, write trip 2-16, warn below trip), so none can
+# disable the breaker.
+NO_PROGRESS_READ_ONLY_WARN  = _p.get("no_progress_read_only_warn", 10)
+NO_PROGRESS_READ_ONLY_TRIP  = _p.get("no_progress_read_only_trip", 20)
+NO_PROGRESS_WRITE_WARN      = _p.get("no_progress_write_warn", 3)
+NO_PROGRESS_WRITE_TRIP      = _p.get("no_progress_write_trip", 5)
 
 # S41 fix: cloud API keys/models saved via Settings UI used to only live in
 # the running config module (setattr in ui/settings.py._save()) and silently
