@@ -123,6 +123,10 @@ async def handle_recovery_command(update, context):
     if emergency_stop.is_latched():
         log.info("[TELEGRAM] Dropped recovery command — emergency stop is active.")
         return
+    from comms import telegram_access
+    if not telegram_access.remote_access_enabled():
+        log.info("[TELEGRAM] Dropped recovery command — Telegram remote access is off.")
+        return
     try:
         verify_recovery_update(update, owner_chat_id=_owner_chat_id(),
                                bot_username=getattr(getattr(context, "bot", None), "username", None))

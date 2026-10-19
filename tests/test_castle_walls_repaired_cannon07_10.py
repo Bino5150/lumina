@@ -411,6 +411,7 @@ def test_cannon10_headless_captures_exact_estimate_for_transport(monkeypatch):
     assert draft_store.is_presented(draft.draft_id) is True
 
 
+@pytest.mark.usefixtures("telegram_remote_access_on")  # TELEGRAM-MASTER-SWITCH-01: owner has remote access ON
 def test_cannon10_telegram_marks_presented_only_after_successful_send(monkeypatch):
     draft = _stage_draft()
     result = {
@@ -449,6 +450,7 @@ def test_cannon10_telegram_marks_presented_only_after_successful_send(monkeypatc
     assert draft_store.is_presented(draft.draft_id) is True
 
 
+@pytest.mark.usefixtures("telegram_remote_access_on")  # TELEGRAM-MASTER-SWITCH-01: owner has remote access ON
 def test_cannon10_failed_telegram_send_never_marks_presented(monkeypatch):
     draft = _stage_draft()
     result = {

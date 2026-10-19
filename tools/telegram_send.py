@@ -1,8 +1,7 @@
 """Telegram outbound tools — send through the Bot API and keep replies live."""
-import threading
-
 import requests
 import config
+from comms import telegram_access
 from comms import telegram_origin_routing as origin_routing
 from core.redaction import redact_telegram_bot_tokens
 from core.secrets import get_secret
@@ -10,7 +9,9 @@ from core.idempotency import make_request_id, check, record
 from core.persistence import load as load_prefs
 
 API_BASE = "https://api.telegram.org/bot{token}"
-_bridge_start_lock = threading.Lock()
+# TELEGRAM-MASTER-SWITCH-01 -- remote access OFF blocks sending too: a lost
+# phone must not receive screenshots or reports.
+ACCESS_OFF_RESULT = "[Telegram remote access is off — nothing was sent.]"
 
 
 def _owner_chat_id():
@@ -25,37 +26,20 @@ def _owner_chat_id():
     return config.TELEGRAM_OWNER_CHAT_ID
 
 
-def _ensure_reply_bridge() -> str | None:
-    """Start the established inbound bridge once when an outbound send needs it.
-
-    Returns a safe warning when the reply path could not be established.  The
-    caller still performs the existing outbound send: bridge startup and Bot
-    API delivery are independent, and a failed listener must not silently
-    discard an otherwise deliverable alert.
-    """
+def _listener_running() -> bool:
+    """Whether an inbound listener is up to receive replies. Read only:
+    an outbound send never starts, restarts or enables listening
+    (TELEGRAM-MASTER-SWITCH-01 removed the old outbound auto-start; automatic
+    listening belongs to TELEGRAM-OWNER-INBOUND-WAKE-01)."""
     try:
-        from comms.telegram_bridge import is_running, start_bridge
-    except Exception as e:
-        return f"could not load ({type(e).__name__})"
+        from comms.telegram_bridge import is_running
+        return bool(is_running())
+    except Exception:
+        return False
 
-    try:
-        if is_running():
-            return None
-        # Tool dispatch is sequential inside one LuminaAgent today, but other
-        # owner agents/background tasks can call this shared module from
-        # different threads.  Serialize only the check/start transition, then
-        # re-check after acquiring the lock so one listener wins the race.
-        with _bridge_start_lock:
-            if is_running():
-                return None
-            started, message = start_bridge()
-            if started or is_running():
-                return None
-            return f"did not start: {message}"
-    except Exception as e:
-        # Exception bodies can contain request/config details.  The type is
-        # enough to represent failure honestly without leaking diagnostics.
-        return f"failed with {type(e).__name__}"
+
+def _reply_path_warning() -> str | None:
+    return None if _listener_running() else "no Telegram listener is running, so replies can't come back yet"
 
 
 def _with_bridge_warning(result: str, warning: str | None) -> str:
@@ -100,6 +84,8 @@ def _record_origin(resp, chat_id) -> None:
 
 
 def send_telegram_file(path: str, caption: str = "") -> str:
+    if not telegram_access.remote_access_enabled():
+        return ACCESS_OFF_RESULT
     request_id = make_request_id("send_telegram_file", path, caption)
     cached = check(request_id)
     if cached:
@@ -109,7 +95,7 @@ def send_telegram_file(path: str, caption: str = "") -> str:
     chat_id = _owner_chat_id()
     if not token or not chat_id:
         return "[Telegram not configured — missing bot token or owner chat id.]"
-    bridge_warning = _ensure_reply_bridge()
+    bridge_warning = _reply_path_warning()
     try:
         with open(path, "rb") as f:
             resp = requests.post(
@@ -131,6 +117,8 @@ def send_telegram_file(path: str, caption: str = "") -> str:
 
 def send_telegram_message(text: str) -> str:
     """Proactive notification — e.g. a completed task alert."""
+    if not telegram_access.remote_access_enabled():
+        return ACCESS_OFF_RESULT
     request_id = make_request_id("send_telegram_message", text)
     cached = check(request_id)
     if cached:
@@ -140,7 +128,7 @@ def send_telegram_message(text: str) -> str:
     chat_id = _owner_chat_id()
     if not token or not chat_id:
         return "[Telegram not configured.]"
-    bridge_warning = _ensure_reply_bridge()
+    bridge_warning = _reply_path_warning()
     try:
         resp = requests.post(
             API_BASE.format(token=token) + "/sendMessage",

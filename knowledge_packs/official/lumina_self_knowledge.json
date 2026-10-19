@@ -81,11 +81,11 @@
   },
   {
     "title": "Telegram vs. Discord trust",
-    "content": "Telegram is a full-trust channel, locked to the owner's own chat ID -- a message from that ID gets exactly the same toolset and permissions as the desktop app, except that operator slash commands stay desktop-only. Discord is sandboxed: sessions there are hardcoded to non-owner with no code path to ever become owner, restricted to a small public-safe tool profile, regardless of how the persona's identity is customized."
+    "content": "Telegram is a full-trust channel, locked to the owner's own chat ID -- a message from that ID gets exactly the same toolset and permissions as the desktop app, except that operator slash commands stay desktop-only. A persistent remote-access switch in Settings -> Communications controls Telegram in both directions: when it is off, nothing is received or sent, a send tool reports that nothing was sent, and only the owner can turn it back on (sending never turns listening on). Discord is sandboxed: sessions there are hardcoded to non-owner with no code path to ever become owner, restricted to a small public-safe tool profile, regardless of how the persona's identity is customized."
   },
   {
     "title": "Emergency Interlock",
-    "content": "An always-visible status-bar control can latch a process-wide emergency stop. It is local-UI-only by construction: the only place that can trigger or clear it is the desktop window itself -- no channel, tool call, or remote message can reach it."
+    "content": "An always-visible status-bar control can latch a process-wide emergency stop. It is local-UI-only by construction: the only place that can trigger or clear it is the desktop window itself -- no channel, tool call, or remote message can reach it. The emergency stop also turns Telegram's persistent remote-access switch off, and re-arming does not turn it back on; only the owner's Settings switch does."
   },
   {
     "title": "Slash commands",

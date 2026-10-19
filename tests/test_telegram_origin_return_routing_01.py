@@ -14,6 +14,10 @@ import types
 
 import pytest
 
+# TELEGRAM-MASTER-SWITCH-01: these tests model the owner having Telegram
+# remote access ON (it defaults to OFF); the switch has its own tests.
+pytestmark = pytest.mark.usefixtures("telegram_remote_access_on")
+
 import comms.telegram_bridge as telegram_bridge
 from core import emergency_stop
 import tools.telegram_send as telegram_send
@@ -102,13 +106,23 @@ def outbound(monkeypatch):
     return records, route_records, bridge
 
 
-def test_01_stopped_bridge_autostarts_and_success_receipt_records_origin(outbound):
+def test_01_outbound_never_starts_a_listener_and_records_origin_only_while_one_runs(outbound):
+    """TELEGRAM-MASTER-SWITCH-01 retired the S74 outbound auto-start (it
+    used to start listening here, which also reopened Telegram after an
+    emergency-stop re-arm). Automatic listening belongs to
+    TELEGRAM-OWNER-INBOUND-WAKE-01; an outbound send only delivers, and
+    records a return route when a listener is already running."""
     records, route_records, bridge = outbound
 
-    assert telegram_send.send_telegram_message("hello") == "[Message sent.]"
+    stopped = telegram_send.send_telegram_message("hello")
+    assert stopped.startswith("[Message sent.]") and "reply bridge unavailable" in stopped.lower()
+    assert bridge["starts"] == 0
+    assert route_records == []
 
-    assert bridge["starts"] == 1
-    assert len(records) == 1
+    bridge["running"] = True
+    assert telegram_send.send_telegram_message("hello again") == "[Message sent.]"
+    assert bridge["starts"] == 0
+    assert len(records) == 2
     assert route_records == [{"destination_chat_id": "42", "telegram_message_id": 7001}]
 
 
@@ -345,6 +359,7 @@ def test_12_route_metadata_contains_no_bot_secret_or_raw_message_content():
 
 def test_13_send_failure_never_records_a_false_origin_route(monkeypatch, outbound):
     _records, route_records, bridge = outbound
+    bridge["running"] = True                    # a listener is up for the first send
     monkeypatch.setattr(
         telegram_send.requests, "post",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network down")),
@@ -359,15 +374,13 @@ def test_13_send_failure_never_records_a_false_origin_route(monkeypatch, outboun
         telegram_send.requests, "post", lambda *args, **kwargs: _Response(7002),
     )
     bridge["running"] = False
-    monkeypatch.setattr(
-        telegram_bridge, "start_bridge", lambda: (False, "listener unavailable"),
-    )
 
     result = telegram_send.send_telegram_message("delivered without listener")
 
     assert result.startswith("[Message sent.]")
     assert "reply bridge unavailable" in result.lower()
     assert route_records == []
+    assert bridge["starts"] == 0                # never starts one (TELEGRAM-MASTER-SWITCH-01)
 
 
 def test_14_emergency_stop_drops_before_route_or_headless_dispatch(monkeypatch):

@@ -225,6 +225,10 @@ def _run_child(tmp_path, mode, scenario="", timeout=30):
     os.chmod(creds, 0o600)
     data_dir = tmp_path / "data"
     data_dir.mkdir()
+    # TELEGRAM-MASTER-SWITCH-01: the owner has remote access ON in this
+    # child's own prefs (it defaults to OFF, which refuses every start).
+    (data_dir / "memory").mkdir()
+    (data_dir / "memory" / "prefs.json").write_text('{"telegram_remote_access": true}')
     env = dict(os.environ)
     # Own data dir and credentials: no emergency-stop latch, prefs or chat
     # state from other tests reaches the child.
@@ -294,7 +298,11 @@ def test_bridge_logging_config_redacts_third_party_records(tmp_path):
 def send_env(monkeypatch):
     monkeypatch.setattr(telegram_send, "get_secret", lambda k: FAKE_TOKEN)
     monkeypatch.setattr(telegram_send, "_owner_chat_id", lambda: 424242)
-    monkeypatch.setattr(telegram_send, "_ensure_reply_bridge", lambda: None)
+    # TELEGRAM-MASTER-SWITCH-01: remote access ON, a listener running (so no
+    # reply-path note is appended); the outbound auto-start helper is gone.
+    from comms import telegram_access
+    monkeypatch.setattr(telegram_access, "remote_access_enabled", lambda: True)
+    monkeypatch.setattr(telegram_send, "_listener_running", lambda: True)
     monkeypatch.setattr(telegram_send, "check", lambda rid: None)
     monkeypatch.setattr(telegram_send, "record", lambda rid, result: None)
 

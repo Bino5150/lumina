@@ -1353,6 +1353,13 @@ class LuminaWindow(QMainWindow):
         from comms.telegram_bridge import request_stop_bridge
         request_stop_bridge()
 
+        # TELEGRAM-MASTER-SWITCH-01 -- Telegram is the other owner channel:
+        # the emergency stop turns its remote-access switch OFF (persisted),
+        # and re-arming never turns it back on -- only the owner's Settings
+        # switch does. Written after the latch, which stays the first change.
+        from comms import telegram_access
+        telegram_persisted_off = telegram_access.turn_off("emergency_stop")
+
         # CODING-04A1: any persistent managed process (engine only in this
         # slice -- no model-facing tool can create one yet) must be reached
         # by the same OH SHIT cascade, after the latch, same as every other
@@ -1360,6 +1367,12 @@ class LuminaWindow(QMainWindow):
         # not block waiting for it, and does not itself touch the latch.
         from core import process_manager
         process_manager.emergency_kill_all()
+
+        if not telegram_persisted_off:
+            self.chat_widget.add_operator_message(
+                "Telegram remote access could not be saved as off; it stays off for this session "
+                "only. Turn it off in Settings → Communications before restarting."
+            )
 
         if already_latched:
             s = self._emergency_snapshot_summary()

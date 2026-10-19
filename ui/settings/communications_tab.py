@@ -93,12 +93,15 @@ class CommunicationsTab(QWidget):
         layout.addWidget(self.tg_save_status_lbl)
         self._tg_save_feedback = ButtonFeedback(self.tg_save_btn)
 
-        # ── Telegram bridge on/off ──
+        # ── Telegram remote access: the persistent master switch ──
+        # TELEGRAM-MASTER-SWITCH-01: ON/OFF survives restarts; OFF wins over
+        # everything (no listening, no sending). The emergency stop turns it
+        # OFF; only this switch turns it back ON.
         tg_bridge_row = QHBoxLayout()
-        self.tg_bridge_status = _lbl("Bridge: checking...", c)
+        self.tg_bridge_status = _lbl("Remote access: checking...", c)
         tg_bridge_row.addWidget(self.tg_bridge_status)
         tg_bridge_row.addStretch()
-        self.tg_bridge_toggle = _btn("Start", c, accent=True)
+        self.tg_bridge_toggle = _btn("Turn on", c, accent=True)
         self.tg_bridge_toggle.clicked.connect(self._toggle_telegram_bridge)
         tg_bridge_row.addWidget(self.tg_bridge_toggle)
         layout.addLayout(tg_bridge_row)
@@ -234,29 +237,38 @@ class CommunicationsTab(QWidget):
         self.tg_save_status_lbl.setText("")
 
     def _refresh_telegram_bridge_status(self):
+        from comms import telegram_access
         try:
             from comms.telegram_bridge import is_running
             running = is_running()
         except Exception:
             running = False
-        if running:
-            self.tg_bridge_status.setText("Bridge: ● Running")
-            self.tg_bridge_toggle.setText("Stop")
+        if telegram_access.remote_access_enabled():
+            listener = ("Listener: ● running" if running else
+                        "Listener: not running — automatic listening arrives with the next update")
+            self.tg_bridge_status.setText(f"Remote access: ON · {listener}")
+            self.tg_bridge_toggle.setText("Turn off")
         else:
-            self.tg_bridge_status.setText("Bridge: ○ Stopped")
-            self.tg_bridge_toggle.setText("Start")
+            why = (" (turned off by the emergency stop)"
+                   if telegram_access.off_reason() == "emergency_stop" else "")
+            self.tg_bridge_status.setText(f"Remote access: OFF{why}")
+            self.tg_bridge_toggle.setText("Turn on")
 
     def _toggle_telegram_bridge(self):
-        try:
-            from comms.telegram_bridge import start_bridge, stop_bridge, is_running
-        except Exception as e:
-            self.tg_bridge_status.setText(f"Bridge: import error — {e}")
+        """The owner's explicit local switch -- the only way to turn Telegram
+        remote access back ON. Turning it ON starts nothing by itself."""
+        from comms import telegram_access
+        if telegram_access.remote_access_enabled():
+            telegram_access.turn_off("owner")
+            try:
+                from comms.telegram_bridge import is_running, stop_bridge
+                if is_running():
+                    stop_bridge()
+            except Exception as e:
+                print(f"[TELEGRAM] stop after switch-off failed: {type(e).__name__}", flush=True)
+        elif not telegram_access.turn_on_by_owner():
+            self.tg_bridge_status.setText("Remote access: OFF — the setting could not be saved.")
             return
-        if is_running():
-            success, msg = stop_bridge()
-        else:
-            success, msg = start_bridge()
-        self.tg_bridge_status.setText(f"Bridge: {msg}")
         self._refresh_telegram_bridge_status()
 
     # ── Discord: token ──

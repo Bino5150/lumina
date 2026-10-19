@@ -6,7 +6,12 @@ username gets owner=True treatment — full toolset, no gate, nothing.
 Do not remove it. Do not make it conditional. Do not "simplify" it later.
 
 Run standalone: python -m comms.telegram_bridge
-Run embedded (GUI toggle): see start_bridge() / stop_bridge() below.
+Run embedded: see start_bridge() / stop_bridge() below.
+
+Every start, every inbound update and the polling loop itself obey the
+persistent Telegram remote-access switch (comms/telegram_access.py,
+TELEGRAM-MASTER-SWITCH-01): while it is OFF nothing starts and a running
+listener shuts itself down.
 """
 import asyncio
 import logging
@@ -15,6 +20,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 import config
+from comms import telegram_access
 from comms import telegram_origin_routing as origin_routing
 from comms import telegram_log_safety
 from comms import telegram_recovery
@@ -60,6 +66,20 @@ def _same_numeric_chat_id(actual, configured) -> bool:
         return False
 
 
+def _sent_while_access_was_off(message) -> bool:
+    """True when the message predates the owner's last OFF→ON flip. A
+    message without a date (real updates always carry one) is not judged
+    stale."""
+    since = telegram_access.on_since()
+    date = getattr(message, "date", None)
+    if since is None or date is None:
+        return False
+    try:
+        return date.timestamp() < int(since)
+    except Exception:
+        return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     owner_id = _owner_chat_id()
@@ -77,6 +97,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from core import emergency_stop
     if emergency_stop.is_latched():
         log.info("[TELEGRAM] Dropped inbound message — emergency stop is active.")
+        return
+
+    # TELEGRAM-MASTER-SWITCH-01 -- remote access OFF closes ingress even in
+    # the moment before the listener notices and shuts down. Silent, like
+    # the E-stop drop above.
+    if not telegram_access.remote_access_enabled():
+        log.info("[TELEGRAM] Dropped inbound message — Telegram remote access is off.")
+        return
+
+    # Telegram holds undelivered updates (~24 h) and hands them over when a
+    # listener next polls. A message sent while remote access was OFF must
+    # never run after the owner turns it back on ("the previous tenant's
+    # mail"). Telegram dates are whole seconds.
+    if _sent_while_access_was_off(update.message):
+        log.info("[TELEGRAM] Refused a message sent while remote access was off.")
+        await update.message.reply_text(telegram_access.STALE_BACKLOG_REPLY)
         return
 
     text = update.message.text
@@ -194,6 +230,12 @@ async def _run_until_stopped(stop_event: threading.Event, token: str):
 
     try:
         while not stop_event.is_set():
+            # TELEGRAM-MASTER-SWITCH-01 -- OFF wins, including a flip made by
+            # another process or runtime on the shared data dir.
+            if not telegram_access.remote_access_enabled():
+                log.info("[TELEGRAM] Remote access turned off — stopping the bridge.")
+                origin_routing.clear_routes()
+                break
             await asyncio.sleep(0.5)
     finally:
         await application.updater.stop()
@@ -220,12 +262,18 @@ def _run_bridge(stop_event: threading.Event, token: str) -> bool:
 
 
 def start_bridge() -> tuple[bool, str]:
-    """Called from the GUI toggle. Returns (success, message)."""
+    """The single start primitive for the embedded listener. Returns
+    (success, message). Refused while the emergency stop is latched or
+    Telegram remote access is OFF (TELEGRAM-MASTER-SWITCH-01); nothing in
+    the desktop calls it on its own until automatic listening
+    (TELEGRAM-OWNER-INBOUND-WAKE-01) exists."""
     global _thread, _stop_event
 
     from core import emergency_stop
     if emergency_stop.is_latched():
         return False, "Emergency stop is active — the bridge cannot start until it's re-armed."
+    if not telegram_access.remote_access_enabled():
+        return False, telegram_access.ACCESS_OFF_MESSAGE
 
     if _thread is not None and _thread.is_alive():
         return False, "Bridge already running."
@@ -298,7 +346,11 @@ def is_running() -> bool:
 def main():
     """Standalone terminal entry point — unchanged behavior for anyone who
     still wants to run this as a separate script instead of toggling it
-    from the GUI."""
+    from the GUI. Refused while Telegram remote access is OFF; stops on its
+    own if the switch goes OFF while it runs."""
+    if not telegram_access.remote_access_enabled():
+        log.error(f"[TELEGRAM] {telegram_access.ACCESS_OFF_MESSAGE}")
+        return
     token = get_secret("telegram_bot_token")
     if not token:
         log.error("telegram_bot_token not set — see core/secrets.py, set_secret().")

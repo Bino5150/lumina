@@ -207,6 +207,14 @@ def dispatch(route: OriginRoute, text: str, *,
     return request.future
 
 
+def clear_routes() -> None:
+    """Forget every return route (TELEGRAM-MASTER-SWITCH-01: remote access
+    turned OFF). Registered runtimes stay; only recorded routes go, so no
+    old route can capture a reply after access comes back on."""
+    with _lock:
+        _routes.clear()
+
+
 def _reset_for_tests() -> None:
     with _lock:
         _routes.clear()

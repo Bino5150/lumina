@@ -3,6 +3,10 @@ falling back to config.py, matching comms/telegram_bridge.py's convention.
 This was the dead-feature bug: anyone who set their chat ID via the
 Communications tab (not by hand-editing config.py) got silently ignored."""
 import pytest
+
+# TELEGRAM-MASTER-SWITCH-01: these tests model the owner having Telegram
+# remote access ON (it defaults to OFF); the switch has its own tests.
+pytestmark = pytest.mark.usefixtures("telegram_remote_access_on")
 import tools.telegram_send as telegram_send
 
 

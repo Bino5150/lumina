@@ -31,6 +31,10 @@ import types
 
 import pytest
 
+# TELEGRAM-MASTER-SWITCH-01: these tests model the owner having Telegram
+# remote access ON (it defaults to OFF); the switch has its own tests.
+pytestmark = pytest.mark.usefixtures("telegram_remote_access_on")
+
 if os.environ.get("LUMINA_REQUIRE_QT") == "1":
     import PySide6  # noqa: F401
 else:

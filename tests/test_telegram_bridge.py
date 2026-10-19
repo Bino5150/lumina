@@ -17,6 +17,10 @@ import types
 
 import pytest
 
+# TELEGRAM-MASTER-SWITCH-01: these tests model the owner having Telegram
+# remote access ON (it defaults to OFF); the switch has its own tests.
+pytestmark = pytest.mark.usefixtures("telegram_remote_access_on")
+
 import comms.telegram_bridge as bridge
 from core import emergency_stop
 

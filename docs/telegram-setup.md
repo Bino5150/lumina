@@ -56,23 +56,40 @@ Hit Save. That's it — the token is stored securely in
 `~/.config/lumina/credentials.json` (not in your regular settings file), and your chat
 ID is saved to your preferences.
 
-## Step 5 — Start the bridge
+## Step 5 — Turn on remote access
 
-Right below the token/chat ID fields is a **Bridge** toggle. Click **Start** — it flips
-to "● Running" and Lumina starts listening for your messages immediately, right from
-the Settings tab. No terminal required.
+Right below the token/chat ID fields is the **Telegram remote access** switch. Click
+**Turn on**. The setting is saved, so it stays on (or off) across restarts until you
+change it.
 
-The bridge stays off by default every time Lumina launches — you turn it on when you
-want it, same as before.
+> **For now, turning it on doesn't start listening by itself.** Automatic listening
+> (Lumina listens whenever she's running and remote access is on) arrives with the next
+> update. Until then Lumina can't receive your Telegram messages; this gap is temporary.
+> With remote access on, she can still send you messages and files.
+
+The switch is the master control for Telegram, in both directions:
+
+- **On:** Lumina may send to your Telegram, and may listen once listening is running.
+- **Off:** nothing is received and nothing is sent. Off wins over everything:
+  - a restart;
+  - Lumina sending you an alert (sending never turns listening on);
+  - a standalone bridge (`python -m comms.telegram_bridge` won't start while it's off,
+    and shuts itself down if you turn it off while it runs);
+  - another computer sharing the same Lumina data, such as Kali.
 
 ## Step 6 — Test it
 
-Open Telegram, find the bot you created in Step 1, and send it a message — something
-simple like "hey, you there?"
+Once listening is running, open Telegram, find the bot you created in Step 1, and send
+it a message, something simple like "hey, you there?"
 
-You should get a real response back within a few seconds. If you don't hear back at all,
-double check Step 4 and that the toggle actually shows "Running" — a missing token,
-unset chat ID, or a bridge that's still off is the most common cause.
+You should get a real response back within a few seconds. If you don't hear back, check
+these first:
+
+- Step 4;
+- that the switch shows **Remote access: ON**;
+- the listener line under it.
+
+A missing token or an unset chat ID is the most common cause.
 
 ### Slash commands over Telegram
 
@@ -89,12 +106,24 @@ Lumina's [operator commands](operator-commands.md) (`/status`, `/btw`, `/compact
 
 ---
 
-## Stopping the bridge
+## Turning remote access off
 
-Click **Stop** in the Communications tab. If you started it from a terminal instead,
-press `Ctrl+C` there. There's no harm in leaving it running continuously if you want
-always-on access, but it's not required to be on for the rest of Lumina to work
-normally.
+Click **Turn off** in the Communications tab. Lumina stops listening, sends nothing to
+Telegram, and keeps it that way across restarts until you turn it back on. Everything
+else in Lumina keeps working normally.
+
+Use it whenever you need to close the channel without stopping Lumina, for example if
+you lose your phone. Turning it off cuts Telegram's access to Lumina. It doesn't sign the
+lost phone out of your Telegram account; do that in Telegram's own device settings.
+
+**The emergency stop turns remote access off too.** Re-arming Lumina doesn't turn it
+back on. You turn it on yourself in the Communications tab, when you're ready. The
+switch then shows "turned off by the emergency stop".
+
+**Messages you sent while it was off never run.** Telegram holds undelivered messages
+for about a day and hands them over when Lumina next listens. Anything sent while remote
+access was off gets a short reply saying so, and is not acted on; send it again if you
+still want it.
 
 ## Your bot token and the terminal
 
@@ -116,8 +145,7 @@ out of the terminal and logs:
 
 If your token was ever exposed (pasted into a chat, shared in a screenshot or terminal
 log, or printed by a Lumina version before this protection), revoke it: send
-`/revoke` to @BotFather, pick your bot, then enter the new token in Step 4 and restart
-the bridge.
+`/revoke` to @BotFather, pick your bot, then enter the new token in Step 4.
 
 ## Known limitations (beta)
 
@@ -136,11 +164,11 @@ python3 -c "import json, os; d = json.load(open(os.path.expanduser('~/.config/lu
 **"InvalidToken: The token `[REDACTED]` was rejected by the server"** — the saved token
 is wrong or was revoked. Copy a current one from @BotFather and save it again in Step 4.
 
-**"Owner chat ID not set — configure it above first"** (shown when clicking Start) —
+**"Owner chat ID not set — configure it above first"** —
 your chat ID isn't saved yet. Go back to Step 4.
 
 **Bot doesn't respond, no error shown** — most likely your chat ID doesn't match what
 you entered in Step 2 or 4. Double-check it digit for digit.
 
-**Bridge toggle shows an import error** — `python-telegram-bot` isn't installed in the
-environment Lumina's running in.
+**The listener never runs** (once listening is available) — `python-telegram-bot` may not
+be installed in the environment Lumina's running in.

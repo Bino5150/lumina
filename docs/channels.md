@@ -15,6 +15,11 @@ no acknowledgment. The emergency-stop interlock still applies — several
 checkpoints in the Telegram dispatch path check (never set) whether it's
 latched, closing Telegram ingress during/after an emergency stop.
 
+Telegram has its own persistent **remote access** switch in Settings →
+Communications. Off means nothing is received and nothing is sent, and it
+stays off across restarts until you turn it back on there. The emergency
+stop turns it off, and re-arming doesn't turn it back on.
+
 Set up through Settings → Communications (bot token, chat ID) — see
 [Telegram Setup](telegram-setup.md) for the full step-by-step walkthrough.
 

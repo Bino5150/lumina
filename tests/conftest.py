@@ -192,3 +192,14 @@ def _drain_qt_events_after_each_test(_retained_qapplication):
     yield
     if _retained_qapplication is not None:
         _retained_qapplication.processEvents()
+
+
+@pytest.fixture
+def telegram_remote_access_on(monkeypatch):
+    """TELEGRAM-MASTER-SWITCH-01: Telegram remote access defaults to OFF.
+    Opt-in only (never autouse): for tests that exercise Telegram traffic
+    and model the owner having turned remote access ON in Settings. The
+    switch itself is tested in test_telegram_master_switch_01*.py."""
+    from comms import telegram_access
+    monkeypatch.setattr(telegram_access, "remote_access_enabled", lambda: True)
+    monkeypatch.setattr(telegram_access, "on_since", lambda: None)

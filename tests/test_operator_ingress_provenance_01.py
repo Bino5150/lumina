@@ -26,6 +26,10 @@ import datetime
 import types
 
 import pytest
+
+# TELEGRAM-MASTER-SWITCH-01: these tests model the owner having Telegram
+# remote access ON (it defaults to OFF); the switch has its own tests.
+pytestmark = pytest.mark.usefixtures("telegram_remote_access_on")
 from telegram import Chat, Message, MessageEntity, MessageOriginUser, Update, User
 from telegram.ext import CommandHandler, MessageHandler
 
