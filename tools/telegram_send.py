@@ -4,6 +4,7 @@ import threading
 import requests
 import config
 from comms import telegram_origin_routing as origin_routing
+from core.redaction import redact_telegram_bot_tokens
 from core.secrets import get_secret
 from core.idempotency import make_request_id, check, record
 from core.persistence import load as load_prefs
@@ -63,6 +64,14 @@ def _with_bridge_warning(result: str, warning: str | None) -> str:
     return f"{result} [Telegram reply bridge unavailable — {warning}]"
 
 
+def _send_error(exc) -> str:
+    """requests puts the request URL in HTTPError/ConnectionError messages,
+    and the Bot API URL carries the bot token. This text becomes a tool
+    result (model context, chat history, Flight Recorder), so the token is
+    redacted; the rest of the error stays (TELEGRAM-BOT-TOKEN-LOG-01)."""
+    return f"[Telegram send error: {redact_telegram_bot_tokens(str(exc))}]"
+
+
 def _message_id(resp):
     """Extract the Bot API delivery identity without making send success
     depend on an optional or malformed response body."""
@@ -117,7 +126,7 @@ def send_telegram_file(path: str, caption: str = "") -> str:
     except FileNotFoundError:
         return _with_bridge_warning(f"[File not found: {path}]", bridge_warning)
     except Exception as e:
-        return _with_bridge_warning(f"[Telegram send error: {e}]", bridge_warning)
+        return _with_bridge_warning(_send_error(e), bridge_warning)
 
 
 def send_telegram_message(text: str) -> str:
@@ -144,7 +153,7 @@ def send_telegram_message(text: str) -> str:
         record(request_id, result)
         return _with_bridge_warning(result, bridge_warning)
     except Exception as e:
-        return _with_bridge_warning(f"[Telegram send error: {e}]", bridge_warning)
+        return _with_bridge_warning(_send_error(e), bridge_warning)
 
 
 def register_telegram_tools(registry):

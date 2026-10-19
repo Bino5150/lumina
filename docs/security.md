@@ -151,6 +151,13 @@ by default, overridable via `LUMINA_SECRETS_PATH`) — separate from
 ordinary preferences, deliberately excluded from version control, and
 never included in a Memory Backup archive.
 
+**The Telegram bot token** is part of the URL of every Telegram Bot API request, so
+Lumina keeps those URLs out of terminal output and logs. Telegram request lines aren't
+logged. Telegram errors, such as a rejected token or a network failure, are still logged
+with the token replaced by `[REDACTED]`, and failed Telegram sends are redacted the same
+way before they reach the conversation, chat history or the Flight Recorder. See
+[Telegram Setup](telegram-setup.md#your-bot-token-and-the-terminal).
+
 **ChatGPT sign-in sessions** (General → Backend: ChatGPT Plan → account controls) are kept
 apart again, in `~/.config/lumina/chatgpt/` (override:
 `LUMINA_CHATGPT_AUTH_DIR`): a directory readable only by you (`0700`)

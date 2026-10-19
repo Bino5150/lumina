@@ -96,6 +96,29 @@ press `Ctrl+C` there. There's no harm in leaving it running continuously if you 
 always-on access, but it's not required to be on for the rest of Lumina to work
 normally.
 
+## Your bot token and the terminal
+
+Telegram's Bot API puts your bot token in the address of every request the bridge
+makes, including the poll for new messages that runs every few seconds. Lumina keeps it
+out of the terminal and logs:
+
+- Individual Telegram requests aren't logged. Request lines for other services (model
+  providers, for example) are unchanged.
+- Problems still show up, with the token replaced by `[REDACTED]`. A token Telegram
+  rejects logs `[TELEGRAM] Bridge stopped on an error:` followed by
+  ``InvalidToken: The token `[REDACTED]` was rejected by the server.`` Network
+  failures log `Exception happened while polling for updates.`
+- A standalone bridge (`python -m comms.telegram_bridge`) that stops on an error exits
+  with status 1.
+- A failed `send_telegram_message` or `send_telegram_file` reports the error with the
+  token redacted, so it doesn't reach the conversation, chat history or the Flight
+  Recorder.
+
+If your token was ever exposed (pasted into a chat, shared in a screenshot or terminal
+log, or printed by a Lumina version before this protection), revoke it: send
+`/revoke` to @BotFather, pick your bot, then enter the new token in Step 4 and restart
+the bridge.
+
 ## Known limitations (beta)
 
 - Telegram doesn't yet respect whichever persona is active on your desktop, or let you
@@ -104,10 +127,14 @@ normally.
 
 ## Troubleshooting
 
-**"telegram_bot_token not set"** — Step 4 didn't save correctly. Confirm with:
+**"telegram_bot_token not set"** — Step 4 didn't save correctly. To check whether a
+token is saved without printing it:
 ```bash
-cat ~/.config/lumina/credentials.json
+python3 -c "import json, os; d = json.load(open(os.path.expanduser('~/.config/lumina/credentials.json'))); print('token saved' if d.get('telegram_bot_token') else 'no token saved')"
 ```
+
+**"InvalidToken: The token `[REDACTED]` was rejected by the server"** — the saved token
+is wrong or was revoked. Copy a current one from @BotFather and save it again in Step 4.
 
 **"Owner chat ID not set — configure it above first"** (shown when clicking Start) —
 your chat ID isn't saved yet. Go back to Step 4.

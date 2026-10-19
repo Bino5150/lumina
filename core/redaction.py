@@ -30,6 +30,24 @@ SECRET_KEY_MARKERS = (
     "private_key",
 )
 
+# TELEGRAM-BOT-TOKEN-LOG-01: a Telegram Bot API token is "<bot id>:<35-char
+# secret>", and the Bot API carries it in the request URL path
+# (https://api.telegram.org/bot<TOKEN>/<method>) rather than a header, so any
+# URL-bearing diagnostic for a Bot API call (an httpx request log line, a
+# requests HTTPError/ConnectionError message) carries the credential.
+# The colon may arrive percent-encoded in a URL.
+TELEGRAM_BOT_TOKEN_PATTERN = r"(?<![0-9])[0-9]{5,}(?::|%3[Aa])[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"
+TELEGRAM_BOT_TOKEN_RE = re.compile(TELEGRAM_BOT_TOKEN_PATTERN)
+
+# Shape-independent backstop for the Bot API's URL path: whatever follows
+# "bot" up to the next "/" is the token, even one that doesn't match the
+# standard shape above. Anchored to the two URL forms that actually appear in
+# diagnostics -- the full api.telegram.org URL (httpx, requests HTTPError) and
+# urllib3's host-less "url: /bot..." (requests ConnectionError).
+TELEGRAM_BOT_URL_PATH_RE = re.compile(
+    r"((?:api\.telegram\.org|url: ?)/(?:file/)?bot)[^/\s?#'\"`]+"
+)
+
 # Regex layer for known secret VALUE shapes that could appear under an
 # innocuous key name (e.g. a tool arg literally named "query" containing a
 # pasted API key). Deliberately narrow, known-prefix patterns -- same
@@ -41,6 +59,7 @@ SECRET_VALUE_RE = re.compile(
     r"|AKIA[0-9A-Z]{16}"
     r"|ghp_[A-Za-z0-9]{20,}"
     r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|" + TELEGRAM_BOT_TOKEN_PATTERN
 )
 
 
@@ -48,6 +67,14 @@ def redact_secret_shapes(text: str) -> str:
     """Replace every known secret-value shape in `text` with "[REDACTED]".
     Best-effort only -- see module docstring."""
     return SECRET_VALUE_RE.sub("[REDACTED]", text)
+
+
+def redact_telegram_bot_tokens(text: str) -> str:
+    """Replace Telegram bot tokens in `text` with "[REDACTED]": the standard
+    token shape anywhere, plus whatever sits in the bot-token slot of a Bot
+    API URL path. Error text around them is kept."""
+    text = TELEGRAM_BOT_URL_PATH_RE.sub(r"\1[REDACTED]", text)
+    return TELEGRAM_BOT_TOKEN_RE.sub("[REDACTED]", text)
 
 
 def is_secret_key(key: str) -> bool:

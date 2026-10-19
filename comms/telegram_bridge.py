@@ -16,6 +16,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 import config
 from comms import telegram_origin_routing as origin_routing
+from comms import telegram_log_safety
 from comms import telegram_recovery
 from core.headless import (
     headless_result_delivery_text,
@@ -27,6 +28,9 @@ from core.secrets import get_secret
 from core.persistence import load as load_prefs
 
 logging.basicConfig(level=logging.INFO)
+# TELEGRAM-BOT-TOKEN-LOG-01: the token rides in every Bot API URL; keep it
+# out of httpx's request lines and anything else that reaches the handler.
+telegram_log_safety.install()
 log = logging.getLogger("telegram_bridge")
 
 CHANNEL_ID = "telegram-owner"
@@ -198,6 +202,23 @@ async def _run_until_stopped(stop_event: threading.Event, token: str):
         log.info("[TELEGRAM] Bridge stopped (embedded).")
 
 
+def _run_bridge(stop_event: threading.Event, token: str) -> bool:
+    """Run the polling loop to completion. A failure (rejected token,
+    unrecoverable network error) is reported as an ERROR log record with the
+    full traceback, token redacted -- an uncaught exception would print
+    python-telegram-bot's InvalidToken message, which embeds the token, to
+    stderr. Returns False on failure."""
+    try:
+        asyncio.run(_run_until_stopped(stop_event, token))
+        return True
+    except Exception as exc:
+        log.error(
+            "[TELEGRAM] Bridge stopped on an error:\n%s",
+            telegram_log_safety.redacted_exception_text(exc).rstrip(),
+        )
+        return False
+
+
 def start_bridge() -> tuple[bool, str]:
     """Called from the GUI toggle. Returns (success, message)."""
     global _thread, _stop_event
@@ -218,7 +239,7 @@ def start_bridge() -> tuple[bool, str]:
     _stop_event = threading.Event()
 
     def _runner():
-        asyncio.run(_run_until_stopped(_stop_event, token))
+        _run_bridge(_stop_event, token)
 
     _thread = threading.Thread(target=_runner, daemon=True)
     _thread.start()
@@ -286,7 +307,8 @@ def main():
         log.error("Owner chat ID not set — refusing to start unsafe.")
         return
     stop_event = threading.Event()
-    asyncio.run(_run_until_stopped(stop_event, token))
+    if not _run_bridge(stop_event, token):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
