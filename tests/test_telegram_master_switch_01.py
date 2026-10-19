@@ -405,13 +405,46 @@ def test_a_message_sent_after_access_came_back_on_proceeds(monkeypatch):
 
 # ── No model-facing path can turn it on ──────────────────────────────────
 
+def _turn_on_callers(root: pathlib.Path) -> list:
+    """Non-test, git-tracked (shipped) source files under `root` that mention
+    turn_on_by_owner. Untracked local files -- dev keeps reports and evidence
+    scripts inside its checkout -- are not code and never count. Fails
+    loudly rather than passing vacuously if git cannot list the files."""
+    import subprocess
+    listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "*.py"],
+                            check=True, capture_output=True).stdout.decode()
+    tracked = [rel for rel in listed.split("\0") if rel]
+    assert tracked, "git listed no tracked .py files"
+    callers = []
+    for rel in tracked:
+        if rel.startswith("tests/"):
+            continue
+        path = root / rel
+        if path.is_file() and "turn_on_by_owner" in path.read_text(errors="ignore"):
+            callers.append(rel)
+    return sorted(callers)
+
+
 def test_only_the_desktop_settings_switch_can_turn_remote_access_on():
     root = pathlib.Path(__file__).resolve().parent.parent
-    callers = []
-    for path in root.rglob("*.py"):
-        rel = path.relative_to(root).as_posix()
-        if rel.startswith(("tests/", ".claude/", ".git/")) or "/__pycache__/" in rel:
-            continue
-        if "turn_on_by_owner" in path.read_text(errors="ignore"):
-            callers.append(rel)
-    assert sorted(callers) == ["comms/telegram_access.py", "ui/settings/communications_tab.py"]
+    assert _turn_on_callers(root) == ["comms/telegram_access.py", "ui/settings/communications_tab.py"]
+
+
+def test_the_caller_scan_reads_shipped_code_only_not_untracked_local_files(tmp_path):
+    """Dev's ~/lumina keeps untracked reports and evidence scripts inside the
+    checkout (excluded via .git/info/exclude). Found on the dev mirror on
+    2026-10-19: an evidence script mentioning turn_on_by_owner was counted
+    as a caller. Only git-tracked files are shipped code."""
+    import subprocess
+    run = lambda *args: subprocess.run(["git", "-C", str(tmp_path), *args], check=True,
+                                       capture_output=True)
+    run("init", "-q")
+    (tmp_path / "ui").mkdir()
+    (tmp_path / "ui" / "switch.py").write_text("telegram_access.turn_on_by_owner()\n")
+    (tmp_path / "reports" / "EVIDENCE").mkdir(parents=True)
+    (tmp_path / "reports" / "EVIDENCE" / "mutation_sweep.py").write_text("x = 'turn_on_by_owner'\n")
+    (tmp_path / ".git" / "info" / "exclude").write_text("/reports/\n")
+    (tmp_path / "scratch.py").write_text("turn_on_by_owner  # untracked, not ignored\n")
+    run("add", "ui/switch.py")
+
+    assert _turn_on_callers(tmp_path) == ["ui/switch.py"]
