@@ -60,16 +60,16 @@ ID is saved to your preferences.
 
 Right below the token/chat ID fields is the **Telegram remote access** switch. Click
 **Turn on**. The setting is saved, so it stays on (or off) across restarts until you
-change it.
+change it. It starts **off** on a new install.
 
-> **For now, turning it on doesn't start listening by itself.** Automatic listening
-> (Lumina listens whenever she's running and remote access is on) arrives with the next
-> update. Until then Lumina can't receive your Telegram messages; this gap is temporary.
-> With remote access on, she can still send you messages and files.
+**While it's on, Lumina listens whenever the desktop app is running.** Turning it on starts
+listening right away, and every time Lumina opens with it on, she starts listening by
+herself; there's no separate Start button. When the desktop app isn't running, nothing
+listens: your messages wait at Telegram (see "Late messages" below).
 
 The switch is the master control for Telegram, in both directions:
 
-- **On:** Lumina may send to your Telegram, and may listen once listening is running.
+- **On:** Lumina listens for your messages and may send to your Telegram.
 - **Off:** nothing is received and nothing is sent. Off wins over everything:
   - a restart;
   - Lumina sending you an alert (sending never turns listening on);
@@ -79,17 +79,40 @@ The switch is the master control for Telegram, in both directions:
 
 ## Step 6 — Test it
 
-Once listening is running, open Telegram, find the bot you created in Step 1, and send
-it a message, something simple like "hey, you there?"
+With remote access on, open Telegram, find the bot you created in Step 1, and send it a
+message, something simple like "hey, you there?"
 
 You should get a real response back within a few seconds. If you don't hear back, check
-these first:
+the status line under the switch first. It reads **Remote access: ON · ● Listening** when
+everything is working; anything else is explained under Troubleshooting below.
 
-- Step 4;
-- that the switch shows **Remote access: ON**;
-- the listener line under it.
+### Who answers: replies and new messages
 
-A missing token or an unset chat ID is the most common cause.
+- **A reply (swipe-reply) to a message Lumina sent from your desktop conversation** goes
+  back into that same desktop conversation. If it's busy, your reply waits its turn.
+- **A reply to one of the Telegram assistant's own answers** continues with it.
+- **A new message (not a reply)** goes to Lumina's Telegram assistant, which has your full
+  owner access but not the desktop conversation's history. If exactly one desktop
+  conversation has messaged you recently, a new message goes there instead.
+- **A reply Lumina can't place is refused, never guessed.** If you reply to a message
+  this session doesn't know (sent before Lumina restarted, or by a background job), to one
+  more than a day old, or to a conversation that's no longer available, you get a short
+  reply saying it was not run. Send it again as a new message (not a reply).
+
+### Late messages
+
+Lumina never acts on stale instructions:
+
+- **Sent while remote access was off:** never run (see "Turning remote access off").
+- **Sent while the desktop app was closed:** Telegram holds it for about a day. When Lumina
+  next opens, a message that's more than 3 minutes old by then is **not run**. You get a
+  short reply naming when it was sent, so you know which one to send again.
+- **A timestamp ahead of the computer's clock** by more than 2 minutes is refused too,
+  because a wrong clock could make an old message look new. Check the computer's clock.
+- At most five of these replies are sent each time Lumina starts listening, then one
+  summary line; older ones beyond that are skipped quietly.
+- **Edited messages never run anything.** Send a new message instead.
+- Each message runs at most once, even if Telegram delivers it twice.
 
 ### Slash commands over Telegram
 
@@ -101,8 +124,9 @@ Lumina's [operator commands](operator-commands.md) (`/status`, `/btw`, `/compact
   model.
 - **Telegram's own bot commands**, such as `/start`, are still ignored.
 - **`/resume`** is reserved for a future runaway-suspension recovery feature. From your
-  own private chat it currently replies that it isn't active and changes nothing. From
-  anywhere else, or as a forwarded or edited message, it's ignored.
+  own private chat it currently replies that it isn't active and changes nothing. A late
+  `/resume` is refused like any late message. From anywhere else, or as a forwarded or
+  edited message, it's ignored.
 
 ---
 
@@ -124,6 +148,14 @@ switch then shows "turned off by the emergency stop".
 for about a day and hands them over when Lumina next listens. Anything sent while remote
 access was off gets a short reply saying so, and is not acted on; send it again if you
 still want it.
+
+**Closing Lumina stops listening.** A message that arrives while Lumina is closing gets a
+short reply saying it was not run.
+
+**One listener per bot.** Only one Lumina on a computer listens to a bot at a time (for
+example, if two Lumina installs share the same bot token). The second one shows "Another
+Lumina is using this bot" and stays quiet. If two computers listen to the same bot at
+once, the later one notices within about two minutes and stops.
 
 ## Your bot token and the terminal
 
@@ -155,6 +187,18 @@ log, or printed by a Lumina version before this protection), revoke it: send
 
 ## Troubleshooting
 
+The status line under the switch says what's going on:
+
+| Status | Meaning |
+|---|---|
+| **● Listening** | Working. |
+| **Starting (no network, retrying)** | Lumina opened before the network was up. She keeps retrying (every 30 seconds at most) and starts listening once Telegram is reachable. |
+| **Not configured — set the bot token and chat ID above** | Step 4 isn't complete, or the chat ID isn't a number. Save both; listening starts once they're saved. |
+| **Bot token looks malformed — paste it again from BotFather** | The saved token isn't shaped like a bot token (a number, a colon, then a long code). |
+| **Bot token rejected — check it with BotFather** | Telegram refused the token (wrong, or revoked). Save a current one, then turn remote access off and on. |
+| **Another Lumina is using this bot** | Another Lumina is already listening to this bot. Close it, then turn remote access off and on here. |
+| **Stopped after an error — turn it off and on to retry** | Something unexpected stopped the listener; the terminal has the details (token redacted). |
+
 **"telegram_bot_token not set"** — Step 4 didn't save correctly. To check whether a
 token is saved without printing it:
 ```bash
@@ -170,5 +214,5 @@ your chat ID isn't saved yet. Go back to Step 4.
 **Bot doesn't respond, no error shown** — most likely your chat ID doesn't match what
 you entered in Step 2 or 4. Double-check it digit for digit.
 
-**The listener never runs** (once listening is available) — `python-telegram-bot` may not
-be installed in the environment Lumina's running in.
+**The listener never runs** — `python-telegram-bot` may not be installed in the
+environment Lumina's running in.

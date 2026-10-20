@@ -9,7 +9,9 @@ and is tested before anything relies on it.
 **There is no resume capability here.** A fully verified owner event gets a
 fixed "not active" reply and changes nothing. Freshness against an incident
 and claim-once event consumption need the suspension store and arrive with
-it (Slice C1/C3).
+it (Slice C1/C3). Transport freshness (sent while remote access was OFF, or
+too late, or dated in the future) is already refused here, by the same
+function the text handler uses (TELEGRAM-OWNER-INBOUND-WAKE-01).
 
 A recovery event is accepted only when every check passes; any failure is a
 silent drop with a logged reason code (never the message text):
@@ -132,5 +134,19 @@ async def handle_recovery_command(update, context):
                                bot_username=getattr(getattr(context, "bot", None), "username", None))
     except RecoveryRejected as rejected:
         log.warning(f"[TELEGRAM] Rejected recovery command ({rejected.reason}).")
+        return
+    # TELEGRAM-OWNER-INBOUND-WAKE-01 -- the same closing, previous-tenant and
+    # transport-staleness gates as text, from the same function. /resume is
+    # deliberately NOT given WAKE's inbound duplicate claim: Gatling C1 must
+    # consume telegram:{chat}:{message_id} exactly once in its own store,
+    # atomically with the resume decision (R3 addendum, C-3).
+    from comms import telegram_bridge
+    if telegram_bridge.is_closing():
+        log.info("[TELEGRAM] Dropped recovery command — Lumina is closing.")
+        return
+    refusal = telegram_bridge.freshness_refusal(update.message)
+    if refusal is not None:
+        log.info("[TELEGRAM] Refused a late or misdated recovery command.")
+        await telegram_bridge.send_refusal(update.message, refusal)
         return
     await update.message.reply_text(RECOVERY_NOT_ACTIVE_REPLY)

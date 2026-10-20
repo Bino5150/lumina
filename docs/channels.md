@@ -16,9 +16,17 @@ checkpoints in the Telegram dispatch path check (never set) whether it's
 latched, closing Telegram ingress during/after an emergency stop.
 
 Telegram has its own persistent **remote access** switch in Settings →
-Communications. Off means nothing is received and nothing is sent, and it
-stays off across restarts until you turn it back on there. The emergency
-stop turns it off, and re-arming doesn't turn it back on.
+Communications. While it's on, Lumina listens whenever the desktop app is
+running; there's nothing else to start. Off means nothing is received and
+nothing is sent, and it stays off across restarts until you turn it back on
+there. The emergency stop turns it off, and re-arming doesn't turn it back
+on.
+
+Lumina never acts on a stale or repeated instruction from Telegram: a message
+that arrives late (sent while remote access was off, or while the desktop was
+closed), an edited message, or a second delivery of the same message is not
+run. A reply Lumina can't place in a conversation is refused, never guessed.
+See [Telegram Setup](telegram-setup.md#late-messages).
 
 Set up through Settings → Communications (bot token, chat ID) — see
 [Telegram Setup](telegram-setup.md) for the full step-by-step walkthrough.

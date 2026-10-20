@@ -311,6 +311,23 @@ def run_gui():
     agent.on_tool_call = on_tool_call
 
     window.show()
+    # TELEGRAM-OWNER-INBOUND-WAKE-01: the desktop listens whenever it runs
+    # and Telegram remote access is ON. Started here -- after the window and
+    # its Telegram origin runtime exist, so no reply can arrive before Prime
+    # can take it -- and never in LuminaWindow.__init__ (tests build windows),
+    # CLI mode or headless agents. Every gate (switch, E-stop, configuration,
+    # single-consumer lock) lives in start_bridge(); a failure never blocks
+    # the launch.
+    # The bridge module (python-telegram-bot, its logging setup) is imported
+    # only when remote access is ON, as before this campaign.
+    telegram_bridge = None
+    try:
+        from comms import telegram_access
+        if telegram_access.remote_access_enabled():
+            from comms import telegram_bridge
+            telegram_bridge.start_bridge(reason="startup")
+    except Exception as e:
+        print(f"[TELEGRAM] launch start failed: {type(e).__name__}", flush=True)
     try:
         exit_code = app.exec()
     except BaseException:
@@ -319,6 +336,13 @@ def run_gui():
     else:
         _record_runtime_shutdown("gui", reason="clean")
     finally:
+        # Bounded: lets python-telegram-bot confirm the update offset (no
+        # redelivery next launch) without ever holding up exit.
+        try:
+            if telegram_bridge is not None:
+                telegram_bridge.shutdown_for_exit(timeout=3.0)
+        except Exception as e:
+            print(f"[TELEGRAM] listener shutdown failed: {type(e).__name__}", flush=True)
         # Canonical GUI lifecycle boundary: runs on normal event-loop return
         # and on adjacent GUI cleanup/event-loop exceptions alike.
         backend = getattr(agent, "tts", None)

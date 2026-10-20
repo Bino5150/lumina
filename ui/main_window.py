@@ -523,6 +523,27 @@ class StatusBar(QFrame):
 
 # ── Main Window ────────────────────────────────────────────────────────────────
 
+def _telegram_origin_still_admissible(request) -> bool:
+    """TELEGRAM-OWNER-INBOUND-WAKE-01 (R3 C-1): the remote-access authority
+    a routed Telegram reply was admitted under still holds -- no OFF, no
+    E-stop (even one already re-armed) and no OFF->ON flip since. Failing
+    the check, or the check itself failing, means it never runs."""
+    check = getattr(request, "admission_check", None)
+    if check is None:
+        return True
+    try:
+        return bool(check())
+    except Exception:
+        return False
+
+
+def _refuse_telegram_origin_for_authority(request) -> None:
+    if not request.future.done():
+        request.future.set_exception(
+            origin_routing.OriginUnavailable("remote access authority changed"),
+        )
+
+
 class LuminaWindow(QMainWindow):
     def __init__(self, agent, stt=None):
         super().__init__()
@@ -642,6 +663,17 @@ class LuminaWindow(QMainWindow):
         # CONTEXT-LIFECYCLE-A5I: mirrors the same discard-in-flight-work
         # pattern for any in-flight deliberate_reconstruct() preparation.
         self._context_generation.bump()
+        # TELEGRAM-OWNER-INBOUND-WAKE-01 (R3 C-4) -- ask the listener to stop
+        # and mark the process as closing BEFORE the origin runtime goes
+        # away, so an in-flight or newly arriving Telegram message gets a
+        # fixed "Lumina closed" reply instead of a headless turn in a
+        # process that is about to exit. Non-blocking; run_gui() does the
+        # bounded join after the event loop returns.
+        try:
+            from comms import telegram_bridge
+            telegram_bridge.begin_shutdown()
+        except Exception as e:
+            print(f"[TELEGRAM] shutdown request failed: {type(e).__name__}", flush=True)
         self._telegram_route_closed = True
         origin_routing.unregister_runtime(self._telegram_route_token)
         if getattr(self.agent, "_telegram_origin_runtime_token", None) == self._telegram_route_token:
@@ -2229,6 +2261,9 @@ class LuminaWindow(QMainWindow):
         if emergency_stop.is_latched():
             request.future.cancel()
             return
+        if not _telegram_origin_still_admissible(request):
+            _refuse_telegram_origin_for_authority(request)
+            return
         self._telegram_origin_queue.append(request)
         self._drain_telegram_origin_queue()
 
@@ -2275,6 +2310,13 @@ class LuminaWindow(QMainWindow):
                     )
                 QTimer.singleShot(0, self._drain_telegram_origin_queue)
                 return
+
+        # Final admission: the reply may have waited behind a long desktop
+        # turn, and remote access may have been revoked meanwhile.
+        if not _telegram_origin_still_admissible(request):
+            _refuse_telegram_origin_for_authority(request)
+            QTimer.singleShot(0, self._drain_telegram_origin_queue)
+            return
 
         self._telegram_active_dispatch = request
         try:

@@ -151,15 +151,18 @@ def _click(widget):
     QApplication.processEvents()
 
 
-def test_flipping_the_switch_on_persists_and_starts_nothing(tab, hermetic):
+def test_flipping_the_switch_on_persists_and_starts_the_listener(tab, hermetic):
+    """Was "...and starts nothing" (the accepted blackout). The blackout
+    ended with TELEGRAM-OWNER-INBOUND-WAKE-01 (D-A): flipping ON starts
+    exactly one listener now; every start gate lives in start_bridge()."""
     assert "OFF" in tab.tg_bridge_status.text()
 
     _click(tab.tg_bridge_toggle)
 
     assert _prefs()[access.PREF_KEY] is True and access.on_since() is not None
-    assert hermetic == []                                          # the accepted blackout
+    assert hermetic == [1]                                         # one start request
     status = tab.tg_bridge_status.text()
-    assert "ON" in status and "not running" in status
+    assert status.startswith("Remote access: ON") and "arrives with the next update" not in status
 
 
 def test_flipping_it_off_persists_the_owner_reason_and_stops_a_running_listener(tab, monkeypatch):

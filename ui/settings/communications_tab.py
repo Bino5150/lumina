@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog, QLineEdit
 from PySide6.QtGui import QIcon
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -106,6 +106,12 @@ class CommunicationsTab(QWidget):
         tg_bridge_row.addWidget(self.tg_bridge_toggle)
         layout.addLayout(tg_bridge_row)
         self._refresh_telegram_bridge_status()
+        # TELEGRAM-OWNER-INBOUND-WAKE-01 -- the listener starts, retries and
+        # can stop on a fault on its own thread; keep the status line true
+        # while Settings is open, not just right after a click.
+        self._tg_status_timer = QTimer(self)
+        self._tg_status_timer.timeout.connect(self._refresh_telegram_bridge_status)
+        self._tg_status_timer.start(2000)
 
         # ── Discord ──
         layout.addWidget(_sec("DISCORD", c))
@@ -235,17 +241,45 @@ class CommunicationsTab(QWidget):
 
         self._tg_save_feedback.success("✓ Saved")
         self.tg_save_status_lbl.setText("")
+        # TELEGRAM-OWNER-INBOUND-WAKE-01 -- "configured" is part of the one
+        # rule: with the switch ON and no listener yet, try now.
+        from comms import telegram_access
+        if telegram_access.remote_access_enabled():
+            try:
+                from comms import telegram_bridge
+                running = telegram_bridge.is_running()
+            except Exception:
+                running = True
+            if not running:
+                self._start_telegram_listener("config_saved")
+            self._refresh_telegram_bridge_status()
+
+    # TELEGRAM-OWNER-INBOUND-WAKE-01 -- the listener's health, as the owner
+    # should read it. Faults are shown even after the thread has stopped.
+    _LISTENER_STATUS = {
+        "listening": "● Listening",
+        "starting": "Starting…",
+        "retrying": "Starting (no network, retrying)",
+        "token_rejected": "Bot token rejected — check it with BotFather",
+        "token_malformed": "Bot token looks malformed — paste it again from BotFather",
+        "conflict": "Another Lumina is using this bot",
+        "lock_held": "Another Lumina is using this bot",
+        "not_configured": "Not configured — set the bot token and chat ID above",
+        "error": "Stopped after an error — turn it off and on to retry",
+    }
 
     def _refresh_telegram_bridge_status(self):
         from comms import telegram_access
-        try:
-            from comms.telegram_bridge import is_running
-            running = is_running()
-        except Exception:
-            running = False
         if telegram_access.remote_access_enabled():
-            listener = ("Listener: ● running" if running else
-                        "Listener: not running — automatic listening arrives with the next update")
+            try:
+                from comms import telegram_bridge
+                running = telegram_bridge.is_running()
+                state = telegram_bridge.health().get("state")
+            except Exception:
+                running, state = False, None
+            listener = self._LISTENER_STATUS.get(state)
+            if listener is None or (running and state not in ("listening", "starting", "retrying")):
+                listener = "● Listening" if running else "Not listening — turn it off and on to retry"
             self.tg_bridge_status.setText(f"Remote access: ON · {listener}")
             self.tg_bridge_toggle.setText("Turn off")
         else:
@@ -254,9 +288,20 @@ class CommunicationsTab(QWidget):
             self.tg_bridge_status.setText(f"Remote access: OFF{why}")
             self.tg_bridge_toggle.setText("Turn on")
 
+    def _start_telegram_listener(self, reason: str):
+        """TELEGRAM-OWNER-INBOUND-WAKE-01 (D-A): with the switch ON, the
+        listener runs. start_bridge() holds every gate; a refusal (not
+        configured, another Lumina, ...) shows up in the status line."""
+        try:
+            from comms import telegram_bridge
+            telegram_bridge.start_bridge(reason=reason)
+        except Exception as e:
+            print(f"[TELEGRAM] listener start failed: {type(e).__name__}", flush=True)
+
     def _toggle_telegram_bridge(self):
         """The owner's explicit local switch -- the only way to turn Telegram
-        remote access back ON. Turning it ON starts nothing by itself."""
+        remote access back ON. Turning it ON starts listening now
+        (TELEGRAM-OWNER-INBOUND-WAKE-01, D-A); OFF stops it."""
         from comms import telegram_access
         if telegram_access.remote_access_enabled():
             telegram_access.turn_off("owner")
@@ -269,6 +314,8 @@ class CommunicationsTab(QWidget):
         elif not telegram_access.turn_on_by_owner():
             self.tg_bridge_status.setText("Remote access: OFF — the setting could not be saved.")
             return
+        else:
+            self._start_telegram_listener("switch_on")
         self._refresh_telegram_bridge_status()
 
     # ── Discord: token ──

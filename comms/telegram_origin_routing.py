@@ -50,6 +50,11 @@ class OriginDispatch:
     # field (kept optional so nothing upstream is forced to change).
     approval_event_id: Optional[str] = None
     future: Future = field(default_factory=Future)
+    # TELEGRAM-OWNER-INBOUND-WAKE-01 (R3 C-1) -- re-checked by the runtime at
+    # final turn admission: False once remote-access authority changed since
+    # the update was admitted (OFF, an E-stop, or an OFF->ON flip), and the
+    # request must then never run. None only for callers that predate it.
+    admission_check: Optional[Callable[[], bool]] = None
 
 
 class OriginUnavailable(RuntimeError):
@@ -62,6 +67,11 @@ _origin: ContextVar[tuple[Optional[str], Optional[int]]] = ContextVar(
 _lock = threading.Lock()
 _routes: dict[tuple[str, int], OriginRoute] = {}
 _runtimes: dict[str, object] = {}
+# TELEGRAM-OWNER-INBOUND-WAKE-01 (R3 C-2) -- message ids of answers the
+# headless telegram-owner channel sent in this process, so a swipe-reply to
+# one of them is a known origin ("headless_reply") rather than unknown.
+# Identifiers and expiry times only; never content.
+_headless_replies: dict[tuple[str, int], float] = {}
 
 
 def _chat_key(value) -> str:
@@ -153,8 +163,38 @@ def record_outbound(*, destination_chat_id, telegram_message_id,
     return route
 
 
+def record_headless_reply(*, destination_chat_id, telegram_message_id,
+                          now: float | None = None) -> bool:
+    """Remember that the headless telegram-owner channel sent this message
+    (TELEGRAM-OWNER-INBOUND-WAKE-01). Never a Prime origin: it only lets a
+    swipe-reply to it continue with the headless channel explicitly."""
+    try:
+        chat_id = _chat_key(destination_chat_id)
+        if isinstance(telegram_message_id, bool):
+            return False
+        message_id = int(telegram_message_id)
+        if message_id <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    created_at = time.monotonic() if now is None else float(now)
+    with _lock:
+        for key, expires_at in list(_headless_replies.items()):
+            if expires_at <= created_at:
+                _headless_replies.pop(key, None)
+        while len(_headless_replies) >= MAX_ROUTES:
+            _headless_replies.pop(min(_headless_replies, key=_headless_replies.get), None)
+        _headless_replies[(chat_id, message_id)] = created_at + ROUTE_TTL_SECONDS
+    return True
+
+
 def resolve(*, destination_chat_id, reply_to_message_id=None,
             now: float | None = None) -> RouteResolution:
+    """A swipe-reply (reply_to_message_id set) resolves to its exact origin:
+    "exact_reply" (Prime), "headless_reply" (an answer the headless channel
+    sent), "expired", or "unknown_reply" -- never a silent "cold"
+    (TELEGRAM-OWNER-INBOUND-WAKE-01 R3 C-2). A plain message resolves to
+    "sole_recent", "ambiguous" or "cold" as before."""
     try:
         chat_id = _chat_key(destination_chat_id)
     except (TypeError, ValueError):
@@ -166,11 +206,17 @@ def resolve(*, destination_chat_id, reply_to_message_id=None,
             try:
                 message_id = int(reply_to_message_id)
             except (TypeError, ValueError):
-                return RouteResolution(None, "cold")
+                return RouteResolution(None, "unknown_reply")
             key = (chat_id, message_id)
             route = _routes.get(key)
             if route is None:
-                return RouteResolution(None, "cold")
+                headless_expiry = _headless_replies.get(key)
+                if headless_expiry is None:
+                    return RouteResolution(None, "unknown_reply")
+                if headless_expiry <= current:
+                    _headless_replies.pop(key, None)
+                    return RouteResolution(None, "expired")
+                return RouteResolution(None, "headless_reply")
             if route.expires_at <= current:
                 _routes.pop(key, None)
                 return RouteResolution(None, "expired")
@@ -191,13 +237,15 @@ def resolve(*, destination_chat_id, reply_to_message_id=None,
 
 
 def dispatch(route: OriginRoute, text: str, *,
-             approval_event_id: Optional[str] = None) -> Future | None:
+             approval_event_id: Optional[str] = None,
+             admission_check: Optional[Callable[[], bool]] = None) -> Future | None:
     with _lock:
         dispatcher = _live_dispatcher_locked(route.runtime_token)
     if dispatcher is None:
         return None
 
-    request = OriginDispatch(route=route, text=text, approval_event_id=approval_event_id)
+    request = OriginDispatch(route=route, text=text, approval_event_id=approval_event_id,
+                             admission_check=admission_check)
     try:
         accepted = dispatcher(request)
     except Exception:
@@ -213,10 +261,12 @@ def clear_routes() -> None:
     old route can capture a reply after access comes back on."""
     with _lock:
         _routes.clear()
+        _headless_replies.clear()
 
 
 def _reset_for_tests() -> None:
     with _lock:
         _routes.clear()
         _runtimes.clear()
+        _headless_replies.clear()
     _origin.set((None, None))

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 
 from core import persistence
 
@@ -90,6 +91,38 @@ def turn_off(reason: str) -> bool:
         _forced_off = True
     _clear_routes()
     return persistence.update({PREF_KEY: False, REASON_KEY: reason})
+
+
+@dataclass(frozen=True)
+class IngressAuthority:
+    """TELEGRAM-OWNER-INBOUND-WAKE-01 (R3 C-1) -- the remote-access
+    authority an inbound update was admitted under: the switch's last
+    OFF->ON time and the emergency-stop epoch (latch() advances it, so even
+    a latch that was already re-armed changes it)."""
+    on_since: float | None
+    epoch: int
+
+
+def capture_ingress_authority() -> IngressAuthority | None:
+    """Snapshot taken when an inbound update passes the gate. None while
+    remote access is OFF or the emergency stop is latched."""
+    from core import emergency_stop
+    if emergency_stop.is_latched() or not remote_access_enabled():
+        return None
+    return IngressAuthority(on_since=on_since(), epoch=emergency_stop.current_epoch())
+
+
+def ingress_authority_valid(authority: IngressAuthority | None) -> bool:
+    """Re-checked at final turn admission and before any reply: the switch
+    is still ON (fresh read, so OFF from another process counts), no E-stop
+    is latched, and neither an OFF->ON flip nor an E-stop has happened since
+    the snapshot."""
+    if authority is None:
+        return False
+    from core import emergency_stop
+    if emergency_stop.is_latched() or not remote_access_enabled():
+        return False
+    return on_since() == authority.on_since and emergency_stop.current_epoch() == authority.epoch
 
 
 def _clear_routes() -> None:

@@ -148,3 +148,12 @@ jobs:
       # pinned PySide6 and fail-never-skip contract.
       - name: Run Qt-bound Telegram master switch guards (blocking)
         run: python -m pytest tests/test_telegram_master_switch_01_qt.py -v -rs -m "not castle_walls_evidence"
+
+      # TELEGRAM-OWNER-INBOUND-WAKE-01 -- automatic listening: the real origin
+      # queue re-checks remote-access authority at final admission, the real
+      # window stops the listener before its origin runtime goes away (no
+      # headless turn after close), and the real Settings switch starts the
+      # listener when flipped ON. Same pinned PySide6 and fail-never-skip
+      # contract.
+      - name: Run Qt-bound Telegram automatic listening guards (blocking)
+        run: python -m pytest tests/test_telegram_owner_inbound_wake_01_qt.py -v -rs -m "not castle_walls_evidence"

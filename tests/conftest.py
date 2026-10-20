@@ -45,6 +45,10 @@ os.environ["LUMINA_SECRETS_PATH"] = os.path.join(_TEST_DATA_ROOT, "credentials.j
 # data dir (OS-local, ~/.config/lumina/chatgpt by default) -- isolate it the
 # same way, before anything can import core.chatgpt_auth.
 os.environ["LUMINA_CHATGPT_AUTH_DIR"] = os.path.join(_TEST_DATA_ROOT, "chatgpt_auth")
+# TELEGRAM-OWNER-INBOUND-WAKE-01: the single-consumer Telegram poller lock
+# lives in the per-user runtime dir ($XDG_RUNTIME_DIR/lumina), shared with a
+# real Lumina on this machine -- never let a test take or probe that one.
+os.environ["LUMINA_RUNTIME_DIR"] = os.path.join(_TEST_DATA_ROOT, "runtime")
 os.environ["LUMINA_TESTING"] = "1"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -171,6 +175,18 @@ def _retained_qapplication():
         return
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+@pytest.fixture(autouse=True)
+def _per_test_idempotency_ledger(tmp_path, monkeypatch):
+    """TELEGRAM-OWNER-INBOUND-WAKE-01: inbound Telegram text is claimed
+    durably (at most once) in core.idempotency's ledger.db, keyed by chat
+    and message id. Many tests reuse the same fake message id, so each test
+    gets its own ledger -- otherwise a later test's message would be dropped
+    as a redelivery of an earlier test's. A test that sets LEDGER_PATH
+    itself still wins (its monkeypatch runs after this one)."""
+    from core import idempotency
+    monkeypatch.setattr(idempotency, "LEDGER_PATH", str(tmp_path / "ledger.db"))
 
 
 @pytest.fixture(autouse=True)

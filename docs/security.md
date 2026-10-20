@@ -140,6 +140,14 @@ does. Telegram is the only other owner-trusted channel, so whatever caused
 the emergency, it stays closed until you decide otherwise. The switch is
 transport policy only: it doesn't change the emergency stop itself.
 
+While remote access is on, Telegram never runs a stale instruction. Messages
+sent while it was off, messages more than 3 minutes late (for example, sent
+while the desktop was closed), edited messages and repeated deliveries are
+not run, and a queued Telegram message is checked again just before it runs:
+if remote access was turned off, the emergency stop was used, or remote
+access was turned off and on again meanwhile, it never runs. Only one Lumina
+on a computer listens to a bot at a time.
+
 ## Content from outside you is data, not instructions
 
 Tool output, and messages from anyone other than the owner, are tagged in

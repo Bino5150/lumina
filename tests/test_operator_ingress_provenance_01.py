@@ -177,8 +177,11 @@ def test_ordinary_owner_text_still_reaches_its_turn(monkeypatch):
     monkeypatch.setattr(telegram_bridge, "_owner_chat_id", lambda: 42)
     monkeypatch.setattr(telegram_bridge, "run_headless_turn",
                         lambda **kw: calls.append(kw) or {"success": True, "response": "hi"})
-    for text in ("hello there", "what does /btw do?", "​/stop all"):
+    for i, text in enumerate(("hello there", "what does /btw do?", "​/stop all")):
         update, replies = _update(42, text)
+        # Telegram gives every new message its own id; a repeated id is a
+        # redelivery and runs at most once (TELEGRAM-OWNER-INBOUND-WAKE-01).
+        update.message.message_id = 9001 + i
         asyncio.run(telegram_bridge.handle_message(update, context=None))
         assert replies == ["hi"]
     assert [c["task"] for c in calls] == ["hello there", "what does /btw do?", "​/stop all"]
@@ -194,12 +197,12 @@ def _owner():
     return User(id=OWNER, first_name="owner", is_bot=False)
 
 
-def _msg(text, *, chat=None, user="owner", **extra):
+def _msg(text, *, chat=None, user="owner", date=NOW, **extra):
     chat = chat or Chat(id=OWNER, type=Chat.PRIVATE)
     from_user = _owner() if user == "owner" else user
     head = text.split(" ", 1)[0]
     entities = [MessageEntity(MessageEntity.BOT_COMMAND, 0, len(head))] if text.startswith("/") else []
-    return Message(message_id=777, date=NOW, chat=chat, from_user=from_user, text=text,
+    return Message(message_id=777, date=date, chat=chat, from_user=from_user, text=text,
                    entities=entities, **extra)
 
 
@@ -308,7 +311,9 @@ def _handle(update):
 
 
 def test_verified_owner_resume_gets_the_not_active_reply_and_changes_nothing(replies):
-    _handle(_upd(_msg("/resume ABCD2345")))
+    # Sent just now: a /resume that reaches Lumina late is refused as stale
+    # before this reply (TELEGRAM-OWNER-INBOUND-WAKE-01).
+    _handle(_upd(_msg("/resume ABCD2345", date=datetime.datetime.now(datetime.timezone.utc))))
     assert replies == [recovery.RECOVERY_NOT_ACTIVE_REPLY]
     assert "ABCD2345" not in recovery.RECOVERY_NOT_ACTIVE_REPLY
 

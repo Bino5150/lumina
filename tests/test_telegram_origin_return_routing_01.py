@@ -317,7 +317,12 @@ def test_10_busy_origin_queues_and_starts_only_after_foreground_is_idle(monkeypa
     assert fake._telegram_active_dispatch is request
 
 
-def test_11_unavailable_exact_origin_has_explicit_headless_fallback(monkeypatch):
+def test_11_unavailable_exact_origin_is_refused_never_run_headless(monkeypatch):
+    """Was "...has explicit headless fallback". TELEGRAM-OWNER-INBOUND-WAKE-01
+    (R3 C-2, owner ruling 2026-10-19): a swipe-reply runs only at its known
+    origin; if Prime can't take it, Lumina refuses explicitly and runs
+    nothing, rather than starting an unrelated headless conversation."""
+    from comms import telegram_ingress_policy as policy
     route = object()
     fake_routes = types.SimpleNamespace(
         resolve=lambda **kwargs: types.SimpleNamespace(route=route, reason="exact_reply"),
@@ -327,15 +332,13 @@ def test_11_unavailable_exact_origin_has_explicit_headless_fallback(monkeypatch)
     monkeypatch.setattr(telegram_bridge, "_owner_chat_id", lambda: "42")
     monkeypatch.setattr(
         telegram_bridge, "run_headless_turn",
-        lambda **kwargs: {"success": True, "response": "fallback answer"},
+        lambda **kwargs: pytest.fail("a swipe-reply must never fall back to headless"),
     )
 
     update, replies = _update(42, "reply", reply_to_message_id=7001)
     asyncio.run(telegram_bridge.handle_message(update, context=None))
 
-    assert len(replies) == 1
-    assert "origin unavailable" in replies[0].lower()
-    assert "fallback answer" in replies[0]
+    assert replies == [policy.ORIGIN_UNAVAILABLE_REFUSAL]
 
 
 def test_12_route_metadata_contains_no_bot_secret_or_raw_message_content():

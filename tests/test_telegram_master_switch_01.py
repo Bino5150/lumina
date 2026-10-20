@@ -7,8 +7,8 @@ stop forces it OFF and re-arm never turns it back ON; only the owner's
 explicit local action restores it. OFF also blocks outbound (a lost phone
 must not receive reports). The outbound auto-start of listening (the S74
 "previous tenant's mail" path) is removed; TELEGRAM-OWNER-INBOUND-WAKE-01
-will start the listener at launch while ON. Until then, ON does not start
-anything: an accepted, temporary Telegram blackout.
+starts the listener at launch while ON, and when the owner flips it ON
+(until it landed, ON started nothing: an accepted, temporary blackout).
 
 Covered here (no Qt): the switch module, every send/start/listen gate,
 the other-process (Kali / standalone) OFF watch, late-backlog refusal, the
@@ -133,7 +133,10 @@ def test_off_clears_the_return_route_ledger():
 
     access.turn_off("owner")
 
-    assert routing.resolve(destination_chat_id=OWNER, reply_to_message_id=7001).reason == "cold"
+    # TELEGRAM-OWNER-INBOUND-WAKE-01 (R3 C-2): a swipe-reply whose route is
+    # gone is now named "unknown_reply" (refused explicitly) instead of a
+    # silent "cold"; either way the old route can no longer capture it.
+    assert routing.resolve(destination_chat_id=OWNER, reply_to_message_id=7001).reason == "unknown_reply"
 
 
 # ── Outbound: never starts listening; OFF sends nothing ──────────────────
@@ -225,9 +228,14 @@ def test_the_outbound_auto_start_helper_is_gone():
 
 # ── Every start path refuses while OFF ───────────────────────────────────
 
+# TELEGRAM-OWNER-INBOUND-WAKE-01 validates the token's shape before starting;
+# assembled at runtime so no token-shaped literal trips secret scanning.
+_WELL_FORMED_FAKE_TOKEN = "12345678" + ":" + "Q" * 35
+
+
 @pytest.fixture
 def startable(monkeypatch):
-    monkeypatch.setattr(telegram_bridge, "get_secret", lambda key: "fake-token")
+    monkeypatch.setattr(telegram_bridge, "get_secret", lambda key: _WELL_FORMED_FAKE_TOKEN)
     monkeypatch.setattr(telegram_bridge, "_owner_chat_id", lambda: OWNER)
     started = []
     monkeypatch.setattr(telegram_bridge, "_run_bridge", lambda event, token: started.append(token) or True)
@@ -252,7 +260,7 @@ def test_start_bridge_still_starts_when_on(startable):
     access.turn_on_by_owner()
     ok, _ = telegram_bridge.start_bridge()
     telegram_bridge._thread.join(timeout=2)
-    assert ok is True and startable == ["fake-token"]
+    assert ok is True and startable == [_WELL_FORMED_FAKE_TOKEN]
 
 
 def test_the_standalone_process_refuses_while_off(startable):
