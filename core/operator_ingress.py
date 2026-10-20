@@ -15,6 +15,10 @@ a model-supplied flag, or ambient UI state.
                              characters.
   LOCAL_RUNTIME_ACTION       text Lumina's own UI code synthesizes for a
                              local action (the image-approval button).
+  LOCAL_SUSPENSION_CONTROL   an owner action on the desktop's runaway-
+                             suspension controls (initialize, resume,
+                             recover; AGENT-RUNAWAY-SUSPEND-01). Never a
+                             command, and never minted for relayed text.
 
 Before this module, Telegram's `filters.TEXT & ~filters.COMMAND` was the
 only barrier: it keys on a bot_command entity at offset 0, so a
@@ -39,6 +43,7 @@ class IngressKind(Enum):
     LOCAL_TEXT_SUBMISSION = "local_text_submission"
     TELEGRAM_RELAYED_TEXT = "telegram_relayed_text"
     LOCAL_RUNTIME_ACTION = "local_runtime_action"
+    LOCAL_SUSPENSION_CONTROL = "local_suspension_control"
 
 
 _MINT = object()
@@ -77,11 +82,28 @@ def local_runtime_action(name: str) -> OperatorIngress:
     return OperatorIngress(IngressKind.LOCAL_RUNTIME_ACTION, name, _MINT)
 
 
+def local_suspension_control(action: str) -> OperatorIngress:
+    """The owner acted on the desktop's runaway-suspension controls."""
+    return OperatorIngress(IngressKind.LOCAL_SUSPENSION_CONTROL, action, _MINT)
+
+
 def may_dispatch_operator_command(ingress) -> bool:
     """True only for a genuine local text-submission envelope."""
     return (type(ingress) is OperatorIngress
             and ingress._mint is _MINT
             and ingress.kind is IngressKind.LOCAL_TEXT_SUBMISSION)
+
+
+def may_control_suspension(ingress) -> bool:
+    """True only for a genuine local desktop envelope that may initialize,
+    resume or recover the runaway-suspension store: the suspension controls
+    themselves, or text the owner typed into the desktop chat. Relayed
+    Telegram text and other runtime actions (the image-approval button)
+    never qualify."""
+    return (type(ingress) is OperatorIngress
+            and ingress._mint is _MINT
+            and ingress.kind in (IngressKind.LOCAL_SUSPENSION_CONTROL,
+                                 IngressKind.LOCAL_TEXT_SUBMISSION))
 
 
 def looks_like_operator_command(text) -> bool:
