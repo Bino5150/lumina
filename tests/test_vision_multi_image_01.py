@@ -134,8 +134,9 @@ class _FakeAgentWorker:
     instances = []
 
     def __init__(self, agent, content, signals, chat_id=None, attachments=None,
-                 approval_event_id=None):
+                 approval_event_id=None, suspension_token=None):
         self.agent = agent
+        self.suspension_token = suspension_token
         self.content = content
         self.signals = signals
         self.chat_id = chat_id

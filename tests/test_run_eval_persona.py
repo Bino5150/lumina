@@ -49,6 +49,10 @@ _DRIVER = textwrap.dedent("""
 
     {persona_stub}
 
+    # AGENT-RUNAWAY-SUSPEND-01: like main(), participate against a disposable
+    # store in the freshly reset eval scratch root before any turn.
+    run_eval.start_eval_suspension_runtime()
+
     task = {task!r}
     result = run_eval.run_task(task)
     captured['result_task_id'] = result['task_id']

@@ -16,6 +16,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from core import emergency_stop
+from core import suspension_runtime
 
 MAX_CONCURRENT_TASKS = 2
 RESULT_TTL_SECONDS = 30 * 60       # matches core/headless.py's IDLE_TIMEOUT_SECONDS convention
@@ -31,7 +32,30 @@ _scheduler_thread_lock = threading.Lock()  # guards _scheduler_thread creation o
 _scheduler_wake = threading.Event()        # lets schedule_task() interrupt a long idle sleep
 
 
-def _dispatch_with_epoch(task_id: str, task_epoch: int, fn, args, kwargs):
+def _cancelled(task_id: str, reason: str = None) -> None:
+    entry = {"status": "cancelled", "result": None, "completed_at": time.time()}
+    if reason:
+        entry["reason"] = reason
+    with _results_lock:
+        _results[task_id] = entry
+
+
+def _capture_lineage(task_id: str):
+    """AGENT-RUNAWAY-SUSPEND-01 -- background and scheduled work carries the
+    execution token of the turn that created it, captured HERE (beside the
+    E-stop epoch), never re-minted at fire time. Work created with no
+    lineage, or in a suspended/stale scope, never runs. Returns the token,
+    or None after recording the task as cancelled."""
+    token = suspension_runtime.inherited()
+    try:
+        suspension_runtime.verify(suspension_runtime.resolve(token))
+    except suspension_runtime.SuspensionRefused as refused:
+        _cancelled(task_id, f"suspension:{refused.refusal}")
+        return None
+    return token
+
+
+def _dispatch_with_epoch(task_id: str, task_epoch: int, fn, args, kwargs, token=None):
     """Shared executor-dispatch core for submit_task() (epoch captured
     fresh at call time) and the scheduler (epoch captured back at
     schedule_task() time, retained verbatim even across a later E-stop +
@@ -50,10 +74,18 @@ def _dispatch_with_epoch(task_id: str, task_epoch: int, fn, args, kwargs):
         completed cleanly after re-arm.
     """
     def _run():
+        # AGENT-RUNAWAY-SUSPEND-01 -- re-admitted with the token captured at
+        # submit/schedule time: a scope suspended (or a token made stale)
+        # since then means fn() never runs.
+        try:
+            suspension_runtime.verify(suspension_runtime.resolve(token))
+        except suspension_runtime.SuspensionRefused as refused:
+            _cancelled(task_id, f"suspension:{refused.refusal}")
+            return
         try:
             with emergency_stop.execution_scope(
                 kind="background_task", label=task_id, expected_epoch=task_epoch,
-            ):
+            ), suspension_runtime.carrying(token):
                 try:
                     result = fn(*args, **kwargs)
                     status = "success"
@@ -61,16 +93,26 @@ def _dispatch_with_epoch(task_id: str, task_epoch: int, fn, args, kwargs):
                     result = {"error": str(e)}
                     status = "error"
         except emergency_stop.EmergencyStopError:
-            with _results_lock:
-                _results[task_id] = {"status": "cancelled", "result": None, "completed_at": time.time()}
+            _cancelled(task_id)
             return
 
+        reason = None
         if emergency_stop.current_epoch() != task_epoch:
             status = "cancelled"
             result = None
+        else:
+            # A result that finished after its scope was suspended is never
+            # reinjected as if it completed cleanly (R2 D11).
+            try:
+                suspension_runtime.verify(token)
+            except suspension_runtime.SuspensionRefused as refused:
+                status, result, reason = "cancelled", None, f"suspension:{refused.refusal}"
 
+        entry = {"status": status, "result": result, "completed_at": time.time()}
+        if reason:
+            entry["reason"] = reason
         with _results_lock:
-            _results[task_id] = {"status": status, "result": result, "completed_at": time.time()}
+            _results[task_id] = entry
 
     _executor.submit(_run)
 
@@ -88,10 +130,13 @@ def submit_task(fn, *args, task_id: str = None, **kwargs) -> str:
         with _results_lock:
             _results[task_id] = {"status": "cancelled", "result": None, "completed_at": time.time()}
         return task_id
+    token = _capture_lineage(task_id)
+    if token is None:
+        return task_id
 
     with _results_lock:
         _results[task_id] = {"status": "running", "result": None, "completed_at": None}
-    _dispatch_with_epoch(task_id, task_epoch, fn, args, kwargs)
+    _dispatch_with_epoch(task_id, task_epoch, fn, args, kwargs, token)
     return task_id
 
 
@@ -107,9 +152,12 @@ def schedule_task(run_at: float, fn, *args, task_id: str = None, **kwargs) -> st
         with _results_lock:
             _results[task_id] = {"status": "cancelled", "result": None, "completed_at": time.time()}
         return task_id
+    token = _capture_lineage(task_id)
+    if token is None:
+        return task_id
 
     with _scheduled_lock:
-        heapq.heappush(_scheduled, (run_at, task_id, task_epoch, fn, args, kwargs))
+        heapq.heappush(_scheduled, (run_at, task_id, task_epoch, token, fn, args, kwargs))
     with _results_lock:
         _results[task_id] = {"status": "scheduled", "result": None, "completed_at": None}
     _ensure_scheduler_running()
@@ -228,7 +276,7 @@ def _scheduler_loop():
             while _scheduled and _scheduled[0][0] <= now:
                 due.append(heapq.heappop(_scheduled))
             next_run_at = _scheduled[0][0] if _scheduled else None
-        for run_at, task_id, task_epoch, fn, args, kwargs in due:
+        for run_at, task_id, task_epoch, token, fn, args, kwargs in due:
             # Deliberately NOT submit_task() -- that would call
             # capture_epoch_for_new_work() again and stamp the job with
             # whatever epoch is current *now*, defeating the whole point of
@@ -237,7 +285,7 @@ def _scheduler_loop():
             # schedule_task() time instead.
             with _results_lock:
                 _results[task_id] = {"status": "running", "result": None, "completed_at": None}
-            _dispatch_with_epoch(task_id, task_epoch, fn, args, kwargs)
+            _dispatch_with_epoch(task_id, task_epoch, fn, args, kwargs, token)
         if next_run_at is not None:
             wait_for = max(0.05, min(SCHEDULER_POLL_SECONDS, next_run_at - time.time()))
         else:

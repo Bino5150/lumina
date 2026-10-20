@@ -42,8 +42,11 @@ memory of the session.
 
 A few short notices mean one of the tool-call limits in [Settings →
 General](settings.md#agent-rounds-and-tool-call-limits) ended a turn. None
-of them is a crash, and nothing continues on its own afterward — send a new
-message to carry on:
+of them is a crash, and nothing continues on its own afterward. After the
+first and last of these (a second refused batch, or the no-progress
+breaker) the work is also **suspended**: resume it in Suspension controls
+(`/suspension`) first (see [Runaway suspension](#runaway-suspension)). For
+the others, send a new message to carry on:
 
 - *"stopped after the model again produced a tool batch that could not be
   run safely"* — the model twice asked for more tool calls in one response
@@ -68,9 +71,11 @@ stop the turn.
 
 To recover:
 
-1. **Send a new message.** Every turn starts with a clean slate, so the
-   model can carry on. It helps to say how: "check less often", "wait, then
-   check once", or "use the result you already have".
+1. **Resume, then send a new message.** The stop suspended the work: open
+   Suspension controls (`/suspension`) and resume it. Every turn then starts
+   with a clean slate, so the model can carry on. It helps to say how:
+   "check less often", "wait, then check once", or "use the result you
+   already have".
 2. **If it keeps happening for a workflow you trust**, raise the thresholds
    in `prefs.json` (see [Settings](settings.md#no-progress-breaker)) and
    restart. They can't go past their fixed maximums.
@@ -94,6 +99,45 @@ use; the Flight Recorder (`provider.dispatch_refused`) has the details.
 If a model keeps hitting these limits on one provider, look at
 `provider.response` in the Flight Recorder: it names the serving provider
 (for OpenRouter, the actual upstream provider) and how each response ended.
+
+## Runaway suspension
+
+See [Security & Authority](security.md#runaway-suspension) for what it is.
+What the notices mean:
+
+- *"runaway suspension is active since … Nothing was run"* — that work was
+  suspended. Open Suspension controls (`/suspension`), review the incident
+  and **Resume selected**. Your message wasn't sent; send it again after
+  resuming.
+- *"this work began before a runaway suspension and can no longer run"* —
+  a task, scheduled task or queued message from before the suspension.
+  It won't run, even after you resume; start it again if you still want it.
+- *"Not yet: … earlier dispatch(es) are still running"* — work admitted
+  before the suspension hasn't finished. Wait and resume again.
+- *"some earlier work's process stopped, so its outcome is unknown"* — a
+  Lumina process quit partway through. Check whether that work happened
+  (the incident lists it), tick the acknowledgement and resume.
+- *"Runaway suspension isn't ready for this data folder"* — first launch
+  with this feature, or its record is missing. Choose **Initialize** only
+  if this really is the first time here; otherwise **Recover** (your work
+  starts suspended so you can review it).
+- *"the runaway-suspension store … failed its identity checks"* — the
+  record is damaged, replaced or from another data folder. **Repair
+  identity** if offered; otherwise **Recover**, which first keeps an exact
+  copy in `memory/suspension_evidence/`. If another Lumina process is still
+  running on the same data folder, recovery waits until it stops or you
+  confirm it can be ignored.
+- *"global suspension unconfirmed"* — a suspension couldn't be written
+  down, so it holds in this desktop process only, and writing it is retried
+  on the next request. Check Suspension controls; a restart before it is
+  written would lose it.
+- *"a runaway suspension is active, so staged items can't be applied right
+  now"* — you approved a pending action, Palace promotion, pending tool or
+  image draft while something is suspended. Nothing changed and the item is
+  still pending: resume in Suspension controls, then approve it again. An
+  image generation reporting `outcome: suspended` spent nothing.
+- The **standalone Telegram or Discord bridge** refuses everything until the
+  desktop has initialized runaway suspension for the same data folder.
 
 ## Telegram setup
 

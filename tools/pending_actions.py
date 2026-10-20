@@ -45,7 +45,7 @@ def _append_audit(event: str, action_id: str, kind: str, payload: dict, reason: 
     os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
     entry = {
         "ts": datetime.now().isoformat(),
-        "event": event,  # "staged" | "approved" | "rejected"
+        "event": event,  # "staged" | "approved" | "rejected" | "refused"
         "action_id": action_id,
         "kind": kind,
         "payload": payload,
@@ -165,21 +165,30 @@ def _apply_action(action_id: str, agent) -> str:
                 "review of the record's live state. This staged entry is a request, "
                 "not an approval.]")
 
+    if kind not in ("edit_prompt", "reset_chat", "delete_knowledge", "delete_memory"):
+        return f"[Error: unknown action kind '{kind}'.]"
+
+    # AGENT-RUNAWAY-SUSPEND-01 C1 stopgap: refused while a runaway suspension
+    # is active or can't be verified, checked here at the mutation rather
+    # than at the Settings button. The entry stays queued.
+    from core.suspension_runtime import SuspensionRefused, owner_application
     try:
-        if kind == "edit_prompt":
-            agent.ctx.update_system_prompt(payload["new_prompt"])
-            result = "System prompt updated."
-        elif kind == "reset_chat":
-            agent.ctx.clear()
-            result = "Chat history cleared."
-        elif kind == "delete_knowledge":
-            from tools.knowledge import _delete_knowledge_direct
-            result = _delete_knowledge_direct(payload.get("entry_id"), payload.get("category"))
-        elif kind == "delete_memory":
-            from tools.memory import _delete_memory_direct
-            result = _delete_memory_direct(payload["memory_id"])
-        else:
-            return f"[Error: unknown action kind '{kind}'.]"
+        with owner_application(f"pending_action:{kind}"):
+            if kind == "edit_prompt":
+                agent.ctx.update_system_prompt(payload["new_prompt"])
+                result = "System prompt updated."
+            elif kind == "reset_chat":
+                agent.ctx.clear()
+                result = "Chat history cleared."
+            elif kind == "delete_knowledge":
+                from tools.knowledge import _delete_knowledge_direct
+                result = _delete_knowledge_direct(payload.get("entry_id"), payload.get("category"))
+            else:
+                from tools.memory import _delete_memory_direct
+                result = _delete_memory_direct(payload["memory_id"])
+    except SuspensionRefused as refused:
+        _append_audit("refused", action_id, kind, payload, reason=refused.refusal)
+        return refused.text
     except Exception as e:
         return f"[Error applying action: {e}]"
 

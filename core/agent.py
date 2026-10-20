@@ -19,6 +19,8 @@ import core.coding_checkpoint as checkpoint_store
 from core import emergency_stop
 from core import flight_recorder
 from core import progress_breaker
+from core import suspension as suspension_core
+from core import suspension_runtime
 from core.backend_identity import (
     LaneFuelViolation,
     OperationKind,
@@ -696,6 +698,79 @@ def _progress_fields(obs) -> dict:
             "result_hash": obs.result_hash, "result_norm_hash": obs.result_norm_hash}
 
 
+def _set_turn_outcome(agent, outcome: str) -> None:
+    """AGENT-RUNAWAY-SUSPEND-01 -- a structured turn outcome ("suspended",
+    "breaker_tripped", "batch_refused") that wrappers (spawn_subagent,
+    run_headless_turn) read instead of classifying the returned text."""
+    try:
+        agent._turn_outcome = outcome
+    except Exception:
+        pass
+
+
+def _suspend_scope(agent, trigger, evidence: dict, *, turn_id=None, chat_id=None):
+    """AGENT-RUNAWAY-SUSPEND-01 -- latch this turn's suspension scope
+    (compare-and-swap on the token the turn inherited). The scope's earlier
+    work is permanently stale from here; anything admitted before this
+    commits is reported as in flight. The Flight Recorder export is best
+    effort; the suspension store's own audit is the authoritative record."""
+    try:
+        outcome = suspension_runtime.trip(trigger, evidence)
+    except Exception as exc:  # the latch must never crash the turn that tripped it
+        print(f"[SUSPENSION] trip failed ({type(exc).__name__})", flush=True)
+        outcome = None
+    if outcome is None:
+        _fr_machine(agent, "suspension.trip_unavailable", turn_id=turn_id, chat_id=chat_id,
+                    severity="error", fields={"trigger": trigger.value})
+        return None
+    _fr_machine(agent, "suspension.tripped", turn_id=turn_id, chat_id=chat_id, severity="warning",
+                fields={"trigger": trigger.value, "result": outcome.result.value,
+                        "suspension_id": outcome.suspension_id, "scope": outcome.scope,
+                        "execution_epoch": outcome.execution_epoch,
+                        "in_flight_at_trip": outcome.in_flight_at_trip})
+    fr = _fr(agent)
+    retain = getattr(fr, "retain_turn", None)
+    if callable(retain) and turn_id:
+        retain(turn_id)
+    print(f"[SUSPENSION] {outcome.scope} -> {outcome.result.value} ({trigger.value})", flush=True)
+    return outcome
+
+
+def _admit_suspension_turn(agent, explicit):
+    """chat()'s turn admission: (token, None) or (None, SuspensionRefused).
+    See chat()'s docstring for the resolution order."""
+    try:
+        if explicit is not None:
+            token = suspension_runtime.resolve(explicit)
+        else:
+            token = suspension_runtime.inherited()
+            if token is None:
+                scope = getattr(agent, "suspension_scope", None)
+                if scope is None:
+                    token = suspension_runtime.resolve(None)   # raises: no lineage
+                else:
+                    token = suspension_runtime.capture(scope)
+        suspension_runtime.verify(token)
+    except suspension_runtime.SuspensionRefused as refused:
+        return None, refused
+    return token, None
+
+
+def _suspension_provider_admission(agent, phase: str, *, turn_id=None, chat_id=None):
+    """AGENT-RUNAWAY-SUSPEND-01 -- admit and lease one provider request
+    against the turn's inherited token. Returns (release, None) when
+    admitted -- release() MUST run once the request (or stream) is over --
+    or (None, refusal_text) when refused, before anything is dispatched."""
+    try:
+        lease = suspension_runtime.admit(suspension_core.LeaseKind.PROVIDER, f"provider.{phase}")
+    except suspension_runtime.SuspensionRefused as refused:
+        _set_turn_outcome(agent, "suspended")
+        _fr_machine(agent, "suspension.refused", turn_id=turn_id, chat_id=chat_id, severity="warning",
+                    fields={"boundary": f"provider.{phase}", "refusal": refused.refusal})
+        return None, refused.text
+    return lease.release, None
+
+
 def _act_on_progress(agent, ledger, obs, unrun_tool_calls: list, *, admitted_tool_calls: int,
                      turn_id=None, chat_id=None) -> Optional[str]:
     """AGENT-NO-PROGRESS-BREAKER-01 -- after an executed call: on a trip, end
@@ -718,6 +793,13 @@ def _act_on_progress(agent, ledger, obs, unrun_tool_calls: list, *, admitted_too
                             "repeated_tool_names": ledger.repeated_names()})
         print(f"[AGENT] no-progress breaker tripped ({obs.trip_kind}, {obs.stale_streak} stale "
               f"calls in a row) — turn stopped", flush=True)
+        _set_turn_outcome(agent, "breaker_tripped")
+        _suspend_scope(agent, suspension_core.Trigger.BREAKER_TRIPPED,
+                       {"trip_kind": obs.trip_kind, "stale_streak": obs.stale_streak,
+                        "write_stale_streak": obs.write_stale_streak,
+                        "executed_calls": ledger.observed_calls,
+                        "distinct_fingerprints": ledger.distinct_fingerprints},
+                       turn_id=turn_id, chat_id=chat_id)
         on_response_token = getattr(agent, "on_response_token", None)
         if callable(on_response_token):
             on_response_token(NO_PROGRESS_NOTICE)
@@ -939,6 +1021,21 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
         if callable(on_response_token):
             on_response_token(err)
         return None, err
+    # AGENT-RUNAWAY-SUSPEND-01 -- admitted and leased against the turn's
+    # token in the suspension store's own transaction, after the lane check
+    # and before anything is dispatched. Refused: nothing is sent.
+    release_suspension_lease, suspended = _suspension_provider_admission(
+        agent, phase, turn_id=turn_id, chat_id=chat_id)
+    if suspended is not None:
+        if tools_used_this_turn:
+            just_ran = ", ".join(f"`{n}`" for n in sorted(tools_used_this_turn))
+            err = f"[Lumina error: Tool {just_ran} completed, but the next request was refused. {suspended}]"
+        else:
+            err = suspended
+        on_response_token = getattr(agent, "on_response_token", None)
+        if callable(on_response_token):
+            on_response_token(err)
+        return None, err
     _llm = getattr(agent, "llm", None)
     _configured_model = getattr(_llm, "configured_model", None)
     _fr_machine(
@@ -1029,6 +1126,8 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
         if callable(on_response_token):
             on_response_token(err)
         return None, err
+    finally:
+        release_suspension_lease()
 
 
 def _gate_safe_content(content):
@@ -2164,6 +2263,13 @@ class LuminaAgent:
         self.ctx = ContextManager(owner=owner)
         self.registry = ToolRegistry()
         self.channel_id = channel_id
+        # AGENT-RUNAWAY-SUSPEND-01 -- the suspension scope this agent may open
+        # a ROOT turn in when no token is handed to it or inherited. Only an
+        # owner agent has one by default; a non-owner agent (a subagent, a
+        # public channel) inherits its lineage or is given one by its entry
+        # point (core/headless.py). Never inferred from anything at turn time.
+        self.suspension_scope = suspension_core.OWNER_SCOPE if owner else None
+        self._turn_outcome = None
         # CASTLE-WALLS-REPAIR-01 R2 -- the CURRENT turn's chat_id, refreshed
         # at the top of _chat_impl() from its own chat_id parameter.
         # channel_id above is fixed for this agent's whole lifetime (one GUI
@@ -2381,7 +2487,8 @@ class LuminaAgent:
 
     def chat(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
              cancel_event=None, reasoning_effort: Optional[str] = None,
-             attachments=None, approval_event_id: Optional[str] = None) -> str:
+             attachments=None, approval_event_id: Optional[str] = None,
+             suspension_token=None) -> str:
         """
         Main entry point. Runs tool loop with non-streaming,
         then streams the final response. Returns full response string.
@@ -2462,7 +2569,35 @@ class LuminaAgent:
         outcome after the fact; it changes no control flow and swallows
         nothing new — every branch below still returns or raises exactly
         as it did before this instrumentation existed.
+
+        AGENT-RUNAWAY-SUSPEND-01 (C1b) -- turn admission. Every turn runs
+        under one execution token, resolved here and bound for the whole
+        turn so every tool dispatch, provider request and synchronous
+        descendant inherits exactly it:
+          1. ``suspension_token`` -- captured by the caller where the work
+             was created, before any asynchronous handoff (the desktop
+             submit, Telegram intake, a headless/Discord channel, the task
+             queue). Never re-minted here.
+          2. otherwise the token already bound on this call stack (a
+             synchronous subagent inside its parent's tool call);
+          3. otherwise a root capture in this agent's own
+             ``suspension_scope`` (an owner agent driven synchronously, e.g.
+             the CLI loop). An agent with no scope and no lineage is refused
+             -- missing lineage never defaults to the owner.
+        A refused turn runs nothing and adds nothing to context: the fixed
+        refusal text (time and trigger only) is streamed and returned, and
+        ``_turn_outcome`` is "suspended".
         """
+        _set_turn_outcome(self, None)
+        token, refused = _admit_suspension_turn(self, suspension_token)
+        if refused is not None:
+            _set_turn_outcome(self, "suspended")
+            _fr_machine(self, "turn.refused", chat_id=chat_id, severity="warning",
+                        fields={"reason": "suspension", "refusal": refused.refusal})
+            on_response_token = getattr(self, "on_response_token", None)
+            if callable(on_response_token):
+                on_response_token(refused.text)
+            return refused.text
         # REDDIT-INGRESS-AUTHORITY-01: channel authority is fixed on the
         # agent at construction.  The caller-controlled source argument may
         # lower trust on an owner agent (e.g. a future routed external
@@ -2504,8 +2639,8 @@ class LuminaAgent:
         # before navigation, multimodal or history rewriting. The context
         # manager always retires live handles and routing identity in finally.
         from chrome_companion.site_actions.runtime_guard import turn as site_action_turn
-        with site_action_turn(self, raw_text=user_input, source=source,
-                              chat=chat_id, event=site_action_event):
+        with suspension_runtime.carrying(token), site_action_turn(
+                self, raw_text=user_input, source=source, chat=chat_id, event=site_action_event):
             # BC-01B-A: capture only an explicit command in this authenticated
             # ingress event. The grant lives in this execution context for this
             # turn, never in model/tool/page text or durable conversation history.
@@ -3508,6 +3643,13 @@ class LuminaAgent:
                       f"{batch_refusal['distinct_calls']} distinct calls) — none executed",
                       flush=True)
                 if refused_tool_batches >= 2:
+                    _set_turn_outcome(self, "batch_refused")
+                    _suspend_scope(self, suspension_core.Trigger.SECOND_BATCH_REFUSED,
+                                   {"refused_batches": refused_tool_batches,
+                                    "batch_size": batch_refusal["batch_size"],
+                                    "limit": batch_refusal["limit"],
+                                    "distinct_calls": batch_refusal["distinct_calls"]},
+                                   turn_id=turn_id, chat_id=chat_id)
                     on_response_token = getattr(self, "on_response_token", None)
                     if callable(on_response_token):
                         on_response_token(TOOL_BATCH_LIMIT_NOTICE)
@@ -3734,6 +3876,7 @@ class LuminaAgent:
         throughout this file for every optional telemetry callback.
         """
         full_response = []
+        release_stream_lease = None
         completed_terminal = False
         terminal_fields = {}
         in_think = False
@@ -3808,6 +3951,15 @@ class LuminaAgent:
                     fields={"request_streamed": True,
                             **_identity_fields(self, OperationKind.FOREGROUND_CHAT)},
                 )
+            # AGENT-RUNAWAY-SUSPEND-01 -- the final stream (and reconciliation,
+            # which streams through here too) is admitted at its START. A
+            # trip mid-stream lets this already-admitted stream finish; it
+            # is reported as in flight. The lease is released in finally.
+            release_stream_lease, suspended = _suspension_provider_admission(
+                self, "final_stream", turn_id=turn_id)
+            if suspended is not None:
+                self.on_response_token(suspended)
+                return suspended
             final_request_dispatch_at = time.monotonic()
             stream = iter(self.llm.chat_stream(
                 messages=messages,
@@ -3966,6 +4118,9 @@ class LuminaAgent:
             err = f"[Stream error: {e}]"
             self.on_response_token(err)
             return err
+        finally:
+            if release_stream_lease is not None:
+                release_stream_lease()
 
         content = "".join(full_response).strip()
         self.ctx.add_assistant(content)

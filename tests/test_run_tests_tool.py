@@ -28,6 +28,13 @@ from tools.registry import ToolRegistry
 from tools.tests import register_tests_tools
 
 
+def _turn_thread(target):
+    """A worker thread running tool dispatch for the test's turn: it carries
+    that turn's suspension lineage explicitly (AGENT-RUNAWAY-SUSPEND-01)."""
+    from core import suspension_runtime
+    return threading.Thread(target=suspension_runtime.carry_into(target))
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
@@ -331,7 +338,7 @@ def test_slow():
     time.sleep(5)
 """)
     holder = {}
-    thread = threading.Thread(target=lambda: holder.setdefault(
+    thread = _turn_thread(lambda: holder.setdefault(
         "raw", agent.registry.call("run_tests", {"cwd": str(root), "timeout_seconds": 30})
     ))
     thread.start()
@@ -435,7 +442,7 @@ def test_slow():
     _activate(agent, "proj")
 
     holder = {}
-    thread = threading.Thread(target=lambda: holder.setdefault(
+    thread = _turn_thread(lambda: holder.setdefault(
         "parsed", json.loads(agent.registry.call("run_tests", {"timeout_seconds": 30}))
     ))
     thread.start()
@@ -498,7 +505,7 @@ def test_slow():
     _activate(agent, "a")
 
     holder = {}
-    thread = threading.Thread(target=lambda: holder.setdefault(
+    thread = _turn_thread(lambda: holder.setdefault(
         "parsed", json.loads(agent.registry.call("run_tests", {"timeout_seconds": 30}))
     ))
     thread.start()
@@ -770,7 +777,7 @@ def test_emergency_latch_during_run_interrupts_tree_and_unbinds(tmp_path):
     _activate(agent, "proj")
 
     holder = {}
-    thread = threading.Thread(target=lambda: holder.setdefault(
+    thread = _turn_thread(lambda: holder.setdefault(
         "parsed", json.loads(agent.registry.call("run_tests", {"timeout_seconds": 30}))
     ))
     thread.start()
@@ -813,7 +820,7 @@ def test_foreground_stop_cancels_running_run_tests_via_tool_dispatch(tmp_path):
     agent.turn_cancellation._set(cancel_event)
 
     holder = {}
-    thread = threading.Thread(target=lambda: holder.setdefault(
+    thread = _turn_thread(lambda: holder.setdefault(
         "parsed", json.loads(agent.registry.call("run_tests", {"timeout_seconds": 30}))
     ))
     thread.start()

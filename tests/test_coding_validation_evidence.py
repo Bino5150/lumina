@@ -31,6 +31,7 @@ from core.agent import LuminaAgent
 from core.project_context import ProjectContext, save_project_binding
 from core.tool_profiles import apply_tool_profile
 from tools.registry import ToolRegistry
+from core import suspension_runtime
 
 
 # ---------------------------------------------------------------------------
@@ -544,9 +545,9 @@ def test_descendant():
     _git(root, "commit", "-q", "-m", "descendant suite")
 
     holder = {}
-    thread = threading.Thread(target=lambda: holder.setdefault(
+    thread = threading.Thread(target=suspension_runtime.carry_into(lambda: holder.setdefault(
         "parsed", json.loads(agent.registry.call("run_tests", {"timeout_seconds": 30}))
-    ))
+    )))
     thread.start()
     try:
         _wait_for_file(started)

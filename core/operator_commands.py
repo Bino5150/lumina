@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 
 
-KNOWN_COMMANDS = {"status", "btw", "compact", "stop", "context"}
+KNOWN_COMMANDS = {"status", "btw", "compact", "stop", "context", "suspension"}
 @dataclass(frozen=True)
 class OperatorCommand:
     name: str
@@ -29,7 +29,7 @@ def command_help() -> str:
     return (
         "Available operator commands: /status · /btw <question> · /compact · "
         "/stop · /stop all · /context · /context status · /context reforge "
-        "(/context rebuild is an alias)"
+        "(/context rebuild is an alias) · /suspension"
     )
 
 

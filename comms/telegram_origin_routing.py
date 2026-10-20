@@ -55,6 +55,10 @@ class OriginDispatch:
     # the update was admitted (OFF, an E-stop, or an OFF->ON flip), and the
     # request must then never run. None only for callers that predate it.
     admission_check: Optional[Callable[[], bool]] = None
+    # AGENT-RUNAWAY-SUSPEND-01 -- the owner execution token captured at
+    # Telegram intake, before this request waited for Prime. The desktop runs
+    # the turn under exactly it (re-checked at admission), never a fresh one.
+    suspension_token: object = None
 
 
 class OriginUnavailable(RuntimeError):
@@ -238,14 +242,15 @@ def resolve(*, destination_chat_id, reply_to_message_id=None,
 
 def dispatch(route: OriginRoute, text: str, *,
              approval_event_id: Optional[str] = None,
-             admission_check: Optional[Callable[[], bool]] = None) -> Future | None:
+             admission_check: Optional[Callable[[], bool]] = None,
+             suspension_token=None) -> Future | None:
     with _lock:
         dispatcher = _live_dispatcher_locked(route.runtime_token)
     if dispatcher is None:
         return None
 
     request = OriginDispatch(route=route, text=text, approval_event_id=approval_event_id,
-                             admission_check=admission_check)
+                             admission_check=admission_check, suspension_token=suspension_token)
     try:
         accepted = dispatcher(request)
     except Exception:

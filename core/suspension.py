@@ -1347,6 +1347,12 @@ class SuspensionStore:
             return ScopeState(scope, 0, 0, False, None)
         return ScopeState(scope, row["epoch"], row["revision"], row["suspended"], row["incident"])
 
+    def unknown_scopes_presumed_suspended(self) -> bool:
+        """True after a lossy recovery until the owner acknowledges the
+        unknown scopes: any scope not seen yet would start suspended."""
+        with self._txn(write=False) as conn:
+            return _meta(conn).get("unknown_scope_policy") == "suspended"
+
     def operator_view(self) -> tuple:
         """Active incidents for the desktop operator display (carries the
         selector; see IncidentView)."""

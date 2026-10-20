@@ -193,6 +193,16 @@ def run_cli(persona_name: str = None, tools_override: str = None):
         # is now explicit ("cli-local" instead of the generic "default") so PIN
         # verification/lockout state (tools/pin.py) never shares a bucket with any
         # other owner=True call site that also left channel_id at its default.
+        # AGENT-RUNAWAY-SUSPEND-01 -- the CLI participates (fail-closed) but
+        # can never initialize or recover a store: that is the desktop's
+        # explicit owner choice.
+        from core import suspension_runtime
+        suspension_status = suspension_runtime.start(config.DATA_DIR, role="cli")
+        if suspension_status.state is not suspension_runtime.State.ACTIVE:
+            print(f"[SUSPENSION] Runaway suspension is {suspension_status.state.value} for "
+                  f"{config.DATA_DIR}; turns will be refused. Open the desktop app to "
+                  "initialize or recover it.", flush=True)
+
         agent = LuminaAgent(on_tool_call=on_tool_call, on_tool_result=on_tool_result,
                              channel_id="cli-local")
 
@@ -300,6 +310,13 @@ def run_gui():
     # FE-16: this used to hardcode base/cpu regardless of what the Settings
     # tab persisted (STT_MODEL/STT_DEVICE), and never checked STT_ENABLED.
     stt = WhisperBridge(model_size=config.STT_MODEL, device=config.STT_DEVICE) if config.STT_ENABLED else None
+    # AGENT-RUNAWAY-SUSPEND-01 -- this process participates in runaway
+    # suspension before any agent exists. It never creates a store on its
+    # own: a missing or faulted one leaves everything refused until the
+    # owner chooses Initialize or Recover (the window offers that at
+    # startup).
+    from core import suspension_runtime
+    suspension_runtime.start(config.DATA_DIR, role="desktop")
     agent = LuminaAgent(tts=tts)
 
     window = LuminaWindow(agent, stt=stt)
@@ -351,6 +368,7 @@ def run_gui():
             tts_loader.unload_tts_backend(backend)
         finally:
             process_manager.shutdown_all()
+            suspension_runtime.stop()
     sys.exit(exit_code)
 
 

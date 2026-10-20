@@ -233,6 +233,9 @@ class FlightRecorder:
         self._conn = None
         self._write_count = 0
         self.enabled = True
+        # AGENT-RUNAWAY-SUSPEND-01 (R2 D8): turn_id -> extended expires_at for
+        # turns that tripped a runaway suspension. Process-local; bounded.
+        self._retained_turns: dict = {}
         self._init()
 
     def _init(self):
@@ -299,6 +302,8 @@ class FlightRecorder:
                 blob = json.dumps(clean_fields)
             ts = time.time()
             expires_at = ts + (ERROR_RETENTION_SECONDS if severity in ("warning", "error") else FULL_RETENTION_SECONDS)
+            if turn_id is not None and turn_id in self._retained_turns:
+                expires_at = max(expires_at, self._retained_turns[turn_id])
             with self._lock:
                 self._conn.execute(
                     "INSERT INTO events (ts, runtime_id, chat_id, turn_id, task_id, "
@@ -315,6 +320,33 @@ class FlightRecorder:
                     self._prune()
         except Exception as e:
             print(f"[FLIGHT_RECORDER] write failed (event_type={event_type}): {e}", flush=True)
+
+    def retain_turn(self, turn_id: str, seconds: int = ERROR_RETENTION_SECONDS) -> int:
+        """AGENT-RUNAWAY-SUSPEND-01 (R2 D8): keep a turn that tripped a runaway
+        suspension. Extends every existing row of `turn_id` (its tool.call and
+        tool.result rows included) to at least `seconds` from now, and writes
+        any LATER event for that turn (a result from a worker still in flight)
+        with the same extended expiry. Best effort, like every recorder write:
+        returns the number of rows extended, never raises. This is not a
+        preservation guarantee -- the size ceiling (_enforce_size_ceiling) can
+        still evict these rows, and the suspension store's own audit, not this
+        recorder, is the authoritative record."""
+        if not self.enabled or self._conn is None or not turn_id:
+            return 0
+        until = time.time() + seconds
+        try:
+            with self._lock:
+                if len(self._retained_turns) >= 256:
+                    self._retained_turns.pop(next(iter(self._retained_turns)))
+                self._retained_turns[turn_id] = max(until, self._retained_turns.get(turn_id, 0))
+                cursor = self._conn.execute(
+                    "UPDATE events SET expires_at = ? WHERE turn_id = ? AND expires_at < ?",
+                    (until, turn_id, until))
+                self._conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            print(f"[FLIGHT_RECORDER] retain_turn failed: {e}", flush=True)
+            return 0
 
     # -- retention (mission section 1 / 9) --------------------------------
 

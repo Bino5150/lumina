@@ -38,8 +38,10 @@ Separately from these numbers, a response that was **cut off at its output
 limit** (Response Tokens) while requesting tools is refused whole too — a
 truncated batch is not the batch the model finished planning. A first
 refusal is recoverable (the model gets its next round); a second refusal in
-the same turn ends it. When any limit ends a turn, you see a short notice
-and nothing continues on its own: your next message starts a fresh turn.
+the same turn ends it **and suspends** that conversation's work (see
+[Runaway suspension](security.md#runaway-suspension)). When any other limit
+ends a turn, you see a short notice and nothing continues on its own: your
+next message starts a fresh turn.
 
 ### No-progress breaker
 
@@ -56,7 +58,10 @@ something new resets the count.
 
 The warning tells the model to stop repeating itself. When the turn stops,
 you see a notice, and calls the model asked for but that never ran are
-marked as stopped. Nothing continues on its own.
+marked as stopped. Nothing continues on its own: the stop also **suspends**
+that conversation's work until you review and resume it in Suspension
+controls (`/suspension`; see [Runaway
+suspension](security.md#runaway-suspension)).
 
 The breaker ignores numbers, timestamps and IDs when comparing results, so
 a clock or counter changing doesn't count as new information. Real browsing

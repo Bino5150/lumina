@@ -85,6 +85,9 @@ def describe_refusal(exc: BaseException) -> str:
     """One owner-facing sentence for a refused promotion."""
     if isinstance(exc, PromotionRefused):
         return _REASON_TEXT.get(exc.detail, "") or _REASON_TEXT.get(exc.reason, exc.reason)
+    from core.suspension_runtime import SuspensionRefused
+    if isinstance(exc, SuspensionRefused):
+        return exc.text
     return f"Promotion failed ({type(exc).__name__}); nothing was changed."
 
 
@@ -429,55 +432,60 @@ def promote_with_owner_approval(approval) -> dict:
         approval_id = approval._approval_id
     except AttributeError:
         raise PromotionRefused("not_an_owner_approval") from None
-    with _LOCK:
-        live = _LIVE.pop(approval_id, None) if type(approval_id) is str else None
-    if live is None:
-        raise PromotionRefused("unknown_or_consumed_approval")
-    if _now() > live.expires:
-        raise PromotionRefused("approval_expired")
+    # AGENT-RUNAWAY-SUSPEND-01 C1 stopgap: refused (SuspensionRefused) while a
+    # runaway suspension is active or can't be verified, before the approval
+    # is consumed; the staged request stays queued.
+    from core.suspension_runtime import owner_application
+    with owner_application("palace_promotion"):
+        with _LOCK:
+            live = _LIVE.pop(approval_id, None) if type(approval_id) is str else None
+        if live is None:
+            raise PromotionRefused("unknown_or_consumed_approval")
+        if _now() > live.expires:
+            raise PromotionRefused("approval_expired")
 
-    conn = palace.get_db()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        if conn.execute("SELECT 1 FROM palace_promotion_receipts WHERE approval_id=?",
-                        (approval_id,)).fetchone():
-            raise PromotionRefused("replayed_approval")
-        snap = capture_promotion_snapshot(live.target_kind, live.target_id, live.dest_layer,
-                                          operation_id=live.operation_id, conn=conn)
-        if snap.digest != live.digest:
-            raise PromotionRefused("stale_state_changed")
-        if snap.blocked_reason:
-            raise PromotionRefused("snapshot_blocked", snap.blocked_reason)
-        admission = palace._mint_owner_promotion_admission(
-            live.target_kind, live.target_id, live.dest_layer)
-        facts = snap.facts
-        if live.target_kind == "drawer":
-            done = palace._promote_drawer_in_conn(conn, live.target_id, live.dest_layer, admission)
-        else:
-            done = palace._promote_hall_in_conn(conn, live.target_id, live.dest_layer, admission)
-        receipt = {
-            "approval_id": approval_id, "operation_id": live.operation_id,
-            "owner_event": live.owner_event, "target_kind": live.target_kind,
-            "target_id": live.target_id, "from_layer": facts.get("current_layer"),
-            "to_layer": live.dest_layer, "snapshot_digest": live.digest,
-            "untrusted": facts.get("untrusted"), "result_closet_id": done.get("closet_id"),
-            "closet_outcome": done.get("extraction"),
-            "promoted_at": datetime.now().isoformat(),
-        }
-        conn.execute(
-            "INSERT INTO palace_promotion_receipts (approval_id, operation_id, owner_event, "
-            "target_kind, target_id, from_layer, to_layer, snapshot_digest, untrusted, "
-            "result_closet_id, closet_outcome, promoted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (receipt["approval_id"], receipt["operation_id"], receipt["owner_event"],
-             receipt["target_kind"], receipt["target_id"], receipt["from_layer"],
-             receipt["to_layer"], receipt["snapshot_digest"],
-             1 if receipt["untrusted"] else 0, receipt["result_closet_id"],
-             receipt["closet_outcome"], receipt["promoted_at"]),
-        )
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    return receipt
+        conn = palace.get_db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM palace_promotion_receipts WHERE approval_id=?",
+                            (approval_id,)).fetchone():
+                raise PromotionRefused("replayed_approval")
+            snap = capture_promotion_snapshot(live.target_kind, live.target_id, live.dest_layer,
+                                              operation_id=live.operation_id, conn=conn)
+            if snap.digest != live.digest:
+                raise PromotionRefused("stale_state_changed")
+            if snap.blocked_reason:
+                raise PromotionRefused("snapshot_blocked", snap.blocked_reason)
+            admission = palace._mint_owner_promotion_admission(
+                live.target_kind, live.target_id, live.dest_layer)
+            facts = snap.facts
+            if live.target_kind == "drawer":
+                done = palace._promote_drawer_in_conn(conn, live.target_id, live.dest_layer, admission)
+            else:
+                done = palace._promote_hall_in_conn(conn, live.target_id, live.dest_layer, admission)
+            receipt = {
+                "approval_id": approval_id, "operation_id": live.operation_id,
+                "owner_event": live.owner_event, "target_kind": live.target_kind,
+                "target_id": live.target_id, "from_layer": facts.get("current_layer"),
+                "to_layer": live.dest_layer, "snapshot_digest": live.digest,
+                "untrusted": facts.get("untrusted"), "result_closet_id": done.get("closet_id"),
+                "closet_outcome": done.get("extraction"),
+                "promoted_at": datetime.now().isoformat(),
+            }
+            conn.execute(
+                "INSERT INTO palace_promotion_receipts (approval_id, operation_id, owner_event, "
+                "target_kind, target_id, from_layer, to_layer, snapshot_digest, untrusted, "
+                "result_closet_id, closet_outcome, promoted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (receipt["approval_id"], receipt["operation_id"], receipt["owner_event"],
+                 receipt["target_kind"], receipt["target_id"], receipt["from_layer"],
+                 receipt["to_layer"], receipt["snapshot_digest"],
+                 1 if receipt["untrusted"] else 0, receipt["result_closet_id"],
+                 receipt["closet_outcome"], receipt["promoted_at"]),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return receipt

@@ -129,9 +129,15 @@ def prime(qapp, tmp_path, monkeypatch):
         where it ran, then do the tool work through Prime's own registry."""
         turns.append({"input": user_input, "kwargs": kwargs,
                       "origin": routing._origin.get(), "thread": threading.current_thread()})
-        if "source-vet" in str(user_input):
-            win.agent.registry.call("send_telegram_file", {"path": str(report), "caption": "Findings"})
-            win.agent.registry.call("send_telegram_message", {"text": "Findings sent."})
+        # AGENT-RUNAWAY-SUSPEND-01: like the real chat(), run the turn under
+        # the token Telegram intake captured and the desktop carried here.
+        from core import suspension, suspension_runtime
+        token = kwargs["suspension_token"]
+        assert type(token) is suspension.ExecutionToken and token.scope == suspension.OWNER_SCOPE
+        with suspension_runtime.carrying(token):
+            if "source-vet" in str(user_input):
+                win.agent.registry.call("send_telegram_file", {"path": str(report), "caption": "Findings"})
+                win.agent.registry.call("send_telegram_message", {"text": "Findings sent."})
         return PRIME_FINAL
 
     win.agent.chat = prime_turn
@@ -254,6 +260,11 @@ def test_cold_owner_message_uses_the_existing_headless_owner_channel(prime, monk
 
     assert replies == ["headless answer"]
     assert prime._turns == []
+    # AGENT-RUNAWAY-SUSPEND-01: intake captured the owner token and carried it.
+    from core import suspension
+    for call in calls:
+        token = call.pop("suspension_token")
+        assert type(token) is suspension.ExecutionToken and token.scope == suspension.OWNER_SCOPE
     assert calls == [{"task": "hello, anyone home?", "channel_id": "telegram-owner", "owner": True,
                       "approval_event_id": f"telegram:{OWNER}:9001"}]
 

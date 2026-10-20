@@ -8,6 +8,7 @@ import traceback
 from typing import Callable, Optional
 
 from core import emergency_stop
+from core import suspension, suspension_runtime
 from chrome_companion.site_actions.model import ContractError
 from chrome_companion.site_actions.runtime_guard import dispatch_scope
 
@@ -100,6 +101,15 @@ class ToolRegistry:
             lease_id = emergency_stop.begin_tool_dispatch(name)
         except emergency_stop.EmergencyStopError as e:
             return f"[Tool '{name}' blocked: emergency stop active — {e}]"
+        # AGENT-RUNAWAY-SUSPEND-01 -- the second, independent gate: the
+        # dispatch is admitted and leased against the calling turn's
+        # execution token in the suspension store's own transaction. No
+        # dispatch whose admission lands after a committed trip can start.
+        try:
+            suspension_lease = suspension_runtime.admit(suspension.LeaseKind.TOOL, name)
+        except suspension_runtime.SuspensionRefused as refused:
+            emergency_stop.end_tool_dispatch(lease_id)
+            return f"[Tool '{name}' blocked: {refused.text}]"
         try:
             result = self._tools[name]["fn"](**args)
             return str(result) if result is not None else "[No result]"
@@ -108,6 +118,7 @@ class ToolRegistry:
         except Exception as e:
             return f"[Tool error in '{name}': {e}]"
         finally:
+            suspension_lease.release()
             emergency_stop.end_tool_dispatch(lease_id)
 
     def list_tools(self) -> list[str]:

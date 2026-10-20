@@ -39,7 +39,9 @@ from comms import telegram_origin_routing as origin_routing
 from comms import telegram_log_safety
 from comms import telegram_poller_lock
 from comms import telegram_recovery
+from core import suspension, suspension_runtime
 from core.headless import (
+    headless_reply_text,
     headless_result_delivery_text,
     mark_headless_result_presented,
     run_headless_turn,
@@ -179,9 +181,11 @@ def _remember_headless_answer(chat_id, sent) -> None:
         log.info(f"[TELEGRAM] Could not remember a headless answer ({type(exc).__name__}).")
 
 
-def _admitted_headless_turn(authority, text: str, approval_event_id: str):
+def _admitted_headless_turn(authority, text: str, approval_event_id: str, suspension_token=None):
     """Final admission for the headless channel, on the worker thread right
-    before the turn starts (R3 C-1, C-4). None means it never started."""
+    before the turn starts (R3 C-1, C-4). None means it never started.
+    suspension_token is the one captured at intake (AGENT-RUNAWAY-SUSPEND-01),
+    carried unchanged -- a fallback never mints a fresh one."""
     if _closing or not telegram_access.ingress_authority_valid(authority):
         log.info(f"[TELEGRAM] Headless turn not admitted for {approval_event_id}: "
                  "remote access authority changed or Lumina is closing.")
@@ -189,6 +193,7 @@ def _admitted_headless_turn(authority, text: str, approval_event_id: str):
     return run_headless_turn(
         task=text, channel_id=CHANNEL_ID, owner=True,
         approval_event_id=approval_event_id,
+        suspension_token=suspension_token,
     )
 
 
@@ -291,6 +296,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def still_authorized() -> bool:
         return telegram_access.ingress_authority_valid(authority)
 
+    # AGENT-RUNAWAY-SUSPEND-01 -- capture the owner execution token HERE:
+    # after every WAKE-01 gate (owner, E-stop, switch, edit, closing,
+    # freshness, at-most-once claim, command refusal) and BEFORE the turn
+    # waits on Prime or a worker thread. The routed turn and the headless
+    # fallback both carry exactly this token; a suspension that lands while
+    # the request waits makes it stale, and it never runs. A suspension never
+    # stops polling -- only admission.
+    try:
+        suspension_token = suspension_runtime.capture(suspension.OWNER_SCOPE)
+    except suspension_runtime.SuspensionRefused as refused:
+        log.info(f"[TELEGRAM] Refused {approval_event_id}: runaway suspension ({refused.refusal}).")
+        if still_authorized():
+            await message.reply_text(refused.text)
+        return
+
     reply_to = getattr(message, "reply_to_message", None)
     reply_to_message_id = getattr(reply_to, "message_id", None)
     is_swipe_reply = reply_to_message_id is not None
@@ -317,7 +337,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fallback_note = "[No unique Telegram origin; telegram-owner fallback.]"
     if resolution.route is not None:
         routed = origin_routing.dispatch(resolution.route, text, approval_event_id=approval_event_id,
-                                         admission_check=still_authorized)
+                                         admission_check=still_authorized,
+                                         suspension_token=suspension_token)
         failure = None
         if routed is not None:
             try:
@@ -356,12 +377,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not still_authorized():
         return
-    result = await asyncio.to_thread(_admitted_headless_turn, authority, text, approval_event_id)
+    result = await asyncio.to_thread(_admitted_headless_turn, authority, text, approval_event_id,
+                                     suspension_token)
     if result is None:
         if _closing and still_authorized():
             await message.reply_text(ingress_policy.CLOSING_REFUSAL)
         return
-    reply = result["response"] if result["success"] else f"[Lumina error: {result['error']}]"
+    reply = headless_reply_text(result)
     reply = headless_result_delivery_text(result, reply)
     if fallback_note:
         reply = f"{fallback_note}\n{reply}"
@@ -736,6 +758,14 @@ def main():
     if not ingress_policy.valid_owner_chat_id(_owner_chat_id()):
         log.error("Owner chat ID not set — refusing to start unsafe.")
         return
+    # AGENT-RUNAWAY-SUSPEND-01 -- a standalone bridge opens the desktop's
+    # store and never creates one. Not ready means every message gets the
+    # fixed refusal until the owner resolves it at the desktop.
+    import config
+    suspension_status = suspension_runtime.start(config.DATA_DIR, role="telegram_bridge")
+    if suspension_status.state is not suspension_runtime.State.ACTIVE:
+        log.error(f"[TELEGRAM] Runaway suspension is {suspension_status.state.value}; "
+                  "messages will be refused until the desktop owner initializes or recovers it.")
     lock, holder = telegram_poller_lock.acquire(bot_id)
     if lock is None:
         log.error(f"[TELEGRAM] Telegram is already being handled by another Lumina (pid {holder or '?'}).")

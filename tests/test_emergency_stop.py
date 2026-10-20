@@ -24,6 +24,7 @@ import pytest
 
 import core.agent as agent_module
 from core import emergency_stop
+from core import suspension_runtime
 from core import task_queue
 from core.agent import LuminaAgent, TurnCancelled
 from tools.registry import ToolRegistry
@@ -201,7 +202,7 @@ def test_in_flight_tool_dispatch_blocks_rearm_until_it_closes():
     def _call():
         result_box["result"] = registry.call("slow", {})
 
-    t = threading.Thread(target=_call)
+    t = threading.Thread(target=suspension_runtime.carry_into(_call))
     t.start()
     assert entered.wait(timeout=5)
 
@@ -379,7 +380,7 @@ def test_blocked_provider_turn_cancelled_via_emergency_latch(monkeypatch):
         else:
             outcome["cancelled"] = False
 
-    t = threading.Thread(target=_run_turn)
+    t = threading.Thread(target=suspension_runtime.carry_into(_run_turn))
     t.start()
     assert provider_entered.wait(timeout=5)
 
@@ -479,7 +480,7 @@ def test_worker_held_before_scope_admission_then_latched_finishes_cancelled_neve
         else:
             outcome["cancelled"] = False
 
-    t = threading.Thread(target=_run_turn)
+    t = threading.Thread(target=suspension_runtime.carry_into(_run_turn))
     t.start()
     assert entered_wrapper.wait(timeout=5)
 
@@ -529,7 +530,7 @@ def test_incident_snapshot_is_safe_and_useful():
     def _tool_worker():
         tool_box["result"] = registry.call("slow", {})
 
-    t2 = threading.Thread(target=_tool_worker)
+    t2 = threading.Thread(target=suspension_runtime.carry_into(_tool_worker))
     t2.start()
     assert tool_entered.wait(timeout=5)
 

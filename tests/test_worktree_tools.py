@@ -573,10 +573,11 @@ def test_model_cancellation_reaches_underlying_git_tree_and_no_descendant_escape
     registry = _bare_registry(cancel_state=cancel)
     outcome = {}
 
+    from core import suspension_runtime   # the worker carries its turn's lineage
     thread = threading.Thread(
-        target=lambda: outcome.setdefault(
+        target=suspension_runtime.carry_into(lambda: outcome.setdefault(
             "result", _create(registry, source_repository=str(source))
-        )
+        ))
     )
     thread.start()
     deadline = time.monotonic() + 10

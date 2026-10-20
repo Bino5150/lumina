@@ -48,6 +48,15 @@ def resume(store, expectation, **kw):
 
 
 @pytest.fixture
+def no_lineage():
+    """C1b's conftest binds an owner root token for every test; these tests
+    check behavior with nothing bound."""
+    reset = S._token_var.set(None)
+    yield
+    S._token_var.reset(reset)
+
+
+@pytest.fixture
 def data_dir(tmp_path):
     root = tmp_path / "data"
     (root / "memory").mkdir(parents=True, mode=0o700)
@@ -194,7 +203,15 @@ def _tracked_python():
     return [REPO / p for p in out.stdout.split()]
 
 
-def test_no_production_module_imports_the_suspension_core():
+# C1a shipped the core inert (no production importer). C1b wires it in; from
+# here on the core may be reached only by these designated participants.
+SUSPENSION_CORE_IMPORTERS = {
+    "core/suspension_runtime.py", "ui/suspension_dialog.py", "core/agent.py", "core/headless.py",
+    "tools/registry.py", "comms/telegram_bridge.py", "ui/main_window.py", "eval/run_eval.py",
+}
+
+
+def test_only_designated_participants_import_the_suspension_core():
     offenders = []
     for path in _tracked_python():
         rel = path.relative_to(REPO).as_posix()
@@ -209,7 +226,8 @@ def test_no_production_module_imports_the_suspension_core():
             elif isinstance(node, ast.Import):
                 if any(a.name == "core.suspension" for a in node.names):
                     offenders.append(rel)
-    assert offenders == [], f"C1a must stay inert; imported by {offenders}"
+    assert set(offenders) <= SUSPENSION_CORE_IMPORTERS, \
+        f"unexpected importers of core.suspension: {sorted(set(offenders) - SUSPENSION_CORE_IMPORTERS)}"
 
 
 def test_importing_the_core_creates_nothing_and_starts_no_thread(tmp_path):
@@ -540,7 +558,7 @@ def test_scopes_are_isolated(store, runtime):
         store.capture(a)
 
 
-def test_missing_lineage_fails_closed_and_never_defaults_to_owner(store):
+def test_missing_lineage_fails_closed_and_never_defaults_to_owner(store, no_lineage):
     with pytest.raises(S.AdmissionRefused) as exc:
         S.inherited_token()
     assert exc.value.refusal is S.Refusal.MISSING_TOKEN
@@ -549,7 +567,7 @@ def test_missing_lineage_fails_closed_and_never_defaults_to_owner(store):
             pass
 
 
-def test_synchronous_descendants_inherit_the_exact_captured_token(store):
+def test_synchronous_descendants_inherit_the_exact_captured_token(store, no_lineage):
     outer = store.capture(S.OWNER_SCOPE)
     inner = store.capture(S.channel_scope("discord", "9"))
     with S.carrying(outer):

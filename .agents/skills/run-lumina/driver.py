@@ -66,6 +66,10 @@ def run_full(out_dir):
     from stt.whisper_bridge import WhisperBridge
     tts = get_tts_backend()
     stt = WhisperBridge(model_size=config.STT_MODEL, device=config.STT_DEVICE) if config.STT_ENABLED else None
+    # AGENT-RUNAWAY-SUSPEND-01 -- participate like main.py's run_gui();
+    # never initializes a store (the window offers Initialize/Recover).
+    from core import suspension_runtime
+    suspension_runtime.start(config.DATA_DIR, role="driver")
     agent = LuminaAgent(tts=tts)
 
     window = LuminaWindow(agent, stt=stt)

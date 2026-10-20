@@ -87,7 +87,16 @@ def main():
         print("Cancelled — still pending.")
         return
 
-    result = approve_pending_tool(args.name, _ThrowawayRegistry())
+    # AGENT-RUNAWAY-SUSPEND-01: approval is refused while a runaway
+    # suspension is active, so this process opens the data folder's
+    # suspension record (never creates or repairs it) for the check.
+    import config
+    from core import suspension_runtime
+    suspension_runtime.start(config.DATA_DIR, role="cli", heartbeat=False)
+    try:
+        result = approve_pending_tool(args.name, _ThrowawayRegistry())
+    finally:
+        suspension_runtime.stop()
     print(result)
 
 

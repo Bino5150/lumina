@@ -123,10 +123,13 @@ Lumina's [operator commands](operator-commands.md) (`/status`, `/btw`, `/compact
   gets a short fixed reply saying so. Nothing runs, and the message isn't sent to the
   model.
 - **Telegram's own bot commands**, such as `/start`, are still ignored.
-- **`/resume`** is reserved for a future runaway-suspension recovery feature. From your
-  own private chat it currently replies that it isn't active and changes nothing. A late
-  `/resume` is refused like any late message. From anywhere else, or as a forwarded or
-  edited message, it's ignored.
+- **`/resume`** is reserved for [runaway suspension](security.md#runaway-suspension)
+  recovery over Telegram, which isn't active yet. From your own private chat it replies
+  that it isn't active and changes nothing; resume from the desktop (`/suspension`). A
+  late `/resume` is refused like any late message. From anywhere else, or as a forwarded
+  or edited message, it's ignored.
+- **While your work is suspended**, your Telegram messages get a short notice with the
+  time and reason instead of a reply. Nothing runs until you resume at the desktop.
 
 ---
 

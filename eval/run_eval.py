@@ -35,6 +35,23 @@ from core.headless import run_headless_turn, reset_headless_agent
 import config
 
 
+def start_eval_suspension_runtime():
+    """AGENT-RUNAWAY-SUSPEND-01 -- runaway suspension is fail-closed: with no
+    store, every eval turn would be refused. reset_scratch_dir() above has
+    just rebuilt EVAL_DATA_DIR as a brand-new empty scratch root, so this
+    harness initializes a disposable store THERE -- and refuses to touch any
+    other data directory."""
+    from core import operator_ingress, suspension, suspension_runtime
+    if os.path.realpath(config.DATA_DIR) != os.path.realpath(EVAL_DATA_DIR):
+        raise SystemExit("[EVAL] refusing to initialize a suspension store outside the eval scratch root")
+    os.makedirs(os.path.join(EVAL_DATA_DIR, suspension.MEMORY_DIRNAME), mode=0o700, exist_ok=True)
+    if suspension.probe(EVAL_DATA_DIR).status is suspension.StoreStatus.ABSENT_NO_TRACE:
+        suspension.initialize(
+            EVAL_DATA_DIR,
+            ingress=operator_ingress.local_suspension_control("eval_scratch_root")).close()
+    return suspension_runtime.start(EVAL_DATA_DIR, role="eval")
+
+
 def load_tasks(path: str) -> list:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -60,11 +77,21 @@ def run_task(task: dict) -> dict:
             print(f"[EVAL] WARNING: persona '{persona_name}' not found for task "
                   f"{task['id']} -- running with base config instead.", flush=True)
 
+    # AGENT-RUNAWAY-SUSPEND-01 -- each prompt is new root work: owner tasks in
+    # the owner scope, non-owner tasks isolated in their own eval channel.
+    from core import suspension, suspension_runtime
+    scope = suspension.OWNER_SCOPE if owner else suspension.channel_scope("eval", task["id"])
     turns = []
     for prompt in prompts:
+        try:
+            token = suspension_runtime.capture(scope)
+        except suspension_runtime.SuspensionRefused as refused:
+            turns.append({"success": False, "outcome": "suspended", "response": refused.text})
+            continue
         result = run_headless_turn(
             task=prompt, channel_id=channel_id, owner=owner,
             tools_profile=tools_profile, persona=persona, trace=True,
+            suspension_token=token,
         )
         turns.append(result)
 
@@ -90,6 +117,7 @@ def main():
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     print(f"[EVAL] Data dir isolated to: {EVAL_DATA_DIR}", flush=True)
+    start_eval_suspension_runtime()
     print(f"[EVAL] Running {len(tasks)} tasks -> {out_path}", flush=True)
 
     with open(out_path, "w", encoding="utf-8") as f:

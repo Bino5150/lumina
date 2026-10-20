@@ -46,6 +46,7 @@ from typing import Optional
 
 import core.image_generation_draft as draft_store
 import core.image_generation_service as svc
+from core import suspension_runtime
 from core.generation_spending_policy import SpendingPolicy
 from core.higgsfield_adapter import (
     HiggsfieldAdapter,
@@ -231,6 +232,26 @@ def generate_image(draft_id: str, *, channel_id: Optional[str],
             "claiming approval already happened. Nothing was spent."
         )
 
+    # AGENT-RUNAWAY-SUSPEND-01 C1 stopgap: the spend is admitted and leased
+    # against the calling turn's suspension token BEFORE the draft is
+    # consumed, so a refusal (suspended, stale, no lineage on a direct call,
+    # store unavailable) spends nothing and leaves the approved draft intact.
+    try:
+        spend = suspension_runtime.admit_provider("image_generation")
+    except suspension_runtime.SuspensionRefused as refused:
+        return (
+            "outcome: suspended\n"
+            f"detail: {refused.text}\n"
+            "Nothing was spent and the draft was not used. Do not retry; tell the owner "
+            "the generation is paused."
+        )
+    try:
+        return _spend_approved_draft(draft_id)
+    finally:
+        spend.release()
+
+
+def _spend_approved_draft(draft_id: str) -> str:
     draft = draft_store.consume_draft(draft_id)
     if draft is None:
         return (

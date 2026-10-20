@@ -28,6 +28,7 @@ import config
 from comms import telegram_origin_routing as origin_routing
 from core.agent import TurnCancelled, is_error_response
 from core import emergency_stop
+from core import suspension, suspension_runtime
 from core.context_checkpoints import get_latest_usable_checkpoint
 from core import context_rebuild
 from core.context_reconstruction import reconstruct_chat_context, resolve_context_skip
@@ -150,6 +151,29 @@ def make_round_pixmap(path: str, size: int) -> QPixmap:
 
 # ── Streaming signals ──────────────────────────────────────────────────────────
 
+def suspension_status_lines() -> list:
+    """AGENT-RUNAWAY-SUSPEND-01 -- /status's runaway-suspension block
+    (aggregate counts and states only; never a selector)."""
+    status = suspension_runtime.status()
+    if status.state is suspension_runtime.State.ACTIVE:
+        line = (f"Runaway suspension: {status.active_incidents} suspended scope(s)"
+                if status.active_incidents else "Runaway suspension: active, nothing suspended")
+    else:
+        line = f"Runaway suspension: {status.state.value} — nothing is admitted (/suspension)"
+    lines = [line]
+    if status.local_stops:
+        lines.append("⚠ Stopped in this process only (global suspension unconfirmed): "
+                     + ", ".join(status.local_stops))
+    return lines
+
+
+class SuspensionSignals(QObject):
+    """AGENT-RUNAWAY-SUSPEND-01 -- suspension_runtime listeners fire on
+    whichever thread tripped or resumed; this marshals them onto the GUI
+    thread."""
+    event = Signal(str, object)
+
+
 class StreamSignals(QObject):
     tool_call      = Signal(str, dict)
     tool_result    = Signal(str, str)
@@ -206,8 +230,10 @@ class AgentWorker(QThread):
     BATCH_CHARS = 12  # flush every N characters
 
     def __init__(self, agent, user_input, signals: StreamSignals, chat_id: int = None,
-                 attachments=None, approval_event_id: str = None):
+                 attachments=None, approval_event_id: str = None, suspension_token=None):
         super().__init__()
+        # AGENT-RUNAWAY-SUSPEND-01 -- captured at submit, carried unchanged.
+        self.suspension_token = suspension_token
         self.agent = agent
         self.user_input = user_input
         self.signals = signals
@@ -324,6 +350,7 @@ class AgentWorker(QThread):
                 cancel_event=self._cancel_event,
                 attachments=self.attachments,
                 approval_event_id=self.approval_event_id,
+                suspension_token=self.suspension_token,
             )
             runtime_token = getattr(
                 self.agent, "_telegram_origin_runtime_token", None,
@@ -630,6 +657,15 @@ class LuminaWindow(QMainWindow):
             self._relay_telegram_origin,
         )
         self.agent._telegram_origin_runtime_token = self._telegram_route_token
+        # AGENT-RUNAWAY-SUSPEND-01 -- trip/resume/state events, marshalled to
+        # this thread for operator receipts; the startup check offers the
+        # explicit Initialize/Recover choice if the store isn't usable yet.
+        self._suspension_signals = SuspensionSignals()
+        self._suspension_signals.event.connect(self._on_suspension_event)
+        self._suspension_listener = lambda kind, payload: self._suspension_signals.event.emit(kind, payload)
+        suspension_runtime.add_listener(self._suspension_listener)
+        self._suspension_dialog = None
+        QTimer.singleShot(0, self._check_suspension_ready)
         self._restore_session()
         QTimer.singleShot(600, self._check_connection)
         self._telemetry_timer = QTimer(self)
@@ -647,6 +683,9 @@ class LuminaWindow(QMainWindow):
         self.setStyleSheet(APP_STYLESHEET)
 
     def closeEvent(self, event):
+        listener = getattr(self, "_suspension_listener", None)
+        if listener is not None:
+            suspension_runtime.remove_listener(listener)
         dialog = getattr(self, "_site_action_dialog", None)
         if dialog is not None:
             dialog.reject()
@@ -1566,6 +1605,51 @@ class LuminaWindow(QMainWindow):
             self._command_stop(command.argument)
         elif command.name == "context":
             self._command_context(command.argument)
+        elif command.name == "suspension":
+            self._open_suspension_dialog()
+
+    # ── AGENT-RUNAWAY-SUSPEND-01: runaway-suspension receipts and controls ──
+
+    def _open_suspension_dialog(self):
+        from ui.suspension_dialog import SuspensionDialog
+        if self._suspension_dialog is None:
+            self._suspension_dialog = SuspensionDialog(self)
+        self._suspension_dialog.refresh()
+        self._suspension_dialog.show()
+        self._suspension_dialog.raise_()
+
+    def _check_suspension_ready(self):
+        status = suspension_runtime.status()
+        if status.state is suspension_runtime.State.ACTIVE:
+            if status.active_incidents:
+                self.chat_widget.add_operator_message(
+                    f"⛔ Runaway suspension: {status.active_incidents} scope(s) are suspended. "
+                    "Review and resume them in Suspension controls (/suspension).")
+            return
+        self.chat_widget.add_operator_message(
+            "⛔ Runaway suspension isn't ready for this data folder, so nothing will run yet. "
+            "Choose Initialize or Recover in Suspension controls (/suspension).")
+        self._open_suspension_dialog()
+
+    def _on_suspension_event(self, kind: str, payload):
+        if self._suspension_dialog is not None and self._suspension_dialog.isVisible():
+            self._suspension_dialog.refresh()
+        if kind != "trip" or payload is None:
+            return
+        result = payload.result
+        if result is suspension.TripResult.TRIPPED:
+            in_flight = payload.in_flight_at_trip
+            flight = (f" {in_flight} dispatch(es) were already in flight when it latched; they may "
+                      "still finish." if in_flight else "")
+            self.chat_widget.add_operator_message(
+                f"⛔ Runaway suspension: {payload.scope} is suspended.{flight} New turns, tools and "
+                "provider requests in this scope are refused until you review and resume it in "
+                "Suspension controls (/suspension). Work from before the suspension never resumes.")
+        elif result is suspension.TripResult.GLOBAL_UNCONFIRMED:
+            self.chat_widget.add_operator_message(
+                f"⛔ A runaway suspension of {payload.scope} could not be recorded (global suspension "
+                "unconfirmed). It is stopped in this desktop process only, and recording is retried "
+                "on the next request. Check Suspension controls (/suspension).")
 
     def _command_status(self, argument: str):
         if argument:
@@ -1583,6 +1667,7 @@ class LuminaWindow(QMainWindow):
         if emergency_stop.is_latched():
             lines.extend(self._emergency_status_lines())
             lines.append("")
+        lines.extend(suspension_status_lines())
 
         if self.worker is not None and self.worker.isRunning():
             started = self._operator_turn_started_at or now
@@ -1813,13 +1898,21 @@ class LuminaWindow(QMainWindow):
             )
             return
 
+        # AGENT-RUNAWAY-SUSPEND-01 -- /btw is new owner work: capture its
+        # token here, on the Qt thread, and carry it into the task queue.
+        try:
+            btw_token = suspension_runtime.capture(suspension.OWNER_SCOPE)
+        except suspension_runtime.SuspensionRefused as refused:
+            self.chat_widget.add_operator_message(f"/btw not started. {refused.text}")
+            return
         try:
             from tools.tasks import run_background_subagent
             persona = None
             current_persona = getattr(self.agent, "current_persona", None)
             if isinstance(current_persona, dict):
                 persona = current_persona.get("name")
-            result = run_background_subagent(question, persona=persona)
+            with suspension_runtime.carrying(btw_token):
+                result = run_background_subagent(question, persona=persona)
             task_id = result["task_id"]
             # Deliberately DO NOT add this to agent._background_task_ids.
             # /btw is UI-owned and must never be injected into main context by
@@ -2321,7 +2414,8 @@ class LuminaWindow(QMainWindow):
         self._telegram_active_dispatch = request
         try:
             self._on_user_message(request.text, approval_event_id=request.approval_event_id,
-                                  ingress=telegram_relayed_text(request.approval_event_id))
+                                  ingress=telegram_relayed_text(request.approval_event_id),
+                                  suspension_token=request.suspension_token)
         except Exception:
             self._telegram_active_dispatch = None
             if not request.future.done():
@@ -2354,7 +2448,8 @@ class LuminaWindow(QMainWindow):
         """The chat input's submit signal: the only local text-submission ingress."""
         self._on_user_message(text, ingress=local_text_submission())
 
-    def _on_user_message(self, text: str, approval_event_id: str = None, ingress=None):
+    def _on_user_message(self, text: str, approval_event_id: str = None, ingress=None,
+                         suspension_token=None):
         if not text.strip():
             return
 
@@ -2394,6 +2489,26 @@ class LuminaWindow(QMainWindow):
             # SmartInput clears immediately after emitting submit. Restore on
             # the next event-loop tick so an accidental normal message isn't lost.
             QTimer.singleShot(0, lambda text=text: self.chat_widget.input.setPlainText(text))
+            return
+
+        # AGENT-RUNAWAY-SUSPEND-01 -- turn admission on the Qt thread, before
+        # anything is shown or the worker starts. A local turn captures the
+        # owner token here; a Telegram-relayed turn must arrive with the one
+        # captured at intake and is only re-checked -- it is never re-minted.
+        relayed = getattr(ingress, "kind", None) is IngressKind.TELEGRAM_RELAYED_TEXT
+        try:
+            if suspension_token is not None:
+                suspension_runtime.verify(suspension_token)
+            elif relayed:
+                # Relayed work must carry its intake token; whatever is bound
+                # on this thread is not its lineage.
+                raise suspension_runtime.missing_lineage_refusal()
+            else:
+                suspension_token = suspension_runtime.capture(suspension.OWNER_SCOPE)
+        except suspension_runtime.SuspensionRefused as refused:
+            self.chat_widget.add_operator_message(f"⛔ {refused.text} Your message was not sent.")
+            if not relayed:
+                QTimer.singleShot(0, lambda text=text: self.chat_widget.input.setPlainText(text))
             return
         self.worker = None
         
@@ -2498,7 +2613,8 @@ class LuminaWindow(QMainWindow):
         self._context_generation.bump()
         self.worker = AgentWorker(self.agent, content, self.signals, chat_id=self._current_chat_id,
                                    attachments=attachments_for_chat,
-                                   approval_event_id=approval_event_id)
+                                   approval_event_id=approval_event_id,
+                                   suspension_token=suspension_token)
         self.worker.start()
         
 
@@ -2748,10 +2864,15 @@ class LuminaWindow(QMainWindow):
         the model's next generate_image attempt can pass the turn-boundary
         gate without requiring the owner to also type anything."""
         from core.image_generation_draft import approve_draft
-        approved = approve_draft(
-            draft_id, channel_id=getattr(self.agent, "channel_id", None),
-            chat_id=self._current_chat_id,
-        )
+        try:
+            approved = approve_draft(
+                draft_id, channel_id=getattr(self.agent, "channel_id", None),
+                chat_id=self._current_chat_id,
+            )
+        except suspension_runtime.SuspensionRefused as refused:
+            # Not approved, still pending; no follow-up turn is sent.
+            self.chat_widget.add_operator_message(refused.text)
+            return
         if not approved:
             self.chat_widget.add_operator_message(
                 "This draft could not be approved (expired, already used, or from a "

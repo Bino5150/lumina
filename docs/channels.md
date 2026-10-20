@@ -48,6 +48,10 @@ status** — persona identity (name, avatar, system prompt) is editable
 through Settings, but what she's *allowed to do* is fixed in code, so no
 amount of persona tweaking changes actual permissions. Per-user rate
 limiting and idle-channel cleanup keep it light on constrained hardware.
+Each Discord channel is its own [runaway-suspension](security.md#runaway-suspension)
+scope: a runaway there pauses only that channel, which then just sees that
+Lumina is paused (no times, reasons or details) until you resume it at the
+desktop.
 
 ## Public bio
 

@@ -219,3 +219,45 @@ def telegram_remote_access_on(monkeypatch):
     from comms import telegram_access
     monkeypatch.setattr(telegram_access, "remote_access_enabled", lambda: True)
     monkeypatch.setattr(telegram_access, "on_since", lambda: None)
+
+
+_SUSPENSION_TEST_STORES = os.path.join(_TEST_DATA_ROOT, "suspension-test-stores")
+_suspension_store_counter = [0]
+
+
+def _fresh_suspension_test_store():
+    """A brand-new disposable store under the test root, never a real data
+    directory. Its initialization uses a local suspension-control envelope,
+    exactly like the desktop's explicit Initialize button."""
+    from core import operator_ingress, suspension, suspension_runtime
+    _suspension_store_counter[0] += 1
+    root = os.path.join(_SUSPENSION_TEST_STORES, f"store-{_suspension_store_counter[0]}")
+    os.makedirs(os.path.join(root, suspension.MEMORY_DIRNAME), mode=0o700)
+    suspension.initialize(
+        root, ingress=operator_ingress.local_suspension_control("pytest_disposable_store")).close()
+    suspension_runtime.start(root, role="test", heartbeat=False)
+    return root
+
+
+@pytest.fixture(autouse=True)
+def _suspension_owner_root_turn():
+    """AGENT-RUNAWAY-SUSPEND-01 C1b: runaway-suspension participation is
+    fail-closed (a process with no active store admits nothing; work with no
+    lineage is refused). Every test therefore runs the way an owner's own
+    synchronous turn does: this process participates against a disposable
+    store, and an owner root token is bound on the test's call stack.
+
+    The store is rebuilt whenever a test leaves anything behind (an incident,
+    a local stop, a stopped or re-pointed runtime), so a trip in one test can
+    never leak into the next. Threads a test starts do NOT inherit the token,
+    by design -- production handoffs carry it explicitly. Tests of the
+    fail-closed paths clear the binding themselves."""
+    from core import suspension, suspension_runtime
+    current = suspension_runtime.status()
+    if (current.state is not suspension_runtime.State.ACTIVE or current.role != "test"
+            or not (current.data_dir or "").startswith(_SUSPENSION_TEST_STORES)
+            or current.active_incidents or current.local_stops):
+        _fresh_suspension_test_store()
+    token = suspension_runtime.capture(suspension.OWNER_SCOPE)
+    with suspension.carrying(token):
+        yield

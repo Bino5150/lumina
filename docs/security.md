@@ -148,6 +148,92 @@ if remote access was turned off, the emergency stop was used, or remote
 access was turned off and on again meanwhile, it never runs. Only one Lumina
 on a computer listens to a bot at a time.
 
+## Runaway suspension
+
+When a turn runs away, Lumina **suspends** that work instead of just
+ending the turn. Two things trigger it:
+
+- the [no-progress breaker](settings.md#no-progress-breaker) stops a turn;
+- a second oversized or cut-off tool batch is refused in the same turn.
+
+Hitting a tool-call, round or time budget on its own does **not** suspend
+anything.
+
+What is suspended is a *scope*: everything working for you (your desktop
+chat, Telegram, and the subagents and background tasks they started) shares
+one owner scope, and each public Discord channel has its own. While a scope
+is suspended:
+
+- **Nothing new starts in it** — no new turn, tool call or model request.
+  Your next message is refused with a short notice giving the time and the
+  reason (Telegram gets the same notice; a Discord channel just sees that
+  Lumina is paused).
+- **Work from before the suspension never runs again**, even after you
+  resume: a background task, a scheduled task or a queued Telegram message
+  created before it is cancelled when it comes up.
+- **Work already running may finish.** A tool call, model request or
+  answer stream that had already started when it latched is allowed to
+  complete (nothing is killed), and the notice says how many were in
+  flight. A result that arrives after the suspension is not fed back in.
+
+**Resuming is desktop-only and deliberate.** Open **Suspension controls**
+(`/suspension`, or the notice). Each suspended scope is listed with when
+and why it latched. **Resume selected** clears exactly that incident. It
+waits while earlier work is still running, and if a Lumina process stopped
+partway through earlier work, you must tick that its outcome is unknown.
+Nothing restores itself after a timeout. Telegram `/resume` is not active
+yet.
+
+**First launch.** The suspension record lives in your data folder
+(`memory/suspension.db`, pinned by `memory/soul_identity.json`). Lumina
+never creates it on its own: a missing record can't be told apart from a
+deleted one. On the first launch with this feature, the desktop asks you to
+choose **Initialize** (first time here) or **Recover** (Lumina ran with it
+here before, or you're not sure — your work starts suspended so you can
+review it). Until you choose, nothing runs. If the record fails its checks
+(missing, damaged, replaced, from another data folder), everything is
+refused until you **Repair identity** or **Recover** — recovery keeps an
+exact copy of the old record first. The Telegram and Discord bridges, the
+CLI and other helpers only ever open an existing record.
+
+**Independent controls.** Runaway suspension, the Emergency Interlock and
+Telegram remote access are separate: a suspension doesn't latch the
+emergency stop, re-arming doesn't resume a suspension, and resuming doesn't
+turn anything else back on.
+
+**Staged items wait.** Approving something Lumina staged for you is
+refused at the moment it would take effect while a suspension is active:
+a pending action or Palace promotion in Settings, a pending tool (in
+Settings or `scripts/approve_tool.py`), and an image draft (its Approve
+button or a "yes"). Nothing changes, the item stays pending, and resuming
+doesn't apply it for you: approve it again afterwards. A pending action,
+promotion or tool doesn't record which scope staged it, so a suspension of
+*any* scope blocks those; an image draft is blocked by its own scope. An
+image approved earlier isn't generated while its scope is suspended. If
+the suspension record can't be checked, these approvals are refused too.
+The Suspension controls themselves are never blocked.
+
+**What it does not cover yet.** It is enforced at turns, tool calls, the
+main model requests, image-generation spend and the approvals above. It
+does **not** yet cover:
+
+- the vision specialist that describes images;
+- Dreaming, and the other utility-model work (profile curation, chat
+  naming, `/compact` and Reforge summaries);
+- approvals made before a suspension: they aren't cancelled or checked
+  again, so an image draft approved before it can still be generated
+  after you resume (until the draft expires).
+
+These are planned. It also can't control a Lumina process running an
+older version, or one using a different data folder, and like everything
+in Lumina it is not a defense against other software running as your own
+user account.
+
+**Records.** The suspension record's own audit is authoritative. The
+Flight Recorder keeps the tripped turn's events longer
+(`suspension.tripped`, and the turn's `tool.call`/`tool.result` rows) on a
+best-effort basis: its size limit can still remove them.
+
 ## Content from outside you is data, not instructions
 
 Tool output, and messages from anyone other than the owner, are tagged in

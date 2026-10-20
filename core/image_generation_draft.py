@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Mapping, Optional
 
+from core import suspension_runtime
+
 __all__ = [
     "ImageGenerationDraft",
     "DEFAULT_TTL_SECONDS",
@@ -120,6 +122,10 @@ class ImageGenerationDraft:
     # tools/image_generation.py's register_image_generation_tools().
     chat_id: Optional[int] = None
     staged_at_turn_seq: Optional[int] = None
+    # AGENT-RUNAWAY-SUSPEND-01: the suspension scope of the turn that staged
+    # this draft, recorded by stage_draft() from the call stack (never a
+    # caller-supplied value). None = no lineage at staging.
+    suspension_scope: Optional[str] = None
 
 
 _drafts: dict[str, ImageGenerationDraft] = {}
@@ -167,6 +173,7 @@ def stage_draft(
         expires_at=now + ttl_seconds,
         chat_id=chat_id,
         staged_at_turn_seq=staged_at_turn_seq,
+        suspension_scope=suspension_runtime.staging_scope(),
     )
     with _lock:
         _prune_expired_locked(now)
@@ -266,20 +273,43 @@ def approve_draft(draft_id: str, *, channel_id: Optional[str], chat_id: Optional
     runs (or fails to), the real in-memory approval this function's
     return value is about has already unconditionally happened, so a
     ledger hiccup here can never make this function's own return value
-    or the caller's is_approved()-based S14 guard lie."""
-    with _lock:
-        now = time.time()
-        _prune_expired_locked(now)
-        draft = _drafts.get(draft_id)
-        if draft is None:
-            return False
-        if draft.channel_id != channel_id or draft.chat_id != chat_id:
-            return False
-        if draft_id not in _presented:
-            return False
-        _approvals[draft_id] = now
+    or the caller's is_approved()-based S14 guard lie.
+
+    Raises core.suspension_runtime.SuspensionRefused, recording nothing,
+    when an otherwise approvable draft's staging scope is suspended or the
+    suspension store can't be verified (AGENT-RUNAWAY-SUSPEND-01 C1)."""
+    draft = _approvable(draft_id, channel_id, chat_id)
+    if draft is None:
+        return False
+    # AGENT-RUNAWAY-SUSPEND-01 C1 stopgap: raises SuspensionRefused (draft
+    # left pending, unapproved) while the staging scope is suspended or
+    # can't be verified. Store I/O never runs under _lock, so the draft is
+    # re-checked under it before the one mutation.
+    with suspension_runtime.owner_application("image_draft_approval",
+                                              scope=draft.suspension_scope):
+        with _lock:
+            if _approvable_locked(draft_id, channel_id, chat_id) is None:
+                return False
+            _approvals[draft_id] = time.time()
     _record_ever_approved(draft_id)
     return True
+
+
+def _approvable_locked(draft_id, channel_id, chat_id) -> Optional[ImageGenerationDraft]:
+    _prune_expired_locked(time.time())
+    draft = _drafts.get(draft_id)
+    if draft is None:
+        return None
+    if draft.channel_id != channel_id or draft.chat_id != chat_id:
+        return None
+    if draft_id not in _presented:
+        return None
+    return draft
+
+
+def _approvable(draft_id, channel_id, chat_id) -> Optional[ImageGenerationDraft]:
+    with _lock:
+        return _approvable_locked(draft_id, channel_id, chat_id)
 
 
 def is_approved(draft_id: str) -> bool:

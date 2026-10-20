@@ -275,7 +275,18 @@ def spawn_subagent(task: str,
         # OWNER_DIRECT (the default) — not EXTERNAL_CHANNEL_INBOUND. The task
         # is model-initiated by a trusted parent process, not untrusted
         # inbound content; see the module docstring's "S51 Part E fix" note.
+        # AGENT-RUNAWAY-SUSPEND-01 -- owner=False with no suspension scope of
+        # its own: the child runs under exactly the token its parent's turn
+        # (or the task queue) carries -- owner lineage without owner tools.
+        # No lineage means chat() refuses it. A stop is a structured
+        # success=False outcome, never a "completed" result the parent model
+        # could read as done.
         response = sub.chat(task)
+        outcome = getattr(sub, "_turn_outcome", None)
+        if outcome in ("suspended", "breaker_tripped", "batch_refused"):
+            return {"success": False, "outcome": outcome, "result": response,
+                    "tool_calls_made": tool_call_count["n"],
+                    "error": f"subagent stopped: {outcome}"}
         return {"success": True, "result": response,
                 "tool_calls_made": tool_call_count["n"], "error": None}
     except Exception as e:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import core.image_generation_draft as draft_store
+from core import suspension_runtime
 import tools.image_generation as image_tool
 from core.agent import LuminaAgent, _maybe_approve_pending_draft
 
@@ -269,7 +270,9 @@ def test_concurrent_confirm_attempts_after_approval_has_exactly_one_winner(monke
                                        current_turn_seq=1)
         outcomes.append(r)
 
-    threads = [Thread(target=attempt) for _ in range(8)]
+    # Concurrent tool calls of one turn: each carries that turn's suspension
+    # lineage, as registry dispatch does (AGENT-RUNAWAY-SUSPEND-01).
+    threads = [Thread(target=suspension_runtime.carry_into(attempt)) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
@@ -277,6 +280,7 @@ def test_concurrent_confirm_attempts_after_approval_has_exactly_one_winner(monke
 
     successes = [o for o in outcomes if "outcome: success" in o]
     assert len(successes) == 1
+    assert len(outcomes) == 8 and not [o for o in outcomes if "outcome: suspended" in o]
     assert len(submissions) == 1
 
 

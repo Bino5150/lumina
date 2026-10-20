@@ -25,7 +25,8 @@ import logging
 import discord
 
 import config
-from core.headless import run_headless_turn
+from core import suspension_runtime
+from core.headless import headless_reply_text, run_headless_turn, suspension_scope_for
 from core.secrets import get_secret
 from core.rate_limiter import check as rate_check
 from core.personas import DISCORD_TEMPLATE_PATH as DISCORD_PERSONA_PATH
@@ -83,6 +84,16 @@ async def on_message(message: discord.Message):
     channel_id = f"discord-{message.channel.id}"
     persona = load_discord_persona()
 
+    # AGENT-RUNAWAY-SUSPEND-01 -- this public channel's own isolated
+    # suspension scope, captured before the to_thread handoff and carried
+    # unchanged. A refusal here is a generic line: a public channel never
+    # learns incident times, triggers or store state.
+    try:
+        suspension_token = suspension_runtime.capture(suspension_scope_for(channel_id, owner=False))
+    except (suspension_runtime.SuspensionRefused, ValueError):
+        await message.reply(suspension_runtime.PUBLIC_REFUSAL)
+        return
+
     async with message.channel.typing():
         # asyncio.to_thread, not a direct call — run_headless_turn() blocks
         # on local LLM inference, which can easily exceed 10s on a 4B model.
@@ -99,8 +110,12 @@ async def on_message(message: discord.Message):
             owner=False,
             persona=persona,
             force_tools_profile=DISCORD_TOOLS_PROFILE,
+            suspension_token=suspension_token,
         )
-    reply = result["response"] if result["success"] else f"[Lumina error: {result['error']}]"
+    if result.get("outcome") == "suspended":
+        reply = suspension_runtime.PUBLIC_REFUSAL
+    else:
+        reply = headless_reply_text(result)
     await message.reply(reply[:2000])  # Discord message length cap
 
 
@@ -109,6 +124,12 @@ def main():
     if not token:
         log.error("discord_bot_token not set — see core/secrets.py, set_secret().")
         return
+    # AGENT-RUNAWAY-SUSPEND-01 -- opens the desktop's store, never creates one.
+    import config
+    suspension_status = suspension_runtime.start(config.DATA_DIR, role="discord_bridge")
+    if suspension_status.state is not suspension_runtime.State.ACTIVE:
+        log.error(f"[DISCORD] Runaway suspension is {suspension_status.state.value}; "
+                  "requests will be refused until the desktop owner initializes or recovers it.")
     log.info("Discord bridge starting...")
     client.run(token)
 

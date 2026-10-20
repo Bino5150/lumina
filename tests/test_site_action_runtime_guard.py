@@ -12,6 +12,8 @@ import threading
 
 import pytest
 
+from core import suspension_runtime
+
 from chrome_companion.site_actions import runtime_guard as g
 from chrome_companion.site_actions.model import ContractError
 from tools.registry import ToolRegistry
@@ -111,7 +113,8 @@ def test_ordinary_unscoped_worker_registry_calls_remain_unchanged_outside_site_w
     agent = ServiceAgent(broker, tmp_path)
     agent.tool("browser_click")
     with ThreadPoolExecutor(max_workers=1) as executor:
-        assert executor.submit(agent.registry.call, "browser_click", {}).result(timeout=10) == "ordinary result"
+        call = suspension_runtime.carry_into(agent.registry.call)   # the worker carries its turn's lineage
+        assert executor.submit(call, "browser_click", {}).result(timeout=10) == "ordinary result"
     assert len(agent.calls) == 1
 
 
@@ -168,6 +171,8 @@ def test_N25_async_tasks_nested_calls_and_independent_B(broker, tmp_path):
     a, b = ServiceAgent(broker, tmp_path), ServiceAgent(broker, tmp_path)
     a.tool("browser_click"); b.tool("browser_click")
 
+    lineage = suspension_runtime.inherited()   # B's own turn lineage, carried explicitly below
+
     async def run():
         with scope(broker, a):
             async def inherited():
@@ -180,7 +185,7 @@ def test_N25_async_tasks_nested_calls_and_independent_B(broker, tmp_path):
                 finally:
                     broker._context.reset(token)
             async def independent():
-                with scope(broker, b, False):
+                with suspension_runtime.carrying(lineage), scope(broker, b, False):
                     assert b.registry.call("browser_click", {}) == "ordinary result"
             await asyncio.gather(asyncio.create_task(inherited()),
                                  asyncio.create_task(independent(), context=Context()))

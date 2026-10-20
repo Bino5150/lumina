@@ -157,3 +157,11 @@ jobs:
       # contract.
       - name: Run Qt-bound Telegram automatic listening guards (blocking)
         run: python -m pytest tests/test_telegram_owner_inbound_wake_01_qt.py -v -rs -m "not castle_walls_evidence"
+      # AGENT-RUNAWAY-SUSPEND-01 (C1b): the desktop side of runaway
+      # suspension in a real LuminaWindow -- submit-time token capture, the
+      # relayed-turn token contract, /btw, receipts, the startup readiness
+      # check and the Suspension controls dialog (explicit Initialize,
+      # Resume with drain/outcome-unknown acknowledgement, Repair, Recover).
+      # Same pinned PySide6 and fail-never-skip contract.
+      - name: Run Qt-bound runaway suspension guards (blocking)
+        run: python -m pytest tests/test_agent_runaway_suspend_01_c1b_qt.py -v -rs -m "not castle_walls_evidence"

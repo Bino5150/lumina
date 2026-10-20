@@ -6,6 +6,8 @@ import subprocess
 
 import pytest
 
+from core import suspension_runtime
+
 import config
 import core.coding_checkpoint as checkpoint_store
 import core.coding_checkpoint_observation as checkpoint_observation
@@ -371,7 +373,7 @@ def test_two_agents_racing_same_revision_produce_one_save_and_one_conflict(tmp_p
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(update, [0, 1]))
+        results = list(pool.map(suspension_runtime.carry_into(update), [0, 1]))
     assert sorted(item["status"] for item in results) == ["error", "saved"]
     assert [item for item in results if item["status"] == "error"][0]["error"] == "revision_conflict"
     loaded = _call_json(agents[0], "read_coding_checkpoint")

@@ -100,7 +100,7 @@ def _append_audit_log(event: str, name: str, description: str = "", code: str = 
     os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
     entry = {
         "ts": datetime.now().isoformat(),
-        "event": event,          # "staged" | "approved" | "rejected" | "deleted"
+        "event": event,          # "staged" | "approved" | "rejected" | "deleted" | "refused"
         "name": name,
         "description": description,
         "code": code,
@@ -133,34 +133,43 @@ def approve_pending_tool(name: str, registry) -> str:
     if not os.path.exists(pending_path):
         return f"[Error: no pending tool named '{name}'.]"
 
-    live_path = os.path.join(CUSTOM_TOOLS_DIR, f"{name}.py")
-    with open(pending_path, "r", encoding="utf-8") as f:
-        code = f.read()
-
+    # AGENT-RUNAWAY-SUSPEND-01 C1 stopgap: refused while a runaway suspension
+    # is active or can't be verified (in scripts/approve_tool.py too), before
+    # the file moves; the tool stays pending.
+    from core.suspension_runtime import SuspensionRefused, owner_application
     try:
-        os.replace(pending_path, live_path)
-    except Exception as e:
-        return f"[Error moving tool into place: {e}]"
+        with owner_application(f"pending_tool:{name}"):
+            live_path = os.path.join(CUSTOM_TOOLS_DIR, f"{name}.py")
+            with open(pending_path, "r", encoding="utf-8") as f:
+                code = f.read()
 
-    try:
-        spec = importlib.util.spec_from_file_location(name, live_path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    except Exception:
-        return f"[Error loading tool module: {traceback.format_exc()}]"
+            try:
+                os.replace(pending_path, live_path)
+            except Exception as e:
+                return f"[Error moving tool into place: {e}]"
 
-    register_fn_name = f"register_{name}_tool"
-    if not hasattr(module, register_fn_name):
-        return f"[Error: module missing '{register_fn_name}' function.]"
+            try:
+                spec = importlib.util.spec_from_file_location(name, live_path)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[name] = module
+                spec.loader.exec_module(module)
+            except Exception:
+                return f"[Error loading tool module: {traceback.format_exc()}]"
 
-    try:
-        getattr(module, register_fn_name)(registry)
-    except Exception:
-        return f"[Error registering tool: {traceback.format_exc()}]"
+            register_fn_name = f"register_{name}_tool"
+            if not hasattr(module, register_fn_name):
+                return f"[Error: module missing '{register_fn_name}' function.]"
 
-    _append_audit_log("approved", name, code=code)
-    return f"[Tool '{name}' approved, loaded, and live.]"
+            try:
+                getattr(module, register_fn_name)(registry)
+            except Exception:
+                return f"[Error registering tool: {traceback.format_exc()}]"
+
+            _append_audit_log("approved", name, code=code)
+            return f"[Tool '{name}' approved, loaded, and live.]"
+    except SuspensionRefused as refused:
+        _append_audit_log("refused", name)
+        return refused.text
 
 
 def load_approved_custom_tools(registry) -> list:

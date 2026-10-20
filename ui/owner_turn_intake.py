@@ -89,7 +89,7 @@ def chat_accepts(agent, param: str) -> bool:
 
 
 def owner_chat_call(agent, user_input, *, chat_id, cancel_event, attachments,
-                    approval_event_id):
+                    approval_event_id, suspension_token=None):
     """Return (user_input, kwargs) for the worker's agent.chat() call.
 
     user_input is passed through unchanged; attachments travel only as the
@@ -113,4 +113,8 @@ def owner_chat_call(agent, user_input, *, chat_id, cancel_event, attachments,
     # turn) leaves approval_event_id out entirely so chat() mints its own.
     if approval_event_id and chat_accepts(agent, "approval_event_id"):
         kwargs["approval_event_id"] = approval_event_id
+    # AGENT-RUNAWAY-SUSPEND-01 -- the token captured on the Qt thread at
+    # submit, before this worker started; chat() runs under exactly it.
+    if suspension_token is not None and chat_accepts(agent, "suspension_token"):
+        kwargs["suspension_token"] = suspension_token
     return user_input, kwargs

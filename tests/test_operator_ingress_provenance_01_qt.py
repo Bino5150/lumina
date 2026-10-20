@@ -43,9 +43,11 @@ def qapp():
 class _Worker:
     created = []
 
-    def __init__(self, agent, user_input, signals, chat_id=None, attachments=None, approval_event_id=None):
+    def __init__(self, agent, user_input, signals, chat_id=None, attachments=None, approval_event_id=None,
+                 suspension_token=None):
         self.user_input = user_input
         self.approval_event_id = approval_event_id
+        self.suspension_token = suspension_token
         self.started = False
         _Worker.created.append(self)
 
@@ -104,7 +106,11 @@ def _type(win, text):
 def _relay(win, text):
     from comms import telegram_origin_routing as routing
     route = routing.OriginRoute("42", 7001, win._chat, win._telegram_route_token, 1.0, 1e12)
-    request = routing.OriginDispatch(route=route, text=text, approval_event_id="telegram:42:9001")
+    # AGENT-RUNAWAY-SUSPEND-01: Telegram intake captures the owner token
+    # before the request waits for Prime; the relay carries it.
+    from core import suspension, suspension_runtime
+    request = routing.OriginDispatch(route=route, text=text, approval_event_id="telegram:42:9001",
+                                     suspension_token=suspension_runtime.capture(suspension.OWNER_SCOPE))
     win._on_telegram_origin_dispatch(request)
     QApplication.processEvents()
     return request
@@ -158,6 +164,7 @@ def test_relayed_ordinary_text_is_still_an_ordinary_owner_turn(window):
     assert window._calls == []
     assert len(_Worker.created) == 1 and _Worker.created[0].started
     assert _Worker.created[0].approval_event_id == "telegram:42:9001"
+    assert _Worker.created[0].suspension_token is request.suspension_token   # carried, not re-minted
     assert window._telegram_active_dispatch is request
 
 

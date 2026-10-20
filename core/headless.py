@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from core.agent import LuminaAgent
+from core import suspension, suspension_runtime
 from core.reasoning_preferences import resolve_reasoning_effort
 from tools.chrome_companion import (
     CHROME_ACTION_TOOL_NAMES as CHROME_COMPANION_ACTION_TOOL_NAMES,
@@ -124,6 +125,37 @@ def _reap_idle():
             _on_idle_callback(cid)
 
 
+# AGENT-RUNAWAY-SUSPEND-01 -- structured stop outcomes. A wrapper reports
+# these as success=False so a caller (a parent model, a bridge) can never read
+# a stop as a completed result; the fixed machine text rides in "response".
+STOP_OUTCOMES = ("suspended", "breaker_tripped", "batch_refused")
+
+
+def suspension_scope_for(channel_id: str, owner: bool):
+    """The suspension scope a headless channel agent opens root turns in.
+    An owner channel (Telegram) is the owner's own lineage; a public channel
+    ("discord-<id>") is isolated in its own canonical channel scope. Anything
+    else has none, and must be handed a token or inherit one."""
+    if owner:
+        return suspension.OWNER_SCOPE
+    transport, sep, ident = str(channel_id).partition("-")
+    if sep and transport == "discord" and ident:
+        try:
+            return suspension.channel_scope("discord", ident)
+        except ValueError:
+            return None
+    return None
+
+
+def headless_reply_text(result: dict) -> str:
+    """What a bridge relays for a run_headless_turn() result: the response
+    for a completed turn or a structured stop (fixed machine text), and an
+    error line otherwise."""
+    if result.get("success") or result.get("outcome") in STOP_OUTCOMES:
+        return result.get("response", "")
+    return f"[Lumina error: {result.get('error')}]"
+
+
 def get_headless_agent(channel_id: str, owner: bool,
                         persona: dict = None,
                         tools_profile: str = None,
@@ -178,6 +210,7 @@ def get_headless_agent(channel_id: str, owner: bool,
             agent = LuminaAgent(owner=owner, channel_id=channel_id,
                                 on_tool_call=_log_tool_call(channel_id),
                                 on_tool_result=_log_tool_result(channel_id))
+            agent.suspension_scope = suspension_scope_for(channel_id, owner)
             if persona:
                 agent.apply_persona(persona)
             elif tools_profile or tools_enabled:
@@ -252,9 +285,18 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
                        tools_enabled: list = None,
                        force_tools_profile: str = None,
                        trace: bool = False,
-                       approval_event_id: str = None) -> dict:
+                       approval_event_id: str = None,
+                       suspension_token=None) -> dict:
     """Never raises — a bot listener should always get something to relay
     back, even on failure.
+
+    suspension_token (AGENT-RUNAWAY-SUSPEND-01): the token the caller
+    captured where the work was created, before its asynchronous handoff
+    (Telegram intake, the Discord handler). Checked again after this
+    channel's turn lock is acquired -- work that waited behind another turn
+    while its scope was suspended never starts -- then handed to chat()
+    unchanged. A stop is reported as success=False with "outcome" set to
+    one of STOP_OUTCOMES and the fixed text in "response".
 
     trace: MB-06 addition. When True, captures structured tool-call data
     (name, args, result) instead of only console-logging it, and includes
@@ -279,6 +321,11 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
         # transport delivery itself remains outside this lock; a separate
         # presented-state gate below binds approval to successful delivery.
         with turn_lock:
+            if suspension_token is not None:
+                try:
+                    suspension_runtime.verify(suspension_token)
+                except suspension_runtime.SuspensionRefused as refused:
+                    return {"success": False, "outcome": "suspended", "response": refused.text}
             previous_on_tool_call = agent.on_tool_call
             previous_on_tool_result = agent.on_tool_result
 
@@ -340,13 +387,19 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
                 # with no external event to preserve.
                 if approval_event_id is not None and _agent_accepts_approval_event_id(agent):
                     chat_kwargs["approval_event_id"] = approval_event_id
+                if suspension_token is not None:
+                    chat_kwargs["suspension_token"] = suspension_token
                 response = agent.chat(task, **chat_kwargs)
                 response = _sanitize_response(response, authoritative_owner)
             finally:
                 agent.on_tool_call = previous_on_tool_call
                 agent.on_tool_result = previous_on_tool_result
 
-        result = {"success": True, "response": response}
+        outcome = getattr(agent, "_turn_outcome", None)
+        if outcome in STOP_OUTCOMES:
+            result = {"success": False, "outcome": outcome, "response": response}
+        else:
+            result = {"success": True, "response": response}
         if presentable_drafts:
             # Internal transport metadata, never interpolated into model/user
             # text by the model. The bridge explicitly includes this exact
