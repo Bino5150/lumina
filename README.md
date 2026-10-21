@@ -164,7 +164,7 @@ Requirements, install, configure, and first-run notes: **[docs/getting-started.m
 
 **Already using Lumina? Read [Upgrading to the C1 Runaway Suspension release](docs/upgrading.md#upgrading-to-the-c1-runaway-suspension-release)**
 before updating or choosing Initialize/Recover. It covers backups, the current
-launchers' different data folders, and the desktop safety setup.
+shared launch-folder check, and the desktop safety setup.
 
 Quick version:
 

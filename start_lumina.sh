@@ -3,28 +3,17 @@
 # Start your LLM backend (llama.cpp, Ollama, LM Studio, etc.) before running
 # this script. See README for recommended setup and configuration.
 
-# ── Data-dir isolation ──────────────────────────────────────────────────────
-# This build is the disposable release copy — it must NEVER read or write
-# ~/lumina's (the dev build's) shared memory/chat/prefs state. config.py
-# resolves DATA_DIR from this env var if set, falling back to a shared
-# platformdirs path otherwise (see config.py's DATA_DIR line) — so this must
-# be exported before config.py is ever imported, i.e. before anything else
-# in this script runs. Same pattern eval/run_eval.py (MB-23) already proved
-# out for isolating eval runs from the real data dir.
-export LUMINA_DATA_DIR="$HOME/.local/share/lumina-release"
-
-LUMINA_DIR="$(dirname "$0")"
-# Was "$LUMINA_DIR/memory/prefs.json" — a stale pre-FE-13, BASE_DIR-relative
-# path that never matched where prefs.json actually lives (DATA_DIR, not
-# BASE_DIR, since the platformdirs migration). That meant this check almost
-# always fell through to the "chatterbox" default regardless of the real
-# configured backend — plausible root cause of prior backend-switching
-# weirdness. Now points at this build's own isolated data dir.
+# Select once, before any prefs read, TTS operation or change of working dir.
+# This uses the same interpreter and read-only policy as main.py/bridges.
+LUMINA_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+LUMINA_DATA_DIR="$(python "$LUMINA_DIR/data_directory.py" --shell)" || exit 1
+LUMINA_DATA_DIR="${LUMINA_DATA_DIR%.}"
+export LUMINA_DATA_DIR
 PREFS="$LUMINA_DATA_DIR/memory/prefs.json"
 
 # ── Detect active TTS backend from prefs.json ──────────────────────────────
 if [ -f "$PREFS" ]; then
-    TTS_BACKEND=$(python3 -c "import json; d=json.load(open('$PREFS')); print(d.get('tts_backend','chatterbox'))" 2>/dev/null)
+    TTS_BACKEND=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("tts_backend","chatterbox"))' "$PREFS" 2>/dev/null)
 else
     TTS_BACKEND="chatterbox"
 fi

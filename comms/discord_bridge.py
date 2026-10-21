@@ -18,6 +18,10 @@ identity, not authority, and those are different things here on purpose.
 
 Run standalone: python -m comms.discord_bridge
 """
+import os
+from data_directory import require_data_directory
+require_data_directory(base_dir=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import json
 import logging

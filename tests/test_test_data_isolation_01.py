@@ -197,16 +197,20 @@ def test_guard_is_inactive_when_not_under_test(monkeypatch):
 # ── M1: prove the ORIGINAL vulnerability is real, not hypothetical ───────
 
 
-def test_original_vulnerability_reproduced_without_isolation_env():
-    """Runs a fresh subprocess with LUMINA_DATA_DIR/LUMINA_SECRETS_PATH/
-    LUMINA_TESTING all stripped -- i.e. tests/conftest.py's fix removed --
-    and confirms config.DATA_DIR really does resolve to the owner's real
-    data directory in that state. This is the guard-RED half of the M1
-    mutation proof: without the isolation this suite now provides, any
-    persistence write during a test run would land exactly here."""
+def test_without_isolation_env_config_uses_installation_default_in_synthetic_home(tmp_path):
+    """Unset override still selects persistent state, not a test scratch root.
+
+    Probe a synthetic HOME only. The shared release profile now selects the
+    historical main.py release default, and ambiguous folders stop first.
+    Never import production config against the owner's actual home here.
+    """
     env = dict(os.environ)
-    for key in ("LUMINA_DATA_DIR", "LUMINA_SECRETS_PATH", "LUMINA_TESTING"):
+    for key in ("LUMINA_DATA_DIR", "LUMINA_TESTING"):
         env.pop(key, None)
+    env["HOME"] = str(tmp_path / "home")
+    env["USERPROFILE"] = env["HOME"]
+    env["XDG_DATA_HOME"] = str(tmp_path / "native-data")
+    env["LUMINA_SECRETS_PATH"] = str(tmp_path / "credentials.json")
     result = subprocess.run(
         [sys.executable, "-c",
          "import config; print(config.DATA_DIR)"],
@@ -214,18 +218,18 @@ def test_original_vulnerability_reproduced_without_isolation_env():
         env=env, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    from platformdirs import user_data_dir
-    assert result.stdout.strip() == user_data_dir("lumina", appauthor=False)
+    from data_directory import DEFAULT_PROFILE
+    expected = (os.path.join(env["HOME"], ".local", "share", "lumina-release")
+                if DEFAULT_PROFILE == "release" else os.path.join(env["XDG_DATA_HOME"], "lumina"))
+    assert result.stdout.strip() == expected
 
 
-def test_migrate_legacy_state_skipped_under_lumina_testing():
-    """config.py's own migrate_legacy_state() call (a shutil.move, not a
-    copy, of any legacy in-repo memory/lumina.db-style file into DATA_DIR)
-    must never run against a throwaway test data dir -- a fresh test root
-    always looks "unmigrated," which would relocate (and delete from the
-    real repo tree) any legacy file that happened to exist. Verified via a
-    fresh subprocess with a stub migrate_state_dir module so this doesn't
-    depend on any legacy file actually existing on this machine."""
+def test_config_never_runs_implicit_legacy_migration(tmp_path):
+    """Startup must no longer move legacy state, in production or tests.
+
+    The read-only preflight reports old in-repo state instead. A stub pins
+    that importing config cannot invoke even the old migration entry point.
+    """
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     probe = (
         "import sys, types, os, json\n"
@@ -251,5 +255,6 @@ def test_migrate_legacy_state_skipped_under_lumina_testing():
         assert result.returncode == 0, result.stderr
         return json.loads(result.stdout.strip())
 
-    assert _run({"LUMINA_TESTING": "1", "LUMINA_DATA_DIR": "/tmp/does-not-matter"}) == 0
-    assert _run({"LUMINA_DATA_DIR": "/tmp/does-not-matter"}) == 1
+    selected = str(tmp_path / "synthetic-state")
+    assert _run({"LUMINA_TESTING": "1", "LUMINA_DATA_DIR": selected}) == 0
+    assert _run({"LUMINA_DATA_DIR": selected}) == 0

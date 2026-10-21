@@ -23,6 +23,10 @@ offline launch, reports its health truthfully and yields to another poller.
 Every inbound update passes one gate (comms/telegram_ingress_policy.py)
 before routing, any turn or any model.
 """
+import os
+from data_directory import require_data_directory
+require_data_directory(base_dir=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import collections
 import logging

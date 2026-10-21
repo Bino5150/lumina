@@ -58,22 +58,10 @@ DEFAULT_MODEL = None
 import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# FE-13: personal/runtime state (db, prefs, tool audit log, approved custom
-# tools) now lives outside the tracked repo tree, in a platformdirs-managed
-# data dir instead of BASE_DIR-relative paths. A fresh `git clone` no longer
-# mixes runtime-generated content into source. LUMINA_DATA_DIR env var
-# overrides for testing/portable setups; unset in normal use. Migration is
-# safe to call every startup -- no-op after the first real move.
-from platformdirs import user_data_dir
-from migrate_state_dir import migrate_legacy_state
-DATA_DIR = os.environ.get("LUMINA_DATA_DIR") or user_data_dir("lumina", appauthor=False)
-# TEST-DATA-ISOLATION-01: never migrate real in-repo legacy state (shutil.move,
-# not copy) into a throwaway test data dir -- tests/conftest.py sets
-# LUMINA_TESTING before this module is ever imported. A fresh test dir would
-# otherwise always look "unmigrated," relocating (and deleting from BASE_DIR)
-# any legacy file that happened to exist.
-if os.environ.get("LUMINA_TESTING") != "1":
-    migrate_legacy_state(BASE_DIR, DATA_DIR)
+# All entry points share read-only folder selection before state is opened.
+# Legacy in-checkout state requires explicit review; startup never moves it.
+from data_directory import require_data_directory
+DATA_DIR = require_data_directory(base_dir=BASE_DIR)
 
 DB_PATH = os.path.join(DATA_DIR, "memory", "lumina.db")
 PERSONAS_DIR = os.path.join(BASE_DIR, "personas")

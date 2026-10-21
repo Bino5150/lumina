@@ -16,10 +16,10 @@ config.py`, that's a regression worth reporting, not expected behavior.
 
 - Data directory: chat history, MemPalace, Knowledge Base, prefs and the
   Flight Recorder live under the selected folder. Public `main.py`
-  defaults to `~/.local/share/lumina-release` and honors a nonempty
-  `LUMINA_DATA_DIR`; `start_lumina.sh` always forces that release folder.
-  Standalone bridges instead default to the platform location (normally
-  `~/.local/share/lumina` on Linux). Follow [the upgrade guide's folder
+  and every other launch method share the `~/.local/share/lumina-release`
+  release default and honor `LUMINA_DATA_DIR`. Without an override, another
+  plausible existing folder causes **Data folder selection needs review**;
+  legacy in-checkout state also stops instead of migrating. Follow [the upgrade guide's folder
   check](upgrading.md#1-find-the-data-folder-you-already-use) before
   changing launch methods. If history looks missing, stop and preserve
   both folders; do not delete one or initialize again to fix the display.

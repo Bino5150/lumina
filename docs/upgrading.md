@@ -24,24 +24,35 @@ are different things. Record both paths before upgrading. The data folder
 normally contains `memory/lumina.db` (history and other stored knowledge)
 and `memory/prefs.json` (preferences).
 
-**Current launch methods select different defaults.** The following table
-describes the public release, regardless of what you named its checkout:
+**Desktop, CLI, shell and standalone bridges now share one folder-selection
+check.** A nonempty `LUMINA_DATA_DIR` takes precedence. Without it, the
+public release retains its existing `~/.local/share/lumina-release` default,
+regardless of what you named its checkout. It stops if another plausible
+data folder exists, rather than choosing between histories.
 
 | Launch method | Persistent data folder selected |
 |---|---|
-| `python main.py` (desktop), including an IDE that runs it | `~/.local/share/lumina-release` when `LUMINA_DATA_DIR` is unset; an explicitly set, nonempty `LUMINA_DATA_DIR` takes precedence. |
-| `python main.py --cli` | Same selection as the desktop through `main.py`. It cannot initialize C1. |
-| `bash start_lumina.sh`, or an alias/shortcut that runs that script | Always `~/.local/share/lumina-release`. The script **overwrites** `LUMINA_DATA_DIR`, even if you set it first. |
-| `python -m comms.telegram_bridge` or `python -m comms.discord_bridge` | Uses a nonempty `LUMINA_DATA_DIR` if set. Otherwise uses the operating system's `platformdirs` location for `lumina`, without passing through `main.py`. |
+| `python main.py` (desktop), including an IDE that runs it | Explicit `LUMINA_DATA_DIR`, otherwise the release default after the folder check. |
+| `python main.py --cli` | Identical selection. It cannot initialize C1. |
+| `bash start_lumina.sh`, or an alias/shortcut that runs that script | Identical selection, before reading preferences or starting TTS. It now **honors** your override. |
+| `python -m comms.telegram_bridge` or `python -m comms.discord_bridge` | Identical selection, before loading preferences or starting a bridge. |
 | An alias, desktop shortcut, service or IDE configuration you created | Inspect its command and environment; apply the corresponding row above. A name such as `lumina` alone does not establish which folder it uses. |
 
-For standalone bridges on Linux, the unset default is
-`~/.local/share/lumina`, or `$XDG_DATA_HOME/lumina` if that base is configured.
-On macOS it is normally `~/Library/Application Support/lumina`; on Windows
-it is under the user's Local AppData directory as `lumina`.
-`main.py` and the shell launcher instead use the literal
-`~/.local/share/lumina-release` default, including on those platforms.
-Do not set `LUMINA_DATA_DIR` to an empty string; use a full folder path.
+**Earlier standalone bridges** defaulted to the platform's `lumina` folder:
+on Linux, `~/.local/share/lumina` or `$XDG_DATA_HOME/lumina`; on macOS,
+`~/Library/Application Support/lumina`; on Windows, `lumina` under your
+Local AppData directory. The new check notices these existing alternatives
+and asks you to select a folder explicitly. It also checks the older Linux
+location if your XDG base changed. No history is moved to the release folder.
+The public release's literal `~/.local/share/lumina-release` default is
+retained on macOS/Windows too; it has not silently switched to a native path.
+
+An empty or whitespace-only override is an error. Prefer an absolute path.
+A relative override is pinned to the terminal's current directory before
+the shell launcher changes directories. IDEs/services can start in another
+directory, so give them the same absolute path. The separate local dev
+installation retains its explicit `dev` profile and platformdirs default;
+the public release never automatically adopts its folder.
 
 To identify your installation:
 
@@ -62,9 +73,9 @@ If you already have a Flight Recorder diagnostic, its `runtime.startup`
 event from `main.py` records `data_dir`. That can help confirm what a prior
 launch used; you do not need to edit a database or run Lumina to find out.
 
-**Existing users of `~/.local/share/lumina`:** the public launcher does not
-automatically select or migrate that folder to `lumina-release`. Switching
-to that launcher can therefore show an apparently fresh installation.
+**Existing users of `~/.local/share/lumina`:** when this folder exists, an
+unset launch now stops with **Data folder selection needs review** and
+lists the candidates. It does not automatically select or migrate them.
 After the backup below, use the direct desktop entry point with your
 verified existing folder. For example, from your Lumina installation on
 Linux, if this is the folder you confirmed:
@@ -73,10 +84,12 @@ Linux, if this is the folder you confirmed:
 LUMINA_DATA_DIR="$HOME/.local/share/lumina" python main.py
 ```
 
-This selects the folder; it does not copy or merge data. Do not pass this
-override to `start_lumina.sh`: the script ignores it. Keep using the same
-explicit folder in future launch configurations. The inconsistent defaults
-are a release issue; this guide does not change them.
+This selects the folder; it does not copy or merge data. You may now use
+the same override with `bash start_lumina.sh`, CLI and standalone bridges.
+Keep that explicit folder in future launch configurations. If you cannot
+identify the right one, preserve all candidates and stop for help. Do not
+delete an alternative just to make the check pass. The check runs before
+preferences, services or C1 are opened and creates no data directory.
 
 ### 2. Stop everything and preserve your installation
 
@@ -128,10 +141,12 @@ For a clean installation with no previous Lumina data to retain, follow
 For another machine or data folder, read [Moving installations](#moving-to-another-machine-or-data-folder)
 first; an empty destination does not establish a first installation.
 
-Very old in-repository state can be moved automatically by the existing
-startup migration into the selected data folder when destination files do
-not exist. It does not merge two populated data folders. That is why both
-the installation and data folder must be preserved **before** launching.
+Very old in-repository state now produces an **Unreviewed legacy state**
+stop instead of being moved during startup. Preserve the installation and
+data folder and get a reviewed transfer plan. If you deliberately still
+use the installation folder itself as your data folder, an explicit
+`LUMINA_DATA_DIR` can select that original folder without moving it. Startup
+does not copy, merge, migrate or overwrite state to resolve either warning.
 
 ### 4. Open the desktop and choose the right safety action
 
@@ -274,7 +289,8 @@ review existing suspensions rather than rebuilding it. Verify history,
 preferences and local project/credential configuration before resuming
 ordinary use. Stop if an unexpected identity or recovery prompt appears.
 
-Launch selection is defined in [main.py](../main.py),
+Launch selection is defined in [data_directory.py](../data_directory.py),
+[main.py](../main.py),
 [start_lumina.sh](../start_lumina.sh) and [config.py](../config.py).
 The labels and safety actions above come from
 [the suspension dialog](../ui/suspension_dialog.py),
