@@ -184,17 +184,15 @@ partway through earlier work, you must tick that its outcome is unknown.
 Nothing restores itself after a timeout. Telegram `/resume` is not active
 yet.
 
-**First launch.** The suspension record lives in your data folder
-(`memory/suspension.db`, pinned by `memory/soul_identity.json`). Lumina
-never creates it on its own: a missing record can't be told apart from a
-deleted one. On the first launch with this feature, the desktop asks you to
-choose **Initialize** (first time here) or **Recover** (Lumina ran with it
-here before, or you're not sure — your work starts suspended so you can
-review it). Until you choose, nothing runs. If the record fails its checks
-(missing, damaged, replaced, from another data folder), everything is
-refused until you **Repair identity** or **Recover** — recovery keeps an
-exact copy of the old record first. The Telegram and Discord bridges, the
-CLI and other helpers only ever open an existing record.
+**First launch and recovery.** The safety record lives in your selected
+data folder (`memory/suspension.db`, pinned by `memory/soul_identity.json`).
+Only the desktop can initialize, repair, recover or resume it; the CLI and
+bridges require an existing usable record. Follow [Upgrading Lumina](upgrading.md)
+for folder selection, backups and the exact **Initialize**, **Recover…**,
+**Repair identity** and **Resume selected** steps, including the current
+recovery limitation when all prior traces are absent. Missing files are
+not proof of a first installation. Never remove safety records to bypass
+a hold. C1 recovery rebuilds the safety record; it is not Agent Restore.
 
 **Independent controls.** Runaway suspension, the Emergency Interlock and
 Telegram remote access are separate: a suspension doesn't latch the

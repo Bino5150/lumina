@@ -10,6 +10,9 @@
 
 ## Install
 
+Already have an installation or are moving one? Start with
+[Upgrading Lumina](upgrading.md) to preserve your data and personal overlays.
+
 ```bash
 git clone https://github.com/bino5150/lumina.git
 cd lumina
@@ -42,8 +45,21 @@ never crashes Settings on a missing key.
 ## Launch
 
 ```bash
-lumina   # alias to start_lumina.sh — starts TTS + UI
+bash start_lumina.sh   # launches desktop; selects ~/.local/share/lumina-release
 ```
+
+On the first launch with C1 runaway protection, the desktop asks you to
+establish its safety record. Follow [the Initialize/Recover steps](upgrading.md#4-open-the-desktop-and-choose-the-right-safety-action)
+before chatting. Only the desktop can do this; CLI, Telegram and Discord
+need an existing usable safety record in the same data folder.
+
+**Existing data:** the script always selects `~/.local/share/lumina-release`,
+even if `LUMINA_DATA_DIR` is set. Direct `python main.py` uses that same
+default when unset, but honors an explicit nonempty override. Standalone
+bridges use the platform default when unset (normally
+`~/.local/share/lumina` on Linux). See [the launch-method table](upgrading.md#1-find-the-data-folder-you-already-use)
+before switching launch methods; select your existing folder explicitly
+through `main.py` rather than starting with an empty history.
 
 `main.py` also accepts:
 
@@ -55,7 +71,7 @@ lumina   # alias to start_lumina.sh — starts TTS + UI
 
 | Variable | Purpose |
 |---|---|
-| `LUMINA_DATA_DIR` | Overrides the default data directory (`~/.local/share/lumina`) — used to run isolated installs/builds side by side. |
+| `LUMINA_DATA_DIR` | Explicit persistent data folder for direct `main.py` and standalone bridge launches. Defaults differ by entry point; `start_lumina.sh` overwrites this variable. See [launch methods](upgrading.md#1-find-the-data-folder-you-already-use). Use a nonempty absolute path. |
 | `LUMINA_BROWSER_HEADLESS` | Set to `0` to watch the Playwright browser session instead of running it headless (default `1`). |
 | `LUMINA_SECRETS_PATH` | Overrides where credentials (API keys, Higgsfield keys, Telegram token) are stored, outside `prefs.json` and outside version control (default `~/.config/lumina/credentials.json`, mode `0600`). |
 | `LUMINA_CHATGPT_AUTH_DIR` | Overrides where ChatGPT sign-in sessions are stored (default `~/.config/lumina/chatgpt/`, owner-only, never inside the data directory). |

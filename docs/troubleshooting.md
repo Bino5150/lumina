@@ -14,9 +14,15 @@ config.py`, that's a regression worth reporting, not expected behavior.
 
 ## Where things live
 
-- Data directory: `~/.local/share/lumina` by default (override with
-  `LUMINA_DATA_DIR`) — chat history, MemPalace, Knowledge Base, prefs, and
-  the Flight Recorder database all live here.
+- Data directory: chat history, MemPalace, Knowledge Base, prefs and the
+  Flight Recorder live under the selected folder. Public `main.py`
+  defaults to `~/.local/share/lumina-release` and honors a nonempty
+  `LUMINA_DATA_DIR`; `start_lumina.sh` always forces that release folder.
+  Standalone bridges instead default to the platform location (normally
+  `~/.local/share/lumina` on Linux). Follow [the upgrade guide's folder
+  check](upgrading.md#1-find-the-data-folder-you-already-use) before
+  changing launch methods. If history looks missing, stop and preserve
+  both folders; do not delete one or initialize again to fix the display.
 - Credentials: `~/.config/lumina/credentials.json`, mode `0600` (override
   with `LUMINA_SECRETS_PATH`) — never inside the data directory, never in
   a Memory Backup archive.
@@ -117,16 +123,12 @@ What the notices mean:
 - *"some earlier work's process stopped, so its outcome is unknown"* — a
   Lumina process quit partway through. Check whether that work happened
   (the incident lists it), tick the acknowledgement and resume.
-- *"Runaway suspension isn't ready for this data folder"* — first launch
-  with this feature, or its record is missing. Choose **Initialize** only
-  if this really is the first time here; otherwise **Recover** (your work
-  starts suspended so you can review it).
-- *"the runaway-suspension store … failed its identity checks"* — the
-  record is damaged, replaced or from another data folder. **Repair
-  identity** if offered; otherwise **Recover**, which first keeps an exact
-  copy in `memory/suspension_evidence/`. If another Lumina process is still
-  running on the same data folder, recovery waits until it stops or you
-  confirm it can be ignored.
+- *"Runaway suspension isn't ready for this data folder"* or a failed
+  identity check — follow [the desktop upgrade and recovery steps](upgrading.md#4-open-the-desktop-and-choose-the-right-safety-action).
+  They cover first initialization, damaged/missing state and active
+  processes. If **Recover…** refuses because no prior state exists and
+  earlier C1 use is possible, stop for help; do not bypass it with
+  **Initialize**. Recovery is not full Agent Restore.
 - *"global suspension unconfirmed"* — a suspension couldn't be written
   down, so it holds in this desktop process only, and writing it is retried
   on the next request. Check Suspension controls; a restart before it is

@@ -162,6 +162,10 @@ She is not finished. She will never be finished — that's the point. But she is
 
 Requirements, install, configure, and first-run notes: **[docs/getting-started.md](docs/getting-started.md)**.
 
+**Already using Lumina? Read [Upgrading to the C1 Runaway Suspension release](docs/upgrading.md#upgrading-to-the-c1-runaway-suspension-release)**
+before updating or choosing Initialize/Recover. It covers backups, the current
+launchers' different data folders, and the desktop safety setup.
+
 Quick version:
 
 ```bash
@@ -170,8 +174,11 @@ cd lumina
 pip install -r requirements.txt
 playwright install chromium
 cp config.example.py config.py   # point it at your llama.cpp server and preferred model
-lumina                           # alias to start_lumina.sh — starts TTS + UI
+bash start_lumina.sh              # launches desktop; selects ~/.local/share/lumina-release
 ```
+
+On first launch, follow the [desktop safety setup](docs/upgrading.md#4-open-the-desktop-and-choose-the-right-safety-action).
+For an existing data folder, use the guide's explicit-folder launch instructions.
 
 ## COMING SOON!
 

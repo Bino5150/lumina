@@ -22,6 +22,7 @@ for the full model.
 ## Contents
 
 - [Getting Started](getting-started.md) — install, configure, launch, first-run notice
+- [Upgrading](upgrading.md) — C1 first launch, existing data folders, backups, Initialize/Recover and safe resume
 - [Settings](settings.md) — every Settings tab, backend switching, reasoning control
 - [Memory](memory.md) — MemPalace, Dreaming, My Human, Context Compaction, `/context reforge`, Chat History, Knowledge Base, Backup
 - [Reforge](reforge.md) — the transactional context-reconstruction architecture behind `/context reforge` (alias `/context rebuild`), including empirical validation results
