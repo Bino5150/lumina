@@ -2076,18 +2076,26 @@ def _strict_json_loads(raw):
                        parse_constant=_reject_non_finite_json_constant)
 
 
-def _read_lumina_version(base_dir: str) -> str:
+def _read_lumina_version(base_dir: str, *, _forbidden=None) -> str:
     """Static source read of main.py's LUMINA_VERSION constant --
     deliberately never `import main`, which is the application entry
     point and may carry startup side effects far heavier than reading one
     constant. Falls back to 'unknown' (never a fabricated value) if the
     file or the constant can't be found."""
     main_py = os.path.join(base_dir, "main.py")
-    try:
-        with open(main_py, "r", encoding="utf-8") as f:
-            source = f.read()
-    except OSError:
-        return "unknown"
+    if _forbidden is not None:
+        raw, kind, _, _ = _open_and_capture_stable_bytes(
+            main_py, os.path.realpath(base_dir), _forbidden,
+            max_capture_bytes=_determine_aggregate_payload_budget(0))
+        if kind != "ok":
+            return "unknown"
+        source = raw.decode("utf-8")
+    else:
+        try:
+            with open(main_py, "r", encoding="utf-8") as f:
+                source = f.read()
+        except OSError:
+            return "unknown"
     match = re.search(r'^LUMINA_VERSION\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
     return match.group(1) if match else "unknown"
 
@@ -2142,17 +2150,22 @@ def _resolve_ledger_identity(data_dir: str):
         return None
 
 
-def _build_forbidden_identities(credentials_identity, ledger_identity) -> dict:
+def _build_forbidden_identities(credentials_identity, ledger_identity, *,
+                                _c1_exclusion=None, _data_dir=None) -> dict:
     """The trusted set of forbidden source identities (Section 9) shared
     by both the lenient plain-file boundary (_open_verified, which
     excludes-with-warning on a match -- unchanged policy, now checking a
     wider set) and the strict state-bearing capture boundary
     (_open_state_bearing, which fails the whole backup on a match --
     Section 10's new requirement for required, discovered state)."""
-    return {
+    forbidden = {
         _CREDENTIALS_IDENTITY_LABEL: credentials_identity,
         _LEDGER_IDENTITY_LABEL: ledger_identity,
     }
+    if _c1_exclusion is not None:
+        from core.agent_backup_export import C1CaptureBoundary
+        return C1CaptureBoundary(forbidden, _data_dir, _c1_exclusion)
+    return forbidden
 
 
 def _classify_root(top_dir: str):
@@ -2258,6 +2271,8 @@ def _open_verified(path: str, canonical_root_real: str, forbidden_identities: di
     fstat(fd) of what was actually opened -- never from a path-based
     os.stat() call that could observe a different file than the one that
     gets read afterward."""
+    if hasattr(forbidden_identities, "reject_protected_source"):
+        forbidden_identities.reject_protected_source(path)
     try:
         lst = os.lstat(path)
     except OSError as e:
@@ -2297,15 +2312,19 @@ def _open_verified(path: str, canonical_root_real: str, forbidden_identities: di
     return fd, "", False
 
 
-def _read_fd_fully_keep_open(fd: int) -> bytes:
+def _read_fd_fully_keep_open(fd: int, *, max_bytes: int | None = None) -> bytes:
     """Reads fd to EOF without ever closing it -- used by
     _read_stable_bytes_or_none, which needs to fstat/reread the SAME
     descriptor a second time after the first read completes."""
     chunks = []
+    total = 0
     while True:
-        chunk = os.read(fd, 1 << 20)
+        chunk = os.read(fd, min(1 << 20, max_bytes - total + 1) if max_bytes is not None else 1 << 20)
         if not chunk:
             break
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise AgentBackupError("EXPORT_CAPTURE_RESOURCE_LIMIT")
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -2332,7 +2351,7 @@ def _stability_tuple(st) -> tuple:
     return tuple(getattr(st, field) for field in _STABILITY_STAT_FIELDS)
 
 
-def _read_stable_bytes_or_none(fd: int):
+def _read_stable_bytes_or_none(fd: int, *, max_bytes: int | None = None):
     """Consumes and ALWAYS closes fd (mirrors _read_fd_fully's ownership
     contract). Proves the bytes read through it are a single, coherent,
     repeatable version via three fstat calls bracketing two full reads of
@@ -2357,12 +2376,16 @@ def _read_stable_bytes_or_none(fd: int):
     replacement for and must not be layered onto (Section 10)."""
     try:
         st_a = os.fstat(fd)
-        data1 = _read_fd_fully_keep_open(fd)
+        if max_bytes is not None and st_a.st_size > max_bytes:
+            raise AgentBackupError("EXPORT_CAPTURE_RESOURCE_LIMIT")
+        data1 = (_read_fd_fully_keep_open(fd) if max_bytes is None else
+                 _read_fd_fully_keep_open(fd, max_bytes=max_bytes))
         st_b = os.fstat(fd)
         if _stability_tuple(st_a) != _stability_tuple(st_b):
             return None, False
         os.lseek(fd, 0, os.SEEK_SET)
-        data2 = _read_fd_fully_keep_open(fd)
+        data2 = (_read_fd_fully_keep_open(fd) if max_bytes is None else
+                 _read_fd_fully_keep_open(fd, max_bytes=max_bytes))
         st_c = os.fstat(fd)
         if _stability_tuple(st_b) != _stability_tuple(st_c):
             return None, False
@@ -2465,6 +2488,8 @@ def _open_state_bearing(path: str, canonical_root_real: str, forbidden_identitie
                        canonical root, fstat failure) -- an availability
                        problem, not a deliberate special-file/identity
                        rejection, but still never returns an fd."""
+    if hasattr(forbidden_identities, "reject_protected_source"):
+        forbidden_identities.reject_protected_source(path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path, flags)
@@ -2529,7 +2554,7 @@ _MAX_STABLE_CAPTURE_ATTEMPTS = 2
 
 
 def _open_and_capture_stable_bytes(path: str, canonical_root_real: str,
-                                    forbidden_identities: dict, expected_identity=None):
+                                    forbidden_identities: dict, expected_identity=None, *, max_capture_bytes=None):
     """THE universal physical-file capture loop (AGENT-BACKUP-RESTORE-
     A2R7, Section 2-4, BLOCKER, A2F7): every ZIP payload sourced from a
     mutable filesystem pathname -- REQUIRED state or merely OPTIONAL
@@ -2570,7 +2595,8 @@ def _open_and_capture_stable_bytes(path: str, canonical_root_real: str,
         if kind != "ok":
             return None, kind, reason, attempt
         try:
-            data, stable = _read_stable_bytes_or_none(fd)
+            data, stable = (_read_stable_bytes_or_none(fd) if max_capture_bytes is None else
+                            _read_stable_bytes_or_none(fd, max_bytes=max_capture_bytes))
         except OSError as e:
             return None, "unavailable", f"could not be read ({e})", attempt
         if stable:
@@ -2805,7 +2831,8 @@ def _newly_acquired_identities(before: dict, after: dict) -> set:
 
 
 def _connect_sqlite_with_bound_identity(open_fn, source_path: str,
-                                         expected_identity, credentials_identity):
+                                         expected_identity, credentials_identity, *,
+                                         _forbidden_identities=None):
     """Calls open_fn() (a zero-arg callable performing sqlite3.connect())
     and proves, from file descriptor(s) NEWLY ACQUIRED BY THIS SPECIFIC
     CALL, that it is bound to expected_identity and never to
@@ -2909,6 +2936,8 @@ def _connect_sqlite_with_bound_identity(open_fn, source_path: str,
             f"credentials guarantee (fail closed)"
         )
 
+    if _forbidden_identities is not None:
+        _forbidden_identities.reject_sqlite_sources(source_path)
     with _SQLITE_CONNECT_SERIALIZE_LOCK:
         before = _proc_fd_identity_snapshot(f"pre-connect snapshot for {source_path}")
         conn = open_fn()
@@ -2919,6 +2948,10 @@ def _connect_sqlite_with_bound_identity(open_fn, source_path: str,
             raise
 
     new_identities = _newly_acquired_identities(before, after)
+    if (_forbidden_identities is not None
+            and new_identities & (set(_forbidden_identities.values()) - {None})):
+        conn.close()
+        raise AgentBackupError("C1_PROTECTED_SQLITE_IDENTITY")
 
     if not new_identities:
         conn.close()
@@ -2962,7 +2995,8 @@ def _snapshot_sqlite(source_path: str, staged_path: str,
                       canonical_root_real: str | None = None, credentials_identity=None,
                       expected_identity=None,
                       timeout_seconds: float = _SQLITE_BACKUP_TIMEOUT_SECONDS,
-                      budget: "_AggregateBudget | None" = None) -> bytes:
+                      budget: "_AggregateBudget | None" = None, *,
+                      _forbidden_identities=None) -> bytes:
     """A real point-in-time-consistent copy via sqlite3.Connection.backup()
     (SQLite's own Online Backup API), not a raw file copy after a
     checkpoint. wal_checkpoint(TRUNCATE) is NOT quiescence: a checkpoint
@@ -3048,7 +3082,9 @@ def _snapshot_sqlite(source_path: str, staged_path: str,
     try:
         if canonical_root_real is not None:
             source_conn = _connect_sqlite_with_bound_identity(
-                _open_source, source_path, expected_identity, credentials_identity)
+                _open_source, source_path, expected_identity, credentials_identity,
+                **({"_forbidden_identities": _forbidden_identities}
+                   if _forbidden_identities is not None else {}))
         else:
             source_conn = _open_source()
     except sqlite3.OperationalError as e:
@@ -3064,6 +3100,8 @@ def _snapshot_sqlite(source_path: str, staged_path: str,
         dest_conn = sqlite3.connect(staged_path, timeout=timeout_seconds)
         try:
             try:
+                if _forbidden_identities is not None:
+                    _forbidden_identities.reject_sqlite_sources(source_path)
                 source_conn.backup(dest_conn, pages=64, progress=_progress, sleep=0.1)
             except _SnapshotDeadline as e:
                 raise AgentBackupError(str(e))
@@ -3631,7 +3669,9 @@ def _collect_database_members(data_dir: str, staging_root: str, canonical_data_r
         )
     staged = os.path.join(staging_root, "state", "databases", "lumina.db")
     data = _snapshot_sqlite(lumina_db, staged, canonical_data_root, credentials_identity, identity,
-                             budget=budget)
+                             budget=budget,
+                             **({"_forbidden_identities": forbidden_identities}
+                                if hasattr(forbidden_identities, "reject_sqlite_sources") else {}))
     _require_immediate_sqlite_validity(data, "lumina_db", lumina_db)
     members.append({
         "logical_id": "state.databases.lumina_db",
@@ -3669,7 +3709,9 @@ def _collect_database_members(data_dir: str, staging_root: str, canonical_data_r
         )
     staged = os.path.join(staging_root, "state", "telemetry", "flight_recorder.db")
     data = _snapshot_sqlite(telemetry_db, staged, canonical_data_root, credentials_identity, identity,
-                             budget=budget)
+                             budget=budget,
+                             **({"_forbidden_identities": forbidden_identities}
+                                if hasattr(forbidden_identities, "reject_sqlite_sources") else {}))
     _require_immediate_sqlite_validity(data, "flight_recorder_db", telemetry_db)
     db_meta = _sqlite_metadata_from_bytes(data)
     retention = _flight_recorder_retention_metadata()
@@ -4304,7 +4346,7 @@ class _BuiltArchiveResult:
 
 def _capture_and_verify_archive(path_to_capture: str, forbidden_identities: dict,
                                  canonical_root_real: str, label: str,
-                                 resident_bytes_hint: int = 0):
+                                 resident_bytes_hint: int = 0, *, _export_v2: bool = False):
     """AGENT-BACKUP-RESTORE-A2R8/A2F8 (Section 2-6, BLOCKER B1): captures
     `path_to_capture`'s exact bytes via the SAME universal stable-capture
     boundary every other physical source in this module uses (fstat/read/
@@ -4355,7 +4397,11 @@ def _capture_and_verify_archive(path_to_capture: str, forbidden_identities: dict
     # never-raises, monkeypatchable seam every other caller in this
     # module goes through, now fed the captured bytes (io.BytesIO)
     # instead of a pathname.
-    report = verify_agent_backup(io.BytesIO(data), resident_bytes_hint=resident_bytes_hint)
+    if _export_v2:
+        from core.agent_backup_export import verify_export
+        report = verify_export(io.BytesIO(data), resident_bytes_hint=resident_bytes_hint)
+    else:
+        report = verify_agent_backup(io.BytesIO(data), resident_bytes_hint=resident_bytes_hint)
     if not report["valid"]:
         raise AgentBackupError(f"{label} failed strict verification ({path_to_capture}): {report['errors']}")
     sha256 = hashlib.sha256(data).hexdigest()
@@ -4605,7 +4651,8 @@ def _preserve_rollback_failure_artifact(data: bytes, dest_dir: str, dest_dir_rea
 def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
                               identity_trailers_path: str | None = None,
                               baseline_hashes_path: str | None = None,
-                              credentials_path: str | None = None) -> "_BuiltArchiveResult":
+                              credentials_path: str | None = None, *,
+                              _export_v2: bool = False) -> "_BuiltArchiveResult":
     """Collects a full Agent Backup archive at dest_path and returns a
     _BuiltArchiveResult binding the manifest to the exact archive bytes
     this call published (Section 15-18, A2F6; single-snapshot capture and
@@ -4648,14 +4695,21 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
     unattested state.
     """
     _reject_unsafe_destination(dest_path, data_dir, base_dir, identity_trailers_path)
+    c1_exclusion = None
+    if _export_v2:
+        from core.agent_backup_export import preflight_incomplete
+        c1_exclusion = preflight_incomplete(data_dir, dest_path)
 
     if baseline_hashes_path is None:
         baseline_hashes_path = _default_baseline_hashes_path(base_dir)
 
     credentials_identity = _resolve_credentials_identity(credentials_path)
     ledger_identity = _resolve_ledger_identity(data_dir)
-    forbidden_identities = _build_forbidden_identities(credentials_identity, ledger_identity)
-    lumina_version = _read_lumina_version(base_dir)
+    forbidden_identities = (_build_forbidden_identities(
+        credentials_identity, ledger_identity, _c1_exclusion=c1_exclusion, _data_dir=data_dir)
+        if _export_v2 else _build_forbidden_identities(credentials_identity, ledger_identity))
+    lumina_version = (_read_lumina_version(base_dir, _forbidden=forbidden_identities)
+                      if _export_v2 else _read_lumina_version(base_dir))
 
     # AGENT-BACKUP-RESTORE-A2F10 (HIGH H2, Section 20-27): a cheap stat
     # (never a read) of whatever archive already occupies dest_path --
@@ -4677,6 +4731,12 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
         members, baseline_snapshot_data = _collect_members(
             data_dir, base_dir, staging_root, identity_trailers_path, baseline_hashes_path,
             credentials_identity, forbidden_identities, warnings, budget=budget)
+
+        export_observations = None
+        if _export_v2:
+            from core.agent_backup_export import prepare_export_members
+            members, export_observations = prepare_export_members(
+                members, data_dir, staging_root, forbidden_identities, warnings, budget)
 
         # AGENT-BACKUP-RESTORE-A2F10 (Section 8-10, part of B1): fail
         # BEFORE ever attempting to build the ZIP if the physical entry
@@ -4776,6 +4836,9 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
             "warnings": warnings,
         }
 
+        if _export_v2:
+            from core.agent_backup_export import apply_export_contract
+            apply_export_contract(manifest, export_observations)
         _validate_namespace(public_members)
 
         dest_dir = os.path.dirname(os.path.abspath(dest_path)) or "."
@@ -4858,7 +4921,7 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
             already_collected_payload_bytes = sum(len(m["data"]) for m in members)
             built_data, built_sha256, built_size, built_manifest = _capture_and_verify_archive(
                 tmp_path, forbidden_identities, dest_dir_real, "freshly-built archive",
-                resident_bytes_hint=already_collected_payload_bytes)
+                resident_bytes_hint=already_collected_payload_bytes, _export_v2=_export_v2)
         finally:
             try:
                 os.remove(tmp_path)
@@ -4880,11 +4943,21 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
         # just-built, not-yet-published candidate archive) are
         # simultaneously resident -- the prior-destination verification
         # below is charged for both, not just its own compressed bytes.
+        if _export_v2:
+            # Incomplete exports have no overwrite or rollback authority.
+            # Atomic no-clobber publication also closes the preflight race.
+            from core.agent_backup_export import publish_new_export
+            publication_observation = publish_new_export(
+                built_data, built_sha256, dest_path, dest_dir_real, forbidden_identities)
+            return _BuiltArchiveResult(built_manifest, built_data, built_sha256, built_size,
+                                       dest_path, publication_observation["published_identity"],
+                                       publication_observation)
+
         prior_snapshot = None
         if os.path.lexists(dest_path):
             prior_data, prior_sha256, _prior_size, _prior_manifest = _capture_and_verify_archive(
                 dest_path, forbidden_identities, dest_dir_real, "existing destination archive",
-                resident_bytes_hint=already_collected_payload_bytes + len(built_data))
+                resident_bytes_hint=already_collected_payload_bytes + len(built_data), _export_v2=_export_v2)
             prior_snapshot = (prior_data, prior_sha256)
 
         # Section 6: publish FROM the immutable captured bytes via a
@@ -6268,7 +6341,8 @@ def verify_agent_backup(archive_source, resident_bytes_hint: int = 0) -> dict:
                 "manifest": None, "verified_sqlite_members": []}
 
 
-def _verify_agent_backup_inner(archive_source, resident_bytes_hint: int = 0) -> dict:
+def _verify_agent_backup_inner(archive_source, resident_bytes_hint: int = 0, *,
+                               _export_v2: bool = False) -> dict:
     """archive_source is anything zipfile.ZipFile itself accepts: a path
     string (the public verify_agent_backup's own contract), or an
     already-materialized file-like object (io.BytesIO) -- used by
@@ -6429,7 +6503,11 @@ def _verify_agent_backup_inner(archive_source, resident_bytes_hint: int = 0) -> 
             return {"valid": False, "errors": errors + [f"manifest.json is not valid JSON: {e}"],
                     "manifest": None, "verified_sqlite_members": []}
 
-        errors.extend(_validate_manifest_schema(manifest))
+        if _export_v2:
+            from core.agent_backup_export import validate_export_schema
+            errors.extend(validate_export_schema(manifest))
+        else:
+            errors.extend(_validate_manifest_schema(manifest))
 
         # Namespace allowlist/collision rules apply to every PHYSICAL zip
         # entry too, not just declared members -- an undeclared forbidden
@@ -6464,6 +6542,9 @@ def _verify_agent_backup_inner(archive_source, resident_bytes_hint: int = 0) -> 
                 except Exception as e:
                     errors.append(f"could not read {archive_path_m}: {e}")
                     continue
+                if _export_v2:
+                    from core.agent_backup_export import validate_export_payload
+                    errors.extend(validate_export_payload(m, data, manifest))
                 if isinstance(m.get("size"), int) and len(data) != m["size"]:
                     errors.append(
                         f"size mismatch for {archive_path_m}: manifest says {m['size']}, "

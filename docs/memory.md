@@ -241,7 +241,7 @@ never look like "never installed" and trigger a silent reseed.
 
 ## Backup
 
-**Backup Memory** in Settings is a one-click button
+**Backup Memory (Legacy)** in Settings is a one-click button
 (`core/memory_backup.py`) that checkpoints the database
 (`PRAGMA wal_checkpoint(TRUNCATE)`) and zips the entire data directory —
 chat history, MemPalace, flat memories, Knowledge Base, the pending-action
@@ -258,5 +258,13 @@ cannot be parsed safely is excluded as ambiguous. The bytes checked are the byte
 source-path replacement during backup cannot substitute later bytes.
 Keep other copies of credentials out of the data directory.
 
-There is no separate "restore" UI for this yet — the backup is a file you
-keep.
+Settings also provides a separate **Verified Agent Backup** entry, which currently
+refuses complete-backup claims until C1 safety coverage is available, and an
+explicitly acknowledged **Incomplete State Export**. The latter validates archive
+integrity and recoverable content, requires a new destination, and reports missing
+C1 coverage and unproven recovery acceptance. It cannot be used as a complete
+Restore input. See [Agent Backup](agent-backup.md) for coverage, prefs security,
+format compatibility and publication limits.
+
+There is no functioning Restore UI. Full Restore, Selective Palace/Skills Recovery
+and Legacy Recovery remain pending.

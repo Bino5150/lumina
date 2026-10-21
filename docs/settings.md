@@ -8,7 +8,7 @@ Settings is a tabbed panel (`ui/settings/panel.py`). Current tabs, in order:
 | 👤 User Profile | Your own bio and Lumina's curated notes about you — see [My Human](memory.md#my-human) |
 | 🎭 Personas | Create/edit/import/export personas — see [Personas & Skills](personas-and-skills.md) |
 | 📡 Communications | Telegram, Discord, and your public bio — see [Channels](channels.md) |
-| 🧠 Memory | Browse/edit flat memory and MemPalace entries |
+| 🧠 Memory | Browse/edit flat memory and MemPalace entries; separate Legacy Backup, eligibility-gated Verified Agent Backup, and acknowledged Incomplete State Export — see [Agent Backup](agent-backup.md) |
 | 📚 Knowledge | Browse/edit Knowledge Base entries |
 | 🧩 Skills | Browse Lumina's procedural skills — see [Personas & Skills](personas-and-skills.md#skills) |
 | 🔧 Tools | Tool profiles, and the **Pending Actions**/**Pending Tools** approval queues (a Palace promotion request opens a review of the record's live state instead of a plain confirm) — see [Security & Authority](security.md) |

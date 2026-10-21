@@ -6,6 +6,8 @@ from PySide6.QtWidgets import (
 import json
 import os
 from datetime import datetime
+from PySide6.QtCore import QCoreApplication, QThread, Signal
+from core import agent_backup_export
 
 from ._widgets import _lbl, _le, _btn, _table
 # CI-CORRECTIVE (Flight Recorder backup test collection) -- the actual
@@ -24,6 +26,59 @@ def _db():
     return connect()
 
 
+# Export lifetime belongs to the application, not a disposable Settings tab.
+# Closing Settings cannot destroy a running QThread. Normal application quit
+# drains these read/export operations before Qt tears down worker objects.
+_EXPORT_WORKERS = set()
+
+
+def _release_backup_worker(worker):
+    _EXPORT_WORKERS.discard(worker)
+    worker.deleteLater()
+
+
+def _wait_for_backup_workers():
+    for worker in tuple(_EXPORT_WORKERS):
+        worker.wait()
+
+
+def _retain_backup_worker(worker):
+    _EXPORT_WORKERS.add(worker)
+    worker.finished.connect(lambda: _release_backup_worker(worker))
+    app = QCoreApplication.instance()
+    if app is not None and not app.property("agentBackupShutdownConnected"):
+        app.aboutToQuit.connect(_wait_for_backup_workers)
+        app.setProperty("agentBackupShutdownConnected", True)
+
+
+class _AgentBackupWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, data_dir, base_dir, destination, parent=None, *, incomplete=False):
+        super().__init__(parent)
+        self.data_dir, self.base_dir, self.destination = data_dir, base_dir, destination
+        self.incomplete = incomplete
+
+    def run(self):
+        try:
+            if self.incomplete:
+                manifest, receipt = agent_backup_export.export_incomplete_state(
+                    self.data_dir, self.base_dir, self.destination, owner_acknowledged=True)
+            else:
+                manifest, receipt = agent_backup_export.export_verified_agent_backup(
+                    self.data_dir, self.base_dir, self.destination)
+            receipt = agent_backup_export.confirm_export_result(self.destination, manifest, receipt)
+            self.completed.emit(receipt)
+        except agent_backup_export.ExportUnavailable as exc:
+            self.failed.emit(str(exc))
+        except Exception:
+            # Product errors cannot echo archive payloads, credential-like
+            # preference values, or arbitrary exception representations.
+            self.failed.emit("Agent Backup failed validation or publication. No verified "
+                             "success was recorded. Keep any prior backup and recovery evidence.")
+
+
 # ── Tab: Memory ────────────────────────────────────────────────────────────────
 
 class MemoryTab(QWidget):
@@ -31,6 +86,7 @@ class MemoryTab(QWidget):
         super().__init__(parent)
         self.agent = agent
         self.c = c
+        self._backup_worker = None
         self._build()
         self._load()
 
@@ -96,14 +152,32 @@ class MemoryTab(QWidget):
         paste_btn = _btn("Import Memories", self.c)
         paste_btn.setToolTip("Paste a block of memories exported from another agent")
         paste_btn.clicked.connect(self._paste_import)
-        backup_btn = _btn("⬇ Backup Memory...", self.c, accent=True)
-        backup_btn.setToolTip("Package chat history, MemPalace, and everything else in Lumina's data directory into one archive")
+        backup_btn = _btn("Backup Memory (Legacy)...", self.c)
+        backup_btn.setToolTip("Legacy data-directory ZIP. Source overlays are not included; "
+                              "full Agent Restore is not yet available. Not encrypted.")
         backup_btn.clicked.connect(self._backup_memory)
         bot.addWidget(del_btn)
         bot.addWidget(paste_btn)
-        bot.addWidget(backup_btn)
+        exports = QHBoxLayout()
+        exports.addWidget(backup_btn)
+        self.verified_backup_btn = _btn("Verified Agent Backup...", self.c, accent=True)
+        self.verified_backup_btn.setObjectName("verified_agent_backup")
+        self.verified_backup_btn.setToolTip(
+            "Checks complete export coverage before writing. Safety-state support is pending; "
+            "this workflow refuses incomplete full-backup claims.")
+        self.verified_backup_btn.clicked.connect(self._export_agent_backup)
+        exports.addWidget(self.verified_backup_btn)
+        self.incomplete_export_btn = _btn("Incomplete State Export...", self.c)
+        self.incomplete_export_btn.setObjectName("incomplete_state_export")
+        self.incomplete_export_btn.setToolTip(
+            "Deliberately export recoverable content with explicit omissions. "
+            "Requires acknowledgement and a new file; full Restore is unproven.")
+        self.incomplete_export_btn.clicked.connect(lambda: self._export_agent_backup(incomplete=True))
+        exports.addWidget(self.incomplete_export_btn)
+        exports.addStretch()
         bot.addStretch()
         layout.addLayout(bot)
+        layout.addLayout(exports)
 
     def _load(self):
         conn = _db()
@@ -115,7 +189,7 @@ class MemoryTab(QWidget):
     def _backup_memory(self):
         import config as _config
         default_name = f"lumina_memory_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-        dest, _ = QFileDialog.getSaveFileName(self, "Save Memory Backup", default_name, "Zip Archives (*.zip)")
+        dest, _ = QFileDialog.getSaveFileName(self, "Save Legacy Memory Backup", default_name, "Zip Archives (*.zip)")
         if not dest:
             return
         try:
@@ -124,7 +198,10 @@ class MemoryTab(QWidget):
             QMessageBox.critical(self, "Backup Failed", f"Could not write backup archive: {e}")
             return
         size_mb = os.path.getsize(dest) / (1024 * 1024)
-        message = f"Memory backup saved to:\n{dest}\n\n({size_mb:.1f} MB)"
+        message = (f"Legacy Memory Backup saved to:\n{dest}\n\n({size_mb:.1f} MB)\n\n"
+                   "Partial data-directory coverage. Personas, source Skills and other source overlays "
+                   "are not included. This is not an A2 Agent Backup or proof of recoverability. "
+                   "Not encrypted; ordinary content may contain sensitive information.")
         if exclusions.count:
             names = "\n".join(repr(path) for path in exclusions.paths)
             rest = exclusions.count - len(exclusions.paths)
@@ -133,6 +210,76 @@ class MemoryTab(QWidget):
             if rest:
                 message += f"\n…and {rest} more."
         QMessageBox.information(self, "Backup Complete", message)
+
+    def _export_agent_backup(self, *, incomplete=False):
+        if not getattr(self.agent, "owner", False):
+            QMessageBox.critical(self, "Owner required", "Only the local owner can export Agent Backup state.")
+            return
+        if self._backup_worker is not None or _EXPORT_WORKERS:
+            QMessageBox.warning(self, "Export running",
+                                "An Agent Backup export is already running. Closing Settings does not cancel it.")
+            return
+        if incomplete:
+            answer = QMessageBox.question(
+                self, "Acknowledge incomplete coverage",
+                "This exports validated recoverable content with incomplete state coverage. "
+                "C1 safety store, soul identity, incidents, epochs, replay state and evidence "
+                "are omitted; enforcement compatibility is unproven. The Knowledge Pack "
+                "installation marker is captured if present; absence remains unknown. "
+                "PIN, owner bindings and communications credentials are omitted. "
+                "Full recovery acceptance is not proven; this archive is not accepted as a "
+                "complete Restore input. It is not encrypted, and ordinary content may contain secrets. "
+                "Existing files cannot be overwritten. Closing Settings does not cancel the export; "
+                "quitting waits for it to finish. Continue with Incomplete State Export?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        import config as _config
+        label = "Incomplete State Export" if incomplete else "Verified Agent Backup"
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Save " + label,
+            "lumina_incomplete_state.zip" if incomplete else "lumina_agent_backup.zip",
+            "Zip Archives (*.zip)")
+        if not dest:
+            return
+        self.verified_backup_btn.setEnabled(False)
+        self.incomplete_export_btn.setEnabled(False)
+        worker = _AgentBackupWorker(_config.DATA_DIR, _config.BASE_DIR, dest, incomplete=incomplete)
+        self._backup_worker = worker
+        worker.completed.connect(self._agent_backup_completed)
+        worker.failed.connect(self._agent_backup_failed)
+        worker.finished.connect(self._agent_backup_worker_finished)
+        _retain_backup_worker(worker)
+        worker.start()
+
+    def _agent_backup_worker_finished(self):
+        self._backup_worker = None
+        self.verified_backup_btn.setEnabled(True)
+        self.incomplete_export_btn.setEnabled(True)
+
+    def _agent_backup_failed(self, message):
+        QMessageBox.critical(self, "Agent Backup unavailable", message)
+
+    def _agent_backup_completed(self, receipt):
+        # Current contract cannot establish full coverage or Restore acceptance.
+        # The worker re-verifies the exact file and checks receipt claims first.
+        marker = receipt["semantic_coverage"]["knowledge_pack_installation_marker"]
+        durability = ("confirmed" if receipt["publication"].get("directory_fsynced")
+                      else "not confirmed; best effort only")
+        QMessageBox.warning(
+            self, "Incomplete State Export",
+            f"Incomplete State Export written to:\n{receipt['destination']}\n\n"
+            "Archive integrity and structure: PASS\n"
+            f"SHA-256: {receipt['archive_sha256']}\n"
+            f"Verified members: {receipt['member_count']}\n"
+            f"Verified SQLite snapshots: {receipt['database_snapshots_verified']}\n"
+            "Semantic state coverage: INCOMPLETE\n"
+            f"Knowledge Pack installation marker: {marker}\n"
+            "C1 store / soul identity / safety evidence: OMITTED\n"
+            "C1 enforcement compatibility: UNPROVEN\n"
+            "Full recovery acceptance: NOT PROVEN; not a complete Restore input\n"
+            f"Directory durability: {durability}\n"
+            "Not encrypted. Ordinary content may contain secrets. Preserve prior verified backups.")
 
     def _render(self, rows: list):
         self.table.setRowCount(0)

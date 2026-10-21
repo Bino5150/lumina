@@ -28,7 +28,7 @@ Companion, Security).
 - 🧩 Specialized sub-agents for delegated tasks (optional, off by default)
 - ⏰ Background and scheduled task execution (optional, off by default)
 - 🗜️ Context compaction and [Reforge](docs/reforge.md), an owner-facing `/context reforge` transactional continuity checkpoint (alias `/context rebuild`) — live-tested to cut active context by 60–90% without touching the durable transcript
-- 💾 Memory backup, one click
+- 💾 Legacy memory backup and explicit incomplete state export — [coverage and limits](docs/agent-backup.md)
 - ⌨️ Fully functional CLI mode with persona flags
 
 ## Included Personas
@@ -114,7 +114,7 @@ Two remote channels, sharing the security model above but sitting at very differ
 
 ## Memory
 
-Lumina's memory is a set of related subsystems, not one database: the **MemPalace** (a decaying, layered hierarchy plus cross-cutting Halls), Context Compaction and `/context reforge` (alias `/context rebuild`), **Dreaming**, **My Human** (three fields — your own bio, Lumina's curated notes, and a separate public bio for outside channels), FTS5-indexed **Chat History Search**, a **Knowledge Base** for reference material, a **Skills** system with a real official/user trust split, and one-click **Memory Backup**.
+Lumina's memory is a set of related subsystems, not one database: the **MemPalace** (a decaying, layered hierarchy plus cross-cutting Halls), Context Compaction and `/context reforge` (alias `/context rebuild`), **Dreaming**, **My Human** (three fields — your own bio, Lumina's curated notes, and a separate public bio for outside channels), FTS5-indexed **Chat History Search**, a **Knowledge Base** for reference material, a **Skills** system with a real official/user trust split, and **Backup Memory (Legacy)** plus an explicitly acknowledged **Incomplete State Export**. Complete Verified Agent Backup remains blocked on C1 safety coverage; full recovery acceptance is unproven.
 
 Full detail: **[Memory](docs/memory.md)**.
 
