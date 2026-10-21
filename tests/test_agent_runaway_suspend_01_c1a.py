@@ -208,6 +208,7 @@ def _tracked_python():
 SUSPENSION_CORE_IMPORTERS = {
     "core/suspension_runtime.py", "ui/suspension_dialog.py", "core/agent.py", "core/headless.py",
     "tools/registry.py", "comms/telegram_bridge.py", "ui/main_window.py", "eval/run_eval.py",
+    "core/suspension_backup.py",
 }
 
 
