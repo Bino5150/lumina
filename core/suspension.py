@@ -50,7 +50,11 @@ deleted with all of its traces -- so the caller (the desktop, Slice C1b) must
 put the decision to the owner. Recovery (repair_identity, recover_destructively)
 is likewise local-owner only, preserves byte-identical evidence before it
 changes anything, and destructive recovery rotates the incarnation so every
-old token is rejected.
+old token is rejected. When no trace survives at all, recovery restores
+nothing: on an explicit owner acknowledgement that earlier state is unknown
+it starts a new soul and incarnation with the owner suspended and every
+scope first seen afterwards suspended, and leaves a receipt saying no
+evidence survived.
 
 Not guaranteed (design R2 §1): interrupting work admitted before a trip;
 control over runtimes that do not run this code or that are bound to a
@@ -470,6 +474,9 @@ class RecoveryOutcome:
     salvage_complete: bool
     unknown_scope_policy: str
     unknown_outcome_leases: int
+    # False only for recovery with no trace at all: evidence_dir then holds
+    # a receipt saying so, not a copy of any earlier state.
+    evidence_survived: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +788,10 @@ def _insert_incident(conn, *, now: float, scope: str, epoch: int, trigger: str, 
 
 
 def _create_schema(conn, *, now: float, soul_id: str, incarnation: str,
-                   unknown_scope_policy: str = "clear") -> None:
+                   unknown_scope_policy: str = "clear",
+                   populate: Optional[Callable[[sqlite3.Connection], None]] = None) -> None:
+    """`populate` runs inside the creating transaction, so whatever it
+    writes (e.g. an owner suspension) commits together with the schema."""
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -798,6 +808,8 @@ def _create_schema(conn, *, now: float, soul_id: str, incarnation: str,
             ("unknown_scope_policy", unknown_scope_policy),
         ])
         conn.execute("INSERT INTO scopes VALUES (?, 0, 0, 0, NULL)", (OWNER_SCOPE,))
+        if populate is not None:
+            populate(conn)
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
@@ -1391,13 +1403,18 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def _preserve_evidence(paths: _Paths, now: float) -> str:
-    """Copy every store file and the identity pin, byte for byte, before
-    anything else happens. Returns the evidence directory."""
+def _new_evidence_dir(paths: _Paths, now: float) -> str:
     os.makedirs(paths.evidence, mode=0o700, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + "-" + secrets.token_hex(4)
     target = os.path.join(paths.evidence, stamp)
     os.mkdir(target, 0o700)
+    return target
+
+
+def _preserve_evidence(paths: _Paths, now: float) -> str:
+    """Copy every store file and the identity pin, byte for byte, before
+    anything else happens. Returns the evidence directory."""
+    target = _new_evidence_dir(paths, now)
     for name in _STORE_FILES + (IDENTITY_NAME,):
         source = os.path.join(paths.memory_dir, name)
         try:
@@ -1486,9 +1503,76 @@ def repair_identity(data_dir, *, ingress, now: Optional[Callable[[], float]] = N
     return store
 
 
+NO_TRACE_RECEIPT_NAME = "no_prior_state.json"
+_NO_TRACE_RECEIPT_SCHEMA = "lumina.suspension_no_trace_recovery"
+
+
+def _recover_without_traces(data_dir, paths: _Paths, *, acknowledged, clear_unknown_scopes: bool,
+                            clock: Callable[[], float],
+                            now: Optional[Callable[[], float]]) -> RecoveryOutcome:
+    """Recovery when probe() finds no trace at all. Nothing survives to
+    preserve or salvage, and the absence is not proof of a first run, so
+    nothing is restored: a brand-new soul and incarnation, the owner
+    suspended until an acknowledged review, and every scope first seen
+    afterwards suspended until the owner reviews it."""
+    if acknowledged is not True:
+        raise RecoveryBlocked("no earlier suspension state survives here; to recover, the owner must "
+                              "acknowledge that earlier suspensions, other Lumina processes and the "
+                              "outcome of earlier work are unknown (initialize only for a genuine "
+                              "first launch)")
+    if clear_unknown_scopes:
+        raise RecoveryBlocked("no earlier suspension state survives, so channels must start suspended "
+                              "and be reviewed after recovery")
+    at = clock()
+    soul_id, incarnation = secrets.token_hex(16), secrets.token_hex(16)
+    # The receipt goes first. It is itself a trace, so a crash from here on
+    # leaves ABSENT_WITH_TRACE (recover again), never a first-run look-alike.
+    receipt_dir = _new_evidence_dir(paths, at)
+    _write_new_private(os.path.join(receipt_dir, NO_TRACE_RECEIPT_NAME), _canonical({
+        "schema": _NO_TRACE_RECEIPT_SCHEMA, "version": 1, "at": at, "evidence_survived": False,
+        "prior_state": "unknown", "soul_id": soul_id, "store_incarnation": incarnation}))
+    _fsync_dir(receipt_dir)
+    _fsync_dir(paths.memory_dir)
+    if set(_traces(paths)) != {EVIDENCE_DIRNAME}:
+        raise RecoveryBlocked("suspension state appeared while recovering; review it again")
+
+    def suspend_owner(conn) -> None:
+        sid = _insert_incident(conn, now=at, scope=OWNER_SCOPE, epoch=1, trigger=RECOVERY_TRIGGER,
+                               evidence={"reason": "prior_state_unknown_no_trace"},
+                               leases=[], requires_ack=True)
+        conn.execute("UPDATE scopes SET execution_epoch = 1, state_revision = 1, suspended = 1, "
+                     "active_incident = ? WHERE scope = ?", (sid, OWNER_SCOPE))
+        _audit(conn, at, "no_trace_recovery",
+               detail={"evidence": "none_survived", "receipt": os.path.basename(receipt_dir),
+                       "new_incarnation": incarnation, "prior_state": "unknown",
+                       "suspended_scopes": 1, "unknown_scope_policy": "suspended"})
+
+    # O_EXCL: losing a race with a concurrent initializer or recovery
+    # fails, never adopts.
+    try:
+        _write_new_private(paths.db, b"")
+    except FileExistsError:
+        raise RecoveryBlocked("a suspension store appeared while recovering; review it again") from None
+    conn = _connect(paths.db)
+    try:
+        _create_schema(conn, now=at, soul_id=soul_id, incarnation=incarnation,
+                       unknown_scope_policy="suspended", populate=suspend_owner)
+    finally:
+        conn.close()
+    try:
+        _write_new_private(paths.identity, _identity_bytes(soul_id))
+    except FileExistsError:
+        raise RecoveryBlocked("an identity pin appeared while recovering; review it again") from None
+    _fsync_dir(paths.memory_dir)
+    open_store(data_dir, now=now).close()
+    return RecoveryOutcome(receipt_dir, None, incarnation, soul_id, (OWNER_SCOPE,), False,
+                           "suspended", -1, evidence_survived=False)
+
+
 def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(),
                           acknowledge_unreadable_runtimes: bool = False,
                           acknowledge_unknown_scopes: bool = False,
+                          acknowledge_unknown_prior_state: bool = False,
                           now: Optional[Callable[[], float]] = None) -> RecoveryOutcome:
     """Destructive recovery, for a store that can't be opened and can't be
     repaired non-destructively (design R2 §4.4). Local owner only:
@@ -1502,6 +1586,9 @@ def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(
          table was unreadable, new scopes start suspended until the owner
          acknowledges them (unless acknowledge_unknown_scopes).
 
+    With no trace at all, see _recover_without_traces: it needs
+    acknowledge_unknown_prior_state and never pre-clears unknown scopes.
+
     A healthy store is never destroyed."""
     _require_local_owner(ingress)
     clock = now or time.time
@@ -1511,7 +1598,9 @@ def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(
     if status is StoreStatus.HEALTHY:
         raise RecoveryBlocked("the store is healthy; refusing to destroy it")
     if status is StoreStatus.ABSENT_NO_TRACE:
-        raise RecoveryBlocked("no prior state exists here; this is initialization, not recovery")
+        return _recover_without_traces(data_dir, paths, acknowledged=acknowledge_unknown_prior_state,
+                                       clear_unknown_scopes=bool(acknowledge_unknown_scopes),
+                                       clock=clock, now=now)
 
     evidence_dir = _preserve_evidence(paths, clock())
     found = _salvage(evidence_dir)
@@ -1561,12 +1650,11 @@ def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(
     _fsync_dir(paths.memory_dir)
 
     incarnation = secrets.token_hex(16)
-    _write_new_private(paths.db, b"")
-    conn = _connect(paths.db)
-    try:
-        _create_schema(conn, now=clock(), soul_id=soul_id, incarnation=incarnation,
-                       unknown_scope_policy=policy)
-        conn.execute("BEGIN IMMEDIATE")
+
+    def restore_suspensions(conn) -> None:
+        # Inside the creating transaction: the identity pin can survive on
+        # this path, so a store committed before its suspensions would open
+        # HEALTHY with every restriction cleared.
         at = clock()
         for scope in suspended:
             ack = unknown_leases != 0 or not salvage_complete
@@ -1581,7 +1669,12 @@ def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(
                detail={"old_incarnation": old_incarnation or "unknown", "new_incarnation": incarnation,
                        "evidence": os.path.basename(evidence_dir), "salvage_complete": salvage_complete,
                        "suspended_scopes": len(suspended), "unknown_scope_policy": policy})
-        conn.execute("COMMIT")
+
+    _write_new_private(paths.db, b"")
+    conn = _connect(paths.db)
+    try:
+        _create_schema(conn, now=clock(), soul_id=soul_id, incarnation=incarnation,
+                       unknown_scope_policy=policy, populate=restore_suspensions)
     finally:
         conn.close()
     _replace_private(paths.identity, _identity_bytes(soul_id))

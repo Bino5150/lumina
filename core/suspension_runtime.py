@@ -527,14 +527,15 @@ def repair_identity(*, ingress) -> RuntimeStatus:
 
 
 def recover(*, ingress, acknowledged_runtimes=frozenset(), acknowledge_unreadable_runtimes=False,
-            acknowledge_unknown_scopes=False) -> S.RecoveryOutcome:
+            acknowledge_unknown_scopes=False, acknowledge_unknown_prior_state=False) -> S.RecoveryOutcome:
     _require_desktop()
     with _lock:
         _close_locked()
     outcome = S.recover_destructively(
         _data_dir, ingress=ingress, acknowledged_runtimes=acknowledged_runtimes,
         acknowledge_unreadable_runtimes=acknowledge_unreadable_runtimes,
-        acknowledge_unknown_scopes=acknowledge_unknown_scopes)
+        acknowledge_unknown_scopes=acknowledge_unknown_scopes,
+        acknowledge_unknown_prior_state=acknowledge_unknown_prior_state)
     _reopen_after_owner_action()
     return outcome
 
