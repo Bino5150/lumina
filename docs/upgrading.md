@@ -164,7 +164,7 @@ There is no additional confirmation dialog behind **Initialize**,
 |---|---|
 | Brand-new installation, or an older installation that you know has **never used C1 in this folder** | If offered, tick **This is the first launch with runaway suspension for this data folder**, then click **Initialize**. This creates the safety record, with no work suspended initially. |
 | C1 already worked in this folder and no warning appears | Keep the existing safety record. Open `/suspension` if you want to review its status. Do not initialize again. |
-| C1 existed here before, traces remain, or you are unsure whether it existed | Choose **Recover…**, rather than declaring a first initialization. Follow the recovery instructions below. There is a current limitation when all traces are absent; see the warning below. |
+| C1 existed here before, traces remain, or you are unsure whether it existed | Choose **Recover…**, rather than declaring a first initialization. Follow the recovery instructions below. If no traces remain at all, Recover needs its own acknowledgement first; see **When no C1 traces remain** below. |
 | The store fails its checks and **Repair identity** is offered | This can repair a missing or unreadable identity file when the safety record itself is intact. It preserves every suspension. If it fails, preserve the error and review recovery; do not delete the identity file. |
 | The store is missing with traces, damaged, replaced, or does not match its identity | After confirming the folder and preserving a backup, use **Recover…**. An unexpected identity mismatch warrants stopping for help before recovery. |
 
@@ -175,22 +175,35 @@ C1 was never initialized. Use what you know about this particular folder,
 including earlier backups and launches, rather than the age of the app
 installation alone. Do not edit these files to change the screen's choices.
 
-**Current limitation: Recover cannot proceed when all C1 traces are gone.**
-The screen recommends recovery if you are unsure, but **Recover…** then
-refuses with `no prior state exists here; this is initialization, not recovery`
-when it finds no traces. If you know or suspect earlier C1 use, **stop here**
-and retain your folders, backups and error message for support. Do not tick
-the first-launch checkbox just to bypass this refusal, and do not create
-fake traces. This case requires a separate runtime fix or an individually
-reviewed recovery plan.
+**When no C1 traces remain.** If none of those files exist, the screen
+offers both **Initialize** and **Recover…**. If you know or suspect earlier
+C1 use in this folder, do not tick the first-launch checkbox. Instead, first
+make sure you have selected the right folder (step 1) and preserved your
+backups (step 2). Then tick **I can't confirm this is the first launch.
+Earlier suspensions, other Lumina processes and the outcome of earlier work
+are unknown; start with my work and every channel suspended for review**
+and click **Recover…**. The two checkboxes cancel each other out, and
+**Recover…** stays disabled until the acknowledgement is ticked.
+
+No earlier safety record survives, so this restores nothing. It creates a
+new safety record with a new identity, so earlier safety permissions cannot
+authorize new work. This does not prove that earlier work has stopped. Your own work (`owner`) starts suspended, and every
+channel starts suspended the first time it is used. The result begins **New
+safety record started; nothing was restored** and names a receipt in
+`memory/suspension_evidence/` recording that no earlier evidence survived.
+Keep that receipt. If the new record is ever lost, it is the trace that
+keeps a later launch from looking like a first run. Then review and resume
+as described in step 5. The owner entry always needs the outcome-unknown
+acknowledgement, and **After recovery, let channels whose state can't be
+read start unsuspended** is not offered on this path.
 
 ### 5. If recovery is needed, review before resuming
 
 **Recover… rebuilds the safety record, not your agent's memories.** It first
 preserves available old safety files in `memory/suspension_evidence/`, then
 rebuilds that record, retaining readable suspensions and stopping work whose
-earlier safety status cannot be confirmed. Work from the old record cannot
-continue under it. This is not full Agent Restore and cannot bring back
+earlier safety status cannot be confirmed. Earlier safety permissions cannot
+authorize new work; recovery does not stop already-running tools or processes. This is not full Agent Restore and cannot bring back
 missing conversations or reconstruct missing safety history.
 
 1. Keep every other process using this state stopped. A **Recovery waiting**
@@ -207,7 +220,8 @@ missing conversations or reconstruct missing safety history.
    With the conservative default, an unknown channel can acquire a new
    suspension when first used; review it in these desktop controls.
 3. After a successful recovery, the result begins **Recovered. Evidence
-   kept in …** and lists work suspended for review. The list uses `owner`
+   kept in …** (or, when no traces remained, **New safety record started;
+   nothing was restored**) and lists work suspended for review. The list uses `owner`
    for your desktop/Telegram work and channel names such as `channel:…`
    for separate public-channel work. Review each listed incident and its
    time, reason and earlier running work. Recovery may leave readable,
@@ -283,8 +297,8 @@ if a destination already has data or you only have an incomplete export.
 For a transferred installation, explicitly select its intended data folder
 at every entry point and review it on the desktop before enabling other
 interfaces. **Initialize** is only for a genuine first C1 initialization;
-use **Recover…** when earlier C1 state existed or is uncertain, subject to
-the no-traces limitation above. If the transferred record opens normally,
+use **Recover…** when earlier C1 state existed or is uncertain, including
+the no-traces acknowledgement above. If the transferred record opens normally,
 review existing suspensions rather than rebuilding it. Verify history,
 preferences and local project/credential configuration before resuming
 ordinary use. Stop if an unexpected identity or recovery prompt appears.

@@ -189,8 +189,10 @@ data folder (`memory/suspension.db`, pinned by `memory/soul_identity.json`).
 Only the desktop can initialize, repair, recover or resume it; the CLI and
 bridges require an existing usable record. Follow [Upgrading Lumina](upgrading.md)
 for folder selection, backups and the exact **Initialize**, **Recover…**,
-**Repair identity** and **Resume selected** steps, including the current
-recovery limitation when all prior traces are absent. Missing files are
+**Repair identity** and **Resume selected** steps, including recovery when
+no prior trace survives: it needs an explicit acknowledgement that earlier
+state is unknown, restores nothing, starts a new identity with your work
+and every channel suspended, and leaves a receipt. Missing files are
 not proof of a first installation. Never remove safety records to bypass
 a hold. C1 recovery rebuilds the safety record; it is not Agent Restore.
 

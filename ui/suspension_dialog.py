@@ -10,6 +10,9 @@ text, Telegram message or model output can reach these controls.
     suspension here -- an explicit confirmation, because a missing store
     cannot be told apart from a deleted one) or Recover (Lumina ran with it
     before, or the owner isn't sure: the owner scope starts suspended).
+    With no trace at all, Recover needs its own acknowledgement that
+    earlier state and outcomes are unknown; it restores nothing and every
+    channel also starts suspended until reviewed.
   * A faulted store: Repair identity (non-destructive, when only the
     identity pin is missing or unreadable) or Recover (destructive:
     evidence first, other runtimes quiesced or acknowledged, new
@@ -60,8 +63,15 @@ class SuspensionDialog(QDialog):
 
         self.first_run_confirm = QCheckBox(
             "This is the first launch with runaway suspension for this data folder")
-        self.first_run_confirm.toggled.connect(lambda _on: self._sync_buttons())
+        self.first_run_confirm.toggled.connect(lambda on: self._exclusive(self.first_run_confirm, on))
         layout.addWidget(self.first_run_confirm)
+        self.unknown_prior_state = QCheckBox(
+            "I can't confirm this is the first launch. Earlier suspensions, other Lumina processes "
+            "and the outcome of earlier work are unknown; start with my work and every channel "
+            "suspended for review")
+        self.unknown_prior_state.toggled.connect(
+            lambda on: self._exclusive(self.unknown_prior_state, on))
+        layout.addWidget(self.unknown_prior_state)
         self.ack_unknown = QCheckBox(
             "I accept that work whose process stopped may or may not have finished (outcome unknown)")
         layout.addWidget(self.ack_unknown)
@@ -122,8 +132,9 @@ class SuspensionDialog(QDialog):
                         "admitted yet. A missing store can't be told apart from a deleted one. "
                         "If this is the first launch with runaway suspension here, confirm and "
                         "choose Initialize. If Lumina has run with it here before, or you're "
-                        "not sure, choose Recover: it starts with the owner suspended so you "
-                        "can review before resuming.")
+                        "not sure, tick the acknowledgement and choose Recover: no earlier "
+                        "records survive, so nothing is restored. It starts a new record with "
+                        "your work and every channel suspended so you can review before resuming.")
             else:
                 head = ("The runaway-suspension store is missing but traces of an earlier one "
                         f"remain ({', '.join(status.traces)}). Choose Recover. Nothing is "
@@ -144,22 +155,43 @@ class SuspensionDialog(QDialog):
 
     def _sync_buttons(self) -> None:
         status = self._status
-        absent_clean = (status.state is R.State.UNINITIALIZED
-                        and status.probe_status is S.StoreStatus.ABSENT_NO_TRACE)
+        absent_clean = self._absent_clean()
+        if not absent_clean:
+            for box in (self.first_run_confirm, self.unknown_prior_state):
+                box.blockSignals(True)
+                box.setChecked(False)
+                box.blockSignals(False)
         self.first_run_confirm.setVisible(absent_clean)
+        self.unknown_prior_state.setVisible(absent_clean)
         self.initialize_btn.setVisible(absent_clean)
         self.initialize_btn.setEnabled(absent_clean and self.first_run_confirm.isChecked())
         self.repair_btn.setVisible(status.state is R.State.FAULT and status.fault in (
             S.Fault.IDENTITY_MISSING, S.Fault.IDENTITY_INVALID))
-        self.recover_btn.setVisible(status.state in (R.State.UNINITIALIZED, R.State.FAULT))
         recovering = status.state in (R.State.UNINITIALIZED, R.State.FAULT)
-        self.ack_runtimes.setVisible(recovering)
-        self.unknown_scopes_clear.setVisible(recovering)
+        self.recover_btn.setVisible(recovering)
+        self.recover_btn.setEnabled(not absent_clean or self.unknown_prior_state.isChecked())
+        # With no trace there is no old registry or scope table to acknowledge:
+        # the no-trace acknowledgement covers both, and channels always start
+        # suspended.
+        self.ack_runtimes.setVisible(recovering and not absent_clean)
+        self.unknown_scopes_clear.setVisible(recovering and not absent_clean)
         self.resume_btn.setVisible(status.state is R.State.ACTIVE)
         self.resume_btn.setEnabled(bool(self._views) and self.incidents.currentRow() >= 0)
         self.ack_unknown.setVisible(status.state is R.State.ACTIVE and bool(self._views))
         self.ack_scopes_btn.setVisible(status.state is R.State.ACTIVE and any(
             v.trigger == S.RECOVERY_TRIGGER for v in self._views))
+
+    def _exclusive(self, box: QCheckBox, on: bool) -> None:
+        """"First launch" and "can't confirm a first launch" contradict each
+        other: ticking one clears the other."""
+        if on:
+            other = self.unknown_prior_state if box is self.first_run_confirm else self.first_run_confirm
+            other.setChecked(False)
+        self._sync_buttons()
+
+    def _absent_clean(self) -> bool:
+        return (self._status.state is R.State.UNINITIALIZED
+                and self._status.probe_status is S.StoreStatus.ABSENT_NO_TRACE)
 
     def _selected(self):
         row = self.incidents.currentRow()
@@ -213,13 +245,18 @@ class SuspensionDialog(QDialog):
         self.refresh()
 
     def _recover(self) -> None:
-        acked = set(self._blocked_runtimes) if self.ack_runtimes.isChecked() else set()
+        no_trace = self._absent_clean()
+        if no_trace and not self.unknown_prior_state.isChecked():
+            return
+        ack_runtimes = self.ack_runtimes.isChecked() and not no_trace
+        acked = set(self._blocked_runtimes) if ack_runtimes else set()
         try:
             outcome = R.recover(
                 ingress=operator_ingress.local_suspension_control("recover"),
                 acknowledged_runtimes=acked,
-                acknowledge_unreadable_runtimes=self.ack_runtimes.isChecked(),
-                acknowledge_unknown_scopes=self.unknown_scopes_clear.isChecked())
+                acknowledge_unreadable_runtimes=ack_runtimes,
+                acknowledge_unknown_scopes=self.unknown_scopes_clear.isChecked() and not no_trace,
+                acknowledge_unknown_prior_state=no_trace and self.unknown_prior_state.isChecked())
         except S.RecoveryBlocked as exc:
             self._blocked_runtimes = tuple(exc.runtimes)
             listed = f" ({len(exc.runtimes)} process(es))" if exc.runtimes else ""
@@ -232,9 +269,17 @@ class SuspensionDialog(QDialog):
             self.refresh()
             return
         self._blocked_runtimes = ()
+        self.unknown_prior_state.setChecked(False)
         scopes = ", ".join(outcome.suspended_scopes) or "none"
-        self.result_label.setText(
-            f"Recovered. Evidence kept in {outcome.evidence_dir}. Suspended for your review: {scopes}.")
+        if not outcome.evidence_survived:
+            self.result_label.setText(
+                "New safety record started; nothing was restored. No earlier safety records "
+                "survived, so earlier suspensions and the outcome of earlier work are unknown. "
+                f"Receipt kept in {outcome.evidence_dir}. Suspended for your review: {scopes}; "
+                "every channel also starts suspended until you review it.")
+        else:
+            self.result_label.setText(
+                f"Recovered. Evidence kept in {outcome.evidence_dir}. Suspended for your review: {scopes}.")
         self.refresh()
 
     def _resume(self) -> None:

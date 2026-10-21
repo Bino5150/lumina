@@ -33,18 +33,25 @@ def _shell(tmp_path, override=None):
         shutil.copyfile(ROOT / "data_directory.py", install / "data_directory.py")
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    # Only main.py is intercepted. The real selector runs in Python; no app,
-    # backend, TTS or network is launched. All prefs choose serverless piper.
+    # Intercept main.py and dev-only local-mode writes. The real selector and
+    # prefs reader run in Python. Stub service commands too, so the preserved
+    # dev launcher cannot start a backend or contact a live service.
     fake = bindir / "python"
     fake.write_text(
         f"#!{sys.executable}\n"
         "import json,os,subprocess,sys\n"
         "if os.path.basename(sys.argv[1]) == 'main.py':\n"
         " print(json.dumps({'data_dir':os.environ.get('LUMINA_DATA_DIR'), 'cwd':os.getcwd()}))\n"
+        "elif sys.argv[1] == '-':\n"
+        " sys.stdin.read()  # local-mode preference write is outside this selection probe\n"
         "else:\n"
         f" sys.exit(subprocess.call([{sys.executable!r},*sys.argv[1:]]))\n"
     )
     fake.chmod(0o700)
+    for name in ("curl", "docker"):
+        command = bindir / name
+        command.write_text("#!/bin/sh\nexit 0\n")
+        command.chmod(0o700)
     env = _env(tmp_path)
     env["PATH"] = str(bindir) + os.pathsep + env["PATH"]
     if override is not None:
@@ -236,3 +243,47 @@ def test_explicit_upgrade_preserves_existing_history_and_suspended_c1(tmp_path):
     with safety.open_store(selected) as store:
         assert (store.soul_id, store.incarnation) == identity
         assert [v.suspension_id for v in store.operator_view()] == [incident.suspension_id]
+
+
+def test_selected_existing_history_survives_no_trace_desktop_recovery(selector, tmp_path, monkeypatch):
+    from core import operator_ingress as oi, suspension as safety, suspension_runtime as runtime
+    paths, release, _ = selector
+    selected = tmp_path / "established data"
+    (selected / "memory").mkdir(parents=True, mode=0o700)
+    history = selected / "memory/lumina.db"
+    with sqlite3.connect(history) as db:
+        db.execute("CREATE TABLE upgrade_history (message TEXT)")
+        db.execute("INSERT INTO upgrade_history VALUES ('established conversation')")
+    history_before = history.read_bytes()
+    with safety.initialize(selected, ingress=oi.local_suspension_control("test")) as store:
+        old_token = store.capture(safety.OWNER_SCOPE)
+        store.trip(old_token, trigger=safety.Trigger.BREAKER_TRIPPED)
+    # Synthetic loss of all safety records, while ordinary history survives.
+    for name in safety._STORE_FILES + (safety.IDENTITY_NAME,):
+        (selected / "memory" / name).unlink(missing_ok=True)
+    release.mkdir(parents=True)
+    monkeypatch.setenv("LUMINA_DATA_DIR", str(selected))
+    chosen = paths.configure_data_directory(base_dir=tmp_path / "installation")
+    assert chosen == str(selected)
+    runtime.start(chosen, role="desktop", heartbeat=False)
+    try:
+        assert runtime.status().probe_status is safety.StoreStatus.ABSENT_NO_TRACE
+        with pytest.raises(safety.RecoveryBlocked):
+            runtime.recover(ingress=oi.local_suspension_control("recover"))
+        outcome = runtime.recover(ingress=oi.local_suspension_control("recover"),
+                                  acknowledge_unknown_prior_state=True)
+        assert outcome.evidence_survived is False
+        with pytest.raises(runtime.SuspensionRefused):
+            runtime.capture(safety.OWNER_SCOPE)
+        with safety.open_store(chosen) as store:
+            with pytest.raises(safety.AdmissionRefused) as exc:
+                store.verify(old_token)
+            assert exc.value.refusal is safety.Refusal.FOREIGN_INCARNATION
+            with pytest.raises(safety.AdmissionRefused):
+                store.capture(safety.channel_scope("discord", "synthetic"))
+    finally:
+        runtime.stop()
+    assert history.read_bytes() == history_before
+    assert list(release.iterdir()) == []
+    with sqlite3.connect(f"file:{history}?mode=ro", uri=True) as db:
+        assert db.execute("SELECT message FROM upgrade_history").fetchone()[0] == "established conversation"

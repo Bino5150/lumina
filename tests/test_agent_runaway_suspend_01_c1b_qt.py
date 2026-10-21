@@ -352,6 +352,49 @@ def test_recover_after_a_lost_store_starts_with_the_owner_suspended(qapp, tmp_pa
     assert [v.scope for v in R.operator_view()] == [S.OWNER_SCOPE]
 
 
+def test_recover_with_no_trace_needs_its_own_acknowledgement_and_restores_nothing(qapp, tmp_path, dialog):
+    # LUMINA-C1-UPGRADE-SAFETY-02 Slice A: the screen recommends Recover when
+    # unsure, so Recover must work when no trace survives.
+    root = tmp_path / "no-trace-root"
+    (root / S.MEMORY_DIRNAME).mkdir(parents=True, mode=0o700)
+    R.start(root, role="desktop", heartbeat=False)
+    d = dialog()
+    assert d.recover_btn.isVisibleTo(d) and d.unknown_prior_state.isVisibleTo(d)
+    assert not d.recover_btn.isEnabled()
+    assert not d.ack_runtimes.isVisibleTo(d) and not d.unknown_scopes_clear.isVisibleTo(d)
+    d._recover()                                                # without the acknowledgement: nothing
+    assert os.listdir(root / S.MEMORY_DIRNAME) == []
+    d.first_run_confirm.setChecked(True)
+    d.unknown_prior_state.setChecked(True)                    # the two answers exclude each other
+    assert not d.first_run_confirm.isChecked() and not d.initialize_btn.isEnabled()
+    assert d.recover_btn.isEnabled()
+    d.recover_btn.click()
+    text = d.result_label.text()
+    assert "nothing was restored" in text and "Recovered." not in text
+    assert R.status().state is R.State.ACTIVE
+    views = R.operator_view()
+    assert [v.scope for v in views] == [S.OWNER_SCOPE] and views[0].requires_ack
+    assert not d.initialize_btn.isVisibleTo(d) and not d.unknown_prior_state.isVisibleTo(d)
+    d.resume_btn.click()                                       # outcome unknown: needs the ack
+    assert "outcome is unknown" in d.result_label.text()
+    d.ack_unknown.setChecked(True)
+    d.resume_btn.click()
+    assert "Resumed owner" in d.result_label.text()
+
+
+def test_initialize_and_no_trace_recovery_exclude_each_other(qapp, tmp_path, dialog):
+    root = tmp_path / "exclusive-root"
+    (root / S.MEMORY_DIRNAME).mkdir(parents=True, mode=0o700)
+    R.start(root, role="desktop", heartbeat=False)
+    d = dialog()
+    d.unknown_prior_state.setChecked(True)
+    d.first_run_confirm.setChecked(True)
+    assert not d.unknown_prior_state.isChecked() and not d.recover_btn.isEnabled()
+    d.initialize_btn.click()
+    assert "Initialized" in d.result_label.text()
+    assert R.operator_view() == ()
+
+
 def test_ci_runs_this_file_as_a_blocking_qt_guard():
     workflow = open(os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "tests.yml")).read()
     qt_job = workflow[workflow.index("qt-security-guards:"):]
