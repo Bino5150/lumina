@@ -227,7 +227,7 @@ def test_startup_offers_initialize_or_recover_when_the_store_is_not_ready(qapp, 
         QApplication.processEvents()
         dialog = win._suspension_dialog                                        # opened by the startup check
         assert dialog is not None and dialog.isVisible()
-        assert "No runaway-suspension store exists" in dialog.state_label.text()
+        assert "Set up Lumina's safety protection" in dialog.state_label.text()
         win._check_suspension_ready()
         assert any("isn't ready for this data folder" in n for n in win._notices)
         assert os.listdir(root / S.MEMORY_DIRNAME) == []                    # nothing created on its own
@@ -258,13 +258,18 @@ def test_initialize_needs_the_explicit_first_launch_confirmation(qapp, tmp_path,
     (root / S.MEMORY_DIRNAME).mkdir(parents=True, mode=0o700)
     R.start(root, role="desktop", heartbeat=False)
     d = dialog()
-    assert d.initialize_btn.isVisible() is False or not d.isVisible()
-    assert d.initialize_btn.isEnabled() is False
+    assert d.setup_action_btn.isVisible() is False or not d.isVisible()
+    assert d.setup_action_btn.isEnabled() is False
     d._initialize()                                               # without the checkbox: nothing happens
     assert os.listdir(root / S.MEMORY_DIRNAME) == []
+    assert not d.first_time_choice.isChecked() and not d.previous_use_choice.isChecked()
+    assert not d.incidents.isVisibleTo(d)
+    assert root.as_posix() == d.data_folder_label.text()
+    d.first_time_choice.setChecked(True)
+    assert not d.setup_action_btn.isEnabled()                       # choosing is not confirming
     d.first_run_confirm.setChecked(True)
-    assert d.initialize_btn.isEnabled()
-    d.initialize_btn.click()
+    assert d.setup_action_btn.isEnabled()
+    d.setup_action_btn.click()
     assert R.status().state is R.State.ACTIVE and "Initialized" in d.result_label.text()
 
 
@@ -343,7 +348,7 @@ def test_recover_after_a_lost_store_starts_with_the_owner_suspended(qapp, tmp_pa
     R.start(root, role="desktop", heartbeat=False)
     d = dialog()
     assert R.status().state is R.State.UNINITIALIZED and d.recover_btn.isVisibleTo(d)
-    assert not d.initialize_btn.isVisibleTo(d)                               # traces: never initialize
+    assert not d.setup_action_btn.isVisibleTo(d)                               # traces: never initialize
     d.recover_btn.click()                                    # registry unreadable: needs the ack
     assert "Recovery waiting" in d.result_label.text()
     d.ack_runtimes.setChecked(True)
@@ -359,22 +364,27 @@ def test_recover_with_no_trace_needs_its_own_acknowledgement_and_restores_nothin
     (root / S.MEMORY_DIRNAME).mkdir(parents=True, mode=0o700)
     R.start(root, role="desktop", heartbeat=False)
     d = dialog()
-    assert d.recover_btn.isVisibleTo(d) and d.unknown_prior_state.isVisibleTo(d)
-    assert not d.recover_btn.isEnabled()
+    assert d.setup_action_btn.isVisibleTo(d) and not d.recover_btn.isVisibleTo(d)
+    assert not d.unknown_prior_state.isVisibleTo(d)
+    assert not d.setup_action_btn.isEnabled()
     assert not d.ack_runtimes.isVisibleTo(d) and not d.unknown_scopes_clear.isVisibleTo(d)
     d._recover()                                                # without the acknowledgement: nothing
     assert os.listdir(root / S.MEMORY_DIRNAME) == []
+    d.first_time_choice.setChecked(True)
     d.first_run_confirm.setChecked(True)
-    d.unknown_prior_state.setChecked(True)                    # the two answers exclude each other
-    assert not d.first_run_confirm.isChecked() and not d.initialize_btn.isEnabled()
-    assert d.recover_btn.isEnabled()
-    d.recover_btn.click()
+    d.previous_use_choice.setChecked(True)                    # changing paths clears the old confirmation
+    assert not d.first_run_confirm.isChecked() and not d.setup_action_btn.isEnabled()
+    assert d.unknown_prior_state.isVisibleTo(d) and not d.setup_action_btn.isEnabled()
+    d.unknown_prior_state.setChecked(True)
+    assert d.setup_action_btn.isEnabled()
+    assert d.setup_action_btn.text() == "Review safe recovery"
+    d.setup_action_btn.click()
     text = d.result_label.text()
     assert "nothing was restored" in text and "Recovered." not in text
     assert R.status().state is R.State.ACTIVE
     views = R.operator_view()
     assert [v.scope for v in views] == [S.OWNER_SCOPE] and views[0].requires_ack
-    assert not d.initialize_btn.isVisibleTo(d) and not d.unknown_prior_state.isVisibleTo(d)
+    assert not d.setup_action_btn.isVisibleTo(d) and not d.unknown_prior_state.isVisibleTo(d)
     d.resume_btn.click()                                       # outcome unknown: needs the ack
     assert "outcome is unknown" in d.result_label.text()
     d.ack_unknown.setChecked(True)
@@ -387,12 +397,74 @@ def test_initialize_and_no_trace_recovery_exclude_each_other(qapp, tmp_path, dia
     (root / S.MEMORY_DIRNAME).mkdir(parents=True, mode=0o700)
     R.start(root, role="desktop", heartbeat=False)
     d = dialog()
+    d.previous_use_choice.setChecked(True)
     d.unknown_prior_state.setChecked(True)
+    d.first_time_choice.setChecked(True)
+    assert not d.unknown_prior_state.isChecked() and not d.setup_action_btn.isEnabled()
     d.first_run_confirm.setChecked(True)
     assert not d.unknown_prior_state.isChecked() and not d.recover_btn.isEnabled()
-    d.initialize_btn.click()
+    d.setup_action_btn.click()
     assert "Initialized" in d.result_label.text()
     assert R.operator_view() == ()
+
+
+def test_first_run_has_one_primary_action_and_fits_its_current_explanation(qapp, tmp_path, dialog):
+    from PySide6.QtWidgets import QPushButton
+    root = tmp_path / "one-action-root"
+    (root / S.MEMORY_DIRNAME).mkdir(parents=True)
+    R.start(root, role="desktop", heartbeat=False)
+    d = dialog()
+    d.show()
+    QApplication.processEvents()
+    assert d.setup_action_btn.text() == "Continue" and not d.setup_action_btn.isEnabled()
+    d.setup_action_btn.click()
+    assert os.listdir(root / S.MEMORY_DIRNAME) == []
+    for choice, caption, acknowledgement in (
+        (None, "Continue", None),
+        (d.first_time_choice, "Enable protection", d.first_run_confirm),
+        (d.previous_use_choice, "Review safe recovery", d.unknown_prior_state),
+        (d.first_time_choice, "Enable protection", d.first_run_confirm),
+    ):
+        if choice is not None:
+            choice.setChecked(True)
+        QApplication.processEvents()
+        assert [b for b in d.findChildren(QPushButton) if b.isVisibleTo(d)] == [d.setup_action_btn, d.close_btn]
+        assert d.setup_action_btn.text() == caption and not d.setup_action_btn.isEnabled()
+        assert d.height() < 500
+        if acknowledgement is not None:
+            acknowledgement.setChecked(True)
+            assert d.setup_action_btn.isEnabled()
+    assert os.listdir(root / S.MEMORY_DIRNAME) == []
+
+
+@pytest.mark.parametrize("size,font_scale", [((560, 440), 1.0), ((640, 480), 1.5)])
+def test_first_run_layout_wraps_and_scrolls_without_horizontal_clipping(qapp, tmp_path, dialog, size, font_scale):
+    from PySide6.QtWidgets import QAbstractButton, QLabel
+    root = tmp_path / ("long-data-folder-" * 6)
+    (root / S.MEMORY_DIRNAME).mkdir(parents=True)
+    R.start(root, role="desktop", heartbeat=False)
+    d = dialog()
+    font = d.font()
+    font.setPointSizeF(font.pointSizeF() * font_scale)
+    d.setFont(font)
+    d.resize(*size)
+    d.show()
+    for choice in (None, d.first_time_choice, d.previous_use_choice):
+        if choice is not None:
+            choice.setChecked(True)
+        QApplication.processEvents()
+        assert d.width() == size[0]
+        assert d.scroll.widget().width() <= d.scroll.viewport().width()
+        assert d.scroll.horizontalScrollBar().maximum() == 0
+        for label in d.findChildren(QLabel):
+            if label.isVisibleTo(d):
+                assert label.wordWrap()
+                assert label.height() >= label.heightForWidth(label.width())
+        for button in d.findChildren(QAbstractButton):
+            if button.isVisibleTo(d):
+                assert button.width() >= button.sizeHint().width(), button.text()
+        assert not d.incidents.isVisibleTo(d) and not d.detail_label.isVisibleTo(d)
+    assert os.listdir(root / S.MEMORY_DIRNAME) == []             # inspecting choices never changes safety state
 
 
 def test_ci_runs_this_file_as_a_blocking_qt_guard():

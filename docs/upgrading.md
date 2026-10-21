@@ -157,16 +157,29 @@ same folder first. A bridge using a different default still will not work.
 
 If the safety record is not ready, the desktop opens **Runaway suspension**.
 You can also type `/suspension` into the desktop chat to open these controls.
-There is no additional confirmation dialog behind **Initialize**,
-**Repair identity** or **Recover…**; read the screen before clicking.
+The selected **Data folder** is shown above the setup choices. Stop if it is
+not the folder holding your existing history. Neither first-run answer is
+selected for you. Choose an answer, read its explanation, then tick its
+confirmation. One primary action follows your answer: **Enable protection** or
+**Review safe recovery**. It stays disabled until you confirm the matching choice;
+with no answer selected, it reads **Continue** and stays disabled. **Close** is underneath.
+Your chats, memories, Skills and preferences will not be reset by safety setup.
+The empty incident list is hidden until there is suspended work to review.
+The first-run dialog fits its current explanation and expands for incident
+management. Long explanations scroll vertically at smaller window sizes.
+
+There is no additional confirmation dialog behind **Enable protection**,
+**Repair identity** or **Review safe recovery**; read the screen before clicking.
+Despite its name, **Review safe recovery** performs safety recovery after the
+required acknowledgement; it does not open a separate preview or Agent Restore.
 
 | Your situation | What to do |
 |---|---|
-| Brand-new installation, or an older installation that you know has **never used C1 in this folder** | If offered, tick **This is the first launch with runaway suspension for this data folder**, then click **Initialize**. This creates the safety record, with no work suspended initially. |
+| Brand-new installation, or an older installation that you know has **never used C1 in this folder** | Choose **No, this is the first time.**, tick **I confirm this is the first setup.**, then click **Enable protection**. This creates only the safety record, with no work suspended initially. |
 | C1 already worked in this folder and no warning appears | Keep the existing safety record. Open `/suspension` if you want to review its status. Do not initialize again. |
-| C1 existed here before, traces remain, or you are unsure whether it existed | Choose **Recover…**, rather than declaring a first initialization. Follow the recovery instructions below. If no traces remain at all, Recover needs its own acknowledgement first; see **When no C1 traces remain** below. |
+| C1 existed here before, traces remain, or you are unsure whether it existed | Choose **Review safe recovery**, rather than declaring a first initialization. Follow the recovery instructions below. If no traces remain at all, Recover needs its own acknowledgement first; see **When no C1 traces remain** below. |
 | The store fails its checks and **Repair identity** is offered | This can repair a missing or unreadable identity file when the safety record itself is intact. It preserves every suspension. If it fails, preserve the error and review recovery; do not delete the identity file. |
-| The store is missing with traces, damaged, replaced, or does not match its identity | After confirming the folder and preserving a backup, use **Recover…**. An unexpected identity mismatch warrants stopping for help before recovery. |
+| The store is missing with traces, damaged, replaced, or does not match its identity | After confirming the folder and preserving a backup, use **Review safe recovery**. An unexpected identity mismatch warrants stopping for help before recovery. |
 
 The C1 files are `memory/suspension.db` and `memory/soul_identity.json`.
 Their presence, companion files or `memory/suspension_evidence/` indicate
@@ -176,14 +189,15 @@ including earlier backups and launches, rather than the age of the app
 installation alone. Do not edit these files to change the screen's choices.
 
 **When no C1 traces remain.** If none of those files exist, the screen
-offers both **Initialize** and **Recover…**. If you know or suspect earlier
-C1 use in this folder, do not tick the first-launch checkbox. Instead, first
+shows the action matching your selected answer. If you know or suspect earlier
+C1 use in this folder, do not confirm first-time setup. Instead, first
 make sure you have selected the right folder (step 1) and preserved your
-backups (step 2). Then tick **I can't confirm this is the first launch.
-Earlier suspensions, other Lumina processes and the outcome of earlier work
-are unknown; start with my work and every channel suspended for review**
-and click **Recover…**. The two checkboxes cancel each other out, and
-**Recover…** stays disabled until the acknowledgement is ticked.
+backups (step 2). Choose **Yes, or I'm not sure.** Read the acknowledgement:
+earlier safety records, other Lumina processes and work outcomes are unknown.
+Recovery starts a new safety record with your work and every channel paused
+for review; no earlier safety records can be restored. Tick **I accept this
+paused start.**, then click **Review safe recovery**. Changing answers clears the previous
+acknowledgement. **Review safe recovery** stays disabled until its acknowledgement is ticked.
 
 No earlier safety record survives, so this restores nothing. It creates a
 new safety record with a new identity, so earlier safety permissions cannot
@@ -194,12 +208,11 @@ safety record started; nothing was restored** and names a receipt in
 Keep that receipt. If the new record is ever lost, it is the trace that
 keeps a later launch from looking like a first run. Then review and resume
 as described in step 5. The owner entry always needs the outcome-unknown
-acknowledgement, and **After recovery, let channels whose state can't be
-read start unsuspended** is not offered on this path.
+acknowledgement, and **Allow an unpaused start.** is not offered on this path.
 
 ### 5. If recovery is needed, review before resuming
 
-**Recover… rebuilds the safety record, not your agent's memories.** It first
+**Safe recovery rebuilds the safety record, not your agent's memories.** It first
 preserves available old safety files in `memory/suspension_evidence/`, then
 rebuilds that record, retaining readable suspensions and stopping work whose
 earlier safety status cannot be confirmed. Earlier safety permissions cannot
@@ -209,12 +222,14 @@ missing conversations or reconstruct missing safety history.
 1. Keep every other process using this state stopped. A **Recovery waiting**
    message can mean another process still appears active, or the old process
    list cannot be read. Stop the listed processes and retry. The checkbox
-   **Other Lumina processes listed above are stopped or may be ignored**
+   **I acknowledge these processes.** (the explanation says the other
+   processes listed above are stopped or may be ignored)
    is an explicit acknowledgement, not a way to stop them. Use it only
    after you have independently confirmed they are stopped. If you cannot
    establish that, stop and ask for help. Do not ignore a known live process.
-2. Leave **After recovery, let channels whose state can't be read start
-   unsuspended** unchecked while you investigate. That option relaxes the
+2. Leave **Allow an unpaused start.** unchecked while you investigate. Its
+   explanation says that channels whose state cannot be read may start
+   unsuspended after recovery. That option relaxes the
    safety hold; it is not required to recover the record. Likewise, do not
    click **Unknown channels may start unsuspended** just to clear a warning.
    With the conservative default, an unknown channel can acquire a new
@@ -229,8 +244,8 @@ missing conversations or reconstruct missing safety history.
 4. To permit new work for a reviewed entry, select it and click
    **Resume selected**. If earlier work is still running, wait for it to
    finish and try again. If its process stopped, check whether its actions
-   actually completed before ticking **I accept that work whose process
-   stopped may or may not have finished (outcome unknown)** and retrying.
+   actually completed before ticking **I accept the unknown outcome.** and retrying.
+   The explanation warns that work whose process stopped may or may not have finished.
    Recovery incidents may also require this acknowledgement.
 5. Resume permits **new** work. It does not restart the interrupted task,
    resend a refused message, or apply a pending approval. Review the result
@@ -296,8 +311,8 @@ if a destination already has data or you only have an incomplete export.
 
 For a transferred installation, explicitly select its intended data folder
 at every entry point and review it on the desktop before enabling other
-interfaces. **Initialize** is only for a genuine first C1 initialization;
-use **Recover…** when earlier C1 state existed or is uncertain, including
+interfaces. **Enable protection** is only for a genuine first C1 initialization;
+use **Review safe recovery** when earlier C1 state existed or is uncertain, including
 the no-traces acknowledgement above. If the transferred record opens normally,
 review existing suspensions rather than rebuilding it. Verify history,
 preferences and local project/credential configuration before resuming

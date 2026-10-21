@@ -403,9 +403,8 @@ def test_the_upgrade_guide_quotes_the_dialog_labels_exactly():
     joined = " | ".join(_flat(n.value) for n in ast.walk(tree)
                         if isinstance(n, ast.Constant) and isinstance(n.value, str))
     guide = _flat((REPO / "docs" / "upgrading.md").read_text(encoding="utf-8"))
-    label = ("I can't confirm this is the first launch. Earlier suspensions, other Lumina processes "
-             "and the outcome of earlier work are unknown; start with my work and every channel "
-             "suspended for review")
+    label = "I accept this paused start."
     result = "New safety record started; nothing was restored"
-    for needle in (label, result):
+    for needle in (label, result, "Enable protection", "Review safe recovery", "No, this is the first time.",
+                   "Yes, or I'm not sure.", "I confirm this is the first setup."):
         assert needle in joined and needle in guide, needle

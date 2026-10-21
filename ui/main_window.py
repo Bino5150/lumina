@@ -1628,7 +1628,7 @@ class LuminaWindow(QMainWindow):
             return
         self.chat_widget.add_operator_message(
             "⛔ Runaway suspension isn't ready for this data folder, so nothing will run yet. "
-            "Choose Initialize or Recover in Suspension controls (/suspension).")
+            "Open Suspension controls to set up or recover safety protection (/suspension).")
         self._open_suspension_dialog()
 
     def _on_suspension_event(self, kind: str, payload):

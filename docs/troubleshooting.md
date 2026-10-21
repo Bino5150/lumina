@@ -126,10 +126,10 @@ What the notices mean:
 - *"Runaway suspension isn't ready for this data folder"* or a failed
   identity check — follow [the desktop upgrade and recovery steps](upgrading.md#4-open-the-desktop-and-choose-the-right-safety-action).
   They cover first initialization, damaged/missing state and active
-  processes. If **Recover…** is disabled or refuses because no earlier
+  processes. If **Review safe recovery** is disabled or refuses because no earlier
   suspension state survives and earlier C1 use is possible, tick its
   acknowledgement (see [When no C1 traces remain](upgrading.md#4-open-the-desktop-and-choose-the-right-safety-action));
-  do not bypass it with **Initialize**. Recovery is not full Agent Restore.
+  do not bypass it with **Enable protection**. Recovery is not full Agent Restore.
 - *"global suspension unconfirmed"* — a suspension couldn't be written
   down, so it holds in this desktop process only, and writing it is retried
   on the next request. Check Suspension controls; a restart before it is

@@ -6,7 +6,7 @@ resumed. Every button mints a fresh local suspension-control envelope at the
 moment of the click (core.operator_ingress.local_suspension_control); no
 text, Telegram message or model output can reach these controls.
 
-  * No store yet: the owner chooses Initialize (first launch with runaway
+  * No store yet: the owner chooses Enable protection (first launch with runaway
     suspension here -- an explicit confirmation, because a missing store
     cannot be told apart from a deleted one) or Recover (Lumina ran with it
     before, or the owner isn't sure: the owner scope starts suspended).
@@ -28,10 +28,12 @@ the owner's verified Telegram /resume). It is never logged.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
-    QVBoxLayout,
+    QButtonGroup, QCheckBox, QDialog, QLabel, QListWidget, QListWidgetItem, QPushButton,
+    QRadioButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from core import operator_ingress, suspension as S, suspension_runtime as R
@@ -41,53 +43,127 @@ def _when(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
 
 
+def _label(text=""):
+    label = QLabel(text)
+    label.setTextFormat(Qt.PlainText)
+    label.setWordWrap(True)
+    label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+    return label
+
+
+def _acknowledgement(explanation, caption):
+    """Keep the meaning readable; native checkbox captions don't wrap."""
+    group = QWidget()
+    layout = QVBoxLayout(group)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(_label(explanation))
+    box = QCheckBox(caption)
+    box.setAccessibleDescription(explanation)
+    layout.addWidget(box)
+    return group, box
+
+
 class SuspensionDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Runaway suspension")
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(420)
+        available = self.screen().availableGeometry()
+        self.resize(min(640, available.width() - 40), min(560, available.height() - 60))
+        # Keep unchecked choices visible against Lumina's dark application theme.
+        self.setStyleSheet("""
+            QCheckBox::indicator:unchecked, QRadioButton::indicator:unchecked {
+                border: 1px solid #9ba7b9; background: transparent;
+            }
+            QRadioButton::indicator:unchecked { border-radius: 6px; }
+            QPushButton:disabled { color: palette(mid); }
+        """)
         self._views = ()
         self._blocked_runtimes = ()
 
         layout = QVBoxLayout(self)
-        self.state_label = QLabel()
-        self.state_label.setWordWrap(True)
-        layout.addWidget(self.state_label)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget()
+        content = QVBoxLayout(body)
+        content.setAlignment(Qt.AlignTop)
+        self.scroll.setWidget(body)
+        layout.addWidget(self.scroll)
+        self.state_label = _label()
+        content.addWidget(self.state_label)
+        content.addWidget(_label("Data folder — check this is your existing Lumina folder:"))
+        self.data_folder_label = _label()
+        self.data_folder_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.data_folder_label.setStyleSheet("font-weight: bold;")
+        content.addWidget(self.data_folder_label)
+
+        self.setup_choices = QWidget()
+        choices = QVBoxLayout(self.setup_choices)
+        choices.setContentsMargins(0, 0, 0, 0)
+        choices.addWidget(_label("Has runaway-task protection been set up for this data folder before?"))
+        self.first_time_choice = QRadioButton("No, this is the first time.")
+        self.previous_use_choice = QRadioButton("Yes, or I'm not sure.")
+        self.choice_group = QButtonGroup(self)
+        for choice in (self.first_time_choice, self.previous_use_choice):
+            self.choice_group.addButton(choice)
+            choices.addWidget(choice)
+            choice.toggled.connect(self._choice_changed)
+        choices.addWidget(_label("Choose an option, then confirm below. Nothing changes until you click the action button."))
+        content.addWidget(self.setup_choices)
 
         self.incidents = QListWidget()
         self.incidents.currentRowChanged.connect(self._show_incident)
-        layout.addWidget(self.incidents)
-        self.detail_label = QLabel()
-        self.detail_label.setWordWrap(True)
-        layout.addWidget(self.detail_label)
+        self.incidents.setMaximumHeight(160)
+        content.addWidget(self.incidents)
+        self.detail_label = _label()
+        content.addWidget(self.detail_label)
 
-        self.first_run_confirm = QCheckBox(
-            "This is the first launch with runaway suspension for this data folder")
+        self.first_run_group, self.first_run_confirm = _acknowledgement(
+            "Enable protection only if this data folder has never used this safety feature. "
+            "Your existing chats, memories, Skills and preferences will not be reset.",
+            "I confirm this is the first setup.")
         self.first_run_confirm.toggled.connect(lambda on: self._exclusive(self.first_run_confirm, on))
-        layout.addWidget(self.first_run_confirm)
-        self.unknown_prior_state = QCheckBox(
-            "I can't confirm this is the first launch. Earlier suspensions, other Lumina processes "
-            "and the outcome of earlier work are unknown; start with my work and every channel "
-            "suspended for review")
+        content.addWidget(self.first_run_group)
+        self.unknown_prior_group, self.unknown_prior_state = _acknowledgement(
+            "Earlier safety records, other Lumina processes and work outcomes are unknown. "
+            "Recovery starts a new safety record with my work and every channel paused for review. "
+            "No earlier safety records can be restored.",
+            "I accept this paused start.")
         self.unknown_prior_state.toggled.connect(
             lambda on: self._exclusive(self.unknown_prior_state, on))
-        layout.addWidget(self.unknown_prior_state)
-        self.ack_unknown = QCheckBox(
-            "I accept that work whose process stopped may or may not have finished (outcome unknown)")
-        layout.addWidget(self.ack_unknown)
-        self.ack_runtimes = QCheckBox(
-            "Other Lumina processes listed above are stopped or may be ignored")
-        layout.addWidget(self.ack_runtimes)
-        self.unknown_scopes_clear = QCheckBox(
-            "After recovery, let channels whose state can't be read start unsuspended")
-        layout.addWidget(self.unknown_scopes_clear)
+        content.addWidget(self.unknown_prior_group)
+        self.ack_unknown_group, self.ack_unknown = _acknowledgement(
+            "Work whose process stopped may or may not have finished (outcome unknown).",
+            "I accept the unknown outcome.")
+        content.addWidget(self.ack_unknown_group)
+        self.ack_runtimes_group, self.ack_runtimes = _acknowledgement(
+            "Other Lumina processes listed above are stopped or may be ignored.",
+            "I acknowledge these processes.")
+        content.addWidget(self.ack_runtimes_group)
+        self.unknown_scopes_group, self.unknown_scopes_clear = _acknowledgement(
+            "After recovery, let channels whose state can't be read start unsuspended. "
+            "Leave this unchecked to keep unknown channels paused for review.",
+            "Allow an unpaused start.")
+        content.addWidget(self.unknown_scopes_group)
+        self.recovery_note = _label(
+            "Safe recovery rebuilds safety protection. It is not Agent Restore and does not recover "
+            "chats or memories. Stop other Lumina processes using this folder before recovery.")
+        content.addWidget(self.recovery_note)
+        guide = QLabel('<a href="' + (Path(__file__).resolve().parents[1] / "docs/upgrading.md").as_uri()
+                       + '">Upgrade and troubleshooting guide</a> (docs/upgrading.md)')
+        guide.setWordWrap(True)
+        guide.setOpenExternalLinks(True)
+        content.addWidget(guide)
+        self.result_label = _label()
+        content.addWidget(self.result_label)
 
-        buttons = QHBoxLayout()
-        self.initialize_btn = QPushButton("Initialize")
-        self.initialize_btn.clicked.connect(self._initialize)
+        buttons = QVBoxLayout()
+        self.setup_action_btn = QPushButton("Continue")
+        self.setup_action_btn.clicked.connect(self._setup_action)
         self.repair_btn = QPushButton("Repair identity")
         self.repair_btn.clicked.connect(self._repair)
-        self.recover_btn = QPushButton("Recover…")
+        self.recover_btn = QPushButton("Review safe recovery")
         self.recover_btn.clicked.connect(self._recover)
         self.resume_btn = QPushButton("Resume selected")
         self.resume_btn.clicked.connect(self._resume)
@@ -95,14 +171,11 @@ class SuspensionDialog(QDialog):
         self.ack_scopes_btn.clicked.connect(self._acknowledge_unknown_scopes)
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.accept)
-        for button in (self.initialize_btn, self.repair_btn, self.recover_btn, self.resume_btn,
+        for button in (self.setup_action_btn, self.repair_btn, self.recover_btn, self.resume_btn,
                        self.ack_scopes_btn, self.close_btn):
             buttons.addWidget(button)
         layout.addLayout(buttons)
 
-        self.result_label = QLabel()
-        self.result_label.setWordWrap(True)
-        layout.addWidget(self.result_label)
         self.refresh()
 
     # -- state ---------------------------------------------------------------
@@ -110,6 +183,7 @@ class SuspensionDialog(QDialog):
     def refresh(self) -> None:
         status = R.status()
         self._status = status
+        self.data_folder_label.setText(status.data_dir or "No data folder selected — close and check your launch settings.")
         self.incidents.clear()
         self._views = ()
         if status.state is R.State.ACTIVE:
@@ -128,13 +202,10 @@ class SuspensionDialog(QDialog):
                 head = "✅ Runaway suspension is active and nothing is suspended."
         elif status.state is R.State.UNINITIALIZED:
             if status.probe_status is S.StoreStatus.ABSENT_NO_TRACE:
-                head = ("No runaway-suspension store exists for this data folder, so nothing is "
-                        "admitted yet. A missing store can't be told apart from a deleted one. "
-                        "If this is the first launch with runaway suspension here, confirm and "
-                        "choose Initialize. If Lumina has run with it here before, or you're "
-                        "not sure, tick the acknowledgement and choose Recover: no earlier "
-                        "records survive, so nothing is restored. It starts a new record with "
-                        "your work and every channel suspended so you can review before resuming.")
+                head = ("Set up Lumina's safety protection\n\n"
+                        "This update adds protection against runaway AI tasks. Your chats, memories, "
+                        "Skills and preferences will not be reset. Work stays paused until safety "
+                        "protection is ready.")
             else:
                 head = ("The runaway-suspension store is missing but traces of an earlier one "
                         f"remain ({', '.join(status.traces)}). Choose Recover. Nothing is "
@@ -149,37 +220,84 @@ class SuspensionDialog(QDialog):
         local = f" Stopped in this process (unconfirmed): {', '.join(status.local_stops)}." \
             if status.local_stops else ""
         self.state_label.setText(head + local)
+        self.incidents.setVisible(bool(self._views))
+        self.detail_label.setVisible(bool(self._views))
         if not self._views:
             self.detail_label.setText("")
         self._sync_buttons()
+        self._fit_setup()
+
+    def _fit_setup(self) -> None:
+        if self._absent_clean():
+            # Fit the first-run decision to its wrapped content, keeping scrolling
+            # available when the screen is short. No empty incident space remains.
+            self.layout().activate()
+            frame = 2 * self.scroll.frameWidth()
+            height = self.scroll.widget().layout().heightForWidth(self.scroll.width() - frame)
+            margins = self.layout().contentsMargins()
+            actions = self.layout().itemAt(1).sizeHint().height()
+            height += frame + margins.top() + margins.bottom() + self.layout().spacing() + actions
+            self.resize(self.width(), min(height, self.screen().availableGeometry().height() - 60))
+        elif self._views:
+            self.resize(self.width(), min(640, self.screen().availableGeometry().height() - 60))
 
     def _sync_buttons(self) -> None:
         status = self._status
         absent_clean = self._absent_clean()
         if not absent_clean:
+            self.choice_group.setExclusive(False)
+            for choice in (self.first_time_choice, self.previous_use_choice):
+                choice.blockSignals(True)
+                choice.setChecked(False)
+                choice.blockSignals(False)
+            self.choice_group.setExclusive(True)
             for box in (self.first_run_confirm, self.unknown_prior_state):
                 box.blockSignals(True)
                 box.setChecked(False)
                 box.blockSignals(False)
-        self.first_run_confirm.setVisible(absent_clean)
-        self.unknown_prior_state.setVisible(absent_clean)
-        self.initialize_btn.setVisible(absent_clean)
-        self.initialize_btn.setEnabled(absent_clean and self.first_run_confirm.isChecked())
+        self.setup_choices.setVisible(absent_clean)
+        first = absent_clean and self.first_time_choice.isChecked()
+        uncertain = absent_clean and self.previous_use_choice.isChecked()
+        self.first_run_group.setVisible(first)
+        self.unknown_prior_group.setVisible(uncertain)
+        self.setup_action_btn.setVisible(absent_clean)
+        self.setup_action_btn.setText("Enable protection" if first else
+                                      "Review safe recovery" if uncertain else "Continue")
+        self.setup_action_btn.setEnabled((first and self.first_run_confirm.isChecked()) or
+                                         (uncertain and self.unknown_prior_state.isChecked()))
         self.repair_btn.setVisible(status.state is R.State.FAULT and status.fault in (
             S.Fault.IDENTITY_MISSING, S.Fault.IDENTITY_INVALID))
         recovering = status.state in (R.State.UNINITIALIZED, R.State.FAULT)
-        self.recover_btn.setVisible(recovering)
-        self.recover_btn.setEnabled(not absent_clean or self.unknown_prior_state.isChecked())
+        self.recover_btn.setVisible(recovering and not absent_clean)
+        self.recover_btn.setEnabled(recovering and not absent_clean)
         # With no trace there is no old registry or scope table to acknowledge:
         # the no-trace acknowledgement covers both, and channels always start
         # suspended.
-        self.ack_runtimes.setVisible(recovering and not absent_clean)
-        self.unknown_scopes_clear.setVisible(recovering and not absent_clean)
+        self.ack_runtimes_group.setVisible(recovering and not absent_clean)
+        self.unknown_scopes_group.setVisible(recovering and not absent_clean)
+        self.recovery_note.setVisible(recovering)
         self.resume_btn.setVisible(status.state is R.State.ACTIVE)
         self.resume_btn.setEnabled(bool(self._views) and self.incidents.currentRow() >= 0)
-        self.ack_unknown.setVisible(status.state is R.State.ACTIVE and bool(self._views))
+        self.ack_unknown_group.setVisible(status.state is R.State.ACTIVE and bool(self._views))
         self.ack_scopes_btn.setVisible(status.state is R.State.ACTIVE and any(
             v.trigger == S.RECOVERY_TRIGGER for v in self._views))
+        self.result_label.setVisible(bool(self.result_label.text()))
+
+    def _choice_changed(self) -> None:
+        # Choosing a different path never carries its earlier acknowledgement.
+        if not self.first_time_choice.isChecked():
+            self.first_run_confirm.setChecked(False)
+        if not self.previous_use_choice.isChecked():
+            self.unknown_prior_state.setChecked(False)
+        if hasattr(self, "_status"):
+            self._sync_buttons()
+            self._fit_setup()
+
+    def _setup_action(self) -> None:
+        if self.first_time_choice.isChecked():
+            self._initialize()
+        elif self.previous_use_choice.isChecked():
+            self._recover()
 
     def _exclusive(self, box: QCheckBox, on: bool) -> None:
         """"First launch" and "can't confirm a first launch" contradict each
@@ -226,7 +344,7 @@ class SuspensionDialog(QDialog):
     # -- actions (each mints a fresh local envelope at the click) -------------
 
     def _initialize(self) -> None:
-        if not self.first_run_confirm.isChecked():
+        if not self.first_time_choice.isChecked() or not self.first_run_confirm.isChecked():
             return
         try:
             R.initialize(ingress=operator_ingress.local_suspension_control("initialize"))
@@ -246,7 +364,7 @@ class SuspensionDialog(QDialog):
 
     def _recover(self) -> None:
         no_trace = self._absent_clean()
-        if no_trace and not self.unknown_prior_state.isChecked():
+        if no_trace and (not self.previous_use_choice.isChecked() or not self.unknown_prior_state.isChecked()):
             return
         ack_runtimes = self.ack_runtimes.isChecked() and not no_trace
         acked = set(self._blocked_runtimes) if ack_runtimes else set()

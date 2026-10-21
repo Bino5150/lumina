@@ -163,7 +163,7 @@ She is not finished. She will never be finished — that's the point. But she is
 Requirements, install, configure, and first-run notes: **[docs/getting-started.md](docs/getting-started.md)**.
 
 **Already using Lumina? Read [Upgrading to the C1 Runaway Suspension release](docs/upgrading.md#upgrading-to-the-c1-runaway-suspension-release)**
-before updating or choosing Initialize/Recover. It covers backups, the current
+before updating or choosing Enable protection/safe recovery. It covers backups, the current
 shared launch-folder check, and the desktop safety setup.
 
 Quick version:

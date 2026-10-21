@@ -49,7 +49,7 @@ bash start_lumina.sh   # launches desktop; selects ~/.local/share/lumina-release
 ```
 
 On the first launch with C1 runaway protection, the desktop asks you to
-establish its safety record. Follow [the Initialize/Recover steps](upgrading.md#4-open-the-desktop-and-choose-the-right-safety-action)
+establish its safety record. Follow [the Enable protection/safe recovery steps](upgrading.md#4-open-the-desktop-and-choose-the-right-safety-action)
 before chatting. Only the desktop can do this; CLI, Telegram and Discord
 need an existing usable safety record in the same data folder.
 

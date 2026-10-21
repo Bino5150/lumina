@@ -188,7 +188,7 @@ yet.
 data folder (`memory/suspension.db`, pinned by `memory/soul_identity.json`).
 Only the desktop can initialize, repair, recover or resume it; the CLI and
 bridges require an existing usable record. Follow [Upgrading Lumina](upgrading.md)
-for folder selection, backups and the exact **Initialize**, **Recover…**,
+for folder selection, backups and the exact **Enable protection**, **Review safe recovery**,
 **Repair identity** and **Resume selected** steps, including recovery when
 no prior trace survives: it needs an explicit acknowledgement that earlier
 state is unknown, restores nothing, starts a new identity with your work
