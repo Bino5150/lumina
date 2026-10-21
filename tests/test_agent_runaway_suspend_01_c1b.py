@@ -957,8 +957,8 @@ def test_the_security_doc_states_guarantees_and_the_boundaries_not_yet_covered()
     text = _doc("security.md")
     section = text[text.index("## Runaway suspension"):text.index("## Content from outside you")]
     for needle in ("Nothing new starts in it", "never runs again", "Work already running may finish",
-                   "desktop-only and deliberate", "Telegram `/resume` is not active", "Initialize",
-                   "Recover", "does **not** yet cover", "vision specialist", "Dreaming",
+                   "desktop-only and deliberate", "Telegram `/resume` is not active", "Enable protection",
+                   "Review safe recovery", "does **not** yet cover", "vision specialist", "Dreaming",
                    "Staged items wait", "pending tool", "image draft", "stays pending",
                    "*any* scope", "approve it again afterwards", "approvals made before a suspension",
                    "can still be generated", "older version", "best-effort"):
