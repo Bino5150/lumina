@@ -28,15 +28,18 @@ the owner's verified Telegram /resume). It is never logged.
 from __future__ import annotations
 
 import time
+import os
+import stat
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QDialog, QLabel, QListWidget, QListWidgetItem, QPushButton,
-    QRadioButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QRadioButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget, QMessageBox,
 )
 
 from core import operator_ingress, suspension as S, suspension_runtime as R
+from core import suspension_permissions as P
 
 
 def _when(ts: float) -> str:
@@ -80,6 +83,8 @@ class SuspensionDialog(QDialog):
         """)
         self._views = ()
         self._blocked_runtimes = ()
+        self._permission_pending = False
+        self._permission_preview = None
 
         layout = QVBoxLayout(self)
         self.scroll = QScrollArea()
@@ -97,6 +102,25 @@ class SuspensionDialog(QDialog):
         self.data_folder_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.data_folder_label.setStyleSheet("font-weight: bold;")
         content.addWidget(self.data_folder_label)
+
+        self.permission_group = QWidget()
+        permissions = QVBoxLayout(self.permission_group)
+        permissions.setContentsMargins(0, 0, 0, 0)
+        self.permission_label = _label()
+        self.permission_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        permissions.addWidget(self.permission_label)
+        self.permissions_fix_btn = QPushButton("Fix folder permissions")
+        self.permissions_fix_btn.clicked.connect(self._fix_folder_permissions)
+        permissions.addWidget(self.permissions_fix_btn)
+        self.permissions_not_now_btn = QPushButton("Not now")
+        self.permissions_not_now_btn.clicked.connect(self.reject)
+        permissions.addWidget(self.permissions_not_now_btn)
+        explanation = QLabel('<a style="color: #7dcfff;" href="' + (Path(__file__).resolve().parents[1] / "docs/upgrading.md").as_uri()
+                             + '#folder-permissions">Why does this folder need different permissions?</a>')
+        explanation.setOpenExternalLinks(True)
+        explanation.setWordWrap(True)
+        permissions.addWidget(explanation)
+        content.addWidget(self.permission_group)
 
         self.setup_choices = QWidget()
         choices = QVBoxLayout(self.setup_choices)
@@ -150,13 +174,21 @@ class SuspensionDialog(QDialog):
             "Safe recovery rebuilds safety protection. It is not Agent Restore and does not recover "
             "chats or memories. Stop other Lumina processes using this folder before recovery.")
         content.addWidget(self.recovery_note)
-        guide = QLabel('<a href="' + (Path(__file__).resolve().parents[1] / "docs/upgrading.md").as_uri()
+        guide = QLabel('<a style="color: #7dcfff;" href="' + (Path(__file__).resolve().parents[1] / "docs/upgrading.md").as_uri()
                        + '">Upgrade and troubleshooting guide</a> (docs/upgrading.md)')
         guide.setWordWrap(True)
         guide.setOpenExternalLinks(True)
         content.addWidget(guide)
         self.result_label = _label()
         content.addWidget(self.result_label)
+        self.technical_toggle = QPushButton("Technical details")
+        self.technical_toggle.setCheckable(True)
+        content.addWidget(self.technical_toggle)
+        self.technical_details = _label()
+        self.technical_details.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.technical_details.hide()
+        self.technical_toggle.toggled.connect(self.technical_details.setVisible)
+        content.addWidget(self.technical_details)
 
         buttons = QVBoxLayout()
         self.setup_action_btn = QPushButton("Continue")
@@ -183,6 +215,9 @@ class SuspensionDialog(QDialog):
     def refresh(self) -> None:
         status = R.status()
         self._status = status
+        if (status.state is R.State.FAULT and status.fault is S.Fault.INSECURE
+                and not self._permission_pending and self._memory_permissions_problem(status)):
+            self._offer_folder_permissions(f"C1 probe: {status.fault.value}")
         self.data_folder_label.setText(status.data_dir or "No data folder selected — close and check your launch settings.")
         self.incidents.clear()
         self._views = ()
@@ -217,6 +252,8 @@ class SuspensionDialog(QDialog):
                     "damaged; Recover preserves evidence and rebuilds the store.")
         else:
             head = "This process is not participating in runaway suspension."
+        if self._permission_pending:
+            head = "Safety setup is paused until this folder's permissions are reviewed."
         local = f" Stopped in this process (unconfirmed): {', '.join(status.local_stops)}." \
             if status.local_stops else ""
         self.state_label.setText(head + local)
@@ -226,6 +263,96 @@ class SuspensionDialog(QDialog):
             self.detail_label.setText("")
         self._sync_buttons()
         self._fit_setup()
+
+    @staticmethod
+    def _memory_permissions_problem(status):
+        try:
+            info = os.lstat(Path(status.data_dir) / S.MEMORY_DIRNAME)
+            return (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or bool(info.st_mode & 0o022))
+        except (OSError, TypeError, AttributeError):
+            return False
+
+    def _technical_error(self, detail):
+        earlier = self.technical_details.text()
+        self.technical_details.setText((earlier + "\n" if earlier else "") + detail)
+
+    def _offer_folder_permissions(self, detail):
+        self._permission_pending = True
+        self._permission_preview = None
+        self._technical_error(detail)
+        path = Path(self._status.data_dir) / S.MEMORY_DIRNAME
+        explanation = ("Other people may be able to change files in your memory folder. "
+                       "Lumina keeps work paused to protect its safety records.\n\n"
+                       f"Affected folder: {path}\n")
+        try:
+            info = os.lstat(path)
+            mode = stat.S_IMODE(info.st_mode)
+            proposed = f"{mode & ~0o022:04o}" if stat.S_ISDIR(info.st_mode) else "unavailable (not an ordinary directory)"
+            explanation += f"Current mode: {mode:04o}\nProposed mode: {proposed}\n\n"
+        except OSError as exc:
+            explanation += "Current/proposed modes: unavailable; the folder could not be inspected safely.\n\n"
+            self._technical_error(f"{type(exc).__name__}: {exc}")
+        try:
+            preview = P.inspect(path)
+            if not preview.mode & 0o022:
+                raise P.PermissionRepairRefused("No group/other write bits are present; stop and review the error with support.")
+            self._permission_preview = preview
+            explanation += ("This removes only group and other write access to this folder. "
+                            "Files, subfolders, ownership and other permission bits stay as they are. "
+                            "If you intentionally share write access, choose Not now and ask the folder owner "
+                            "for a reviewed plan. Do not use sudo or change data folders to bypass this check.")
+        except (S.SuspensionError, OSError) as exc:
+            explanation += ("Lumina cannot safely repair this folder. It must be an ordinary folder "
+                            "owned by your OS user, with no symlinks in its path. Stop and ask the folder "
+                            "owner or support to review its ownership, sharing and launch path. "
+                            "Do not use sudo, delete safety files or switch data folders to bypass this check.")
+            self._technical_error(f"{type(exc).__name__}: {exc}")
+        self.permission_label.setText(explanation)
+        self.permissions_fix_btn.setEnabled(self._permission_preview is not None)
+        self.first_run_confirm.setChecked(False)
+        self.unknown_prior_state.setChecked(False)
+
+    def _permission_failure(self, exc):
+        if isinstance(exc, S.StoreFault) and exc.fault is S.Fault.INSECURE and exc.detail.startswith("memory directory"):
+            self._offer_folder_permissions(f"{type(exc).__name__}: {exc}")
+            self.result_label.setText("Review the folder permissions above before continuing safety setup.")
+            return True
+        return False
+
+    def _fix_folder_permissions(self):
+        preview = self._permission_preview
+        if preview is None or not self._permission_pending:
+            return
+        confirmation = QMessageBox(self)
+        confirmation.setWindowTitle("Confirm folder permission repair")
+        confirmation.setIcon(QMessageBox.Question)
+        confirmation.setTextFormat(Qt.PlainText)
+        confirmation.setText(
+            "Confirm that this is your private memory folder and write access is NOT intentionally shared.\n\n"
+            f"Folder: {preview.path}\nMode: {preview.mode:04o} → {preview.proposed_mode:04o}\n\n"
+            "Change only this folder's group/other write bits? No files or subfolders will be changed. "
+            "This does not initialize, recover or resume safety protection.")
+        confirmation.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        confirmation.setDefaultButton(QMessageBox.No)
+        if confirmation.exec() != QMessageBox.Yes:
+            return
+        try:
+            R.repair_folder_permissions(preview, ingress=operator_ingress.local_suspension_control("folder_permissions"))
+        except (S.SuspensionError, OSError) as exc:
+            self._technical_error(f"{type(exc).__name__}: {exc}")
+            self.permissions_fix_btn.setEnabled(False)
+            self._permission_preview = None
+            self.result_label.setText("Repair could not be safely completed and verified. Permissions may have changed. "
+                                      "Stop and ask the folder owner or support to review the path and Technical details.")
+        else:
+            self._permission_pending = False
+            self._permission_preview = None
+            self.first_run_confirm.setChecked(False)
+            self.unknown_prior_state.setChecked(False)
+            self.result_label.setText("Folder permissions repaired and verified. Review your original safety setup choice "
+                                      "and confirm it again. Nothing was initialized, recovered or resumed.")
+        self.refresh()
 
     def _fit_setup(self) -> None:
         if self._absent_clean():
@@ -282,6 +409,13 @@ class SuspensionDialog(QDialog):
         self.ack_scopes_btn.setVisible(status.state is R.State.ACTIVE and any(
             v.trigger == S.RECOVERY_TRIGGER for v in self._views))
         self.result_label.setVisible(bool(self.result_label.text()))
+        self.permission_group.setVisible(self._permission_pending)
+        self.technical_toggle.setVisible(bool(self.technical_details.text()))
+        if self._permission_pending:
+            for widget in (self.setup_choices, self.first_run_group, self.unknown_prior_group,
+                           self.setup_action_btn, self.repair_btn, self.recover_btn,
+                           self.ack_runtimes_group, self.unknown_scopes_group, self.recovery_note):
+                widget.hide()
 
     def _choice_changed(self) -> None:
         # Choosing a different path never carries its earlier acknowledgement.
@@ -350,7 +484,8 @@ class SuspensionDialog(QDialog):
             R.initialize(ingress=operator_ingress.local_suspension_control("initialize"))
             self.result_label.setText("Initialized. Runaway suspension is now active.")
         except S.SuspensionError as exc:
-            self.result_label.setText(f"Not initialized: {exc}")
+            if not self._permission_failure(exc):
+                self.result_label.setText(f"Not initialized: {exc}")
         self.first_run_confirm.setChecked(False)
         self.refresh()
 
@@ -359,7 +494,8 @@ class SuspensionDialog(QDialog):
             R.repair_identity(ingress=operator_ingress.local_suspension_control("repair_identity"))
             self.result_label.setText("Identity repaired; every suspension was kept.")
         except S.SuspensionError as exc:
-            self.result_label.setText(f"Repair not possible: {exc}")
+            if not self._permission_failure(exc):
+                self.result_label.setText(f"Repair not possible: {exc}")
         self.refresh()
 
     def _recover(self) -> None:
@@ -383,7 +519,8 @@ class SuspensionDialog(QDialog):
             self.refresh()
             return
         except S.SuspensionError as exc:
-            self.result_label.setText(f"Recovery failed: {exc}")
+            if not self._permission_failure(exc):
+                self.result_label.setText(f"Recovery failed: {exc}")
             self.refresh()
             return
         self._blocked_runtimes = ()

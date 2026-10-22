@@ -156,7 +156,12 @@ or resume**. The desktop must establish a usable safety store for that
 same folder first. A bridge using a different default still will not work.
 
 If the safety record is not ready, the desktop opens **Runaway suspension**.
-You can also type `/suspension` into the desktop chat to open these controls.
+Click **Open safety controls** above the chat to reopen them at any time,
+including after setup. You can also type `/suspension` into the desktop chat.
+The safety banner reflects current status: after initialization it changes
+to **Safety protection is active; nothing is suspended.** Recovery may leave
+scopes suspended; review them before resuming. This status is separate from
+conversation history and does not clear earlier incident receipts.
 The selected **Data folder** is shown above the setup choices. Stop if it is
 not the folder holding your existing history. Neither first-run answer is
 selected for you. Choose an answer, read its explanation, then tick its
@@ -187,6 +192,37 @@ that earlier safety state may exist. Their absence **cannot prove** that
 C1 was never initialized. Use what you know about this particular folder,
 including earlier backups and launches, rather than the age of the app
 installation alone. Do not edit these files to change the screen's choices.
+
+#### Folder permissions
+
+If setup stops with `insecure_permissions: memory directory is writable by
+others`, Lumina explains the problem and shows the actual `memory/` path,
+its current permission mode and the proposed mode. For example, `0777`
+becomes `0755`, or `0775` becomes `0755`. Open **Technical details** for
+the original error. The explanation link opens this guide.
+
+If this is your private folder and write access is **not intentionally
+shared**, click **Fix folder permissions** and confirm at the desktop.
+Lumina checks that it is an ordinary directory owned by your current OS
+user, refuses symlinks anywhere in its path, rechecks its identity,
+ownership and mode immediately before repair, and verifies the result.
+It removes **only group and other write bits on that directory**. It does
+not recursively change files or subfolders, alter ownership, or remove
+unrelated permission bits. It never uses sudo or chooses a new data folder.
+
+Choose **Not now** (or decline the confirmation) to leave permissions
+unchanged. If the folder is intentionally shared, belongs to another user,
+changes during review, or cannot be safely opened or verified, stop and ask
+the folder owner or support for a reviewed plan. The repair is available
+only on systems supporting safe directory-descriptor operations; other
+systems show guidance. Do not delete safety files, weaken protection or
+switch folders to bypass the refusal.
+
+After verified repair, the original safety choices return. Review your
+answer and tick its acknowledgement again before clicking **Enable
+protection** or **Review safe recovery**. Permission repair does not
+initialize, recover or resume anything. Existing safety records can become
+readable again; any recorded suspensions still require their normal review.
 
 **When no C1 traces remain.** If none of those files exist, the screen
 shows the action matching your selected answer. If you know or suspect earlier

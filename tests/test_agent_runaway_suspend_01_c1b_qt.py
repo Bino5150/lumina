@@ -229,7 +229,8 @@ def test_startup_offers_initialize_or_recover_when_the_store_is_not_ready(qapp, 
         assert dialog is not None and dialog.isVisible()
         assert "Set up Lumina's safety protection" in dialog.state_label.text()
         win._check_suspension_ready()
-        assert any("isn't ready for this data folder" in n for n in win._notices)
+        assert "isn't ready for this data folder" in win.safety_banner.status_label.text()
+        assert not any("isn't ready for this data folder" in n for n in win._notices)
         assert os.listdir(root / S.MEMORY_DIRNAME) == []                    # nothing created on its own
     finally:
         win._suspension_dialog.close()

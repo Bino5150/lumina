@@ -31,4 +31,4 @@ What a message says never decides that.
 | `/context status` | Show the current context-checkpoint state. |
 | `/context reforge` | Run Reforge, a continuity-checkpoint reconstruction — see [`/context reforge`](memory.md#context-reforge). |
 | `/context rebuild` | Backward-compatible alias for `/context reforge`; runs the same operation with the same protections. |
-| `/suspension` | Open Suspension controls: review and resume suspended work, set up runaway suspension on first launch, or repair/recover its store (see [Runaway suspension](security.md#runaway-suspension)). |
+| `/suspension` | Open Suspension controls, also available through **Open safety controls** above chat: review and resume suspended work, set up runaway suspension on first launch, or repair/recover its store (see [Runaway suspension](security.md#runaway-suspension)). |

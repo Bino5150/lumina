@@ -526,6 +526,17 @@ def repair_identity(*, ingress) -> RuntimeStatus:
     return _reopen_after_owner_action()
 
 
+def repair_folder_permissions(preview, *, ingress) -> RuntimeStatus:
+    """Desktop-confirmed filesystem repair, followed only by a fresh probe."""
+    import os
+    from core import suspension_permissions
+    _require_desktop()
+    if preview.path != os.path.join(os.path.abspath(_data_dir), S.MEMORY_DIRNAME):
+        raise suspension_permissions.PermissionRepairRefused("The selected data folder changed. Close and review safety controls again.")
+    suspension_permissions.repair(preview, ingress=ingress)
+    return _reopen_after_owner_action()
+
+
 def recover(*, ingress, acknowledged_runtimes=frozenset(), acknowledge_unreadable_runtimes=False,
             acknowledge_unknown_scopes=False, acknowledge_unknown_prior_state=False) -> S.RecoveryOutcome:
     _require_desktop()

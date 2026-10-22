@@ -109,6 +109,9 @@ If a model keeps hitting these limits on one provider, look at
 ## Runaway suspension
 
 See [Security & Authority](security.md#runaway-suspension) for what it is.
+**Open safety controls** above the chat is always available; `/suspension`
+opens the same window. The banner updates after setup, recovery and resume;
+an earlier incident receipt in the conversation remains historical evidence.
 What the notices mean:
 
 - *"runaway suspension is active since … Nothing was run"* — that work was
@@ -130,6 +133,11 @@ What the notices mean:
   suspension state survives and earlier C1 use is possible, tick its
   acknowledgement (see [When no C1 traces remain](upgrading.md#4-open-the-desktop-and-choose-the-right-safety-action));
   do not bypass it with **Enable protection**. Recovery is not full Agent Restore.
+- *"memory directory is writable by others"* — review the affected path
+  and modes, then use the desktop's **Fix folder permissions** only for your
+  private, unshared folder. **Not now** leaves it alone. See [Folder
+  permissions](upgrading.md#folder-permissions) for confirmations, refusal
+  guidance and **Technical details**. Setup acknowledgements remain required.
 - *"global suspension unconfirmed"* — a suspension couldn't be written
   down, so it holds in this desktop process only, and writing it is retried
   on the next request. Check Suspension controls; a restart before it is

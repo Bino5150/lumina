@@ -651,6 +651,12 @@ class LuminaWindow(QMainWindow):
         
         
         self._setup_window()
+        # Readiness callbacks need their status view even when the layout
+        # builder is replaced by a minimal window shell.
+        from ui.safety_banner import SafetyBanner
+        self.safety_banner = SafetyBanner(self)
+        self.safety_banner.controls_btn.clicked.connect(self._open_suspension_dialog)
+        self.safety_banner.refresh(suspension_runtime.status())
         self._build_ui()
         self._connect_signals()
         self._telegram_route_token = origin_routing.register_runtime(
@@ -841,6 +847,7 @@ class LuminaWindow(QMainWindow):
         main.setContentsMargins(0,0,0,0)
         main.setSpacing(0)
         main.addWidget(self._build_header())
+        main.addWidget(self.safety_banner)
 
         self.chat_widget = ChatWidget(
             COLORS,
@@ -1620,18 +1627,13 @@ class LuminaWindow(QMainWindow):
 
     def _check_suspension_ready(self):
         status = suspension_runtime.status()
+        self.safety_banner.refresh(status)
         if status.state is suspension_runtime.State.ACTIVE:
-            if status.active_incidents:
-                self.chat_widget.add_operator_message(
-                    f"⛔ Runaway suspension: {status.active_incidents} scope(s) are suspended. "
-                    "Review and resume them in Suspension controls (/suspension).")
             return
-        self.chat_widget.add_operator_message(
-            "⛔ Runaway suspension isn't ready for this data folder, so nothing will run yet. "
-            "Open Suspension controls to set up or recover safety protection (/suspension).")
         self._open_suspension_dialog()
 
     def _on_suspension_event(self, kind: str, payload):
+        self.safety_banner.refresh(suspension_runtime.status())
         if self._suspension_dialog is not None and self._suspension_dialog.isVisible():
             self._suspension_dialog.refresh()
         if kind != "trip" or payload is None:
