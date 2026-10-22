@@ -841,8 +841,31 @@ def _record_provider_response(agent, response, chat_kwargs: dict, phase: str, *,
             "reasoning_output_count": _nonnegative_int(details.get("reasoning_tokens")),
             "output_limit": chat_kwargs.get("max_tokens"),
         })
+        # OPENROUTER-PROVIDER-ROUTING-01 -- truth check on a configured pin:
+        # a served provider outside the requested set is recorded, never
+        # silently accepted. OpenRouter enforces the pin; this only reports.
+        mismatch = getattr(agent.llm, "provider_pin_mismatch", None)
+        if callable(mismatch) and mismatch(identity.get("provider_name")) is True:
+            _fr_machine(agent, "provider.pin_mismatch", turn_id=turn_id, chat_id=chat_id,
+                        severity="warning", fields={
+                            "phase": phase,
+                            "provider_name": identity.get("provider_name"),
+                            **_provider_routing_fields(agent.llm),
+                        })
     except Exception as exc:
         print(f"[AGENT] provider.response telemetry skipped: {type(exc).__name__}", flush=True)
+
+
+def _provider_routing_fields(llm) -> dict:
+    """OPENROUTER-PROVIDER-ROUTING-01 -- the upstream routing a backend will
+    request, for provider.dispatch telemetry. Empty when the backend has no
+    routing concept or none is configured. Never raises."""
+    try:
+        summary = getattr(llm, "provider_routing_summary", None)
+        routing = summary() if callable(summary) else None
+    except Exception:
+        return {}
+    return {"provider_routing": routing} if routing else {}
 
 
 # MB-35 -- per-role "known" message fields for a wire-bound OpenAI-shaped
@@ -1042,7 +1065,8 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
         agent, "provider.dispatch", turn_id=turn_id, chat_id=chat_id,
         backend=getattr(_llm, "name", None),
         model=_configured_model() if callable(_configured_model) else None,
-        fields={**dispatch_fields, **_identity_fields(agent, OperationKind.FOREGROUND_CHAT)},
+        fields={**dispatch_fields, **_provider_routing_fields(_llm),
+                **_identity_fields(agent, OperationKind.FOREGROUND_CHAT)},
     )
     try:
         response = agent.llm.chat(**chat_kwargs)

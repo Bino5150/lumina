@@ -105,6 +105,14 @@ use; the Flight Recorder (`provider.dispatch_refused`) has the details.
 If a model keeps hitting these limits on one provider, look at
 `provider.response` in the Flight Recorder: it names the serving provider
 (for OpenRouter, the actual upstream provider) and how each response ended.
+If one OpenRouter provider behaves worse than another for the same model,
+you can pin the provider. See [OpenRouter provider
+routing](settings.md#openrouter-provider-routing).
+
+An error saying *"OpenRouter provider routing in prefs.json is invalid;
+request not sent"* means the `backend_provider_routing` entry has a key or
+value Lumina doesn't accept. The message names it. Nothing was sent. Fix or
+remove the entry, then restart.
 
 ## Runaway suspension
 

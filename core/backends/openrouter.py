@@ -16,11 +16,80 @@ list_models() wrapper delegates to it, and reasoning_capabilities() only
 reads whatever the last successful structured discovery cached.
 """
 
+import copy
+import math
+import re
 from typing import Optional, Generator
 from .lmstudio import LMStudioBackend
 from .base import ModelDiscoveryOutcome, ModelDiscoveryResult
 from .reasoning import ReasoningCapabilities, NO_REASONING_CONTROL
 import config
+
+
+class ProviderRoutingConfigError(ValueError):
+    """OPENROUTER-PROVIDER-ROUTING-01 -- the configured provider routing is
+    malformed. Raised before any network I/O so a broken pin can never
+    quietly fall back to unpinned routing."""
+
+
+# OpenRouter's documented request-body `provider` fields this backend will
+# forward (openrouter.ai/docs/guides/routing/provider-selection). Anything
+# else is refused rather than passed through unvalidated.
+_ROUTING_SLUG_LIST_KEYS = ("order", "only", "ignore", "quantizations")
+_ROUTING_BOOL_KEYS = ("allow_fallbacks", "require_parameters")
+_ROUTING_SORT_VALUES = ("price", "throughput", "latency")
+_ROUTING_DATA_COLLECTION_VALUES = ("allow", "deny")
+_ROUTING_PRICE_KEYS = ("prompt", "completion", "request", "image")
+_ROUTING_KEYS = frozenset(_ROUTING_SLUG_LIST_KEYS + _ROUTING_BOOL_KEYS
+                          + ("sort", "data_collection", "max_price"))
+
+
+def validate_provider_routing(raw) -> Optional[dict]:
+    """Return a validated deep copy of prefs["backend_provider_routing"]
+    ["openrouter"], or None when no routing is configured (absent, None or
+    {}). Raises ProviderRoutingConfigError for anything malformed."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProviderRoutingConfigError("backend_provider_routing must be an object")
+    entry = raw.get("openrouter")
+    if entry is None or entry == {}:
+        return None
+    if not isinstance(entry, dict):
+        raise ProviderRoutingConfigError("backend_provider_routing.openrouter must be an object")
+    unknown = sorted(set(entry) - _ROUTING_KEYS)
+    if unknown:
+        raise ProviderRoutingConfigError(f"unsupported provider routing key(s): {', '.join(unknown)}")
+    for key in _ROUTING_SLUG_LIST_KEYS:
+        if key in entry:
+            value = entry[key]
+            if (not isinstance(value, list) or not value
+                    or not all(isinstance(s, str) and s.strip() and s == s.strip() for s in value)):
+                raise ProviderRoutingConfigError(f"provider routing '{key}' must be a non-empty list of slugs")
+    for key in _ROUTING_BOOL_KEYS:
+        if key in entry and not isinstance(entry[key], bool):
+            raise ProviderRoutingConfigError(f"provider routing '{key}' must be true or false")
+    if "sort" in entry and entry["sort"] not in _ROUTING_SORT_VALUES:
+        raise ProviderRoutingConfigError(f"provider routing 'sort' must be one of {', '.join(_ROUTING_SORT_VALUES)}")
+    if "data_collection" in entry and entry["data_collection"] not in _ROUTING_DATA_COLLECTION_VALUES:
+        raise ProviderRoutingConfigError("provider routing 'data_collection' must be 'allow' or 'deny'")
+    if "max_price" in entry:
+        price = entry["max_price"]
+        if not isinstance(price, dict) or not price or set(price) - set(_ROUTING_PRICE_KEYS):
+            raise ProviderRoutingConfigError(
+                f"provider routing 'max_price' must be an object of {', '.join(_ROUTING_PRICE_KEYS)}")
+        for key, value in price.items():
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
+                raise ProviderRoutingConfigError(f"provider routing max_price '{key}' must be a positive number")
+    return copy.deepcopy(entry)
+
+
+def _provider_key(name: str) -> str:
+    """Comparison key shared by a routing slug's provider part ("crusoe" of
+    "crusoe/fp4", "open-inference") and a served provider_name ("Crusoe",
+    "OpenInference"). Telemetry only -- never an authorization decision."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
 class OpenRouterBackend(LMStudioBackend):
@@ -560,6 +629,51 @@ class OpenRouterBackend(LMStudioBackend):
         """
         reasoning = payload.setdefault("reasoning", {})
         reasoning["effort"] = effort
+
+    def _apply_provider_routing(self, payload: dict) -> None:
+        """OPENROUTER-PROVIDER-ROUTING-01 -- attach the configured upstream
+        routing as OpenRouter's `provider` object on every request this
+        backend builds (WORK, gate, utility, final stream). Read per request
+        and validated each time; a malformed value raises before anything is
+        sent, so a pin can never silently become unpinned routing."""
+        try:
+            routing = validate_provider_routing(getattr(config, "BACKEND_PROVIDER_ROUTING", {}))
+        except ProviderRoutingConfigError as e:
+            raise ProviderRoutingConfigError(
+                f"OpenRouter provider routing in prefs.json is invalid; request not sent: {e}") from e
+        if routing is not None:
+            payload["provider"] = routing
+
+    def provider_routing_summary(self) -> Optional[dict]:
+        """The routing this backend will request, for provider.dispatch
+        telemetry. None when unconfigured; {"invalid": True} when malformed
+        (the request itself is then refused by _apply_provider_routing()).
+        Never raises."""
+        try:
+            return validate_provider_routing(getattr(config, "BACKEND_PROVIDER_ROUTING", {}))
+        except ProviderRoutingConfigError:
+            return {"invalid": True}
+
+    def provider_pin_mismatch(self, provider_name) -> bool:
+        """True only when routing pins the request to a definite provider
+        set (`only`, or `order` with fallbacks disabled) and the provider
+        OpenRouter reports as having served the response is outside it.
+        Telemetry only; OpenRouter itself enforces the pin. Never raises."""
+        if not isinstance(provider_name, str) or not provider_name:
+            return False
+        try:
+            routing = validate_provider_routing(getattr(config, "BACKEND_PROVIDER_ROUTING", {}))
+        except ProviderRoutingConfigError:
+            return False
+        if not routing:
+            return False
+        slugs = routing.get("only")
+        if slugs is None and routing.get("allow_fallbacks") is False:
+            slugs = routing.get("order")
+        if not slugs:
+            return False
+        expected = {_provider_key(slug.split("/", 1)[0]) for slug in slugs}
+        return _provider_key(provider_name) not in expected
 
     def _apply_disable_thinking(self, payload: dict) -> None:
         """No local thinking-disable wire fields on OpenRouter's transport.

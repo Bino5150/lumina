@@ -193,6 +193,13 @@ NO_PROGRESS_READ_ONLY_WARN  = _p.get("no_progress_read_only_warn", 10)
 NO_PROGRESS_READ_ONLY_TRIP  = _p.get("no_progress_read_only_trip", 20)
 NO_PROGRESS_WRITE_WARN      = _p.get("no_progress_write_warn", 3)
 NO_PROGRESS_WRITE_TRIP      = _p.get("no_progress_write_trip", 5)
+# OPENROUTER-PROVIDER-ROUTING-01 -- optional per-backend upstream-provider
+# routing, prefs only (no Settings field): prefs["backend_provider_routing"]
+# ["openrouter"] is sent as OpenRouter's request-body `provider` object.
+# Absent (the default) sends no routing field at all. Validated per request
+# by core/backends/openrouter.py, which refuses to send rather than silently
+# drop a malformed value. Restart to apply.
+BACKEND_PROVIDER_ROUTING    = _p.get("backend_provider_routing", {})
 
 # S41 fix: cloud API keys/models saved via Settings UI used to only live in
 # the running config module (setattr in ui/settings.py._save()) and silently

@@ -395,6 +395,14 @@ class LMStudioBackend(BaseLLMBackend):
         """
         payload["max_tokens"] = max_tokens
 
+    def _apply_provider_routing(self, payload: dict) -> None:
+        """OPENROUTER-PROVIDER-ROUTING-01 -- provider-boundary hook for an
+        aggregator's upstream-provider routing field. No-op here: local and
+        single-provider OpenAI-compatible servers have no upstream to route
+        to, so every payload stays byte-identical. OpenRouterBackend
+        overrides this to attach its validated `provider` object."""
+        return None
+
     def _apply_disable_thinking(self, payload: dict) -> None:
         """
         LM Studio / local-server wire translation for the disable_thinking
@@ -424,6 +432,7 @@ class LMStudioBackend(BaseLLMBackend):
             "stream": False,
         }
         self._apply_output_token_limit(payload, max_tokens, model=model)
+        self._apply_provider_routing(payload)
         # VISION-TOOL-INTEROP-01 -- has_vision has existed unmodified since
         # the very first commit (6c0b78d, 2026-06-12): a blanket, backend-
         # wide default that drops tools/tool_choice the moment ANY message
@@ -868,6 +877,7 @@ class LMStudioBackend(BaseLLMBackend):
             "stream": True,
         }
         self._apply_output_token_limit(payload, max_tokens, model=model)
+        self._apply_provider_routing(payload)
         # No disable_thinking on this signature (never had one) -- forward
         # reasoning_effort straight through, no precedence guard needed.
         self.apply_reasoning(payload, reasoning_effort, model=model)

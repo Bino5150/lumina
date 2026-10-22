@@ -111,6 +111,50 @@ LM Studio, Ollama, vLLM, OmniRoute, and Custom — those six are the
 intended route for a gateway or a corporate proxy; pointing a fixed cloud
 provider at a different URL is refused rather than honored.
 
+### OpenRouter provider routing
+
+OpenRouter serves most models through several upstream providers. By
+default it picks one for you, and the same model can behave differently
+from one provider to the next. To choose the provider yourself, add a
+`backend_provider_routing` entry to `prefs.json` (there's no Settings field
+for it). Quit Lumina before you edit, then restart. For example, to use only
+Crusoe's endpoint, with no fallback to any other provider and a price cap:
+
+```json
+"backend_provider_routing": {
+  "openrouter": {
+    "only": ["crusoe/fp4"],
+    "allow_fallbacks": false,
+    "require_parameters": true,
+    "max_price": {"prompt": 0.15, "completion": 0.5}
+  }
+}
+```
+
+The object is sent unchanged as OpenRouter's
+[`provider` routing field](https://openrouter.ai/docs/guides/routing/provider-selection)
+on every OpenRouter request: chat, tool work, the final reply, and
+background jobs such as chat naming and dream summaries. Lumina accepts
+`order`, `only`, `ignore`, `quantizations`, `allow_fallbacks`,
+`require_parameters`, `sort` (`price`, `throughput` or `latency`),
+`data_collection` (`allow` or `deny`) and `max_price` (`prompt`,
+`completion`, `request`, `image`, in dollars per million tokens). Provider
+names are OpenRouter's slugs, as shown on the model's page; a slug with a
+suffix such as `crusoe/fp4` selects one endpoint of that provider.
+
+With `allow_fallbacks` set to `false`, a request the chosen provider can't
+serve fails with an error instead of going somewhere else. That includes a
+provider that's down, rate-limited, or priced above `max_price`. A value
+Lumina doesn't recognize stops the request before it's sent, with an error
+naming the problem, rather than being ignored. Removing the entry (or
+setting it to `{}`) goes back to OpenRouter's own choice. Other backends
+ignore this setting.
+
+Each request's routing is recorded with its `provider.dispatch` event in the
+Flight Recorder. `provider.response` names the provider that actually
+answered. If a pinned request is ever answered by a provider outside the pin,
+Lumina records a `provider.pin_mismatch` warning.
+
 ## Reasoning Control
 
 Every backend that supports it gets a per-backend, per-model **Reasoning
