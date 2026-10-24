@@ -1,4 +1,4 @@
-"""core/agent_restore_intake.py -- Restore intake and recovery preview
+"""core/agent_backup_restore_intake.py -- Restore intake and recovery preview
 (AGENT-BACKUP-RESTORE-01, first slice).
 
 Reads one owner-chosen archive once, decides what kind of input it is, and

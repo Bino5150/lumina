@@ -14,7 +14,7 @@ import pytest
 
 import core.agent_backup as ab
 import core.agent_backup_export as abx
-import core.agent_restore_intake as ri
+import core.agent_backup_restore_intake as ri
 from core import memory_backup
 from test_agent_backup import _make_env, NO_IDENTITY_TRAILERS, NO_CREDENTIALS
 
@@ -689,7 +689,7 @@ def test_preview_requires_an_intake_object(tmp_path):
 # ---------------------------------------------------------------- source boundaries
 
 def test_intake_module_has_no_write_or_execute_paths():
-    tree = ast.parse((REPO / "core" / "agent_restore_intake.py").read_text(encoding="utf-8"))
+    tree = ast.parse((REPO / "core" / "agent_backup_restore_intake.py").read_text(encoding="utf-8"))
     os_verbs = {"replace", "rename", "unlink", "remove", "rmdir", "mkdir", "makedirs", "link", "symlink",
                 "chmod", "chown", "open", "fdopen", "truncate", "system", "popen", "utime"}
     any_receiver = {"write", "write_bytes", "write_text", "writestr", "extractall", "extract", "connect",
