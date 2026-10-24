@@ -267,6 +267,41 @@ def test_slice1_generic_observe_and_navigate_through_worker_host_and_hub(world):
     assert landed["observed"]["document_id"] == "doc-21-navigated"
 
 
+@pytest.mark.parametrize("action,event,suffix", [("back", "history", "?step=1"),
+                                                ("forward", "fragment", "#section")])
+def test_history_within_a_document_reaches_the_owner_tool_with_a_fresh_observation(world, action, event, suffix):
+    """Real tools/mission/worker/host/hub; only Chrome itself is simulated."""
+    from chrome_companion import mission
+    from tools.chrome_companion import register_chrome_companion_tools
+    from tools.registry import ToolRegistry
+
+    landed = FORUM + suffix
+    tabs = [{"id": 21, "windowId": 1, "active": True, "incognito": False, "status": "complete",
+             "url": FORUM, "title": "Thread 42"}]
+    chrome = world.launch(tabs=tabs, pages=FORUM_PAGES, granted=["https://forum.example.test/*"],
+                          historyMoves=[{"method": action, "url": landed, "event": event}])
+    _ready(world.hub)
+    _extension_ready(chrome)
+    chrome.command(cmd="navigation", allowed=True)
+    registry = ToolRegistry()
+    assert register_chrome_companion_tools(registry, data_dir=world.data_dir, hub=world.hub, agent=object())
+    args = {"action": action, "tab_id": 21, "document_id": "doc-21"}
+    denied = json.loads(registry.call("chrome_navigate", args))
+    assert denied["failure_class"] == "no_owner_mission"
+    token = mission.begin_turn("browse the forum", source="OWNER_DIRECT", owner=True, event_id="history-e2e")
+    try:
+        answer = json.loads(registry.call("chrome_navigate", args))
+    finally:
+        mission.end_turn(token)
+    assert answer["ok"] is True and answer["status"] == "browser_local_effect_observed"
+    assert answer["observed_url"] == landed
+    assert answer["verified_document_id"] == "doc-21"
+    assert answer["page"]["url"] == landed, "a fresh observation follows even though document_id is unchanged"
+    assert answer["page"]["elements"]
+    assert answer["provenance"] == {"owner": False, "trust": "external_untrusted", "source": "chrome_companion"}
+    assert landed not in repr(world.recorder.events)
+
+
 def test_finger_through_the_real_chain_keeps_document_identity_private(world):
     """FINGER-STALE-DOC: get_links -> follow_link through the real worker, host
     and hub. The worker's private per-document identity never reaches the hub

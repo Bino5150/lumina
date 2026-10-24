@@ -68,7 +68,9 @@ class _Relay:
         )
 
     def start(self) -> None:
-        init = self._spawn("init")
+        # Only the adapter, peer-seed, and spoof/refusal seats are needed.
+        # All remain ordinary seats; goblin must have no forwarding authority.
+        init = self._spawn("init", "--seat", "lumina", "--seat", "tech", "--seat", "goblin")
         assert init.wait(timeout=30) == 0, "wire init failed"
         self._serve_proc = self._spawn("serve")
         sock_path = self.state_dir / "wire.sock"

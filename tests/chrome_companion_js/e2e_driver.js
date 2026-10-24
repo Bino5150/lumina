@@ -45,6 +45,21 @@ const tabs = cfg.tabs;
 const pages = cfg.pages;
 const granted = new Set(cfg.granted);
 const listeners = { message: [], alarm: [], startup: [], installed: [], permissionRemoved: [] };
+const historyEvents = { history: new Set(), fragment: new Set() };
+const historyMoves = [...(cfg.historyMoves || [])];
+function historyEventSource(kind) {
+  return { addListener: (fn) => historyEvents[kind].add(fn), removeListener: (fn) => historyEvents[kind].delete(fn) };
+}
+async function traverseHistory(tabId, method) {
+  const move = historyMoves.shift();
+  if (!move || move.method !== method) throw new Error("Cannot find a next page in history.");
+  const tab = tabs.find((t) => t.id === tabId);
+  tab.url = move.url;
+  pages[String(tabId)].href = move.url;
+  const details = { tabId, frameId: 0, documentId: documentId(tabId), documentLifecycle: "active",
+    url: move.url, transitionQualifiers: ["forward_back"] };
+  for (const fn of historyEvents[move.event || "history"]) fn(details);
+}
 // {cmd: hold, tab} parks the NEXT injection into that tab until {cmd: release}
 // (a page busy on its main thread), so a test can act while a read is pending.
 const holds = new Map();
@@ -178,6 +193,8 @@ const chrome = {
     onAlarm: { addListener: (fn) => listeners.alarm.push(fn) },
   },
   tabs: {
+    goBack: (tabId) => traverseHistory(tabId, "back"),
+    goForward: (tabId) => traverseHistory(tabId, "forward"),
     async query(query) {
       return (query.active ? tabs.filter((t) => t.active) : tabs).map((t) => ({ ...t }));
     },
@@ -218,6 +235,8 @@ const chrome = {
     onRemoved: { addListener: (fn) => listeners.permissionRemoved.push(fn) },
   },
   webNavigation: {
+    onHistoryStateUpdated: historyEventSource("history"),
+    onReferenceFragmentUpdated: historyEventSource("fragment"),
     async getFrame({ tabId, frameId }) {
       const tab = tabs.find((t) => t.id === tabId);
       if (!tab || frameId !== 0) return null;

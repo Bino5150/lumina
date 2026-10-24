@@ -265,6 +265,14 @@ function makeEnv(opts = {}) {
       onRemoved: { addListener: (fn) => env.listeners.permissionRemoved.push(fn) },
     },
     webNavigation: {
+      onHistoryStateUpdated: {
+        addListener(fn) { (env.listeners.history ||= new Set()).add(fn); },
+        removeListener(fn) { env.listeners.history.delete(fn); },
+      },
+      onReferenceFragmentUpdated: {
+        addListener(fn) { (env.listeners.fragment ||= new Set()).add(fn); },
+        removeListener(fn) { env.listeners.fragment.delete(fn); },
+      },
       async getFrame(details) {
         env.frameCalls.push(details);
         if (env.frameHook) {
@@ -3703,6 +3711,164 @@ test("SLICE1 navigate(back): history moves are bound to the observed document an
   const restricted = await drive(env, port, back({ document_id: "doc-forum-index" }));
   assert.equal(restricted.result.status, "ambiguous_after_dispatch");
   assert.equal(restricted.result.observed_url, null, "a restricted landing is never named");
+});
+
+// History receipt precision: Chrome can traverse within one SPA document.
+function historyEvent(env, changes = {}, kind = "history") {
+  const event = { tabId: 7, frameId: 0, documentId: GEN_DOC, documentLifecycle: "active",
+    url: env.tabs[0].url, transitionQualifiers: ["forward_back"], ...changes };
+  for (const fn of env.listeners[kind] || []) fn(event);
+}
+function noHistoryListeners(env) {
+  assert.equal(env.listeners.history?.size || 0, 0);
+  assert.equal(env.listeners.fragment?.size || 0, 0);
+}
+const historyReq = (kind = "back") => navReq({ kind, window_id: 1, document_id: GEN_DOC });
+
+test("HISTORY: back and forward confirm SPA and fragment traversals once, without a new document", async () => {
+  for (const kind of ["back", "forward"]) for (const event of ["history", "fragment"]) {
+    const { env, port } = await genericReady();
+    let calls = 0;
+    env.chrome.tabs[kind === "back" ? "goBack" : "goForward"] = async () => {
+      calls++;
+      env.tabs[0].url = GEN_URL + (event === "history" ? "?step=2" : "#section");
+      historyEvent(env, {}, event);
+    };
+    const answer = await drive(env, port, historyReq(kind));
+    assert.equal(answer.result.status, "browser_local_effect_observed");
+    assert.equal(answer.result.observed_url, env.tabs[0].url);
+    assert.equal(answer.observed.document_id, GEN_DOC);
+    assert.equal(answer.result.load_confirmed, true);
+    assert.equal(env.timers.filter((t) => t.ms === 150).length, 0, "confirmed without waiting out the settle window");
+    assert.equal(calls, 1);
+    noHistoryListeners(env);
+  }
+});
+
+test("HISTORY: unrelated, missing, stale and same-URL events cannot confirm a history move", async () => {
+  for (const change of [null, { tabId: 10 }, { frameId: 1 }, { documentId: "other-doc" },
+    { documentLifecycle: "cached" }, { transitionQualifiers: [] }, { url: GEN_URL },
+    { url: "https://forum.example.test/different" }]) {
+    const { env, port } = await genericReady();
+    let calls = 0;
+    env.chrome.tabs.goBack = async () => {
+      calls++;
+      env.tabs[0].url = GEN_URL + "?step=2";
+      if (change) historyEvent(env, change);
+    };
+    const answer = await drive(env, port, historyReq(), 160);
+    assert.equal(answer.result.status, "ambiguous_after_dispatch", JSON.stringify(change));
+    assert.equal(answer.result.observed_url, null);
+    assert.equal(answer.tab_id, 7);
+    assert.equal(calls, 1);
+    noHistoryListeners(env);
+  }
+});
+
+test("HISTORY: an event from a completed request cannot confirm the next request", async () => {
+  const { env, port } = await genericReady();
+  env.chrome.tabs.goBack = async () => { env.tabs[0].url = GEN_URL + "?step=2"; historyEvent(env); };
+  assert.equal((await drive(env, port, historyReq())).result.status, "browser_local_effect_observed");
+  noHistoryListeners(env);
+  env.chrome.tabs.goBack = async () => {};
+  assert.equal((await drive(env, port, historyReq(), 160)).result.status, "ambiguous_after_dispatch");
+  noHistoryListeners(env);
+});
+
+test("HISTORY: same-URL entries and an event delivered before dispatch stay ambiguous", async () => {
+  for (const beforeDispatch of [false, true]) {
+    const { env, port } = await genericReady();
+    const destination = GEN_URL + "?step=2";
+    if (beforeDispatch) historyEvent(env, { url: destination });
+    env.chrome.tabs.goBack = async () => {
+      if (beforeDispatch) env.tabs[0].url = destination;
+      else historyEvent(env); // same URL: cannot distinguish the history entry
+    };
+    const answer = await drive(env, port, historyReq(), 160);
+    assert.equal(answer.result.status, "ambiguous_after_dispatch");
+    noHistoryListeners(env);
+  }
+});
+
+test("HISTORY: PAUSE and disconnect drop the answer and retire traversal listeners", async () => {
+  for (const control of ["pause", "disconnect"]) {
+    const { env, port } = await genericReady();
+    env.chrome.tabs.goBack = async () => {
+      env.tabs[0].url = GEN_URL + "?step=2";
+      historyEvent(env);
+      if (control === "pause") await env.popup({ kind: "set_paused", paused: true });
+      else port.hostGone();
+    };
+    const req = historyReq();
+    port.deliver(req);
+    await settle(20);
+    env.runTimers();
+    await settle(20);
+    assert.equal(port.sent.filter((m) => m.type === "response" && m.request_id === req.request_id).length, 0);
+    noHistoryListeners(env);
+  }
+});
+
+test("HISTORY: a later page update or mismatched frame URL invalidates traversal evidence", async () => {
+  for (const invalidation of ["page-update", "frame-url"]) {
+    const { env, port } = await genericReady();
+    env.chrome.tabs.goBack = async () => {
+      env.tabs[0].url = GEN_URL + "?step=2";
+      historyEvent(env);
+      if (invalidation === "page-update") historyEvent(env, { transitionQualifiers: [] });
+      else env.frameHook = async () => ({ documentId: GEN_DOC, documentLifecycle: "active",
+        frameType: "outermost_frame", url: GEN_URL });
+    };
+    const answer = await drive(env, port, historyReq(), 160);
+    assert.equal(answer.result.status, "ambiguous_after_dispatch");
+    noHistoryListeners(env);
+  }
+});
+
+test("HISTORY: same-document traversal evidence never relaxes ref or URL navigation", async () => {
+  for (const action of ["ref", "url"]) {
+    const { env, port } = await genericReady();
+    const observed = await single(port, observeReq());
+    const destination = GEN_URL + "?page=2";
+    const move = () => { env.tabs[0].url = destination; historyEvent(env); };
+    env.navigationHook = move;
+    env.updateHook = async () => { move(); return { ...env.tabs[0] }; };
+    const req = action === "ref" ? refNav(el(observed, "Next", 0).ref)
+      : navReq({ kind: "url", window_id: 1, document_id: GEN_DOC, url: destination, scope: [] });
+    const answer = await drive(env, port, req, 160);
+    assert.equal(answer.result.status, "ambiguous_after_dispatch", action);
+    noHistoryListeners(env);
+  }
+});
+
+test("HISTORY: withdrawn navigation, revoke and restricted landings stay ambiguous", async () => {
+  for (const control of ["navigation", "revoke", "restricted"]) {
+    const { env, port } = await genericReady();
+    env.chrome.tabs.goBack = async () => {
+      env.tabs[0].url = control === "restricted" ? "https://accounts.google.com/" : GEN_URL + "?step=2";
+      historyEvent(env);
+      if (control === "navigation") await env.popup({ kind: "set_navigation", allowed: false });
+      if (control === "revoke") await env.popupRevoke("https://forum.example.test/*");
+    };
+    const answer = await drive(env, port, historyReq());
+    assert.equal(answer.result.status, "ambiguous_after_dispatch", control);
+    assert.equal(answer.result.observed_url, null);
+    noHistoryListeners(env);
+  }
+});
+
+test("HISTORY: refusal and a changed URL followed by an API error release listeners", async () => {
+  for (const moved of [false, true]) {
+    const { env, port } = await genericReady();
+    env.chrome.tabs.goBack = async () => {
+      if (moved) { env.tabs[0].url = GEN_URL + "?step=2"; historyEvent(env); }
+      throw new Error("history API failed");
+    };
+    const answer = await drive(env, port, historyReq());
+    if (moved) assert.equal(answer.result.status, "ambiguous_after_dispatch");
+    else assert.equal(answer.error.code, "no_history_entry");
+    noHistoryListeners(env);
+  }
 });
 
 // ── BROWSER-COMPANION-HARDENING-01 ────────────────────────────────────────

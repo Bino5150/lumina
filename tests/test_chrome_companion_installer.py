@@ -204,9 +204,9 @@ def test_generated_launcher_really_starts_the_host(fake_home, data_dir, monkeypa
 def test_extension_manifest_is_least_privilege():
     manifest = json.loads((EXTENSION_DIR / "manifest.json").read_text())
     assert manifest["manifest_version"] == 3
-    # webNavigation (R1/F3): only webNavigation.getFrame, for Chrome's document
-    # identity; Chrome shows the same install warning as "tabs" ("Read your
-    # browsing history"), so it adds no new warning. No listeners are added.
+    # webNavigation: getFrame for document identity, plus request-local
+    # same-document history events for back/forward confirmation. No new
+    # permission, navigation initiator, or general history API is added.
     assert sorted(manifest["permissions"]) == sorted(["nativeMessaging", "tabs", "scripting", "storage", "alarms",
                                                       "webNavigation"])
     assert manifest["optional_host_permissions"] == ["http://*/*", "https://*/*"]
@@ -219,7 +219,9 @@ def test_extension_manifest_is_least_privilege():
         assert forbidden_perm not in manifest["permissions"]
     assert manifest["background"] == {"service_worker": "worker.js"}
     code = "\n".join(re.sub(r"(?m)^\s*//.*$", "", p.read_text()) for p in EXTENSION_DIR.glob("*.js"))
-    assert set(re.findall(r"webNavigation\.(\w+)", code)) == {"getFrame"}, "webNavigation is used for getFrame only"
+    assert set(re.findall(r"webNavigation\.(\w+)", code)) == {
+        "getFrame", "onHistoryStateUpdated", "onReferenceFragmentUpdated",
+    }, "webNavigation is limited to document identity and bounded history confirmation"
 
 
 def test_extension_has_no_page_bridge_or_remote_code():

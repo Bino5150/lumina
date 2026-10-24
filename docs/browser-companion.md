@@ -198,11 +198,21 @@ page that still hasn't finished by then is reported as ambiguous — and the
 receipt still names the tab the action went to, so it is never mistaken for
 another tab's answer.
 
-`chrome_follow_link` and `chrome_navigate` report the URL and the new
-document identity Chrome actually loaded (after a redirect, the URL it
-landed on, never the one requested), and only claims success when the tab reached the
-destination *and* the document was replaced. A same-document load that
-never replaced the page is reported ambiguous, not as a navigation.
+`chrome_follow_link` and `chrome_navigate` report the URL and document
+identity Chrome actually loaded (after a redirect, the URL it landed on,
+never the one requested). Link and address navigation only claim success
+when the document was replaced.
+
+Back/forward can also confirm a history move within the same page, as used
+by single-page apps. This requires Chrome to report a back/forward traversal
+on that exact main document after dispatch, with a changed URL that agrees
+with both the tab and frame. The verified document ID then stays the same;
+Lumina still requests a fresh observation of the landing. A URL change alone,
+a missing traversal event, or a same-URL history entry stays ambiguous. This
+does not confirm that the app finished updating its content, or repeat the
+history move.
+Those event listeners exist only while the back/forward request is in flight
+and retain only its requested tab's main-frame landing URL until it ends.
 
 ## Revoke, unpair, and uninstall
 

@@ -1567,7 +1567,10 @@ function withoutHash(url) {
 // reports the URL actually read back, never the one requested. A landing on
 // a restricted or companion-revoked surface ends observation at once and is
 // reported without a URL. Bounded; never a second navigation.
-async function settleNewDocument(tabId, expectedWindow, req, s, navEpoch, grantEpoch, priorDocumentId, live) {
+// Back/forward alone may supply request-local evidence of a same-document
+// traversal; URL and ref navigation still require a replacement document.
+async function settleNewDocument(tabId, expectedWindow, req, s, navEpoch, grantEpoch, priorDocumentId, live,
+  history = null) {
   for (let attempt = 0; attempt < LIMITS.NAVIGATE_SETTLE_POLLS; attempt++) {
     if (!live() || !s.navigationAllowed || s.navigationEpoch !== navEpoch
       || grantRevocations !== grantEpoch || Date.now() >= settleDeadline(req)) return null;
@@ -1580,7 +1583,7 @@ async function settleNewDocument(tabId, expectedWindow, req, s, navEpoch, grantE
       const doc = await mainDocument(tabId);
       const again = doc ? await safeActionTab(tabId, expectedWindow) : null;
       if (doc && again && again.status === "complete" && again.url === raw.url && doc.url === raw.url
-        && doc.documentId !== priorDocumentId) {
+        && (doc.documentId !== priorDocumentId || (history && history.url === again.url))) {
         return { tab: again, doc, verdict };
       }
     }
@@ -1701,6 +1704,27 @@ const NAVIGATE = Object.freeze({
 // owner's or Lumina's earlier navigations), not anything a page supplies; it
 // cannot be checked before dispatch, so the receipt reports where the tab
 // actually landed, and a restricted landing is reported without a URL.
+// Only back/forward may confirm within the source document. A URL change
+// alone (pushState, a hash change, or a page redirect) is not evidence of a
+// traversal: require Chrome's forward_back event on this exact main document,
+// received after dispatch, then read the same URL back from tab AND frame.
+// Request-local listeners retain no browsing history and are always removed.
+function watchHistoryTraversal(req, sourceUrl) {
+  const history = { url: null };
+  const events = [chrome.webNavigation.onHistoryStateUpdated, chrome.webNavigation.onReferenceFragmentUpdated];
+  const onTraversal = (details) => {
+    if (!req._actionDispatched || details.tabId !== req.tab_id || details.frameId !== 0) return;
+    history.url = null;
+    if (details.documentId === req.args.document_id && details.documentLifecycle === "active"
+      && Array.isArray(details.transitionQualifiers) && details.transitionQualifiers.includes("forward_back")
+      && typeof details.url === "string" && details.url.length <= LIMITS.MAX_TAB_URL_CHARS
+      && details.url !== sourceUrl) history.url = details.url;
+  };
+  history.stop = () => events.forEach((event) => event.removeListener(onTraversal));
+  events.forEach((event) => event.addListener(onTraversal));
+  return history;
+}
+
 async function navigateHistory(req, s, live, method) {
   if (!live() || !s.navigationAllowed) throw new CompanionFailure("navigation_not_allowed", req.tab_id);
   const { tab, doc } = await boundSource(req);
@@ -1710,22 +1734,27 @@ async function navigateHistory(req, s, live, method) {
   if (!grantHeld(grantEpoch) || revocationsPending || Date.now() > req.deadline_ms) {
     throw new CompanionFailure("navigation_not_allowed", req.tab_id);
   }
-  req._actionDispatched = true;
+  const history = watchHistoryTraversal(req, tab.url);
   try {
-    await chrome.tabs[method](req.tab_id);
-  } catch {
-    // Chrome refuses outright when there is no such entry. Only when the very
-    // same document is still there is that proof nothing was dispatched.
-    const now = await mainDocument(req.tab_id);
-    if (now && now.documentId === doc.documentId) {
-      req._actionDispatched = false;
-      throw new CompanionFailure("no_history_entry", req.tab_id);
+    req._actionDispatched = true;
+    try {
+      await chrome.tabs[method](req.tab_id);
+    } catch {
+      // A same-document traversal may already have happened before an API
+      // error. Only an unchanged source with no traversal evidence is refused.
+      const now = await mainDocument(req.tab_id);
+      if (now && now.documentId === doc.documentId && now.url === tab.url && !history.url) {
+        req._actionDispatched = false;
+        throw new CompanionFailure("no_history_entry", req.tab_id);
+      }
+      return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, tab, sourcePattern);
     }
-    return navigateReceipt(req, s, navEpoch, grantEpoch, live, null, tab, sourcePattern);
+    const settled = await settleNewDocument(req.tab_id, req.args.window_id, req, s, navEpoch, grantEpoch,
+      doc.documentId, live, history);
+    return navigateReceipt(req, s, navEpoch, grantEpoch, live, settled, tab, sourcePattern);
+  } finally {
+    history.stop();
   }
-  const settled = await settleNewDocument(req.tab_id, req.args.window_id, req, s, navEpoch, grantEpoch,
-    doc.documentId, live);
-  return navigateReceipt(req, s, navEpoch, grantEpoch, live, settled, tab, sourcePattern);
 }
 
 const OPERATIONS = Object.freeze({

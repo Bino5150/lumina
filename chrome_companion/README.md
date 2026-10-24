@@ -125,6 +125,12 @@ your tabs
   was sent to.
   A reported tab load is an observation inside Chrome, not proof of any
   remote site's commit or resulting account change.
+  Back/forward may also confirm a history move within the same document:
+  Chrome must report a back/forward event for that exact main document after
+  dispatch, and its changed URL must agree with both the tab and frame. The
+  receipt keeps the same verified document ID and the tool requests a fresh
+  observation. A URL change without that event, or a same-URL history entry,
+  remains ambiguous; this does not establish that the app finished rendering.
 - Restricted surfaces are never read: every non-`http(s)` scheme
   (`chrome://`, `chrome-extension://`, `file://`, `data:`, …), incognito
   tabs, and password/payment/account-security hosts such as
