@@ -357,6 +357,335 @@ def test_budget_packing_invariant_never_silently_violated():
     assert issubclass(cc.CompilerInputError, cc.CompilerError)
 
 
+# ── Budget: REFORGE-COMPILER-PACKING-01 (live 8,004 > 8,000, 2026-10-26) ──
+#
+# Prime's chat 166 failed /context reforge twice with "packed input bundle
+# estimated at 8004 tokens". Per-piece estimate_tokens() floors each packed
+# block (up to 3 chars lost each) and the inner "\n\n"/"\n" joins between
+# rounds/lines were never charged; the truncated boundary round then fills
+# the budget exactly, so the accumulated slack overshoots the whole-render
+# check by ~1.25 tokens per packed round. These shapes reproduce it.
+
+def _rounds_history(n_small, small_result_len, big_result_len=200_000, results=None):
+    """Oldest round is huge (becomes the truncated boundary round); the n_small
+    newer rounds are packed whole, newest first."""
+    history = []
+    entries = [("c_big", "x" * big_result_len)]
+    entries += [(f"c{i:04d}", (results or "x") * small_result_len) for i in range(n_small)]
+    for tc_id, content in entries:
+        history.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": tc_id, "type": "function", "function": {"name": "run_command", "arguments": "{}"}}]})
+        history.append({"role": "tool", "tool_call_id": tc_id, "name": "run_command", "content": content})
+    return history
+
+
+def _round_len_with_remainder(rem):
+    """A result length whose rendered round text has len % 4 == rem."""
+    base = len(cc._render_round_pair("run_command", "c0000", ""))
+    return next(n for n in range(100, 110) if (base + n) % 4 == rem)
+
+
+@pytest.mark.parametrize("remainder", [0, 1, 2, 3])
+@pytest.mark.parametrize("n_small", [0, 1, 11, 12, 14, 20, 38, 80])
+def test_budget_many_whole_rounds_never_exceed_8k(n_small, remainder):
+    chat_id = _seed_chat([("user", "please do X")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    history = _rounds_history(n_small, _round_len_with_remainder(remainder))
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    assert bundle.input_token_estimate <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+    assert cc.estimate_tokens(bundle.rendered_prompt) == bundle.input_token_estimate
+
+
+def test_budget_packing_stays_tight_not_fixed_by_wasting_budget():
+    """The repair must not 'fix' the overshoot by reserving a big cushion:
+    a pressured bundle still lands within a few tokens of the ceiling."""
+    chat_id = _seed_chat([("user", "please do X")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    history = _rounds_history(38, _round_len_with_remainder(3))
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    assert bundle.input_token_estimate >= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET - 16
+
+
+def test_budget_truncated_multi_call_round_never_exceeds_8k():
+    """Boundary round holding many calls: its truncated lines are "\\n"-joined."""
+    chat_id = _seed_chat([("user", "please do X")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    calls = [{"id": f"m{i}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+             for i in range(1000)]
+    history = [{"role": "assistant", "content": "", "tool_calls": calls}]
+    history += [{"role": "tool", "tool_call_id": f"m{i}", "name": "read_file", "content": "q" * 37}
+                for i in range(1000)]
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    assert bundle.input_token_estimate <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+
+
+@pytest.mark.parametrize("row_len", [997, 998, 999, 1000, 5000])
+def test_budget_durable_tail_lines_never_exceed_8k(row_len):
+    chat_id = _seed_chat([("user", "u" * row_len), ("assistant", "a" * row_len),
+                          ("user", "v" * row_len), ("assistant", "b" * row_len)])
+    reconstruction = reconstruct_chat_context(chat_id)
+    history = _rounds_history(30, _round_len_with_remainder(3), big_result_len=1000)
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    assert bundle.input_token_estimate <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+
+
+def test_budget_unicode_results_never_exceed_8k():
+    chat_id = _seed_chat([("user", "hej då ✓")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    history = _rounds_history(40, 37, results="å✓")
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    assert bundle.input_token_estimate <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+
+
+def test_budget_boundary_truncation_still_ends_packing_before_durable_tail():
+    """Unchanged priority rule: once the boundary round is truncated, nothing
+    lower-priority (the durable tail) is squeezed in after it."""
+    chat_id = _seed_chat([("user", "t")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    history = _rounds_history(14, _round_len_with_remainder(3))
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    assert "TRUNCATED BY COMPILER INPUT BUDGET" in bundle.rendered_prompt
+    assert cc._TAIL_HEADER not in bundle.rendered_prompt
+
+
+@pytest.mark.parametrize("pad", range(0, 200, 7))
+def test_budget_tiny_leftover_before_boundary_round_never_exceeds_8k(pad):
+    """Sweep the leftover the boundary round sees, including below the
+    marker reserve, where only a marker-less call identity would 'fit'."""
+    chat_id = _seed_chat([("user", "please do X")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    history = _rounds_history(0, 0, big_result_len=200_000)
+    # one newer whole round sized to leave `pad`-ish chars for the boundary round
+    whole = (cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET - cc._ceil_tokens(cc._render_preamble())
+             - cc._SECTION_JOIN_RESERVE_TOKENS) * 4 - len(cc._ROUNDS_HEADER) - 2 - pad
+    base = len(cc._render_round_pair("run_command", "c_new", ""))
+    history += [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c_new", "type": "function", "function": {"name": "run_command", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c_new", "name": "run_command", "content": "n" * (whole - base)},
+    ]
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    assert bundle.input_token_estimate <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+    if "(id=c_big)" in bundle.rendered_prompt:
+        assert "(id=c_big)\n  result: " in bundle.rendered_prompt
+
+
+def _section_chars(machine_text=""):
+    """Exact char allowance build_input_bundle() hands the packed sections."""
+    remaining = (cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET - cc._ceil_tokens(cc._render_preamble())
+                 - cc._SECTION_JOIN_RESERVE_TOKENS
+                 - (cc._ceil_tokens(machine_text) if machine_text else 0))
+    return remaining * 4
+
+
+def _whole_round(tc_id, rendered_len):
+    """One call/result round whose rendered text is exactly rendered_len chars."""
+    base = len(cc._render_round_pair("run_command", tc_id, ""))
+    return [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": tc_id, "type": "function", "function": {"name": "run_command", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": tc_id, "name": "run_command", "content": "r" * (rendered_len - base)},
+    ]
+
+
+def _machine_facts_with_len_mod4(rem):
+    for n in range(10, 20):
+        facts = [{"kind": "coding_checkpoint", "value": "v" * n,
+                  "captured_at": "2026-10-26T00:00:00+00:00", "scope": "compile_time_snapshot"}]
+        if len(cc._render_machine_evidence(facts)) % 4 == rem:
+            return facts
+
+
+@pytest.mark.parametrize("machine_rem", [None, 1, 2, 3])
+def test_budget_exact_fill_round_kept_whole_one_char_more_truncated(machine_rem):
+    """Fixed material (preamble, machine evidence) is charged rounded UP, so the
+    rounds allowance is exact: a round of exactly that size stays whole, one
+    char more becomes the truncated boundary round."""
+    facts = _machine_facts_with_len_mod4(machine_rem) if machine_rem else []
+    mtext = cc._render_machine_evidence(facts)
+    allowance = _section_chars(mtext) - len(cc._ROUNDS_HEADER)
+    reconstruction = ReconstructionResult(chat_id=1, context_skip=0, eligible_rows=[])
+
+    fits = cc.build_input_bundle(1, reconstruction, _whole_round("c_fit", allowance), facts)
+    assert "TRUNCATED BY COMPILER INPUT BUDGET" not in fits.rendered_prompt
+    assert fits.input_token_estimate <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+
+    over = cc.build_input_bundle(1, reconstruction, _whole_round("c_over", allowance + 1), facts)
+    assert "TRUNCATED BY COMPILER INPUT BUDGET" in over.rendered_prompt
+    assert over.input_token_estimate <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+
+
+def _tail_prefix_len(chat_id, row):
+    return len(f"[chat_row:{chat_id}:{row['id']}] {row['role']}: ")
+
+
+def test_budget_tail_gets_only_whole_leftover_tokens_from_rounds():
+    """Rounds leave 4*t + 3 chars; the tail is handed t tokens, never t + 1."""
+    chat_id = _seed_chat([("user", "placeholder")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    row = reconstruction.eligible_rows[-1]
+    t = 120
+    leftover = 4 * t + 3
+    history = _whole_round("c_whole", _section_chars() - len(cc._ROUNDS_HEADER) - leftover)
+    tail_chars = 4 * t - len(cc._TAIL_HEADER)
+
+    for line_len, expect_tail in ((tail_chars, True), (tail_chars + 2, False)):
+        row["content"] = "p" * (line_len - _tail_prefix_len(chat_id, row))
+        bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+        assert (cc._TAIL_HEADER in bundle.rendered_prompt) is expect_tail, line_len
+        assert bundle.input_token_estimate <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+
+
+def test_budget_tail_charges_the_newline_between_rows():
+    """Two rows whose lines plus their "\\n" join exceed the tail by one char:
+    the second row must not be admitted on the strength of an uncharged join."""
+    chat_id = _seed_chat([("user", "a"), ("assistant", "b")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    first, second = reconstruction.eligible_rows[-2], reconstruction.eligible_rows[-1]
+    t = 120
+    history = _whole_round("c_whole", _section_chars() - len(cc._ROUNDS_HEADER) - 4 * t)
+    tail_chars = 4 * t - len(cc._TAIL_HEADER)
+    line1 = 150
+    line2 = tail_chars - line1  # line1 + "\n" + line2 == tail_chars + 1
+    first["content"] = "f" * (line1 - _tail_prefix_len(chat_id, first))
+    second["content"] = "s" * (line2 - _tail_prefix_len(chat_id, second))
+
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    assert f"chat_row:{chat_id}:{first['id']}" in bundle.rendered_prompt
+    assert f"chat_row:{chat_id}:{second['id']}" not in bundle.rendered_prompt
+
+
+def _multi_call_round(result_lens):
+    calls = [{"id": f"c{i}", "function": {"name": "tool"}} for i in range(len(result_lens))]
+    results = [{"tool_call_id": f"c{i}", "content": "x" * n} for i, n in enumerate(result_lens)]
+    return {"call": {"tool_calls": calls}, "results": results}
+
+
+def _disclosed_omitted_count(text):
+    import re
+    m = re.search(r"-- (\d+) more tool_call\(s\) in this round omitted", text)
+    return int(m.group(1)) if m else 0
+
+
+def test_pack_two_call_round_never_silently_drops_second_call():
+    """Sol's review case (2026-10-26): the first call fits, the second does not
+    and not even its marker fits. Keeping only c0 with no disclosure is a
+    silent omission -- the round must disclose c1 or be excluded whole."""
+    text, remaining, excluded = cc._pack_tool_rounds([_multi_call_round([18, 300])], 44)
+    assert len(text) <= 44 * 4
+    if "(id=c0)" in text:
+        assert "(id=c1)" in text or _disclosed_omitted_count(text) == 1
+    else:
+        assert text == "" and excluded == 1
+
+
+@pytest.mark.parametrize("result_lens", [[18, 300], [5, 5, 400], [40, 40, 40, 40, 2000], [0, 900, 0]])
+@pytest.mark.parametrize("remaining", range(10, 200, 3))
+def test_pack_boundary_round_every_call_kept_or_disclosed(result_lens, remaining):
+    """Every call of a partially retained boundary round is either present by
+    identity (with its result or an explicit truncation marker) or counted in
+    an explicit omitted-calls notice; otherwise the whole round is excluded.
+    The section never exceeds its char allowance either way."""
+    text, _, excluded = cc._pack_tool_rounds([_multi_call_round(result_lens)], remaining)
+    assert len(text) <= remaining * 4
+    present = sum(f"(id=c{i})\n  result: " in text for i in range(len(result_lens)))
+    if text:
+        assert excluded == 0
+        assert present + _disclosed_omitted_count(text) == len(result_lens)
+        if present < len(result_lens):  # disclosed calls are the trailing ones
+            assert all(f"(id=c{i})" in text for i in range(present))
+    else:
+        assert excluded == 1
+
+
+def test_pack_boundary_round_drops_only_as_many_calls_as_the_notice_needs():
+    """Dropping a kept call to make room for the omitted-calls notice must
+    refund that call's chars: here c1 is dropped and c0 still fits beside the
+    notice, so the round is kept (disclosed), not excluded whole."""
+    text, _, excluded = cc._pack_tool_rounds([_multi_call_round([5, 5, 400])], 55)
+    assert excluded == 0
+    assert "(id=c0)\n  result: xxxxx" in text
+    assert "(id=c1)" not in text
+    assert _disclosed_omitted_count(text) == 2
+
+
+def test_budget_identities_kept_on_packed_and_boundary_rounds():
+    chat_id = _seed_chat([("user", "please do X")])
+    reconstruction = reconstruct_chat_context(chat_id)
+    history = _rounds_history(14, _round_len_with_remainder(3))
+    bundle = cc.build_input_bundle(chat_id, reconstruction, history, [])
+    for i in range(14):
+        assert f"(id=c{i:04d})\n  result: " in bundle.rendered_prompt
+    assert "(id=c_big)\n  result: " in bundle.rendered_prompt
+    assert "TRUNCATED BY COMPILER INPUT BUDGET" in bundle.rendered_prompt
+
+
+def test_budget_oversized_machine_evidence_fails_closed():
+    """Fixed priority material that alone exceeds the ceiling is explicit
+    non-success -- never silently cut."""
+    facts = [{"kind": "coding_checkpoint", "value": "w" * 40_000,
+              "captured_at": "2026-10-26T00:00:00+00:00", "scope": "compile_time_snapshot"}]
+    reconstruction = ReconstructionResult(chat_id=1, context_skip=0, eligible_rows=[])
+    with pytest.raises(cc.CompilerInputError):
+        cc.build_input_bundle(1, reconstruction, [], facts)
+
+
+# ── Lifecycle: an input-packing failure never orphans a BUILDING row ──
+
+def test_compile_input_invariant_failure_records_failed_not_building(monkeypatch):
+    chat_id = _seed_chat([("user", "hi")])
+
+    def _boom(*a, **k):
+        raise cc.CompilerInputError("packed input bundle estimated at 8004 tokens")
+
+    monkeypatch.setattr(cc, "build_input_bundle", _boom)
+    backend = _ScriptedBackend([_valid_candidate()])
+    record = cc.compile_continuity_checkpoint(chat_id, backend, ephemeral_history=[])
+    assert record.state == STATE_FAILED
+    assert record.failure_reason == cc.REASON_COMPILER_INPUT_INVARIANT
+    assert backend.calls == []  # no model call on an invalid bundle
+    assert [c.state for c in list_checkpoints(chat_id)] == [STATE_FAILED]
+
+
+def test_compile_unexpected_input_build_error_fails_row_then_propagates(monkeypatch):
+    chat_id = _seed_chat([("user", "hi")])
+
+    def _boom(*a, **k):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(cc, "assemble_machine_facts", _boom)
+    backend = _ScriptedBackend([_valid_candidate()])
+    with pytest.raises(RuntimeError):
+        cc.compile_continuity_checkpoint(chat_id, backend, ephemeral_history=[])
+    assert backend.calls == []
+    assert [(c.state, c.failure_reason) for c in list_checkpoints(chat_id)] == [
+        (STATE_FAILED, cc.REASON_COMPILER_INPUT_BUILD_ERROR)]
+
+
+def test_compile_real_oversized_bundle_records_failed(monkeypatch):
+    chat_id = _seed_chat([("user", "hi")])
+    facts = [{"kind": "coding_checkpoint", "value": "w" * 40_000,
+              "captured_at": "2026-10-26T00:00:00+00:00", "scope": "compile_time_snapshot"}]
+    monkeypatch.setattr(cc, "assemble_machine_facts", lambda project_context: facts)
+    backend = _ScriptedBackend([_valid_candidate()])
+    record = cc.compile_continuity_checkpoint(chat_id, backend, ephemeral_history=[])
+    assert record.state == STATE_FAILED
+    assert record.failure_reason == cc.REASON_COMPILER_INPUT_INVARIANT
+    assert backend.calls == []
+
+
+def test_compile_live_8004_shape_now_reaches_ready():
+    """The live failure shape (dozens of small tool rounds after a large
+    boundary round) now compiles instead of tripping the invariant."""
+    chat_id = _seed_chat([("user", "flash the card"), ("assistant", "running")])
+    backend = _ScriptedBackend([_valid_candidate()])
+    history = _rounds_history(38, _round_len_with_remainder(3))
+    record = cc.compile_continuity_checkpoint(chat_id, backend, ephemeral_history=history)
+    assert record.state == STATE_READY
+    assert len(backend.calls) == 1
+    assert cc.estimate_tokens(backend.calls[0]) <= cc.CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET
+
+
 # ── Parser ────────────────────────────────────────────────────────────
 
 def test_parser_pure_json_accepted():

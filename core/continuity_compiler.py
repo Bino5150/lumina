@@ -98,6 +98,13 @@ REASON_CANCELLED_BEFORE_FINALIZE = "cooperative_cancel_before_finalize"
 # written to the store as a failure.
 REASON_CANCELLED_AFTER_FINALIZE_READY = "cooperative_cancel_observed_after_finalize_ready"
 
+# REFORGE-COMPILER-PACKING-01: FAILED-row reasons for a compile that never
+# reached a utility call because its own input could not be built. Without
+# these, a CompilerInputError escaped compile_continuity_checkpoint() and
+# left its checkpoint BUILDING forever (live: chat 166, checkpoints 21/22).
+REASON_COMPILER_INPUT_INVARIANT = "compiler_input_invariant_violated"
+REASON_COMPILER_INPUT_BUILD_ERROR = "compiler_input_build_error"
+
 # A4-PIN-01: what the compiler MAY represent. "authorization_boundary" from
 # the A4D-R draft is deliberately gone -- replaced by scope_constraint,
 # framed only as a non-authoritative scope/STOP note, never a grant.
@@ -121,10 +128,24 @@ TRUNCATION_MARKER_TEMPLATE = "[...TRUNCATED BY COMPILER INPUT BUDGET -- {n} char
 # its own char budget BEFORE truncating, or the appended marker text itself
 # silently pushes the line past the budget it was computed against.
 _MARKER_RESERVE_CHARS = 96
+# REFORGE-COMPILER-PACKING-01: discloses tool calls a truncated boundary round
+# had to drop entirely (no room even for their call identity + marker), so a
+# multi-call round is never shown as if it held fewer calls than it did.
+OMITTED_CALLS_MARKER_TEMPLATE = (
+    "[...TRUNCATED BY COMPILER INPUT BUDGET -- {n} more tool_call(s) in this round omitted...]"
+)
 # Small fixed reservation for "\n\n".join() section-separator overhead in
 # build_input_bundle() -- reserved once, off the top, alongside the fixed
 # preamble cost.
 _SECTION_JOIN_RESERVE_TOKENS = 8
+
+
+def _ceil_tokens(text: str) -> int:
+    """Upper-bound counterpart of estimate_tokens() for charging FIXED
+    material (preamble, machine evidence) against the budget. estimate_tokens()
+    floors, so summing per-piece floors under-counts the whole render it is
+    later compared against (REFORGE-COMPILER-PACKING-01)."""
+    return -(-len(str(text)) // 4)
 
 
 # ---------------------------------------------------------------------
@@ -294,18 +315,28 @@ def _pack_tool_rounds(rounds: list, remaining: int):
     """Deterministic newest-round-first packing. Whole rounds are included
     while they fit; the first round that does not fit whole is included
     with its result bodies truncated (call/result identity always
-    preserved, marker always explicit); nothing older than that boundary
-    round is ever included. Returns (rendered_text, remaining, excluded_count).
+    preserved, marker always explicit; calls it cannot keep at all are
+    disclosed by count, or the round is excluded whole); nothing older than
+    that boundary round is ever included. Returns (rendered_text, remaining,
+    excluded_count).
 
     The section header's own cost is reserved from `remaining` BEFORE any
     round is packed, and only actually charged (reflected in the returned
     `remaining`) if the section ends up non-empty -- an empty section
-    returns the original `remaining` completely unspent."""
+    returns the original `remaining` completely unspent.
+
+    REFORGE-COMPILER-PACKING-01: accounting is in characters -- exactly what
+    build_input_bundle()'s final whole-render estimate_tokens() measures --
+    and charges every block AND every "\\n\\n"/"\\n" join between blocks and
+    lines. Per-block estimate_tokens() floors used to lose up to 3 chars per
+    block and the joins were never charged; the truncated boundary round
+    then filled the budget exactly, so that slack overshot the hard ceiling
+    (live: 8,004 > 8,000). The rendered section is now never longer than
+    `remaining * 4` chars, and only whole leftover tokens are returned."""
     if not rounds or remaining <= 0:
         return "", remaining, len(rounds)
 
-    header_cost = estimate_tokens(_ROUNDS_HEADER)
-    budget = max(0, remaining - header_cost)
+    budget_chars = max(0, remaining * 4 - len(_ROUNDS_HEADER))
 
     included_blocks = []
     rounds_included = 0
@@ -317,20 +348,21 @@ def _pack_tool_rounds(rounds: list, remaining: int):
             continue
 
         round_text = "\n".join(_render_round_pair(name, tc_id, text) for tc_id, name, text in pairs)
-        cost = estimate_tokens(round_text)
+        block_sep = 2 if included_blocks else 0  # the "\n\n" joining this block to the newer ones
 
-        if cost <= budget:
+        if block_sep + len(round_text) <= budget_chars:
             included_blocks.insert(0, round_text)
-            budget -= cost
+            budget_chars -= block_sep + len(round_text)
             rounds_included += 1
             continue
 
-        max_chars = max(0, budget * 4)
+        max_chars = max(0, budget_chars - block_sep)
         truncated_lines = []
         used_chars = 0
         for tc_id, name, text in pairs:
+            line_sep = 1 if truncated_lines else 0  # the "\n" joining truncated lines
             header = f"- tool_call {name} (id={tc_id})\n  result: "
-            budget_for_body = max_chars - used_chars - len(header)
+            budget_for_body = max_chars - used_chars - line_sep - len(header)
             if budget_for_body <= 0:
                 break
             if len(text) > budget_for_body:
@@ -341,19 +373,34 @@ def _pack_tool_rounds(rounds: list, remaining: int):
                 body = text[:body_budget] + "\n  " + TRUNCATION_MARKER_TEMPLATE.format(n=omitted)
             else:
                 body = text
+            if len(body) > budget_for_body:
+                break  # not even the marker fits; never emit a call without its result
             line = header + body
             truncated_lines.append(line)
-            used_chars += len(line)
+            used_chars += line_sep + len(line)
+        # Truncation is always explicit: calls this boundary round could not
+        # keep are disclosed by count in one notice line. If even that notice
+        # cannot fit, drop kept calls from the end until it does; a round left
+        # with no kept call is excluded whole, never partially and silently.
+        omitted_calls = len(pairs) - len(truncated_lines)
+        while truncated_lines and omitted_calls:
+            notice = OMITTED_CALLS_MARKER_TEMPLATE.format(n=omitted_calls)
+            if used_chars + 1 + len(notice) <= max_chars:
+                truncated_lines.append(notice)
+                break
+            dropped = truncated_lines.pop()
+            used_chars -= len(dropped) + (1 if truncated_lines else 0)
+            omitted_calls += 1
         if truncated_lines:
             included_blocks.insert(0, "\n".join(truncated_lines))
             rounds_included += 1
-            budget = 0
+            budget_chars = 0
         break  # this is the last round attempted; anything older is excluded
 
     excluded_count = len(rounds) - rounds_included
     if not included_blocks:
         return "", remaining, excluded_count
-    return _ROUNDS_HEADER + "\n\n".join(included_blocks), budget, excluded_count
+    return _ROUNDS_HEADER + "\n\n".join(included_blocks), budget_chars // 4, excluded_count
 
 
 def _pack_durable_tail(chat_id: int, tail_rows: list, remaining: int):
@@ -362,18 +409,20 @@ def _pack_durable_tail(chat_id: int, tail_rows: list, remaining: int):
     citable chat_row:<chat_id>:<id> identity. Deterministic newest-fits-
     first cutoff; a row that cannot fit even truncated stops the section
     (older rows excluded). Header cost reserved/charged the same way as
-    _pack_tool_rounds() above."""
+    _pack_tool_rounds() above, and in the same exact-character accounting
+    (REFORGE-COMPILER-PACKING-01): every line and every "\\n" join between
+    lines is charged."""
     if not tail_rows or remaining <= 0:
         return "", remaining
 
-    header_cost = estimate_tokens(_TAIL_HEADER)
-    budget = max(0, remaining - header_cost)
+    budget_chars = max(0, remaining * 4 - len(_TAIL_HEADER))
 
     lines = []
     for row in tail_rows:
         ref = f"chat_row:{chat_id}:{row['id']}"
         content = redact_secret_shapes(row.get("content") or "")
-        cap = min(max(0, budget * 4), MAX_DURABLE_ROW_CHARS)
+        line_sep = 1 if lines else 0
+        cap = min(max(0, budget_chars - line_sep), MAX_DURABLE_ROW_CHARS)
         if len(content) > cap:
             # Reserve the marker's own length BEFORE truncating, or the
             # appended marker text overshoots the computed cap.
@@ -383,15 +432,14 @@ def _pack_durable_tail(chat_id: int, tail_rows: list, remaining: int):
         else:
             body = content
         line = f"[{ref}] {row['role']}: {body}"
-        line_cost = estimate_tokens(line)
-        if line_cost > budget:
+        if line_sep + len(line) > budget_chars:
             break
         lines.append(line)
-        budget -= line_cost
+        budget_chars -= line_sep + len(line)
 
     if not lines:
         return "", remaining
-    return _TAIL_HEADER + "\n".join(lines), budget
+    return _TAIL_HEADER + "\n".join(lines), budget_chars // 4
 
 
 def _render_machine_evidence(machine_facts: list) -> str:
@@ -420,12 +468,16 @@ def build_input_bundle(chat_id: int, reconstruction, ephemeral_history: list,
     section" -- see the module-level constant's own comment."""
     eligible_row_index = {row["id"]: row["role"] for row in reconstruction.eligible_rows}
 
+    # Fixed material is charged rounded UP (_ceil_tokens) and both packers
+    # stay within remaining * 4 chars, so the whole render's floored
+    # estimate cannot exceed the budget by construction; the check below
+    # remains the fail-closed backstop (REFORGE-COMPILER-PACKING-01).
     preamble = _render_preamble()
-    fixed_cost = estimate_tokens(preamble) + _SECTION_JOIN_RESERVE_TOKENS
+    fixed_cost = _ceil_tokens(preamble) + _SECTION_JOIN_RESERVE_TOKENS
     remaining = max(0, CONTINUITY_COMPILER_INPUT_TOKEN_BUDGET - fixed_cost)
 
     machine_evidence_text = _render_machine_evidence(machine_facts)
-    machine_cost = estimate_tokens(machine_evidence_text) if machine_evidence_text else 0
+    machine_cost = _ceil_tokens(machine_evidence_text) if machine_evidence_text else 0
     remaining = max(0, remaining - machine_cost)
 
     rounds = _group_tool_rounds(ephemeral_history)
@@ -753,8 +805,20 @@ def compile_continuity_checkpoint(chat_id: int, backend, ephemeral_history: list
         chat_id, reconstruction.durable_spine_fingerprint, reconstruction.context_skip,
     )
 
-    machine_facts = assemble_machine_facts(project_context)
-    bundle = build_input_bundle(chat_id, reconstruction, ephemeral_history, machine_facts)
+    # REFORGE-COMPILER-PACKING-01 -- the checkpoint already exists as
+    # BUILDING here, so an input-build failure must fail it rather than
+    # escape and orphan it. A packing-invariant violation is a known,
+    # truthful compile failure (FAILED, returned like attempts-exhausted);
+    # anything else still propagates to the caller's catch-all after
+    # recording the failure. No utility call happens on either path.
+    try:
+        machine_facts = assemble_machine_facts(project_context)
+        bundle = build_input_bundle(chat_id, reconstruction, ephemeral_history, machine_facts)
+    except CompilerInputError:
+        return fail_checkpoint(checkpoint.id, chat_id, reason=REASON_COMPILER_INPUT_INVARIANT)
+    except Exception:
+        fail_checkpoint(checkpoint.id, chat_id, reason=REASON_COMPILER_INPUT_BUILD_ERROR)
+        raise
 
     last_failure_reason = "attempts_exhausted"
     for _attempt in range(1, CONTINUITY_COMPILER_MAX_ATTEMPTS + 1):

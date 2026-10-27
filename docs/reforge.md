@@ -238,6 +238,10 @@ normal output quality target:     4 KiB
 hard output ceiling:             16 KiB
 ```
 
+The input budget applies to the **whole rendered compiler prompt**: preamble and schema, machine evidence, tool activity and durable tail together. Packing charges every character of what it renders, including the separators between tool rounds and between conversation lines. Newest material is packed first. The oldest round that only partly fits is truncated with an explicit marker, keeping its call identity. Any of its tool calls that cannot be kept at all are disclosed by count; if even that notice cannot fit, the round is left out whole rather than shown with fewer calls than it had. The finished prompt is then checked against the budget once more as a backstop.
+
+If the compiler's input cannot be built within the budget, `/context reforge` ends as `compile_failed` with the reason `compiler_input_invariant_violated`. The checkpoint is recorded `FAILED` rather than left `BUILDING`, no utility-model call is made, and the live context stays unchanged.
+
 The exact numeric values are implementation details and may evolve, but the architectural requirement is stable: continuity compilation is **bounded, validated, provenance-separated, and fail-closed**.
 
 ### 4.4 Exact checkpoint consumption

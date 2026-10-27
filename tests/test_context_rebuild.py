@@ -445,6 +445,33 @@ def test_compile_attempts_exhausted_yields_compile_failed_receipt(tmp_path):
     assert checkpoint.state == cc.STATE_FAILED
 
 
+def test_compiler_input_invariant_yields_compile_failed_receipt_no_orphan(tmp_path, monkeypatch):
+    """REFORGE-COMPILER-PACKING-01: a packing-invariant failure used to escape
+    as STATUS_ERROR ("Unexpected rebuild failure") and leave the checkpoint
+    BUILDING forever. It is now a truthful FAILED compile, live context unchanged."""
+    import core.continuity_compiler as compiler
+
+    def _boom(*a, **k):
+        raise compiler.CompilerInputError("packed input bundle estimated at 8004 tokens")
+
+    monkeypatch.setattr(compiler, "build_input_bundle", _boom)
+    chat_id = _seed_chat([("user", "u1")])
+    owner = _FakeGenerationOwner(chat_id)
+    owner.ctx.history = [{"role": "user", "content": "u1"}]
+    old_history = owner.ctx.history
+    backend = _ScriptedBackend([_valid_candidate()])
+
+    receipt = cr.run_rebuild(chat_id, owner, backend, list(owner.ctx.history))
+
+    assert receipt.status == cr.STATUS_COMPILE_FAILED
+    assert compiler.REASON_COMPILER_INPUT_INVARIANT in receipt.reason
+    assert "unchanged" in receipt.reason.lower()
+    assert owner.ctx.history is old_history
+    assert owner.current_generation() == 0
+    assert not backend.calls
+    assert [c.state for c in cc.list_checkpoints(chat_id)] == [cc.STATE_FAILED]
+
+
 # ── Provenance / authority: continuity payload cannot grant authority ───
 
 def test_adversarial_continuity_statement_never_becomes_authoritative(tmp_path):
