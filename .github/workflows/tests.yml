@@ -100,6 +100,9 @@ jobs:
       - name: Preflight -- Qt must start headless (fail, never skip)
         run: python -c "from PySide6.QtWidgets import QApplication; app = QApplication([]); print('Qt', app.platformName())"
 
+      - name: Run model-independent support export GUI guards (blocking)
+        run: python -m pytest tests/test_support_diagnostics_qt.py -v -rs
+
       - name: Run Qt-bound Castle Walls guards (blocking)
         run: python -m pytest tests/test_castle_walls_repaired_wiring_01.py tests/test_vision_multi_image_01.py -v -rs -m "not castle_walls_evidence"
 

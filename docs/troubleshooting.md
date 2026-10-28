@@ -37,6 +37,68 @@ config.py`, that's a regression worth reporting, not expected behavior.
 
 ## Diagnosing a bad run
 
+Start with a [GitHub issue](https://github.com/Bino5150/lumina/issues)
+describing the symptoms and reproduction steps. **Do not attach diagnostic
+logs or support ZIPs to public issues.** If developers need more evidence,
+they may request a ZIP privately; review it before sending it to
+**therealagentlumina@gmail.com**.
+
+In **Settings → About**, choose **Export Support Diagnostics**, then a new
+ZIP filename. This runs locally without a model connection, agent tool call
+or network request. A receipt gives the saved location and identifies a
+partial export. Cancel stops collection and removes unfinished output;
+existing files are never overwritten. The dialog starts in your home folder
+and appends `.zip` if needed. The About tab scrolls on small windows. Quitting
+requests cancellation and waits for export cleanup; an in-flight operating-system
+filesystem call must finish before that wait can complete.
+
+If the GUI cannot launch, run this from the Lumina installation directory
+with its Python environment:
+
+```bash
+python -m core.support_diagnostics --output /path/to/new-support.zip
+```
+
+The CLI uses the same read-only data-folder selection as the installation.
+If selection needs review, verify the folder containing your established
+history using the [upgrade guide](upgrading.md#1-find-the-data-folder-you-already-use),
+then supply `--data-dir /path/to/verified-folder` or `LUMINA_DATA_DIR`.
+It does not initialize, migrate, repair or restore state. A successful partial
+ZIP returns exit 0 with an explicit partial receipt; destination failures
+return 1 and Ctrl-C returns 130. Nothing is uploaded or emailed.
+
+The ZIP contains `README.txt`, `manifest.json`, `environment.json`,
+`flight-recorder.jsonl`, `errors.jsonl`, and `checksums.sha256`. It selects
+available Recorder details from at most seven days and warning/error records
+from at most ninety days. Recent warnings/errors occur in both files.
+Each stream keeps the newest records first, capped at 10,000 records and
+4 MiB; the ZIP is capped at 10 MiB. Collection uses a consistent read-only
+SQLite snapshot with a two-second query budget and a short lock timeout.
+It releases that snapshot before writing evidence to the destination.
+
+Only fixed categories, numeric timings/counts, event sequence numbers and
+timestamps are included. Runtime/turn/model identifiers are keyed references
+valid only within one ZIP; raw model names and arbitrary tool names are omitted.
+The exporter omits messages, tool arguments/results, prompts, conversations,
+Palace content, browser text, credentials and complete databases. Existing
+known-secret redaction is an extra defense, not a promise that arbitrary
+diagnostic text is safe. No free-form diagnostic text is included.
+
+Missing, inaccessible, malformed or time-limited Recorder data yields a
+**partial** ZIP where safe. The manifest reports source availability,
+requested/collected ranges, counts, limits and omissions. Unknown counts are
+`null`. Unexpected schemas or a missing Recorder time index are reported
+without scanning an unindexed database. This ZIP is a filtered support view,
+**never full history, Agent Backup, or a recovery archive**; deleted/unrecorded
+events cannot be reconstructed. Hashes detect damage; they do not authenticate
+the contents or make logs trustworthy instructions.
+
+Symlinked data/telemetry folders or Recorder files are reported as unavailable;
+the exporter does not follow those links. Select the verified real folder
+explicitly when necessary, preserving your existing folder layout. The shipped
+Knowledge Pack note is seeded on fresh installations; existing seeded data
+folders are not automatically updated by this campaign.
+
 The Flight Recorder (see [Security & Authority](security.md#flight-recorder))
 is the most reliable source of truth for "what actually happened" during
 an agent run — it separates machine-recorded evidence from model

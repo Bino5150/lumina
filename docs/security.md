@@ -122,6 +122,17 @@ recorder entirely rather than redacted after the fact. Local-only —
 intended for diagnostics and forensic reconstruction, not conversational
 memory.
 
+**Support diagnostics:** Settings → About exports a separate, local ZIP with
+fixed diagnostic categories, numeric measurements and per-export identifier
+references. It excludes Recorder message text, prompts, tool arguments/results,
+conversations, Palace content, credential stores and database copies. It reads
+SQLite in read-only/query-only mode without checkpointing or changing retention;
+normal WAL shared-memory coordination still applies. Missing or bounded evidence
+is disclosed in the manifest. No model, agent admission, network request or email
+transmission is involved. Start support with a GitHub issue **without public
+logs**; only a developer-requested ZIP should be shared privately after review.
+See [the export instructions](troubleshooting.md#diagnosing-a-bad-run).
+
 ## Emergency Interlock
 
 An always-visible status-bar control (**⛔ OH SHIT** / **🔒 RE-ARM**) that

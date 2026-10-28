@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QFrame
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QFrame, QScrollArea, QLayout, QSizePolicy
 from PySide6.QtCore import Signal, QThread, Qt
 
 
@@ -13,7 +13,15 @@ class _UpdateCheckWorker(QThread):
 class AboutTab(QWidget):
     def __init__(self, c: dict, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        layout = QVBoxLayout(content)
+        layout.setSizeConstraint(QLayout.SetMinAndMaxSize)
         layout.setSpacing(16)
         layout.setContentsMargins(24, 24, 24, 24)
 
@@ -45,13 +53,26 @@ class AboutTab(QWidget):
 
         # ── Support text ─────────────────────────────────────────────────────
         support_label = QLabel(
-            "For support, feature requests, or to connect with the community,\n"
-            "visit the links below."
+            "For troubleshooting, start with a GitHub issue. Do not attach diagnostic logs publicly.\n"
+            "If developers request a diagnostic ZIP, review it and send it privately to\n"
+            "therealagentlumina@gmail.com. Export works locally without a model connection."
         )
         support_label.setAlignment(Qt.AlignCenter)
         support_label.setWordWrap(True)
         support_label.setStyleSheet(f"color:{c['text_primary']};font-size:11px;background:transparent;")
         layout.addWidget(support_label)
+
+        self.support_export_btn = QPushButton("Export Support Diagnostics")
+        self.support_export_btn.setToolTip("Save a privacy-filtered local ZIP. Nothing is uploaded or emailed.")
+        layout.addWidget(self.support_export_btn, alignment=Qt.AlignCenter)
+        self.support_export_status = QLabel("")
+        self.support_export_status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.support_export_status.setWordWrap(True)
+        self.support_export_status.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.support_export_status)
+        from .support_diagnostics import SupportDiagnosticsController
+        self.support_diagnostics = SupportDiagnosticsController(
+            self.support_export_btn, self.support_export_status, self)
 
         layout.addSpacing(8)
 

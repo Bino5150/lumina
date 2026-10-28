@@ -15,7 +15,7 @@ Settings is a tabbed panel (`ui/settings/panel.py`). Current tabs, in order:
 | 🗓 Scheduled Tasks | Inspect/cancel scheduled and background work |
 | 🖼 Multimodal | Voice (TTS), Speech-to-text, Vision routing, Image Generation routing and credentials — see [Multimodal](multimodal.md) |
 | 🔮 Oracle | Placeholder — a related, separate project, not yet available here |
-| ✨ About | Version, links, update check |
+| ✨ About | Version, links, update check, local Support Diagnostic ZIP export |
 
 (The Multimodal tab's file on disk is still named `tts_tab.py` with class
 `MultimodalTab` — it grew from a TTS-only tab into the home for

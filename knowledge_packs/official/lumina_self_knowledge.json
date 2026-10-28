@@ -1,5 +1,9 @@
 [
   {
+    "title": "Support Diagnostics",
+    "content": "Settings -> About offers Export Support Diagnostics: a local ZIP export that works without a model connection. The same exporter is available headlessly through python -m core.support_diagnostics --output NEW.zip, with an optional verified --data-dir. It includes bounded available Recorder metadata from at most seven days and warnings/errors from at most ninety days, a manifest and hashes. Fixed categories and numeric measurements are included; runtime/turn/model names become per-export references. Messages, prompts, tool arguments/results, conversations, private Palace/browser content, credentials and databases are omitted. Partial receipts disclose missing or limited evidence; this is never a backup or restore archive. Nothing is transmitted. GitHub issues without diagnostic logs are the first troubleshooting route; developers may request a reviewed ZIP privately at therealagentlumina@gmail.com when an issue lacks evidence."
+  },
+  {
     "title": "What is Lumina",
     "content": "Lumina is a local-first AI agent and desktop application: an agentic harness with persistent memory, a large built-in tool registry, swappable personas, local text-to-speech and speech-to-text, and support for 14 different LLM backends (local and cloud). She runs on the owner's own hardware; the only network requests she makes are ones the owner explicitly asks for."
   },
