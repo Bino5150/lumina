@@ -472,6 +472,16 @@ def _legacy_family(name):
     return "unclassified", None
 
 
+def _rollback_header_copy(data):
+    """Every live Lumina database is WAL-mode (header bytes 18-19 == 2), and
+    an in-memory deserialize() cannot open WAL mode. With no pending WAL the
+    file alone is the complete database, so only the copy checked here gets
+    the rollback-journal header; the archived bytes are never changed."""
+    if len(data) >= 20 and data[18] == 2 and data[19] == 2:
+        return data[:18] + b"\x01\x01" + data[20:]
+    return data
+
+
 def _intake_legacy(z, infos):
     names = [i.filename for i in infos]
     if any(n.startswith(_A2_PREFIXES) for n in names):
@@ -495,7 +505,7 @@ def _intake_legacy(z, infos):
             # not the generation the source last saw.
             if any(sizes.get(name + s, 0) for s in ("-wal", "-journal")):
                 damage = "ambiguous_database_generation"
-            elif not ab._verify_sqlite_payload(data, role=role)[0]:
+            elif not ab._verify_sqlite_payload(_rollback_header_copy(data), role=role)[0]:
                 damage = "sqlite_invalid"
         elif name == "memory/prefs.json" and not ab._verify_prefs_payload(data)[0]:
             damage = "prefs_invalid"

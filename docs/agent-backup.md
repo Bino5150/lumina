@@ -16,9 +16,15 @@ or publish anything. The acknowledgement defaults to **No**. Existing destinatio
 including previously verified backups, cannot be overwritten by Incomplete State
 Export. A concurrent destination creation also blocks publication atomically.
 
-No functioning Restore control is provided. Full Agent Restore, Selective
-MemPalace/Skills Recovery, and Legacy Recovery remain planned separate features.
-Optional encrypted credentials recovery is also a separate future campaign.
+No Restore control is provided in Settings, and no restore into a live or
+production data folder exists. An engineering-only isolated restore engine can
+restore an archive into a new, empty, non-production data folder for testing; it
+is described in [the recovery contract](agent-backup-recovery-contract.md). It
+is not production disaster-recovery activation. Because no archive captures a
+C1 safety-state snapshot, it never produces a Verified Agent Backup: verified
+archives restore as Incomplete State Export, damaged ones only as owner-selected
+Selective Recovery, and Backup Memory (Legacy) ZIPs as limited Legacy Recovery.
+Optional encrypted credentials recovery is a separate future campaign.
 
 ## Coverage and authority
 
@@ -114,8 +120,11 @@ base-member validation is reused internally without changing the accepted v1
 schema. Old v1 archives are classified as older coverage: they did not capture
 the installation marker or C1 contract and copied prefs under a different policy.
 Neither an absent manifest field nor a version rewrite can upgrade their coverage.
-Legacy ZIPs are classified from bounded metadata before any payload read; no
-legacy import/salvage activation is provided.
+Legacy ZIPs are classified from bounded metadata before any payload read. A
+legacy database is accepted only when its archive holds no pending WAL or hot
+journal; a WAL-mode header alone is normal for a live Lumina database. No
+legacy import into a live data folder is provided; the isolated engineering
+restore can recover a legacy ZIP into a new folder as limited Legacy Recovery.
 
 Classification is an explicitly unverified format hint, including when an archive
 declares a known version. Both classifier and v2 verifier use the existing A2

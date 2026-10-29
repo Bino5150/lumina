@@ -17,6 +17,14 @@ refused, never reported as absent.
 This is exclusion only. It captures no snapshot, so it can never support a
 complete backup, and it has no restore semantics: whatever a later restore
 finds, it must still leave a trace and send the owner to Recover.
+
+The one exception to "it only looks" is write_restore_trace()
+(AGENT-BACKUP-RESTORE-02): a restore leaves C1 a durable, write-new-only
+receipt in a freshly staged data root that has no C1 state at all, so the
+restored root probes ABSENT_WITH_TRACE (owner Recover), never
+ABSENT_NO_TRACE (first-run Initialize). It only adds a restriction: it never
+creates or opens a store, never writes the identity pin, never copies
+archived C1 state, and needs no owner envelope because it grants nothing.
 """
 from __future__ import annotations
 
@@ -27,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import core.suspension as _c1
 from core.suspension import EVIDENCE_DIRNAME, IDENTITY_NAME, MEMORY_DIRNAME, STORE_NAME
 
 SCHEMA = "lumina.c1_exclusion"
@@ -219,3 +228,56 @@ def verify_exclusion_unchanged(data_dir, exclusion: C1Exclusion) -> None:
     if (now.data_root != exclusion.data_root or now.memory_dir != exclusion.memory_dir
             or _stable_view(now) != _stable_view(exclusion)):
         raise ExclusionUnavailable("BOUNDARY_CHANGED")
+
+
+RESTORE_TRACE_NAME = "restore_trace.json"
+RESTORE_TRACE_SCHEMA = "lumina.c1_restore_trace"
+_RESTORE_ID = re.compile(r"[0-9a-f]{32}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_RESTORE_CLASS = re.compile(r"[a-z][a-z0-9_]{0,47}")
+
+
+class RestoreTraceRefused(Exception):
+    """The staged root is not a C1-empty root; no trace was written."""
+
+
+def write_restore_trace(data_dir, *, restore_id: str, archive_sha256: str, restore_class: str) -> str:
+    """Leave C1 a restore trace in a staged data root with no C1 state.
+
+    Refuses unless memory/ holds no store, sidecar, identity pin or evidence
+    tree: a restore never writes over, merges with or vouches for existing C1
+    state. The receipt sits in its own evidence directory, so a later
+    owner-local recover_destructively() preserves it and starts the owner
+    suspended with a fresh identity. Returns the receipt's data-root-relative
+    path. The record names the archive but says nothing about archived C1.
+    """
+    if (type(restore_id) is not str or not _RESTORE_ID.fullmatch(restore_id)
+            or type(archive_sha256) is not str or not _SHA256.fullmatch(archive_sha256)
+            or type(restore_class) is not str or not _RESTORE_CLASS.fullmatch(restore_class)):
+        raise ValueError("restore trace fields must be a restore id, a sha256 and a class label")
+    paths = _c1._paths(data_dir)
+    os.makedirs(paths.memory_dir, mode=0o700, exist_ok=True)
+    try:
+        _c1._memory_dir_identity(paths)
+    except _c1.StoreFault as exc:
+        raise RestoreTraceRefused(f"memory directory unsafe: {exc}") from None
+    if _c1._traces(paths):
+        raise RestoreTraceRefused("C1 state already exists in this root; a restore never adds to it")
+    at = datetime.now(timezone.utc).timestamp()
+    receipt_dir = _c1._new_evidence_dir(paths, at)
+    _c1._write_new_private(os.path.join(receipt_dir, RESTORE_TRACE_NAME), _c1._canonical({
+        "schema": RESTORE_TRACE_SCHEMA, "version": 1, "at": at, "restore_id": restore_id,
+        "archive_sha256": archive_sha256, "restore_class": restore_class,
+        "archived_c1_state": "not_restored", "required_next_step": "owner_local_recover"}))
+    _c1._fsync_dir(receipt_dir)
+    _c1._fsync_dir(paths.evidence)
+    _c1._fsync_dir(paths.memory_dir)
+    if _c1.probe(data_dir).status is not _c1.StoreStatus.ABSENT_WITH_TRACE:
+        raise RestoreTraceRefused("the restore trace is not visible to C1")
+    return os.path.relpath(os.path.join(receipt_dir, RESTORE_TRACE_NAME), paths.data_dir).replace(os.sep, "/")
+
+
+def restore_trace_state(data_dir) -> str:
+    """C1's own read-only probe status for a restored root ("absent_with_trace"
+    until the owner recovers). Opens SQLite only if a store exists."""
+    return _c1.probe(data_dir).status.value

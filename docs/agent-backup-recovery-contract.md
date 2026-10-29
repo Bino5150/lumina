@@ -1,7 +1,10 @@
 # Historical recovery acceptance contract
 
-This is the acceptance contract for a future Restore campaign. No Restore engine,
-break-glass control, state import or activation is implemented by Verified Export.
+This is the acceptance contract for Restore. Verified Export implements no
+Restore. The first engineering slice, an isolated staging restore into a new,
+empty, non-production data folder, is described at the end of this document;
+production activation, a Settings control and break-glass recovery remain
+unimplemented.
 `historical_recovery_contract()` is a pure contract assessment of a manifest; it
 does not verify an archive or grant recovery/activation permission. A future
 consumer must first verify immutable archive bytes and validate each selected
@@ -80,3 +83,141 @@ paths, unknown optional/required features, installation tombstones, healthy vers
 absent/unavailable C1, missing restore traces, and incompatible enforcement. Report
 native exits, exact source/destination identities, recovered/skipped units and
 remaining acceptance gaps. Export integrity PASS alone cannot satisfy these tests.
+
+## Isolated staging restore (engineering slice)
+
+`core/agent_backup_restore.py` implements the first slice of this contract for
+an isolated destination only. It has no user interface and refuses, regardless
+of test mode, any destination or install folder inside
+`~/.local/share/lumina`, `~/.local/share/lumina-release`, `~/.config/lumina`, the
+platform data folder, the running process's `LUMINA_DATA_DIR`, or the running
+installation.
+
+Lifecycle: `plan_restore()` runs the shipped intake and preview, applies the
+owner's per-unit selection (`recover`, `recover_keep_destination`, `skip`) and
+returns a plan whose `plan_digest` binds the archive hash, its classification,
+the destination observation, every install-folder observation and the
+selection. `restore_isolated()` refuses unless the caller passes that digest and
+a fresh plan reproduces it. A restore without a selection takes every unit or
+refuses: any damaged or dependency-blocked unit (including a legacy database
+with pending WAL frames) requires an explicit owner selection, and only
+independently valid units can be chosen. Install-folder files that differ
+from the archive block the plan until the owner chooses to keep the
+destination's file or skip the unit; identical files are left alone.
+
+Data-folder contract: the destination must be absent or an empty directory.
+Units are staged in a private sibling directory, SQLite copies are switched to
+rollback-journal mode, Skills paths are rebound to the destination install, and
+both databases must pass `PRAGMA integrity_check`. Archived triggers and views
+are code, not history: before any write, every one is dropped except the
+shipped Skills and chat-message search triggers, kept only when their stored
+definition is exactly the shipped one. The Skills and chat search tables those
+triggers write to must likewise be exactly the shipped definitions (a missing one
+is created, as first start would); anything else refuses. Before publishing, the
+engine replays on the staged database, and rolls back, what first start and
+ordinary use do to it (search tables and triggers created if missing, a Skill and
+a chat message written, changed and deleted, the Skills search index checked),
+and refuses a database the runtime could not survive. Preferences pass the export
+scrubber (credentials, PIN, owner/channel bindings and unknown keys dropped;
+Telegram remote access off; `last_persona` rebound or dropped). No restored
+Skill is official. The archived `skills` table must be exactly one of the
+definitions released versions of Lumina created (its stored `CREATE TABLE` text,
+whitespace aside), with only its own name index, or the restore refuses before
+any authority decision: no other column, constraint, collation or index. The
+first-start replay also writes a row as the official bootstrap does and proves
+names are unique and matched under exact BINARY comparison (case and trailing
+spaces both count). Only the `skills` table, its search table and the
+chat-message search table are pinned to shipped definitions; other archived
+tables (chats, chat messages, memories, Palace and the rest) are checked for
+integrity and required columns, not for every constraint the runtime might
+trip over. Four rules hold for every table: no archived column may be
+generated; every column default must be a literal (NULL, a number or a quoted
+string, as in every shipped table; an expression would be evaluated afresh on
+each later insert); every foreign key and its referential actions must be one
+the shipped runtime declares (the runtime enforces foreign keys, so any other
+action, such as `ON DELETE SET DEFAULT`, would rewrite rows it wrote whenever it
+deletes something); and each kind of row the runtime writes (memories, chats, chat
+messages, Palace wings, rooms, drawers, closets and halls) is rehearsed on the
+staged copy, where every column the runtime leaves unset must read back empty,
+as in the shipped schema. An archived default therefore cannot stamp provenance
+(a Palace drawer's trusted synthesis origin, which can make the runtime omit
+conversation history; source links; admission or withheld marks) onto later
+writes. These checks verify that an archive is a compatible, intact Lumina
+backup; they are not a complete defence against a deliberately hostile
+database. Within them, an archive can still restore a root where some ordinary
+write fails later, and other SQLite schema features (for example conflict
+clauses or column affinity) are not checked; the source install is untouched
+either way. Rows already in the archive are restored as history, with the
+layer, trust and provenance marks the archive carries: archived Palace entries
+at the privileged layers are injected into context like the source's own, and
+an archived compaction checkpoint keeps hiding the rows it covered. Historical
+owner permissions, credentials, grants and C1 state are never restored, as
+described above. Choosing an archive to restore is the owner's explicit
+responsibility: a valid checksum shows the archive is intact, not where it
+came from. Restore only a backup you made, or one whose source you trust. An archived official row named like one of the destination checkout's
+tracked `skill_packages/official/` packages is set aside, so the checkout's own
+first-start bootstrap reinstalls it from shipped bytes; every other one becomes a
+user Skill. A user Skill whose name is exactly a shipped package's (which would
+make that bootstrap stop at the package, skipping every later one) is kept under
+a new name, `<name> (restored)` or `<name> (restored N)`, listed in the receipt as
+`skills_renamed_for_bootstrap`. Archive hashes,
+paths and local files vouch for nothing. The result is re-read before
+publishing, and any row still claiming official refuses the restore. Custom tools, the tool audit log
+(the custom-tool approval record), pending actions and project root bindings are
+written only under `restore_history/<restore_id>/`, where nothing loads them.
+The staged tree is validated against the plan (exact file set, hashes, no links,
+no live authority filenames), install-folder files are created without ever
+replacing one, and the data folder is published with one
+`renameat2(RENAME_NOREPLACE)`. Before that rename the destination is untouched;
+after it the folder is complete. Any earlier failure removes the staging folder
+and every install file the restore created. Each one carries its restore id in
+the `user.lumina.restore_id` extended attribute from the moment its temporary
+file exists (an install folder that cannot hold it is refused), and its inode
+and sealed size and modification time are journaled before it is linked into
+place; a folder it creates is journaled before it exists. A file counts as the restore's only with that mark, inode and seal; equal
+bytes or a reused inode are never proof. Anything else at the same path, or a
+temporary file whose identity was not yet journaled, is left in place and
+reported. Removal works through directory descriptors, so a folder swapped for a
+link mid-recovery cannot redirect it. A killed restore leaves a journaled
+staging folder that blocks new plans (the refusal names it) until
+`recover_interrupted_restore()` rolls it back. Recovery reads only private
+staging folders (real directories owned by this user, writable by no one else)
+and acts only on a journal this engine could have written: a known state, the
+same non-production install folder, targets inside the restore's own install
+namespace (Skills, personas, avatars, voices, tool profiles, project documents)
+and the engine's own temporary names. A staging folder killed before its first
+journal write is removed. One that cannot be removed is reported and recovery
+continues with the rest. Any other one is left intact and reported; the owner
+can then call `recover_interrupted_restore(data_dir,
+quarantine_unrecognized=True)`, which renames it aside as
+`.<name>.restore-<id>.quarantined-<hex>` (never deleting it, or any install file
+it names) so restores can proceed and the folder can be inspected. A process
+running as the same user (including a tool-gated agent) could forge such a
+private staging folder, but it can only reach files carrying a restore's own
+ownership mark inside the install namespace, which that user could delete
+anyway. A restore writes at most 1,000 install files (the journal is rewritten
+for each one); a larger archive is refused when planning.
+`verify_restored_root()` re-checks a published folder read-only,
+including re-deriving the Skill authority and executable-schema invariants from
+the published bytes.
+
+C1 contract: archived C1 state is never written. Before publishing, the engine
+calls `core.suspension_backup.write_restore_trace()`, which refuses any root that
+already holds C1 state and writes a private, write-new-only receipt under
+`memory/suspension_evidence/`. The published folder therefore probes
+`absent_with_trace`: first-run Initialize is refused, and the owner must run
+local Recover, which starts with a fresh identity, the owner suspended and
+unknown scopes suspended. The trace grants nothing and needs no owner envelope.
+
+Each restore writes `restore_history/<restore_id>/receipt.json` (archive
+identity and class, coverage, plan digest, every written file with its hash,
+rebinds, SQLite checks, the C1 trace and the authority fence) and a journal.
+Nothing in the restored database is resumed: the background task queue is
+in-memory only, restored media-generation jobs are consulted only to refuse a
+duplicate submission, and pending actions never reach the live queue.
+
+Not yet covered: a Settings control, restore into an existing or production
+data folder, writer exclusion for a live destination, a rollback snapshot of an
+existing destination, Knowledge Pack bootstrap reconciliation on first start,
+and a full desktop launch of a restored folder. These remain required before
+any production disaster-recovery claim.
