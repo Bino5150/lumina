@@ -243,7 +243,13 @@ def test_only_save_memory_can_set_a_source_link():
     approval digest and shown to the owner -- and preserves it untouched while
     changing only layer/location. So the promotion module may mention the
     column, but only as a read (a SELECT or a row key); see also the
-    behavioural proofs in test_palace_guard_01b4_owner_promotion.py."""
+    behavioural proofs in test_palace_guard_01b4_owner_promotion.py.
+
+    Restore (AGENT-BACKUP-RESTORE-02) must NAME the column too: a restored
+    database may keep only the foreign keys the runtime declares, and two of
+    them are the source links. So the restore engine may mention it, but only
+    as data in its _SHIPPED_FOREIGN_KEYS allow-list (or in a comment) -- never
+    in SQL, a call or anything that writes."""
     assert "source_memory_id" not in inspect.signature(palace.palace_store).parameters
     assert "source_memory_id" not in inspect.signature(palace.palace_store_hall).parameters
 
@@ -273,14 +279,42 @@ def test_only_save_memory_can_set_a_source_link():
                  and "source_memory_id" in n.value
                  and re.search(r"\b(INSERT|UPDATE)\b", n.value, re.I)) == set()
 
-    # (3) Outside the two lifecycle modules, exactly one module may mention the
-    # column at all -- owner promotion -- and every mention there is a read.
+    # (3) Outside the two lifecycle modules, exactly two modules may mention the
+    # column at all -- owner promotion, where every mention is a read, and
+    # restore, where every mention is allow-list data.
     mentioning = sorted(
         py.relative_to(REPO).as_posix() for py in product_py()
         if py.relative_to(REPO).as_posix() not in ("tools/palace.py", "tools/memory.py")
         and any(t in py.read_text(encoding="utf-8", errors="replace")
                 for t in ("_store_in_conn", "_store_hall_in_conn", "source_memory_id")))
-    assert mentioning == ["core/palace_promotion.py"]
+    assert mentioning == ["core/agent_backup_restore.py", "core/palace_promotion.py"]
+
+    restore_rel = "core/agent_backup_restore.py"
+    restore_src = (REPO / restore_rel).read_text(encoding="utf-8")
+    assert "_store_in_conn" not in restore_src and "_store_hall_in_conn" not in restore_src
+    allow_list = [n for n in ast.parse(restore_src).body
+                  if isinstance(n, ast.Assign) and len(n.targets) == 1
+                  and isinstance(n.targets[0], ast.Name)
+                  and n.targets[0].id == "_SHIPPED_FOREIGN_KEYS"]
+    assert len(allow_list) == 1
+    span = range(allow_list[0].lineno, allow_list[0].end_lineno + 1)
+    # Every line that names the column is a comment or inside the allow-list...
+    for lineno, line in enumerate(restore_src.splitlines(), 1):
+        if "source_memory_id" in line:
+            assert line.lstrip().startswith("#") or lineno in span, (lineno, line)
+    # ...where it is a bare string in an FK tuple, never SQL...
+    data = [(fn, n) for rel, fn, n in scan(
+        lambda n: isinstance(n, ast.Constant) and isinstance(n.value, str)
+        and "source_memory_id" in n.value) if rel == restore_rel]
+    assert len(data) == 2
+    for fn, n in data:
+        assert fn == "<module>" and n.value == "source_memory_id" and n.lineno in span
+    # ...naming exactly the two shipped source links, as the migration declares them.
+    from core import agent_backup_restore
+    assert {fk for fk in agent_backup_restore._SHIPPED_FOREIGN_KEYS if "source_memory_id" in fk} == {
+        ("palace_drawers", "source_memory_id", "memories", "id", "NO ACTION", "NO ACTION"),
+        ("palace_halls", "source_memory_id", "memories", "id", "NO ACTION", "NO ACTION")}
+
     reads = [(fn, n.value) for rel, fn, n in scan(
         lambda n: isinstance(n, ast.Constant) and isinstance(n.value, str)
         and "source_memory_id" in n.value) if rel == "core/palace_promotion.py"]
