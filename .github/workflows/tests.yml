@@ -168,3 +168,13 @@ jobs:
       # Same pinned PySide6 and fail-never-skip contract.
       - name: Run Qt-bound runaway suspension guards (blocking)
         run: python -m pytest tests/test_agent_runaway_suspend_01_c1b_qt.py -v -rs -m "not castle_walls_evidence"
+      # AGENT-BACKUP-RESTORE-UI-01: the Settings isolated-recovery cockpit in
+      # a real dialog with real worker threads -- approval bound to the
+      # engine's plan_digest, stale plans forcing a new preview, the dialog
+      # refusing to close under a running recovery, application-level worker
+      # retention, archive-derived text shown as plain text, and the unsafe
+      # destinations the engine refuses. The plain `test` job runs the Qt-free
+      # cockpit core and can only skip these. Same pinned PySide6 and
+      # fail-never-skip contract.
+      - name: Run Qt-bound isolated recovery cockpit guards (blocking)
+        run: python -m pytest tests/test_agent_backup_restore_cockpit_qt.py -v -rs -m "not castle_walls_evidence"

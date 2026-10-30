@@ -1,12 +1,13 @@
 # Agent Backup and Incomplete State Export
 
-Settings → Memory provides three separate workflows:
+Settings → Memory provides four separate workflows:
 
 | Workflow | What the result means |
 |---|---|
 | **Backup Memory (Legacy)** | Existing data-directory ZIP, with its existing exclusion checks. Source overlays are outside its scope. It is useful for bounded future salvage, not a complete Agent Backup. |
 | **Verified Agent Backup** | Checks eligibility for a complete backup. Currently refuses: no approved C1 safety-state snapshot contract exists. It writes no archive and never silently falls back. |
 | **Incomplete State Export** | Local owner explicitly acknowledges missing coverage, then chooses a **new** file. Structure, hashes and SQLite snapshots are verified. Coverage remains incomplete and full recovery acceptance remains unproven. |
+| **Recover Archive (Isolated)** | Local owner inspects an archive read-only, previews the exact changes, approves that exact plan, and recovers it into a **new, empty, non-production** folder, which is then re-verified. It never changes the running Lumina, is not production disaster recovery, and never produces a Verified Agent Backup. |
 
 Exports run locally, without a model tool or cloud upload. The new exporter runs
 in a worker thread retained by the application. Closing Settings does not cancel
@@ -16,13 +17,17 @@ or publish anything. The acknowledgement defaults to **No**. Existing destinatio
 including previously verified backups, cannot be overwritten by Incomplete State
 Export. A concurrent destination creation also blocks publication atomically.
 
-No Restore control is provided in Settings, and no restore into a live or
-production data folder exists. An engineering-only isolated restore engine can
-restore an archive into a new, empty, non-production data folder for testing; it
-is described in [the recovery contract](agent-backup-recovery-contract.md). It
-is not production disaster-recovery activation. Because no archive captures a
-C1 safety-state snapshot, it never produces a Verified Agent Backup: verified
-archives restore as Incomplete State Export, damaged ones only as owner-selected
+No restore into a live or production data folder exists, and Settings offers
+none: **Recover Archive (Isolated)** writes only a new, empty, non-production
+data folder and a fresh install folder you choose, and the engine refuses the
+running installation, this process's data folder and every known Lumina
+production location. It is a front end for the isolated recovery engine described
+in [the recovery contract](agent-backup-recovery-contract.md), including the
+workflow steps (inspect, choose units, choose folders, preview, approve, recover,
+verify, receipt). It is not production disaster-recovery activation, and it does
+not switch Lumina to the recovered folder. Because no archive captures a C1
+safety-state snapshot, it never produces a Verified Agent Backup: verified
+archives recover as Incomplete State Export, damaged ones only as owner-selected
 Selective Recovery, and Backup Memory (Legacy) ZIPs as limited Legacy Recovery.
 Optional encrypted credentials recovery is a separate future campaign.
 

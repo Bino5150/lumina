@@ -174,6 +174,14 @@ class MemoryTab(QWidget):
             "Requires acknowledgement and a new file; full Restore is unproven.")
         self.incomplete_export_btn.clicked.connect(lambda: self._export_agent_backup(incomplete=True))
         exports.addWidget(self.incomplete_export_btn)
+        self.isolated_recovery_btn = _btn("Recover Archive (Isolated)...", self.c)
+        self.isolated_recovery_btn.setObjectName("isolated_archive_recovery")
+        self.isolated_recovery_btn.setToolTip(
+            "Inspect a backup archive and recover it into a NEW folder. Does not change the running "
+            "Lumina, never writes into a live or production folder, and cannot produce a Verified "
+            "Agent Backup.")
+        self.isolated_recovery_btn.clicked.connect(self._open_recovery_cockpit)
+        exports.addWidget(self.isolated_recovery_btn)
         exports.addStretch()
         bot.addStretch()
         layout.addLayout(bot)
@@ -251,6 +259,13 @@ class MemoryTab(QWidget):
         worker.finished.connect(self._agent_backup_worker_finished)
         _retain_backup_worker(worker)
         worker.start()
+
+    def _open_recovery_cockpit(self):
+        if not getattr(self.agent, "owner", False):
+            QMessageBox.critical(self, "Owner required", "Only the local owner can recover an archive.")
+            return
+        from .restore_cockpit import open_cockpit
+        open_cockpit(self.agent, self.c, self)
 
     def _agent_backup_worker_finished(self):
         self._backup_worker = None

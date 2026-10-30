@@ -1,9 +1,9 @@
 # Historical recovery acceptance contract
 
 This is the acceptance contract for Restore. Verified Export implements no
-Restore. The first engineering slice, an isolated staging restore into a new,
-empty, non-production data folder, is described at the end of this document;
-production activation, a Settings control and break-glass recovery remain
+Restore. The first slice, an isolated staging restore into a new, empty,
+non-production data folder, and its Settings workflow are described at the end of
+this document; production activation and break-glass recovery remain
 unimplemented.
 `historical_recovery_contract()` is a pure contract assessment of a manifest; it
 does not verify an archive or grant recovery/activation permission. A future
@@ -87,7 +87,8 @@ remaining acceptance gaps. Export integrity PASS alone cannot satisfy these test
 ## Isolated staging restore (engineering slice)
 
 `core/agent_backup_restore.py` implements the first slice of this contract for
-an isolated destination only. It has no user interface and refuses, regardless
+an isolated destination only. Its only user interface is the Settings workflow
+described under "Settings cockpit" below, and it refuses, regardless
 of test mode, any destination or install folder inside
 `~/.local/share/lumina`, `~/.local/share/lumina-release`, `~/.config/lumina`, the
 platform data folder, the running process's `LUMINA_DATA_DIR`, or the running
@@ -216,8 +217,83 @@ Nothing in the restored database is resumed: the background task queue is
 in-memory only, restored media-generation jobs are consulted only to refuse a
 duplicate submission, and pending actions never reach the live queue.
 
-Not yet covered: a Settings control, restore into an existing or production
-data folder, writer exclusion for a live destination, a rollback snapshot of an
-existing destination, Knowledge Pack bootstrap reconciliation on first start,
-and a full desktop launch of a restored folder. These remain required before
-any production disaster-recovery claim.
+Not yet covered: restore into an existing or production data folder, writer
+exclusion for a live destination, a rollback snapshot of an existing destination,
+Knowledge Pack bootstrap reconciliation on first start, and a full desktop launch
+of a restored folder. These remain required before any production
+disaster-recovery claim.
+
+## Settings cockpit (Recover Archive (Isolated))
+
+Settings → Memory → **Recover Archive (Isolated)...** (local owner only) is a
+front end for the isolated slice above. It adds no recovery capability and
+relaxes no engine rule. Its decisions and wording are in the Qt-free
+`core/agent_backup_restore_cockpit.py`; the dialog is
+`ui/settings/restore_cockpit.py`.
+
+1. **Inspect (read-only).** Choose a local ZIP. The dialog shows its SHA-256,
+   size, format and verification status; the recovery class (Incomplete State
+   Export recovery, Selective Recovery or Legacy Recovery, never a Verified Agent
+   Backup); coverage, exclusions, unknown installation history, damaged units
+   with their reasons, and compatibility limits. Every archive-derived string is
+   displayed as plain text, with control, bidirectional-override and invisible
+   characters shown as `?` (display only; the archive and anything recovered are
+   never altered).
+2. **Choose units.** Each recoverable unit takes *Recover*, *Recover, keep my
+   differing install files* or *Skip*. Damaged and dependency-blocked units are
+   listed with the reason and cannot be chosen. A clean archive starts on
+   Recover; a selective archive, or any archive with a damaged unit, starts on
+   Skip and recovers nothing until the owner picks something.
+3. **Choose folders.** A new (or empty) data folder and a fresh install folder.
+   Production roots, the running installation and this process's data folder are
+   refused by the engine and reported as an unsafe destination.
+4. **Preview.** `plan_restore()` runs off the GUI thread. The dialog lists every
+   file with its action (create; already present and identical; differs, so your
+   file is kept), install-file conflicts, the free space needed, the plan digest
+   and what always holds. Nothing is written. A plan with undecided conflicts
+   cannot be approved.
+5. **Approve and recover.** Approval is bound to the displayed `plan_digest`.
+   Changing the archive, any unit or either folder drops the plan and the
+   approval. Recovering calls `restore_isolated()` with that digest and then
+   `verify_restored_root()`; the outcome is a success only if both pass. A folder
+   that was published but fails verification is reported as such, never as
+   success. One attempt consumes the plan and the approval whether it succeeds or
+   fails, so a retry needs a new preview and a new approval. An archive whose
+   bytes changed since it was inspected is named as such (by SHA-256) and forces
+   a new inspection. Nothing is retried, widened or adjusted automatically. If
+   the engine raises after publishing (a late sync, say), the dialog reads the
+   stored receipt, verifies the folder and says exactly that.
+6. **Receipt.** `restore_history/<id>/receipt.json` inside the new folder is the
+   durable receipt. The dialog shows its path and can copy the path, show the
+   receipt read-only, or save a copy to a new file (never overwriting).
+   *Verify a recovered folder* re-checks an earlier recovery against the receipt
+   stored in it; that detects later changes, not a receipt replaced together with
+   the files.
+7. **Failures** are told apart as unsafe destination, invalid archive,
+   incomplete coverage or selection, interrupted recovery pending, stale plan,
+   insufficient resources, engine failure, published but unverified and
+   unexpected error, each with the engine's rollback report where it has one.
+   *Check for interrupted recovery* runs `recover_interrupted_restore()` after a
+   confirmation; unrecognised staging folders are left untouched until the owner
+   separately chooses to move them aside (never deleted).
+
+Threads and closing. Every engine call runs in a worker thread that the
+application retains, as the Agent Backup exporter does; none runs on the GUI
+thread. The engine has no cancellation and none is offered. The dialog cannot be
+closed while a recovery or an interrupted-recovery step runs, normal application
+quit waits for it, and a read-only step that is still running when the dialog
+closes finishes unseen.
+
+A recovered Knowledge Pack installation record is not inert. It is restored to
+`knowledge_packs_installed.json` in the new data folder, the file Lumina's
+startup reads to decide whether the official pack is installed again, so it is
+historical installation state that can influence that decision if Lumina is
+later started on the folder. It grants no authority and no official-package
+trust; reconciling it before any launch is part of the pending work below.
+
+What this is not. It does not activate the recovered folder, switch Lumina to
+it, stop Lumina, offer "Restore Current Lumina", or take a rollback snapshot.
+Starting Lumina on a recovered folder is not a supported or verified path until
+the "Not yet covered" items above, C1 owner-local Recover, Knowledge Pack
+reconciliation and project rebind have landed. A passing UI test suite is not a
+disaster-recovery claim.

@@ -266,5 +266,10 @@ C1 coverage and unproven recovery acceptance. It cannot be used as a complete
 Restore input. See [Agent Backup](agent-backup.md) for coverage, prefs security,
 format compatibility and publication limits.
 
-There is no functioning Restore UI. Full Restore, Selective Palace/Skills Recovery
-and Legacy Recovery remain pending.
+Settings also offers **Recover Archive (Isolated)**. You inspect an archive
+read-only, preview the exact changes, approve that exact plan, and it is
+recovered into a **new, empty, non-production** folder, which is then re-verified
+against its receipt. It never changes the running Lumina, cannot write into a
+live or production folder, and is not production disaster recovery. Restore into
+your current data folder and activation of a recovered folder do not exist yet.
+See [Agent Backup](agent-backup.md).
