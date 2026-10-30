@@ -205,8 +205,9 @@ def test_extension_manifest_is_least_privilege():
     manifest = json.loads((EXTENSION_DIR / "manifest.json").read_text())
     assert manifest["manifest_version"] == 3
     # webNavigation: getFrame for document identity, plus request-local
-    # same-document history events for back/forward confirmation. No new
-    # permission, navigation initiator, or general history API is added.
+    # same-document history events for back/forward confirmation, plus main-frame
+    # lifecycle invalidation while an inert fixture is attested. No new permission,
+    # navigation initiator, or general history API is added.
     assert sorted(manifest["permissions"]) == sorted(["nativeMessaging", "tabs", "scripting", "storage", "alarms",
                                                       "webNavigation"])
     assert manifest["optional_host_permissions"] == ["http://*/*", "https://*/*"]
@@ -221,7 +222,8 @@ def test_extension_manifest_is_least_privilege():
     code = "\n".join(re.sub(r"(?m)^\s*//.*$", "", p.read_text()) for p in EXTENSION_DIR.glob("*.js"))
     assert set(re.findall(r"webNavigation\.(\w+)", code)) == {
         "getFrame", "onHistoryStateUpdated", "onReferenceFragmentUpdated",
-    }, "webNavigation is limited to document identity and bounded history confirmation"
+        "onBeforeNavigate", "onCommitted", "onCompleted", "onErrorOccurred",
+    }, "webNavigation is limited to identity, history confirmation and attested-fixture lifecycle invalidation"
 
 
 def test_extension_has_no_page_bridge_or_remote_code():
@@ -232,7 +234,7 @@ def test_extension_has_no_page_bridge_or_remote_code():
         for forbidden in ("postMessage(window", "window.postMessage", "addEventListener(\"message\"",
                           "onMessageExternal", "onConnectExternal", "eval(", "new Function",
                           "chrome.debugger", "captureVisibleTab", "chrome.cookies", "fetch(",
-                          "XMLHttpRequest", "WebSocket", "http://localhost", "127.0.0.1"):
+                          "XMLHttpRequest", "WebSocket", "http://localhost"):
             assert forbidden not in text, f"{forbidden!r} in {name}"
     assert "<script>" not in sources["popup.html"]  # MV3 CSP: no inline script
 

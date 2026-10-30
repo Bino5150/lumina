@@ -127,7 +127,7 @@ def test_one_navigation_allow_discloses_stage2_scope():
     assert popup.count('id="navigation"') == 1
     readme = (WORKER.parent.parent / "README.md").read_text().lower()
     assert "follows one verified same-origin link" in readme
-    assert "cannot click page elements" in readme
+    assert "cannot interact with ordinary website controls" in readme
     assert "cannot click page elements, type, submit, follow observed links" not in readme
 
 
@@ -373,7 +373,7 @@ def test_stage_two_added_no_typing_or_submission_capability():
     # navigate (reviewed there); still no typing, filling or submitting op.
     assert set(protocol.OPS) == {"ping", "list_tabs", "get_active_tab", "get_tab",
                                  "extract_text", "get_links", "open_owner_url",
-                                 "switch_tab", "follow_link", "observe", "navigate"}
+                                 "switch_tab", "follow_link", "observe", "navigate", "interact"}
 
 
 def test_the_extension_still_never_executes_page_code_for_a_navigation():

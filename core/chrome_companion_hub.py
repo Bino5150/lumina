@@ -122,12 +122,12 @@ _DISCONNECT_MESSAGES = {
     "uninstalled": "the owner uninstalled Chrome Companion",
 }
 
-ACTION_OPS = frozenset({"open_owner_url", "switch_tab", "follow_link", "navigate"})
+ACTION_OPS = frozenset({"open_owner_url", "switch_tab", "follow_link", "navigate", "interact"})
 
 # Extension versions this hub KNOWS. Fail closed: a version not listed here --
 # including a newer one -- is never sent an action or a newer-vocabulary op,
 # because its semantics have not been reviewed against this hub.
-KNOWN_EXTENSION_VERSIONS = ((0, 2, 0), (0, 3, 0), (0, 4, 0), (0, 4, 1))
+KNOWN_EXTENSION_VERSIONS = ((0, 2, 0), (0, 3, 0), (0, 4, 0), (0, 4, 1), (0, 5, 0))
 # The oldest known version that speaks each op's vocabulary. An op not
 # listed is a 01A read every paired version serves. A newer known version
 # keeps serving every older op; an older one is refused the newer ops up
@@ -136,6 +136,7 @@ OP_MIN_EXTENSION_VERSION = {
     "open_owner_url": (0, 2, 0), "switch_tab": (0, 2, 0),
     "follow_link": (0, 3, 0),
     "observe": (0, 4, 0), "navigate": (0, 4, 0),
+    "interact": (0, 5, 0),
 }
 
 
@@ -741,6 +742,9 @@ class ChromeCompanionHub:
                 and not extension_version_at_least(conn.extension_version, OP_MIN_EXTENSION_VERSION[op]):
             raise CompanionError("unsupported_version", "reload the Chrome Companion extension for this operation")
         if op in ACTION_OPS:
+            if op == "interact" and not conn.has_delivered_ref(tab_id, (args or {}).get("document_id"),
+                                                             (args or {}).get("ref")):
+                raise CompanionError("target_not_found", "interaction target was not delivered on this connection")
             if op == "follow_link" and not conn.has_delivered_link(tab_id, args or {}):
                 raise CompanionError("target_not_found", "link was not delivered by get_links on this connection")
             if op == "navigate" and (args or {}).get("kind") == "ref" \
@@ -781,6 +785,17 @@ class ChromeCompanionHub:
                 raise CompanionError("malformed_response", f"invalid {op} result ({exc.code})") from exc
             if op in ACTION_OPS and response["result"]["operation_id"] != f"{conn.connection_id}:{request_id}":
                 raise CompanionError("malformed_response", "Chrome returned the wrong operation identity")
+            if op == "interact":
+                result = response["result"]
+                if any(result[key] != args[key] for key in ("kind", "ref", "gen")):
+                    raise CompanionError("malformed_response", "interaction receipt differs from the request")
+                if result["status"] == "browser_local_effect_observed":
+                    observed = response.get("observed") or {}
+                    desired = True if args["kind"] == "focus" else args["value"]
+                    if (result["window_id"] != args["window_id"] or result["observed_url"] != args["fixture_url"]
+                            or observed.get("document_id") != args["document_id"]
+                            or result["after"] is not desired or result["load_confirmed"] is not False):
+                        raise CompanionError("malformed_response", "interaction effect does not match its bound request")
             self._apply_policy(op, response)
             if op == "get_links":
                 conn.record_delivered_links(response["tab_id"], response["observed"]["document_id"],
@@ -852,6 +867,13 @@ class ChromeCompanionHub:
             url = result["observed_url"]
             if url is not None and not policy.classify_url(url).readable:
                 raise CompanionError("restricted_surface", "Chrome returned a restricted action surface")
+            if op == "interact" and result["status"] == "browser_local_effect_observed":
+                from chrome_companion.interaction import is_fixture_url
+                observed = response["observed"]
+                if (not is_fixture_url(url) or not observed or observed["url"] != url
+                        or not observed["document_id"] or observed["origin"] != policy.classify_url(url).origin
+                        or response["tab_id"] != result["tab_id"] or result["tab_id"] is None):
+                    raise CompanionError("malformed_response", "interaction lacks a verified fixture document")
             if op in {"follow_link", "navigate"} and result["status"] == "browser_local_effect_observed":
                 observed = response["observed"]
                 if not result["load_confirmed"] or observed is None \

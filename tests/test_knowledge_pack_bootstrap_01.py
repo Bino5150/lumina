@@ -120,6 +120,32 @@ def test_bootstrap_is_idempotent(kb_env):
     assert _row_count(kb_env["db_path"], category=CATEGORY) == len(load_official_pack())
 
 
+def test_existing_v1_keeps_custom_content_and_deletion_when_shipped_guidance_changes(kb_env, monkeypatch):
+    """There is no approved per-version migration: preserve owner choices.
+
+    A pack-file edit alone deliberately does not refresh an installed row.
+    Bumping the version would re-enter the seed loop and resurrect missing
+    titles; a separate migration decision is required before doing that.
+    """
+    import core.knowledge_bootstrap as kb
+    from pathlib import Path
+    assert kb.PACK_VERSION == 1
+    shipped = kb.load_official_pack()
+    first, deleted = shipped[0]["title"], shipped[1]["title"]
+    _bootstrap(kb_env)
+    with sqlite3.connect(kb_env["db_path"]) as conn:
+        conn.execute("UPDATE knowledge SET content='OWNER CUSTOMIZED' WHERE category=? AND title=?", (CATEGORY, first))
+        conn.execute("DELETE FROM knowledge WHERE category=? AND title=?", (CATEGORY, deleted))
+    marker = Path(kb_env["data_dir"]) / "knowledge_packs_installed.json"
+    before = marker.read_bytes()
+    monkeypatch.setattr(kb, "load_official_pack", lambda: [dict(e, content="NEW SHIPPED GUIDANCE") for e in shipped])
+    assert _bootstrap(kb_env) == []
+    with sqlite3.connect(kb_env["db_path"]) as conn:
+        assert conn.execute("SELECT content FROM knowledge WHERE category=? AND title=?", (CATEGORY, first)).fetchone()[0] == "OWNER CUSTOMIZED"
+        assert conn.execute("SELECT 1 FROM knowledge WHERE category=? AND title=?", (CATEGORY, deleted)).fetchone() is None
+    assert marker.read_bytes() == before
+
+
 def test_bootstrap_respects_partial_manual_deletion(kb_env):
     """If the owner (or Lumina, via an approved delete_knowledge) removes
     ONE official entry, re-running the bootstrap must not resurrect it."""

@@ -12,7 +12,7 @@ do, and exactly what has to be true before it can do it.
 
 ## What it can do
 
-Eleven tools, in three groups:
+Twelve tools, in four groups:
 
 **Read-only** (`chrome_status`, `chrome_list_tabs`, `chrome_get_active_tab`,
 `chrome_get_url_title`, `chrome_extract_visible_text`, `chrome_get_links`) —
@@ -34,12 +34,110 @@ sites, or go back/forward. These work the same on every website; no
 site-specific support is needed or consulted. See
 [Generic browsing](#generic-browsing-within-your-request) below.
 
-**None of the following exist in this build:** clicking buttons or other
-page controls, typing, filling or submitting forms, posting or sending
+**Inert fixture interaction** (`chrome_interact`) — focus a plain text
+field, set a native checkbox or activate a native disclosure on an explicitly
+approved local test document. This has a separate owner grant and mission,
+described below. It does not authorize ordinary website controls.
+
+**None of the following exist in this build:** arbitrary button clicks,
+typing, filling or submitting forms, posting or sending
 anything, screenshots, cookie/password access, or any debugger/CDP access.
 There is no selector argument and no page-script tool: Lumina names an
 element only by a reference the extension itself handed her for that exact
 page.
+
+## Inert fixture interactions (F0)
+
+Prepare an inert page whose controls have no external effects. The supplied
+`chrome_companion/fixtures/inert.html` has no scripts, persistence, external
+resources or form submission. For example, serve that directory with
+`python -m http.server 8765 --bind 127.0.0.1 --directory chrome_companion/fixtures`
+and open `http://127.0.0.1:8765/inert.html` in a disposable Chrome profile.
+The fixture must use exactly `http://127.0.0.1:<non-default-port>/…`.
+Loopback is a restriction, **not evidence of safety**; another local page can
+still have consequential event handlers. Only attest a fixture you prepared
+and verified. Unknown ordinary website consequences remain unsupported.
+
+1. Allow site reading and Navigation Allow in the extension popup.
+2. On the fixture tab, click **I verified this inert fixture — allow interactions**.
+   This grants only this connection, exact URL, tab, window, Chrome document
+   and extension-private document identity. It does not persist across PAUSE,
+   reconnect or restart. Stop fixture interactions, Navigation Allow changes
+   and site revoke withdraw the grant. Regranting a site cannot revive it.
+3. Begin an authenticated owner request with `test browser fixture <exact URL>`.
+   Only this command adds the fixture class to the current mission, capped at
+   30 operations and the existing 30-minute lifetime. Tool, page, email and
+   peer text cannot create or expand it.
+4. Use `chrome_observe`, then pass its `tab_id`, `window_id`, `document_id`,
+   `gen` and target `ref` to `chrome_interact`. Fixed actions are `focus`
+   (plain text/search input or textarea), `set_checked` (native checkbox,
+   boolean `value`) and `set_expanded` (native details/summary, boolean `value`).
+   No selector, script, arbitrary button, keypress or submission is accepted.
+5. Re-observe after each operation. A generation is consumed before possible
+   dispatch; even a new operation ID cannot reuse it after a lost answer.
+
+Interaction targets require the very node observed. Re-rendered lookalikes,
+changed documents/URLs, DOM changes, intervening trusted input, hidden,
+disabled, readonly, sensitive or obscured controls require re-observation or
+refusal. Frames and shadow-root controls are unsupported. There is no scrolling
+or alternate targeting to make a refused operation succeed. An already desired
+checkbox/disclosure state is observed without another click.
+
+Starting a navigation invalidates the fixture's prior observations, even if
+the navigation later fails or is canceled. Wait for the tab to settle and
+observe again; reading an old document during a pending load does not make
+its controls eligible for an action. A same-document history/fragment change
+also requires a fresh observation. Navigation in another tab or a child
+frame does not revoke this main-document observation.
+Refusals identify a pending navigation, incomplete load or stale document
+when known. Wait for navigation/loading to settle before observing again;
+waiting may not resolve the condition. If execution is uncertain, observe
+actual state to reconcile it and do not retry that action automatically.
+
+The worker watches navigation in the attested tab, and the fixed actuator
+also checks lifecycle changes inside the observed document immediately before
+acting. These checks cannot cancel an already admitted browser task across
+processes. If lifecycle notification is delayed until after admission, an
+effect may occur; a detected transition after possible dispatch yields only
+an ambiguous receipt, with no automatic replay. This remains an inert,
+owner-prepared fixture feature, not an atomic navigation/action API for
+consequential websites.
+
+Receipts include the operation ID, kind, ref, observation generation and
+bounded boolean before/after state. A pre-dispatch refusal is
+`failed_before_dispatch`. A verified local effect is
+`browser_local_effect_observed`; `load_confirmed` stays false because no
+navigation was established. An injection/transport error, changed binding or
+owner-control withdrawal after possible dispatch is `ambiguous_after_dispatch`.
+Re-observe to reconcile; never retry automatically. A local state read proves
+only that state at the observation instant, not a server commit or durable
+application outcome. An already dispatched effect cannot be recalled by PAUSE
+or revoke; the receipt must retain ambiguity if those controls overtake it.
+
+### F1 and future consequential actions
+
+F1 fill, clear, replace and select are gated on independent F0 review and
+testing. They are not implemented in this F0 candidate. Text entry may invoke
+page handlers; neither filling nor focusing authorizes submission or Enter.
+
+F2 is design-only and has no production actuator. A future consequential
+operation must preserve the exact proposed content (and attachment hashes),
+exact target/account/origin, consequence, action class, mission/scope, current
+tab/window/document/element binding, expiry and unique operation identity.
+An authenticated owner approval must bind that exact proposal at a trusted
+final-admission boundary. Existing site grants, rendered page claims, tool
+results and peer messages cannot approve it. Editing the content or target
+voids approval. Writable same-UID files are not a sufficient approval boundary;
+the dormant site-action/Authority Plane contracts need independent acceptance
+before integration. No F0 fixture grant promotes into external-write authority.
+
+Before dispatch, repeat all permission, provenance and binding checks and
+atomically spend approval/operation identity. After possible dispatch, record
+an unknown outcome until independent service evidence establishes the exact
+effect, where available. No retry/replay without verified service idempotency
+or reconciliation. A browser acknowledgement or changed page cannot confirm
+a publish, message, purchase, upload, deletion or permission change. Live
+consequential activation remains a separate owner decision.
 
 ## Following a link you already read (Stage 2)
 

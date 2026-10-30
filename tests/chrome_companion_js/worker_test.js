@@ -265,6 +265,14 @@ function makeEnv(opts = {}) {
       onRemoved: { addListener: (fn) => env.listeners.permissionRemoved.push(fn) },
     },
     webNavigation: {
+      onBeforeNavigate: { addListener(fn) { (env.listeners.beforeNavigate ||= new Set()).add(fn); },
+        removeListener(fn) { env.listeners.beforeNavigate.delete(fn); } },
+      onCommitted: { addListener(fn) { (env.listeners.committed ||= new Set()).add(fn); },
+        removeListener(fn) { env.listeners.committed.delete(fn); } },
+      onCompleted: { addListener(fn) { (env.listeners.completed ||= new Set()).add(fn); },
+        removeListener(fn) { env.listeners.completed.delete(fn); } },
+      onErrorOccurred: { addListener(fn) { (env.listeners.navError ||= new Set()).add(fn); },
+        removeListener(fn) { env.listeners.navError.delete(fn); } },
       onHistoryStateUpdated: {
         addListener(fn) { (env.listeners.history ||= new Set()).add(fn); },
         removeListener(fn) { env.listeners.history.delete(fn); },
@@ -2934,7 +2942,7 @@ test("FINGER-STALE-DOC: refs and links share ONE identity per document (no compe
   await observeLinks(port);
   const holder = env.worldFor(7, FINGER_DOC);
   const docNonce = vm.runInContext("globalThis.__luminaCompanionDocument_v1.nonce", holder.world);
-  const regNonce = vm.runInContext("globalThis.__luminaCompanionRegistry_v1.nonce", holder.world);
+  const regNonce = vm.runInContext("globalThis.__luminaCompanionRegistry_v2.nonce", holder.world);
   assert.equal(regNonce, docNonce, "the element registry adopts the document identity");
   assert.equal(env.peek("session.deliveredLinks.get(7).nonce"), env.peek("session.deliveredRefs.get(7).nonce"));
   await env.popup({ kind: "set_navigation", allowed: true });
@@ -3987,6 +3995,451 @@ test("HARDEN H-TAB: an ambiguous chrome_navigate(ref) names its tab", async () =
   assert.equal(answer.result.status, "ambiguous_after_dispatch");
   assert.equal(answer.tab_id, 7);
   assert.equal(env.navigationCalls.length, 1);
+});
+
+const FIXTURE_URL = "http://127.0.0.1:8765/inert.html";
+async function fixtureWorld(prepare = () => {}) {
+  const env = makeEnv({ tabs: [{ id: 7, windowId: 1, active: true, incognito: false,
+    status: "complete", url: FIXTURE_URL, title: "Inert fixture" }], granted: ["http://127.0.0.1/*"],
+  pages: { 7: { href: FIXTURE_URL, nodes: [
+    { tag: "section", attrs: { id: "controls" }, children: [
+    { tag: "input", attrs: { id: "field", "aria-label": "Notes" }, rect: { top: 20 } },
+    { tag: "input", attrs: { id: "check", type: "checkbox", "aria-label": "Fixture toggle" }, rect: { top: 70 } },
+    { tag: "details", attrs: { id: "details" }, rect: { top: 110, height: 65 }, children: [
+      { tag: "summary", attrs: { id: "summary" }, text: "Fixture disclosure", rect: { top: 120 } }] },
+    { tag: "button", attrs: { id: "write" }, text: "Delete all", rect: { top: 200 } },
+    ] },
+    { tag: "p", attrs: { id: "notice" }, text: "Fixture status", rect: { top: 260 } },
+  ] } } });
+  prepare(env.pages[7]); // initial ancestry/state, before any observation
+  const port = await toReady(env);
+  await env.popup({ kind: "set_navigation", allowed: true });
+  assert.equal((await env.popup({ kind: "allow_fixture" })).ok, true);
+  const observe = async () => single(port, request("observe", { tab_id: 7 }));
+  const observation = await observe();
+  const args = (name, kind, extra = {}) => ({ kind, window_id: 1, document_id: observation.observed.document_id,
+    ref: observation.result.elements.find((e) => e.name === name).ref, gen: observation.result.gen,
+    fixture_url: FIXTURE_URL, ...extra });
+  return { env, port, observation, observe, args, doc: env.pages[7].dom };
+}
+
+for (const [name, kind, extra, id] of [["Notes", "focus", {}, "field"],
+  ["Fixture toggle", "set_checked", { value: true }, "check"],
+  ["Fixture disclosure", "set_expanded", { value: true }, "summary"]]) {
+  test(`F0: ${kind} observes a local effect and consumes the generation`, async () => {
+    const { port, args, doc } = await fixtureWorld();
+    const req = request("interact", { tab_id: 7, args: args(name, kind, extra) });
+    const answer = await single(port, req);
+    assert.equal(answer.ok, true, JSON.stringify(answer));
+    assert.equal(answer.result.status, "browser_local_effect_observed");
+    assert.equal(answer.result.after, true);
+    const count = doc.find(id).clickCount;
+    const sent = port.sent.length;
+    await call(port, req);
+    assert.equal(port.sent.length, sent, "same request id never repeats");
+    const again = await single(port, request("interact", { tab_id: 7, args: req.args }));
+    assert.equal(again.error.code, "stale_observation");
+    assert.equal(doc.find(id).clickCount, count, "new id cannot replay a consumed observation");
+  });
+}
+
+for (const [label, mutate, expected] of [
+  ["missing fixture grant", ({ env }) => env.popup({ kind: "stop_fixture" }), "fixture_not_allowed"],
+  ["wrong window", (w) => { w.claim.window_id = 9; }, "fixture_not_allowed"],
+  ["wrong document", (w) => { w.claim.document_id = "replacement"; }, "fixture_not_allowed"],
+  ["wrong ref", (w) => { w.claim.ref = "e9999"; }, "stale_observation"],
+  ["old generation", (w) => { w.claim.gen += 1; }, "stale_observation"],
+  ["unknown button", (w) => { w.claim = w.args("Delete all", "set_expanded", { value: true }); }, "unknown_consequence"],
+  ["detached node", ({ doc }) => doc.find("check").remove(), "stale_target"],
+  ["hidden node", ({ doc }) => { doc.find("check").styleSpec.display = "none"; }, "not_interactable"],
+  ["disabled node", ({ doc }) => { doc.find("check").disabled = true; }, "target_changed"],
+  ["changed checkbox", ({ doc }) => { doc.find("check").checked = true; }, "target_changed"],
+  ["concurrent owner key", ({ doc }) => doc.emitUser("keydown"), "stale_observation"],
+  ["overlay", ({ doc }) => { doc.elementFromPoint = () => doc.find("write"); }, "target_obscured"],
+  ["new same-url document", ({ env }) => { env.documents[7] = "new-doc"; }, "stale_document"],
+  ["navigation after observation", ({ env }) => { env.tabs[0].url += "?changed"; }, "stale_document"],
+]) {
+  test(`F0: ${label} refuses before actuator effects`, async () => {
+    const w = await fixtureWorld();
+    w.claim = w.args("Fixture toggle", "set_checked", { value: true });
+    await mutate(w);
+    const answer = await single(w.port, request("interact", { tab_id: 7, args: w.claim }));
+    assert.equal(answer.ok, false, JSON.stringify(answer));
+    assert.equal(answer.error.code, expected);
+    assert.equal(w.doc.find("check")?.clickCount || 0, 0);
+    assert.equal(w.doc.find("write").clickCount, 0);
+  });
+}
+
+test("F0: revoke and regrant never restore a fixture grant", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  await env.popupRevoke("http://127.0.0.1/*");
+  env.granted.add("http://127.0.0.1/*");
+  await env.popup({ kind: "allow_site", pattern: "http://127.0.0.1/*" });
+  const answer = await single(port, request("interact", { tab_id: 7,
+    args: args("Fixture toggle", "set_checked", { value: true }) }));
+  assert.equal(answer.error.code, "fixture_not_allowed");
+  assert.equal(doc.find("check").clickCount, 0);
+});
+
+test("F0 review: unrelated DOM mutation alone invalidates the observation", async () => {
+  const { port, args, doc } = await fixtureWorld();
+  const claim = args("Fixture toggle", "set_checked", { value: true });
+  doc.find("notice").setAttribute("data-warning", "new page context");
+  const answer = await single(port, request("interact", { tab_id: 7, args: claim }));
+  assert.equal(answer.error?.code, "stale_observation", JSON.stringify(answer));
+  assert.equal(doc.find("check").clickCount, 0);
+});
+
+for (const [attr, value] of [["disabled", ""], ["hidden", ""], ["inert", ""],
+  ["aria-disabled", "true"], ["aria-hidden", "true"]]) {
+  test(`F0 review: an initially ${attr} ancestor blocks its ordinary child`, async () => {
+    const { port, args, doc } = await fixtureWorld((page) => {
+      page.nodes[0].attrs[attr] = value;
+    });
+    // The child has no blocking attribute; geometry, hit test and target
+    // state remain ordinary. Only the ancestor action gate refuses it.
+    const child = doc.find("check");
+    assert.equal(child.disabled, false);
+    assert.equal(child.hasAttribute(attr), false);
+    assert.equal(child.checkVisibility(), true);
+    if (["inert", "aria-hidden"].includes(attr)) {
+      // Observation already omits these inherited hidden controls. No ref
+      // exists to authorize an action; don't manufacture one in the test.
+      const observed = await single(port, request("observe", { tab_id: 7 }));
+      assert.equal(observed.result.elements.some((e) => e.name === "Fixture toggle"), false);
+      assert.equal(child.clickCount, 0);
+      return;
+    }
+    const answer = await single(port, request("interact", { tab_id: 7,
+      args: args("Fixture toggle", "set_checked", { value: true }) }));
+    assert.equal(answer.error?.code, "not_interactable", JSON.stringify(answer));
+    assert.equal(child.clickCount, 0);
+  });
+  test(`F0 review: an ancestor becoming ${attr} invalidates an existing child ref`, async () => {
+    const { port, args, doc } = await fixtureWorld();
+    const claim = args("Fixture toggle", "set_checked", { value: true });
+    doc.find("controls").setAttribute(attr, value);
+    const answer = await single(port, request("interact", { tab_id: 7, args: claim }));
+    assert.equal(answer.error?.code, "stale_observation", JSON.stringify(answer));
+    assert.equal(doc.find("check").clickCount, 0);
+  });
+}
+
+for (const [label, change] of [
+  ["tab moved to another window", (w) => { w.env.tabs[0].windowId = 2; }],
+  ["main frame replaced", (w) => { w.env.documents[7] = "replacement-main-frame"; }],
+  ["main frame URL diverges from tab", (w) => { w.env.frameHook = () => ({
+    documentId: w.observation.observed.document_id, documentLifecycle: "active", url: FIXTURE_URL + "?frame" }); }],
+  ["main document is no longer active", (w) => { w.env.frameHook = () => ({
+    documentId: w.observation.observed.document_id, documentLifecycle: "cached", url: FIXTURE_URL }); }],
+]) {
+  test(`F0 review: ${label} invalidates the target before effects`, async () => {
+    const w = await fixtureWorld();
+    const claim = w.args("Fixture toggle", "set_checked", { value: true });
+    change(w);
+    const answer = await single(w.port, request("interact", { tab_id: 7, args: claim }));
+    assert.equal(answer.error?.code, "stale_document", JSON.stringify(answer));
+    assert.equal(w.doc.find("check").clickCount, 0);
+  });
+}
+
+test("F0 review: a fixture observation cannot be used in another tab", async () => {
+  const { port, args, doc } = await fixtureWorld();
+  const answer = await single(port, request("interact", { tab_id: 8,
+    args: args("Fixture toggle", "set_checked", { value: true }) }));
+  assert.equal(answer.error?.code, "fixture_not_allowed", JSON.stringify(answer));
+  assert.equal(doc.find("check").clickCount, 0);
+});
+
+test("F0 review: a pending navigation refuses before the still-live old document can act", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  const claim = args("Fixture toggle", "set_checked", { value: true });
+  // Chrome retains the old committed URL/document while the next response
+  // is pending. Their equality alone must not permit a new actuator call.
+  env.tabs[0].status = "loading";
+  env.tabs[0].pendingUrl = FIXTURE_URL + "?next";
+  const answer = await single(port, request("interact", { tab_id: 7, args: claim }));
+  assert.equal(answer.error?.code, "navigation_pending", JSON.stringify(answer));
+  assert.equal(doc.find("check").clickCount, 0);
+  assert.equal(env.injections.filter((x) => x.func.name === "interactWithFixture").length, 0);
+});
+
+test("F0 review: navigation starting after the local effect prevents a success receipt", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  env.injectionHook = (details) => {
+    if (details.func.name !== "interactWithFixture") return undefined;
+    const documentId = details.target.documentIds[0];
+    const result = runInPage(details.func, details.args, env.pages[7], () => {}, env.worldFor(7, documentId));
+    env.tabs[0].status = "loading";
+    env.tabs[0].pendingUrl = FIXTURE_URL + "?next";
+    return [{ documentId, frameId: 0, result }];
+  };
+  const answer = await single(port, request("interact", { tab_id: 7,
+    args: args("Fixture toggle", "set_checked", { value: true }) }));
+  assert.equal(doc.find("check").clickCount, 1);
+  assert.equal(answer.result.status, "ambiguous_after_dispatch", JSON.stringify(answer));
+  assert.equal(answer.result.after, null);
+  assert.equal(answer.observed, null);
+});
+
+function fixtureNavigation(env, kind, change = {}) {
+  for (const fn of env.listeners[kind] || []) fn({ tabId: 7, frameId: 0, url: FIXTURE_URL, ...change });
+}
+
+function freshFixtureClaim(observed) {
+  return { kind: "set_checked", value: true, window_id: 1, document_id: observed.observed.document_id,
+    ref: observed.result.elements.find((e) => e.name === "Fixture toggle").ref,
+    gen: observed.result.gen, fixture_url: FIXTURE_URL };
+}
+
+for (const kind of ["beforeNavigate", "committed", "completed", "navError", "history", "fragment"]) {
+  test(`F0 navigation: ${kind} invalidates the old observation even at the same URL`, async () => {
+    const { env, port, args, doc } = await fixtureWorld();
+    const claim = args("Fixture toggle", "set_checked", { value: true });
+    fixtureNavigation(env, kind);
+    const answer = await single(port, request("interact", { tab_id: 7, args: claim }));
+    assert.equal(answer.error?.code, "stale_observation", JSON.stringify(answer));
+    assert.equal(doc.find("check").clickCount, 0);
+  });
+}
+
+test("F0 navigation: unrelated tabs and subframes do not invalidate the fixture main frame", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  fixtureNavigation(env, "beforeNavigate", { tabId: 10 });
+  fixtureNavigation(env, "beforeNavigate", { frameId: 2 });
+  const answer = await single(port, request("interact", { tab_id: 7,
+    args: args("Fixture toggle", "set_checked", { value: true }) }));
+  assert.equal(answer.result?.status, "browser_local_effect_observed", JSON.stringify(answer));
+  assert.equal(doc.find("check").clickCount, 1);
+});
+
+test("F0 navigation: canceled or failed navigation requires a fresh observation, not a replay", async () => {
+  const { env, port, args, doc, observe } = await fixtureWorld();
+  const old = args("Fixture toggle", "set_checked", { value: true });
+  doc.emitLifecycle("beforeunload");
+  fixtureNavigation(env, "beforeNavigate");
+  fixtureNavigation(env, "navError"); // old committed document remains active after cancellation
+  assert.equal((await single(port, request("interact", { tab_id: 7, args: old }))).error?.code,
+    "stale_observation");
+  const fresh = await observe();
+  const answer = await single(port, request("interact", { tab_id: 7, args: freshFixtureClaim(fresh) }));
+  assert.equal(answer.result?.status, "browser_local_effect_observed", JSON.stringify(answer));
+  assert.equal(doc.find("check").clickCount, 1);
+});
+
+test("F0 navigation: observing an unresolved load cannot create action eligibility", async () => {
+  const { env, port, doc, observe } = await fixtureWorld();
+  env.tabs[0].status = "loading";
+  env.tabs[0].pendingUrl = FIXTURE_URL + "?next";
+  const pending = await observe();
+  env.tabs[0].status = "complete"; delete env.tabs[0].pendingUrl;
+  const answer = await single(port, request("interact", { tab_id: 7, args: freshFixtureClaim(pending) }));
+  assert.equal(answer.error?.code, "stale_observation", JSON.stringify(answer));
+  assert.equal(doc.find("check").clickCount, 0);
+});
+
+for (const event of ["beforeunload", "pagehide", "pageshow", "popstate", "hashchange"]) {
+  test(`F0 navigation: renderer ${event} arriving after worker checks stops the actuator`, async () => {
+    const { env, port, args, doc } = await fixtureWorld();
+    env.injectionHook = (details) => {
+      if (details.func.name !== "interactWithFixture") return undefined;
+      doc.emitLifecycle(event); // worker notification has not arrived yet
+      return undefined; // run the REAL actuator after the local lifecycle event
+    };
+    const answer = await single(port, request("interact", { tab_id: 7,
+      args: args("Fixture toggle", "set_checked", { value: true }) }));
+    assert.equal(answer.error?.code, "stale_observation", JSON.stringify(answer));
+    assert.equal(doc.find("check").clickCount, 0);
+  });
+}
+
+test("F0 navigation: a lifecycle transition during the local effect cannot confirm success", async () => {
+  const { port, args, doc } = await fixtureWorld();
+  const checkbox = doc.find("check"), click = checkbox.click.bind(checkbox);
+  checkbox.click = () => { click(); doc.emitLifecycle("beforeunload"); };
+  const answer = await single(port, request("interact", { tab_id: 7,
+    args: args("Fixture toggle", "set_checked", { value: true }) }));
+  assert.equal(checkbox.clickCount, 1);
+  assert.equal(answer.result?.status, "ambiguous_after_dispatch", JSON.stringify(answer));
+  assert.equal(answer.result.after, null);
+});
+
+test("F0 navigation: a worker event overtaking the final site check stops dispatch", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  env.containsHook = () => { fixtureNavigation(env, "beforeNavigate"); return undefined; };
+  const answer = await single(port, request("interact", { tab_id: 7,
+    args: args("Fixture toggle", "set_checked", { value: true }) }));
+  assert.equal(answer.error?.code, "fixture_not_allowed", JSON.stringify(answer));
+  assert.equal(doc.find("check").clickCount, 0);
+});
+
+test("F0 navigation: an already admitted effect with delayed renderer notification stays ambiguous, once", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  env.injectionHook = (details) => {
+    if (details.func.name !== "interactWithFixture") return undefined;
+    fixtureNavigation(env, "beforeNavigate");
+    // No renderer lifecycle event was delivered before this admitted task.
+    return undefined;
+  };
+  const claim = args("Fixture toggle", "set_checked", { value: true });
+  const answer = await single(port, request("interact", { tab_id: 7, args: claim }));
+  assert.equal(answer.result?.status, "ambiguous_after_dispatch", JSON.stringify(answer));
+  assert.equal(answer.observed, null);
+  assert.equal(doc.find("check").clickCount, 1);
+  const again = await single(port, request("interact", { tab_id: 7, args: claim }));
+  assert.equal(again.error?.code, "stale_observation");
+  assert.equal(doc.find("check").clickCount, 1);
+});
+
+test("F0 navigation: same-document refresh and ordinary subsequent interactions remain usable", async () => {
+  const { env, port, doc, observe } = await fixtureWorld();
+  fixtureNavigation(env, "history");
+  for (const value of [true, false]) {
+    const fresh = await observe();
+    const answer = await single(port, request("interact", { tab_id: 7,
+      args: { ...freshFixtureClaim(fresh), value } }));
+    assert.equal(answer.result?.status, "browser_local_effect_observed", JSON.stringify(answer));
+  }
+  assert.equal(doc.find("check").clickCount, 2);
+});
+
+test("F0 navigation: fixture lifecycle listeners retire with their connection", async () => {
+  const { env } = await fixtureWorld();
+  assert.equal(env.listeners.beforeNavigate.size, 1);
+  await env.popup({ kind: "set_paused", paused: true });
+  for (const kind of ["beforeNavigate", "committed", "completed", "navError", "history", "fragment"])
+    assert.equal(env.listeners[kind].size, 0);
+});
+
+for (const [label, state, code] of [
+  ["loading without pendingUrl", { status: "loading" }, "page_loading"],
+  ["pendingUrl despite complete status", { status: "complete", pendingUrl: FIXTURE_URL + "?pending" }, "navigation_pending"],
+]) {
+  test(`F0 final: ${label} independently prevents dispatch with guidance`, async () => {
+    const { env, port, args, doc } = await fixtureWorld();
+    Object.assign(env.tabs[0], state);
+    const answer = await single(port, request("interact", { tab_id: 7,
+      args: args("Fixture toggle", "set_checked", { value: true }) }));
+    assert.equal(answer.error?.code, code, JSON.stringify(answer));
+    assert.match(answer.error.message, /wait .*settle.*fresh observation/i);
+    assert.equal(doc.find("check").clickCount, 0);
+    assert.equal(env.injections.filter((x) => x.func.name === "interactWithFixture").length, 0);
+  });
+}
+
+test("F0 final: navigation during observation publication cannot mint action eligibility", async () => {
+  const { env, port, doc, observe } = await fixtureWorld();
+  let gets = 0;
+  env.tabsGetHook = () => {
+    if (++gets === 3) { // final eligibility read, after its epoch comparison
+      fixtureNavigation(env, "beforeNavigate");
+      fixtureNavigation(env, "navError");
+    }
+    return undefined; // settled old document remains available
+  };
+  const observed = await observe();
+  assert.equal(gets, 3);
+  env.tabsGetHook = null;
+  const answer = await single(port, request("interact", { tab_id: 7, args: freshFixtureClaim(observed) }));
+  assert.equal(answer.error?.code, "stale_observation", JSON.stringify(answer));
+  assert.match(answer.error.message, /wait .*settle.*fresh observation/i);
+  assert.equal(doc.find("check").clickCount, 0);
+});
+
+test("F0 final: native-port disconnection retires all fixture listeners", async () => {
+  const { env, port } = await fixtureWorld();
+  assert.equal(env.listeners.beforeNavigate.size, 1);
+  port.onDisconnectFn();
+  for (const kind of ["beforeNavigate", "committed", "completed", "navError", "history", "fragment"])
+    assert.equal(env.listeners[kind].size, 0);
+});
+
+test("F0: a same-url replacement at the actuator is refused by the private document identity", async () => {
+  const { env, port, args, observation } = await fixtureWorld();
+  const replacement = { href: FIXTURE_URL, nodes: JSON.parse(JSON.stringify(env.pages[7].nodes)) };
+  const holder = {};
+  for (let n = 0; n < observation.result.gen; n++)
+    runInPage(env.peek("observePage"), [{ max_items: 40 }], replacement, () => {}, holder);
+  env.injectionHook = (details) => {
+    if (details.func.name !== "interactWithFixture") return undefined;
+    return [{ documentId: details.target.documentIds[0], frameId: 0,
+      result: runInPage(details.func, details.args, replacement, () => {}, holder) }];
+  };
+  const answer = await single(port, request("interact", { tab_id: 7,
+    args: args("Fixture toggle", "set_checked", { value: true }) }));
+  assert.equal(answer.error?.code, "stale_document");
+  assert.equal(replacement.dom.find("check").clickCount, 0);
+});
+
+test("F0: a revoke delivered after actuator effect never becomes a pre-dispatch refusal or success", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  env.injectionHook = async (details) => {
+    if (details.func.name !== "interactWithFixture") return undefined;
+    const documentId = details.target.documentIds[0];
+    const result = runInPage(details.func, details.args, env.pages[7], () => {}, env.worldFor(7, documentId));
+    await env.popupRevoke("http://127.0.0.1/*");
+    return [{ documentId, frameId: 0, result }];
+  };
+  const answer = await single(port, request("interact", { tab_id: 7,
+    args: args("Fixture toggle", "set_checked", { value: true }) }));
+  assert.equal(doc.find("check").clickCount, 1);
+  assert.equal(answer.ok, true, "wire accepted, effect remains ambiguous");
+  assert.equal(answer.result.status, "ambiguous_after_dispatch");
+  assert.equal(answer.result.after, null);
+  assert.equal(answer.observed, null);
+});
+
+test("F0: an overlapping action is refused while the one injected operation is pending", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  const gate = deferred();
+  env.injectionHook = async (details) => {
+    if (details.func.name !== "interactWithFixture") return undefined;
+    await gate.promise;
+    return undefined;
+  };
+  const claim = args("Fixture toggle", "set_checked", { value: true });
+  const first = request("interact", { tab_id: 7, args: claim });
+  port.deliver(first); await settle();
+  const second = await single(port, request("interact", { tab_id: 7, args: claim }));
+  assert.equal(second.error.code, "interaction_busy");
+  gate.resolve(); await settle(20);
+  assert.equal(port.sent.find((m) => m.request_id === first.request_id).result.after, true);
+  assert.equal(doc.find("check").clickCount, 1);
+});
+
+test("F0: live websites and page-supplied popup messages cannot allow fixture interaction", async () => {
+  const env = makeEnv(); await toReady(env);
+  assert.equal((await env.popup({ kind: "allow_fixture" })).ok, false);
+  assert.equal(await env.popup({ kind: "allow_fixture" },
+    { id: EXT_ID, tab: { id: 7 }, url: FIXTURE_URL }), "NO_RESPONSE");
+});
+
+test("F0: dispatch without the requested local effect remains ambiguous", async () => {
+  const { port, args, doc } = await fixtureWorld();
+  doc.find("field").focus = () => {}; // browser accepted the call but no focus was established
+  const answer = await single(port, request("interact", { tab_id: 7, args: args("Notes", "focus") }));
+  assert.equal(answer.result.status, "ambiguous_after_dispatch");
+  assert.equal(answer.result.after, null);
+  assert.equal(answer.observed, null);
+});
+
+test("F0: an actuator transport failure after its effect is honestly ambiguous and cannot repeat", async () => {
+  const { env, port, args, doc } = await fixtureWorld();
+  // Use the actual isolated world and model the lost result after execution.
+  env.injectionHook = (details) => {
+    if (details.func.name !== "interactWithFixture") return undefined;
+    const documentId = details.target.documentIds[0];
+    runInPage(details.func, details.args, env.pages[7], () => {}, env.worldFor(7, documentId));
+    throw new Error("lost result");
+  };
+  const req = request("interact", { tab_id: 7, args: args("Fixture toggle", "set_checked", { value: true }) });
+  const answer = await single(port, req);
+  assert.equal(answer.result.status, "ambiguous_after_dispatch");
+  assert.equal(doc.find("check").clickCount, 1);
+  const again = await single(port, request("interact", { tab_id: 7, args: req.args }));
+  assert.equal(again.error.code, "stale_observation");
+  assert.equal(doc.find("check").clickCount, 1);
 });
 
 let running = null;

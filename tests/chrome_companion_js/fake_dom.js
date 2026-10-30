@@ -39,6 +39,10 @@ class FakeElement {
     this.shadowRoot = null;
     this.value = spec.value;
     this.checked = spec.checked;
+    this.open = spec.open === true;
+    this.readOnly = spec.readOnly === true;
+    this.indeterminate = spec.indeterminate === true;
+    this.clickCount = 0;
     this.disabled = spec.disabled === true;
     this.labelsList = [];
     this.scrollTop = 0;
@@ -48,8 +52,24 @@ class FakeElement {
 
   getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? String(this.attrs[name]) : null; }
   hasAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name); }
-  setAttribute(name, value) { this.attrs[name] = String(value); }
+  setAttribute(name, value) {
+    const before = this.getAttribute(name);
+    this.attrs[name] = String(value);
+    if (before !== String(value)) this.doc.queueMutation({ type: "attributes", target: this, attributeName: name });
+  }
   get id() { return this.attrs.id || ""; }
+  get type() { return this.attrs.type || "text"; }
+  contains(el) {
+    for (let node = el; node; node = node.parentNode) if (node === this) return true;
+    return false;
+  }
+  focus() { this.doc.activeElement = this; }
+  click() {
+    this.clickCount += 1;
+    if (this.tagName === "INPUT" && this.type === "checkbox") this.checked = !this.checked;
+    if (this.tagName === "SUMMARY" && this.parentElement?.tagName === "DETAILS")
+      this.parentElement.open = !this.parentElement.open;
+  }
   // As in Chrome: an element that is not rendered answers its textContent;
   // a rendered one omits the text of children that are not rendered.
   get innerText() {
@@ -189,6 +209,23 @@ function linkLabels(doc) {
 function createDocument(pageSpec) {
   const win = { scrollY: 0, innerHeight: pageSpec.viewport?.height ?? 600, innerWidth: pageSpec.viewport?.width ?? 1000 };
   const doc = { window: win, title: pageSpec.title ?? "", baseURI: pageSpec.href };
+  win.listeners = {};
+  win.addEventListener = (name, fn) => { (win.listeners[name] ||= []).push(fn); };
+  doc.emitLifecycle = (name) => { for (const fn of win.listeners[name] || []) fn({ isTrusted: true }); };
+  doc.activeElement = null;
+  // Model the synchronous pending-record path used immediately before the
+  // actuator. Browser microtask delivery is exercised in real Chrome.
+  doc.mutationObservers = new Set();
+  doc.queueMutation = (record) => {
+    for (const observer of doc.mutationObservers) observer.records.push(record);
+  };
+  doc.listeners = {};
+  doc.addEventListener = (name, fn) => { (doc.listeners[name] ||= []).push(fn); };
+  doc.emitUser = (name) => { for (const fn of doc.listeners[name] || []) fn({ isTrusted: true }); };
+  doc.elementFromPoint = (x, y) => doc.querySelectorAll("*").filter((el) => {
+    const r = el.getBoundingClientRect();
+    return el.checkVisibility() && x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+  }).at(-1) || null;
   doc.documentElement = build({ tag: "html", children: pageSpec.nodes || [], rect: { top: 0, left: 0, width: win.innerWidth,
     height: pageSpec.scrollHeight ?? win.innerHeight } }, doc, null);
   doc.documentElement.scrollHeight = pageSpec.scrollHeight ?? win.innerHeight;
@@ -205,7 +242,16 @@ function createWorld(pageSpec, doc, navigate) {
     assign: (url) => navigate(url) };
   const win = doc.window;
   const world = vm.createContext({
-    document: doc, location, URL, WeakRef, WeakMap, Map, Set, crypto: webcrypto,
+    document: doc, window: win, location, URL, WeakRef, WeakMap, Map, Set, crypto: webcrypto,
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; this.records = []; }
+      observe(target) {
+        if (target !== doc) throw new Error("fake_dom: only whole-document observation is modeled");
+        doc.mutationObservers.add(this);
+      }
+      takeRecords() { return this.records.splice(0); }
+      disconnect() { doc.mutationObservers.delete(this); this.records = []; }
+    },
     get innerHeight() { return win.innerHeight; },
     get innerWidth() { return win.innerWidth; },
     get scrollY() { return win.scrollY; },

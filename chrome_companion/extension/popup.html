@@ -36,6 +36,16 @@
   </section>
 
   <section class="card small">
+    <div class="label">Inert local fixture only</div>
+    <p class="muted">Only enable this on a loopback test page you prepared and verified has no external effects.
+      This authorizes focus, native checkbox and disclosure changes on this exact document.
+      Loopback alone does not make a page safe. Navigation Allow is also required.</p>
+    <div id="fixture-state" class="muted" role="status"></div>
+    <button id="fixture" type="button" class="secondary" hidden>I verified this inert fixture — allow interactions</button>
+    <button id="fixture-stop" type="button" class="secondary" hidden>Stop fixture interactions</button>
+  </section>
+
+  <section class="card small">
     <div class="label">Pairing ID for this Chrome profile</div>
     <div class="row"><code id="instance">…</code><button id="copy" type="button" class="link">Copy</button></div>
     <div id="pair-hint" class="muted" hidden>

@@ -37,3 +37,13 @@ goes through the exact same `list_knowledge`/`search_knowledge`/
   `version` field exists to support. That migration logic doesn't exist
   yet; this is a known, documented limitation of this first pass, not an
   oversight.
+
+The Browser Companion F0 guidance follows this same limit: new installations
+receive the shipped text, while already-seeded version-1 installations keep
+their existing entries and deletions. A version bump alone is unsafe here:
+the seed loop would fill missing titles again without knowing which ones
+the owner deleted, and it would not refresh existing text. F0 does not add
+an automatic migration or overwrite customized knowledge. Runtime tool
+refusals provide the current loading/stale-target guidance independently
+of the installed Knowledge Pack. A safe versioned migration remains a
+separate owner decision.

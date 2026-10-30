@@ -1939,6 +1939,10 @@ def _chrome_action_receipt_success(name: str, result) -> bool:
         return (receipt.get("load_confirmed") is True
                 and isinstance(receipt.get("verified_document_id"), str)
                 and bool(receipt["verified_document_id"]))
+    if name == "chrome_interact":
+        observed = receipt.get("observed")
+        return (isinstance(observed, dict) and bool(observed.get("document_id"))
+                and observed.get("url") == receipt["observed_url"] and type(receipt.get("after")) is bool)
     return True
 
 

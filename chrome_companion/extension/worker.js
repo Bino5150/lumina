@@ -110,10 +110,10 @@ const REQUEST_SEQ_HEX = 12;
 const REQUEST_KEYS = ["v", "type", "connection_id", "request_id", "op", "tab_id", "deadline_ms", "args"];
 const OP_TAB_RULE = { ping: "none", list_tabs: "none", get_active_tab: "none", get_tab: "required",
   extract_text: "optional", get_links: "optional", open_owner_url: "none", switch_tab: "required",
-  follow_link: "required", observe: "optional", navigate: "optional" };
+  follow_link: "required", observe: "optional", navigate: "optional", interact: "required" };
 const OP_ARGS = { ping: {}, list_tabs: {}, get_active_tab: {}, get_tab: {},
   extract_text: { max_chars: [1, LIMITS.MAX_TEXT_CHARS] }, get_links: { max_links: [1, LIMITS.MAX_LINKS] },
-  open_owner_url: null, switch_tab: null, follow_link: null, observe: null, navigate: null };
+  open_owner_url: null, switch_tab: null, follow_link: null, observe: null, navigate: null, interact: null };
 // Every op that may move the owner's browser to another document or tab. The
 // post-dispatch gates below key off this ONE list: an op that can move the
 // browser but is missing from ACTION_OPS would silently skip the owner's
@@ -121,11 +121,19 @@ const OP_ARGS = { ping: {}, list_tabs: {}, get_active_tab: {}, get_tab: {},
 // chrome_companion_hub.py ACTION_OPS and protocol.py OPS. (observe's optional
 // scroll changes only the viewport of the document it reads, under the same
 // read grant, PAUSE and revoke gates as every read; it is not an action.)
-const ACTION_OPS = new Set(["open_owner_url", "switch_tab", "follow_link", "navigate"]);
+const ACTION_OPS = new Set(["open_owner_url", "switch_tab", "follow_link", "navigate", "interact"]);
+const INTERACTION_KINDS = new Set(["focus", "set_checked", "set_expanded"]);
 const TAB_STATUS = new Set(["loading", "complete", "unloaded"]);
 // Fixed, content-free error texts. Raw Chrome error strings can embed URLs,
 // so they never cross the bridge.
 const ERROR_MESSAGES = Object.freeze({
+  fixture_not_allowed: "the owner must explicitly allow this inert loopback fixture in the popup",
+  unknown_consequence: "this control has no supported inert-fixture operation",
+  interaction_busy: "an interaction is already pending; observe again after it finishes",
+  stale_observation: "this observed target is not currently safe to act on; wait for navigation to settle, then obtain a fresh observation; waiting may not resolve it",
+  navigation_pending: "navigation is pending; wait for it to settle, then obtain a fresh observation; waiting may not resolve it",
+  page_loading: "the page has not finished loading; wait for loading to settle, then obtain a fresh observation; waiting may not resolve it",
+  target_obscured: "the target is covered or outside the viewport",
   wrong_connection: "request addressed to a different connection",
   unknown_op: "operation not supported by this companion",
   invalid_args: "malformed request arguments",
@@ -225,7 +233,9 @@ function publicState() {
 
 function statusSnapshot() {
   return { state: publicState(), navigationAllowed: Boolean(session && session.state === "READY"
-    && session.navigationAllowed && !paused), lastError, lastAction, updatedAt: Date.now() };
+    && session.navigationAllowed && !paused), fixtureAllowed: Boolean(session && session.fixtureGrant
+      && grantHeld(session.fixtureGrant.grantEpoch) && session.navigationAllowed && !paused),
+    lastError, lastAction, updatedAt: Date.now() };
 }
 
 async function publishStatus() {
@@ -275,6 +285,8 @@ function connect() {
   }
   const s = { port, state: "CONNECTING", connectionId: null, lastSeq: 0, closed: false,
     deliveredLinks: new Map(), deliveredRefs: new Map(), navigationAllowed: false, navigationEpoch: 0,
+    fixtureGrant: null, fixtureEpoch: 0, fixtureNavigationEpoch: 0, fixtureNavigationCleanup: null,
+    interactionObservations: new Map(), interacting: new Set(),
     endReason: null };
   session = s;
   port.onMessage.addListener((message) => onHostMessage(s, message));
@@ -299,6 +311,7 @@ function connect() {
 function teardown(s, reason, { retry = true } = {}) {
   if (s.closed) return;
   s.closed = true;
+  if (s.fixtureNavigationCleanup) s.fixtureNavigationCleanup();
   s.navigationAllowed = false;
   s.navigationEpoch += 1;
   if (session === s) session = null;
@@ -316,6 +329,7 @@ function onPortDisconnect(s) {
   const detail = (chrome.runtime.lastError && chrome.runtime.lastError.message) || "";
   if (s.closed || s !== session) return;
   s.closed = true;
+  if (s.fixtureNavigationCleanup) s.fixtureNavigationCleanup();
   s.navigationAllowed = false;
   s.navigationEpoch += 1;
   session = null;
@@ -432,6 +446,7 @@ function validateRequest(req) {
   }
   if (req.op === "observe") return validateObserveArgs(req.args);
   if (req.op === "navigate") return validateNavigateArgs(req.tab_id, req.args);
+  if (req.op === "interact") return validateInteractArgs(req.args);
   const spec = OP_ARGS[req.op];
   for (const [name, value] of Object.entries(req.args)) {
     if (!spec[name]) return "invalid_args";
@@ -451,6 +466,27 @@ function validateObserveArgs(args) {
     && args.query.length <= LIMITS.MAX_QUERY_CHARS)) return "invalid_args";
   if ("since_gen" in args && !(Number.isSafeInteger(args.since_gen) && args.since_gen >= 0)) return "invalid_args";
   if ("scroll" in args && !SCROLL_VALUES.has(args.scroll)) return "invalid_args";
+  return null;
+}
+
+function isFixtureUrl(value) {
+  if (typeof value !== "string" || value.length > 4096
+    || !/^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})(\/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]*)$/.test(value)) return false;
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" && u.hostname === "127.0.0.1" && Boolean(u.port)
+      && !u.username && !u.password && !u.hash && u.href === value;
+  } catch { return false; }
+}
+
+function validateInteractArgs(args) {
+  const required = ["kind", "window_id", "document_id", "ref", "gen", "fixture_url"];
+  if (["set_checked", "set_expanded"].includes(args.kind)) required.push("value");
+  if (!INTERACTION_KINDS.has(args.kind) || Object.keys(args).length !== required.length
+    || !required.every((key) => key in args) || !Number.isSafeInteger(args.window_id) || args.window_id < 0
+    || typeof args.document_id !== "string" || !args.document_id || args.document_id.length > 128
+    || typeof args.ref !== "string" || !REF_RE.test(args.ref) || !Number.isSafeInteger(args.gen) || args.gen < 1
+    || !isFixtureUrl(args.fixture_url) || ("value" in args && typeof args.value !== "boolean")) return "invalid_args";
   return null;
 }
 
@@ -518,7 +554,8 @@ async function handleRequest(s, req) {
     outcome = await OPERATIONS[req.op](req, live);
   } catch (error) {
     outcome = req._actionDispatched
-      ? { result: actionReceipt(req, "ambiguous_after_dispatch") }
+      ? { result: req.op === "interact" ? interactionReceipt(req, "ambiguous_after_dispatch")
+        : actionReceipt(req, "ambiguous_after_dispatch") }
       : error instanceof CompanionFailure
         ? { error: error.code, tab_id: error.tabId }
         : { error: "chrome_api_error", tab_id: null };
@@ -555,7 +592,12 @@ async function handleRequest(s, req) {
   // began -- not even one the owner restored before it ended -- and no popup
   // revoke is still waiting for Chrome.
   if (outcome.grantEpoch !== undefined && !grantHeld(outcome.grantEpoch)) {
+    if (req.op === "interact" && req._actionDispatched) {
+      outcome.result = interactionReceipt(req, "ambiguous_after_dispatch");
+      outcome.observed = null;
+    } else {
     return fail("site_access_required", outcome.tab_id ?? null);
+    }
   }
   if (ACTION_OPS.has(req.op) && outcome.result
     && (!s.navigationAllowed || s.navigationEpoch !== outcome.navigationEpoch
@@ -565,6 +607,16 @@ async function handleRequest(s, req) {
     outcome.result.status = "ambiguous_after_dispatch";
     outcome.result.observed_url = null;
     outcome.result.load_confirmed = false;
+  }
+  if (req.op === "interact" && outcome.result && (!s.fixtureGrant
+      || s.fixtureEpoch !== outcome.fixtureEpoch || !grantHeld(s.fixtureGrant.grantEpoch))) {
+    outcome.result = interactionReceipt(req, "ambiguous_after_dispatch");
+    outcome.observed = null;
+  }
+  if (req.op === "interact" && outcome.result?.status !== "browser_local_effect_observed") {
+    outcome.result.observed_url = null;
+    outcome.result.after = null;
+    outcome.observed = null;
   }
   // HARDENING-01: an ambiguous action receipt still concerns the tab the
   // action was dispatched to (or the tab Chrome created for it). Name it, on
@@ -599,6 +651,12 @@ async function handleRequest(s, req) {
       const refs = same ? previous.refs : new Set();
       for (const element of outcome.result.elements) refs.add(element.ref);
       s.deliveredRefs.set(outcome.tab_id, { documentId: outcome.observed.document_id, nonce: outcome.documentNonce, refs });
+      if (!s.interacting.has(outcome.tab_id) && outcome.fixtureNavigationEpoch !== undefined
+        && outcome.fixtureNavigationEpoch === s.fixtureNavigationEpoch) s.interactionObservations.set(outcome.tab_id, {
+        documentId: outcome.observed.document_id, nonce: outcome.documentNonce, url: outcome.observed.url,
+        navigationEpoch: outcome.fixtureNavigationEpoch,
+        gen: outcome.result.gen, refs: new Set(outcome.result.elements.map((e) => e.ref)) });
+      else s.interactionObservations.delete(outcome.tab_id);
     }
     lastAction = { op: req.op, tab_id: outcome.tab_id ?? null, host: outcome.host ?? null, at: Date.now() };
     void publishStatus();
@@ -846,7 +904,7 @@ function observePage(spec) {
     crypto.getRandomValues(bytes);
     globalThis[DOC_KEY] = Object.freeze({ nonce: Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("") });
   }
-  const KEY = "__luminaCompanionRegistry_v1";
+  const KEY = "__luminaCompanionRegistry_v2";
   let reg = globalThis[KEY];
   if (!reg) {
     const L = { name: 120, context: 160, href: 512, value: 80, scan: 6000, shadowDepth: 8, registry: 4000 };
@@ -1106,6 +1164,17 @@ function observePage(spec) {
         return { status: "ok", el: match.el, d: match.d };
       },
     };
+    reg.userEpoch = 0;
+    reg.lifecycleEpoch = 0;
+    reg.domEpoch = 0;
+    reg.mutations = new MutationObserver(() => { reg.domEpoch += 1; });
+    reg.mutations.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    for (const name of ["pointerdown", "keydown", "input", "change", "focusin"])
+      document.addEventListener(name, (event) => { if (event.isTrusted) reg.userEpoch += 1; }, true);
+    // Renderer-local invalidation closes the async worker-check/injection
+    // gap for lifecycle events already delivered to this old document.
+    for (const name of ["beforeunload", "pagehide", "pageshow", "popstate", "hashchange"])
+      window.addEventListener(name, () => { reg.lifecycleEpoch += 1; }, true);
     globalThis[KEY] = reg;
   }
 
@@ -1195,6 +1264,15 @@ function observePage(spec) {
     const sensitive = reg.sensitiveOf(c.el);
     const value = sensitive ? "" : reg.valueOf(c.el, d.kind);
     const state = reg.stateOf(c.el, d.role);
+    // Interaction targets bind the actual observed node, never a re-rendered
+    // lookalike. A generation is consumed before possible dispatch.
+    if (reg.mutations.takeRecords().length) reg.domEpoch += 1;
+    entry.interaction = { node: new WeakRef(c.el), gen, fp, userEpoch: reg.userEpoch, domEpoch: reg.domEpoch,
+      lifecycleEpoch: reg.lifecycleEpoch,
+      type: reg.attr(c.el, "type"),
+      state: JSON.stringify(state), checked: c.el.checked === true,
+      expanded: reg.tagOf(c.el) === "summary" && c.el.parentElement?.open === true,
+      focused: c.el.getRootNode().activeElement === c.el };
     if (sensitive && reg.valueOf(c.el, "field")) state.push("has_value");
     const url = d.href ? new URL(d.href) : null;
     out.push({ ref, role: d.role, name: d.name, kind: d.kind, context: d.context,
@@ -1237,7 +1315,7 @@ function observePage(spec) {
 // Resolve ONE delivered reference to the live link it names (read-only).
 function resolveRefTarget(claim) {
   const out = { href: location.href, status: "not_found", resolved_href: null };
-  const reg = globalThis.__luminaCompanionRegistry_v1;
+  const reg = globalThis.__luminaCompanionRegistry_v2;
   if (!reg || typeof reg.resolve !== "function") return out;
   if (reg.nonce !== claim.document_nonce) {
     out.status = "other_document";
@@ -1261,7 +1339,7 @@ function resolveRefTarget(claim) {
 // exactly where the checked destination does. Never runs page-supplied code.
 function dispatchRefLink(claim) {
   if (location.href !== claim.source_url) return { status: "refused" };
-  const reg = globalThis.__luminaCompanionRegistry_v1;
+  const reg = globalThis.__luminaCompanionRegistry_v2;
   if (!reg || typeof reg.resolve !== "function" || reg.nonce !== claim.document_nonce) return { status: "refused" };
   const hit = reg.resolve(claim.ref);
   if (hit.status !== "ok") return { status: "refused" };
@@ -1276,6 +1354,174 @@ function dispatchRefLink(claim) {
 // whenever the frame loads a new document -- a same-URL reload included --
 // and that page script cannot influence. null unless there is an ACTIVE main
 // document (not prerendering, back/forward-cached, or pending deletion).
+// F0 fixed actuator. Serialized by Chrome into the isolated world; no caller
+// supplies code, a selector or a replacement node. All checks precede effects.
+function interactWithFixture(claim) {
+  const reg = globalThis.__luminaCompanionRegistry_v2;
+  const reject = (rejected) => ({ rejected });
+  if (!reg || reg.nonce !== claim.document_nonce || location.href !== claim.fixture_url)
+    return reject("stale_document");
+  if (Date.now() > claim.deadline_ms) return reject("deadline_expired");
+  const entry = reg.byRef.get(claim.ref);
+  const snapshot = entry && entry.interaction;
+  if (!snapshot || snapshot.gen !== claim.gen || reg.gen !== claim.gen || reg.interactionSpent >= claim.gen)
+    return reject("stale_observation");
+  if (snapshot.lifecycleEpoch !== reg.lifecycleEpoch) return reject("stale_observation");
+  const el = snapshot.node.deref();
+  if (reg.mutations.takeRecords().length) reg.domEpoch += 1;
+  if (snapshot.userEpoch !== reg.userEpoch || snapshot.domEpoch !== reg.domEpoch) return reject("stale_observation");
+  if (!el || !el.isConnected) return reject("stale_target");
+  const d = reg.describe(el);
+  if (reg.fingerprint(d, el) !== snapshot.fp || reg.attr(el, "type") !== snapshot.type
+    || JSON.stringify(reg.stateOf(el, d.role)) !== snapshot.state) return reject("target_changed");
+  if (!reg.visible(el) || el.disabled || el.readOnly || reg.sensitiveOf(el)
+    || el.closest("[disabled],[hidden],[inert],[aria-disabled=true],[aria-hidden=true]"))
+    return reject("not_interactable");
+  // Action visibility is stricter than observation (which describes offscreen
+  // controls too). No scroll/focus/click is used to make a hidden target work.
+  if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return reject("not_interactable");
+  const rect = el.getBoundingClientRect();
+  const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+  if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return reject("target_obscured");
+  const root = el.getRootNode();
+  // Shadow DOM and frames need a separately reviewed hit-test/binding model.
+  if (root !== document) return reject("unknown_consequence");
+  const hit = document.elementFromPoint(x, y);
+  if (!hit || (hit !== el && !el.contains(hit))) return reject("target_obscured");
+  const tag = reg.tagOf(el), type = String(el.type || "text").toLowerCase();
+  let before;
+  const state = () => claim.kind === "focus" ? document.activeElement === el
+    : claim.kind === "set_checked" ? el.checked === true : el.parentElement.open === true;
+  if (claim.kind === "focus") {
+    if (!(tag === "input" && ["text", "search"].includes(type)) && tag !== "textarea")
+      return reject("unknown_consequence");
+    if ((document.activeElement === el) !== snapshot.focused) return reject("target_changed");
+  } else if (claim.kind === "set_checked") {
+    if (tag !== "input" || type !== "checkbox" || el.indeterminate) return reject("unknown_consequence");
+    if ((el.checked === true) !== snapshot.checked) return reject("target_changed");
+  } else if (claim.kind === "set_expanded") {
+    if (tag !== "summary" || !el.parentElement || reg.tagOf(el.parentElement) !== "details"
+      || el.parentElement.querySelector("summary") !== el) return reject("unknown_consequence");
+    if ((el.parentElement.open === true) !== snapshot.expanded) return reject("target_changed");
+  } else return reject("unknown_consequence");
+  before = state();
+  reg.interactionSpent = claim.gen;
+  // No rejection is returned from here on. Exceptions can follow an effect.
+  try {
+    if (claim.kind === "focus") el.focus({ preventScroll: true });
+    else if (before !== claim.value) el.click(); // one native fixture activation
+    const after = state();
+    if (!el.isConnected || location.href !== claim.fixture_url || snapshot.lifecycleEpoch !== reg.lifecycleEpoch
+      || reg.fingerprint(reg.describe(el), el) !== snapshot.fp) return { dispatched: true, before };
+    return { dispatched: true, before, after,
+      established: after === (claim.kind === "focus" ? true : claim.value) };
+  } catch { return { dispatched: true, before }; }
+}
+
+function interactionReceipt(req, status, tab = null, effect = {}) {
+  return { ...actionReceipt(req, status, tab,
+    status === "browser_local_effect_observed" ? tab.url : null, false), kind: req.args.kind,
+  ref: req.args.ref, gen: req.args.gen, before: effect.before ?? null, after: effect.after ?? null };
+}
+
+function fixtureTabSettled(tab) {
+  return tab && tab.status === "complete" && !tab.pendingUrl;
+}
+
+function armFixtureNavigation(s) {
+  if (s.fixtureNavigationCleanup) return;
+  // Only the one attested tab's main-frame events invalidate F0. These
+  // counters convey no authority and retain no URLs or page content.
+  const events = [chrome.webNavigation.onBeforeNavigate, chrome.webNavigation.onCommitted,
+    chrome.webNavigation.onCompleted, chrome.webNavigation.onErrorOccurred,
+    chrome.webNavigation.onHistoryStateUpdated, chrome.webNavigation.onReferenceFragmentUpdated];
+  const invalidate = (event) => {
+    if (session !== s || s.closed || !s.fixtureGrant || event.tabId !== s.fixtureGrant.tabId
+      || event.frameId !== 0) return;
+    s.fixtureNavigationEpoch += 1;
+    s.interactionObservations.delete(event.tabId);
+  };
+  events.forEach((event) => event.addListener(invalidate));
+  s.fixtureNavigationCleanup = () => {
+    events.forEach((event) => event.removeListener(invalidate));
+    s.fixtureNavigationCleanup = null;
+  };
+}
+
+async function allowFixture() {
+  const s = session;
+  if (!s || s.closed || paused || s.state !== "READY") return { ok: false };
+  const epoch = ++s.fixtureEpoch;
+  s.fixtureGrant = null;
+  const live = () => s === session && !s.closed && !paused && s.fixtureEpoch === epoch;
+  try {
+    const tab = await activeTab();
+    if (!tab || !isFixtureUrl(tab.url)) return { ok: false };
+    const out = await readPage({ tab_id: tab.id }, observePage, { max_items: 1 }, live);
+    const current = await activeTab();
+    if (!live() || !grantHeld(out.grantEpoch) || !current || current.id !== tab.id
+      || current.windowId !== tab.windowId || current.url !== tab.url) return { ok: false };
+    s.fixtureGrant = { tabId: tab.id, windowId: tab.windowId, url: tab.url,
+      documentId: out.observed.document_id, nonce: out.page.document_nonce, grantEpoch: out.grantEpoch };
+    armFixtureNavigation(s);
+    s.interactionObservations.delete(tab.id);
+    void publishStatus();
+    return { ok: true };
+  } catch (error) { return { ok: false, error: error.code || "injection_failed" }; }
+}
+
+async function interact(req, s, live) {
+  if (s.interacting.has(req.tab_id)) throw new CompanionFailure("interaction_busy", req.tab_id);
+  const grant = s.fixtureGrant, epoch = s.fixtureEpoch, navEpoch = s.navigationEpoch;
+  const observation = s.interactionObservations.get(req.tab_id);
+  const sourceEpoch = s.fixtureNavigationEpoch;
+  if (!grant || !s.navigationAllowed || !grantHeld(grant.grantEpoch)
+    || grant.tabId !== req.tab_id || grant.windowId !== req.args.window_id
+    || grant.documentId !== req.args.document_id || grant.url !== req.args.fixture_url)
+    throw new CompanionFailure("fixture_not_allowed", req.tab_id);
+  if (!observation || observation.gen !== req.args.gen || !observation.refs.has(req.args.ref)
+    || observation.documentId !== grant.documentId || observation.nonce !== grant.nonce
+    || observation.url !== grant.url || observation.navigationEpoch !== sourceEpoch)
+    throw new CompanionFailure("stale_observation", req.tab_id);
+  // Consume before any await: overlapping/new request IDs cannot act twice.
+  s.interactionObservations.delete(req.tab_id);
+  s.interacting.add(req.tab_id);
+  const held = () => live() && s.fixtureEpoch === epoch && s.fixtureGrant === grant
+    && s.navigationAllowed && s.navigationEpoch === navEpoch && grantHeld(grant.grantEpoch)
+    && s.fixtureNavigationEpoch === sourceEpoch;
+  try {
+    const tab = await readableTab(req.tab_id), doc = await mainDocument(req.tab_id);
+    const verdict = LuminaPolicy.classifyUrl(grant.url);
+    if (!fixtureTabSettled(tab))
+      throw new CompanionFailure(tab?.pendingUrl ? "navigation_pending" : "page_loading", req.tab_id);
+    if (tab.windowId !== grant.windowId || tab.url !== grant.url || !doc
+      || doc.documentId !== grant.documentId || doc.url !== grant.url)
+      throw new CompanionFailure("stale_document", req.tab_id);
+    if (await siteAccess(verdict) !== "granted") throw new CompanionFailure("site_access_required", req.tab_id);
+    if (!held()) throw new CompanionFailure("fixture_not_allowed", req.tab_id);
+    if (Date.now() > req.deadline_ms) throw new CompanionFailure("deadline_expired", req.tab_id);
+    req._actionDispatched = true;
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId: req.tab_id, documentIds: [grant.documentId] }, world: "ISOLATED", func: interactWithFixture,
+      args: [{ ...req.args, document_nonce: grant.nonce, deadline_ms: req.deadline_ms }] });
+    const effect = injection?.result;
+    if (injection?.documentId === grant.documentId && effect?.rejected) {
+      req._actionDispatched = false; // fixed actuator proved no effect was attempted
+      throw new CompanionFailure(effect.rejected, req.tab_id);
+    }
+    const afterTab = await readableTab(req.tab_id), afterDoc = await mainDocument(req.tab_id);
+    const access = await siteAccess(verdict);
+    const established = held() && access === "granted" && injection?.documentId === grant.documentId
+      && effect?.established === true && fixtureTabSettled(afterTab)
+      && afterTab.url === grant.url && afterTab.windowId === grant.windowId
+      && afterDoc?.documentId === grant.documentId && afterDoc.url === grant.url;
+    return { result: interactionReceipt(req, established ? "browser_local_effect_observed" : "ambiguous_after_dispatch",
+      established ? afterTab : null, effect || {}), tab_id: req.tab_id,
+    observed: established ? { url: grant.url, origin: verdict.origin, document_id: grant.documentId } : null,
+    fixtureEpoch: epoch, navigationEpoch: navEpoch, actionGrantEpoch: grant.grantEpoch, targetPattern: verdict.pattern };
+  } finally { s.interacting.delete(req.tab_id); }
+}
+
 async function mainDocument(tabId) {
   let frame;
   try {
@@ -1826,6 +2072,8 @@ const OPERATIONS = Object.freeze({
   // binding, grant, PAUSE and revoke gates (readPage) -- whose optional
   // scroll moves only that document's viewport.
   async observe(req, live) {
+    if (session.interacting.has(req.tab_id)) throw new CompanionFailure("interaction_busy", req.tab_id);
+    const s = session, sourceEpoch = s.fixtureNavigationEpoch;
     const spec = { max_items: req.args.max_items ?? LIMITS.DEFAULT_OBSERVE_ITEMS, query: req.args.query ?? null,
       since_gen: req.args.since_gen ?? null, scroll: req.args.scroll ?? null };
     const { tabId, page, host, observed, grantEpoch } = await readPage(req, observePage, spec, live);
@@ -1833,13 +2081,22 @@ const OPERATIONS = Object.freeze({
     if (!result || typeof page.document_nonce !== "string" || !HEX32.test(page.document_nonce)) {
       throw new CompanionFailure("injection_failed", tabId);
     }
+    // Generic reads remain available; a read during unresolved navigation
+    // must never mint action eligibility, even if its old document is live.
+    const actionEligible = s.fixtureGrant?.tabId === tabId && s.fixtureNavigationEpoch === sourceEpoch
+      && fixtureTabSettled(await readableTab(tabId));
     return { result, tab_id: tabId, observed, host, grantEpoch, documentNonce: page.document_nonce,
+      fixtureNavigationEpoch: actionEligible ? sourceEpoch : undefined,
       truncated: result.total_elements > result.elements.length };
   },
 
   // Slice 1: generic navigation inside an owner mission.
   async navigate(req, live) {
     return NAVIGATE[req.args.kind](req, session, live);
+  },
+
+  async interact(req, live) {
+    return interact(req, session, live);
   },
 
   async open_owner_url(req, live) {
@@ -2147,8 +2404,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     s.navigationAllowed = message.allowed;
     s.navigationEpoch += 1;
+    s.fixtureGrant = null;
+    s.fixtureEpoch += 1;
     void publishStatus();
     sendResponse({ ok: true, navigation_allowed: s.navigationAllowed });
+    return false;
+  }
+  if (message.kind === "allow_fixture") {
+    void allowFixture().then(sendResponse);
+    return true;
+  }
+  if (message.kind === "stop_fixture") {
+    if (session) { session.fixtureGrant = null; session.fixtureEpoch += 1; }
+    void publishStatus();
+    sendResponse({ ok: true });
     return false;
   }
   if (message.kind === "revoke_site") {

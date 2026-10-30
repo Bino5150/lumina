@@ -10,7 +10,10 @@ never readable or writable through any model, tool or page text.
 
 What a mission covers (Slice 1):
 
-  * classes: observe and navigate ONLY. Typing, clicking controls, posting,
+  * default classes: observe and navigate ONLY. An explicit authenticated
+    ``test browser fixture <exact loopback URL>`` additionally grants the
+    bounded F0 fixture class; the extension separately requires its popup
+    fixture attestation, exact document and Navigation Allow. Typing, posting,
     sending, purchases, account or security changes are not in it, and no
     page, tool result or model output can add them.
   * sites: the sites the owner has allowed in the Chrome Companion popup
@@ -40,7 +43,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from chrome_companion import policy, protocol
+from chrome_companion import interaction, policy, protocol
 
 LIFETIME_S = 30 * 60
 MAX_NAVIGATIONS = 60
@@ -102,6 +105,8 @@ class Mission:
     classes: frozenset[str] = CLASSES
     navigations: int = 0
     connection_id: str | None = None
+    fixture_url: str | None = None
+    interactions: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def check(self, action_class: str, connection_id: str | None) -> None:
@@ -127,6 +132,10 @@ class Mission:
                     raise MissionRefused("mission_budget_exhausted",
                                          f"this mission's {MAX_NAVIGATIONS} navigations are used up")
                 self.navigations += 1
+            if action_class == interaction.MISSION_CLASS:
+                if self.interactions >= interaction.MAX_INTERACTIONS:
+                    raise MissionRefused("mission_budget_exhausted", "fixture interaction budget exhausted")
+                self.interactions += 1
 
     def scope(self) -> list[str]:
         return sorted(self.owner_sites)
@@ -144,8 +153,10 @@ def begin_turn(user_input, *, source: str, owner: bool, event_id: str):
                             and isinstance(block.get("text"), str))
         else:
             text = ""
+        fixture_url = interaction.owner_fixture_url(text)
         mission = Mission(mission_id=secrets.token_hex(8), event_id=event_id,
-                          owner_sites=owner_named_sites(text))
+                          owner_sites=owner_named_sites(text), fixture_url=fixture_url,
+                          classes=CLASSES | ({interaction.MISSION_CLASS} if fixture_url else set()))
     return _current.set(mission)
 
 

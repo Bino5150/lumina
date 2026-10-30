@@ -333,7 +333,7 @@ def _forum_host(req):
     return error_response(req, "unknown_op")
 
 
-@pytest.mark.parametrize("version", ["0.2.0", "0.3.0", "0.5.0", "1.0.0", "0.4", "0.4.0-beta"])
+@pytest.mark.parametrize("version", ["0.2.0", "0.3.0", "0.6.0", "1.0.0", "0.4", "0.4.0-beta"])
 def test_old_or_unknown_extensions_never_receive_generic_ops(hub_at, version):
     side = hub_at(version)
     side.host.serve(_forum_host)

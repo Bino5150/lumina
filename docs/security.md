@@ -33,7 +33,10 @@ Emergency Interlock, run only from text typed into the desktop chat box.
 
 Browser Companion exposes only reads, page observation, and owner-granted
 navigation (generic navigation is scoped to the owner's own current request
-and sites; it cannot click, type or submit). Its
+and sites; it cannot type or submit). A separate explicit fixture mission and
+popup grant permits only bounded native focus/checkbox/disclosure operations
+on an owner-attested inert loopback document; ordinary website controls and
+unknown consequences remain refused. Fixture navigation invalidates prior action observations when it begins; unresolved loads cannot grant new action eligibility. A transition detected after possible dispatch yields ambiguity, never an automatic replay. Renderer lifecycle checks narrow the worker-to-page race, but cannot cancel an already admitted browser task or guarantee delivery against a hostile page. See the [F0 contract](browser-companion.md#inert-fixture-interactions-f0). Its
 internal site-action authority and review infrastructure is dormant: it
 does not provide a posting or replying workflow. A protected Companion
 task cannot borrow Playwright, API, terminal or delegation routes, and

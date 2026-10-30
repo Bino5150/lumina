@@ -33,4 +33,4 @@ def test_extension_version_bumped_for_the_r5_1_revoke_contract():
     not pass for this candidate."""
     # >= the R5.1 bump; Slice 1 moved it to 0.4.0; HARDENING-01 (worker receipt
     # and confirmation changes) to 0.4.1.
-    assert json.loads((EXTENSION / "manifest.json").read_text())["version"] == "0.4.1"
+    assert json.loads((EXTENSION / "manifest.json").read_text())["version"] == "0.5.0"

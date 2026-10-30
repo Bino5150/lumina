@@ -48,6 +48,7 @@ const listeners = { message: [], alarm: [], startup: [], installed: [], permissi
 const historyEvents = { history: new Set(), fragment: new Set() };
 const historyMoves = [...(cfg.historyMoves || [])];
 function historyEventSource(kind) {
+  historyEvents[kind] ||= new Set();
   return { addListener: (fn) => historyEvents[kind].add(fn), removeListener: (fn) => historyEvents[kind].delete(fn) };
 }
 async function traverseHistory(tabId, method) {
@@ -235,6 +236,10 @@ const chrome = {
     onRemoved: { addListener: (fn) => listeners.permissionRemoved.push(fn) },
   },
   webNavigation: {
+    onBeforeNavigate: historyEventSource("beforeNavigate"),
+    onCommitted: historyEventSource("committed"),
+    onCompleted: historyEventSource("completed"),
+    onErrorOccurred: historyEventSource("navError"),
     onHistoryStateUpdated: historyEventSource("history"),
     onReferenceFragmentUpdated: historyEventSource("fragment"),
     async getFrame({ tabId, frameId }) {
@@ -300,6 +305,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
     } else if (command.cmd === "navigation") {
       emit({ event: "ack", cmd: "navigation",
         result: await popup({ kind: "set_navigation", allowed: command.allowed === true }) });
+    } else if (command.cmd === "fixture") {
+      emit({ event: "ack", cmd: "fixture", result: await popup({ kind: "allow_fixture" }) });
     } else if (command.cmd === "grant") {
       granted.add(command.pattern);
       emit({ event: "ack", cmd: "grant" });

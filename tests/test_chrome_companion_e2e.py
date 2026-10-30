@@ -302,6 +302,49 @@ def test_history_within_a_document_reaches_the_owner_tool_with_a_fresh_observati
     assert landed not in repr(world.recorder.events)
 
 
+@pytest.mark.parametrize("kind,name,extra", [
+    ("focus", "Notes", {}), ("set_checked", "Toggle", {"value": True}),
+    ("set_expanded", "Disclosure", {"value": True}),
+])
+def test_f0_fixture_through_real_tools_worker_native_host_and_hub(world, kind, name, extra):
+    from chrome_companion import mission
+    from tools.chrome_companion import register_chrome_companion_tools
+    from tools.registry import ToolRegistry
+
+    url = "http://127.0.0.1:8765/inert.html"
+    chrome = world.launch(tabs=[{"id": 7, "windowId": 1, "active": True, "incognito": False,
+        "status": "complete", "url": url, "title": "Inert fixture"}],
+        pages={"7": {"href": url, "nodes": [
+            {"tag": "input", "attrs": {"aria-label": "Notes"}, "rect": {"top": 20}},
+            {"tag": "input", "attrs": {"type": "checkbox", "aria-label": "Toggle"}, "rect": {"top": 70}},
+            {"tag": "details", "rect": {"top": 110, "height": 60}, "children": [
+                {"tag": "summary", "text": "Disclosure", "rect": {"top": 120}}]},
+        ]}}, granted=["http://127.0.0.1/*"])
+    _ready(world.hub)
+    _extension_ready(chrome)
+    chrome.command(cmd="navigation", allowed=True)
+    assert chrome.command(cmd="fixture")["result"]["ok"]
+    registry = ToolRegistry()
+    assert register_chrome_companion_tools(registry, data_dir=world.data_dir, hub=world.hub, agent=object())
+    obs = world.hub.request("observe", tab_id=7)
+    ref = next(e["ref"] for e in obs["result"]["elements"] if e["name"] == name)
+    args = dict(action=kind, tab_id=7, window_id=1, document_id=obs["observed"]["document_id"],
+                gen=obs["result"]["gen"], ref=ref, **extra)
+    token = mission.begin_turn("test browser fixture " + url, source="OWNER_DIRECT", owner=True, event_id="f0-e2e")
+    try:
+        answer = json.loads(registry.call("chrome_interact", args))
+        replay = json.loads(registry.call("chrome_interact", args))
+    finally:
+        mission.end_turn(token)
+    assert answer["ok"] is True, answer
+    assert answer["after"] is True and answer["before"] is False
+    assert answer["load_confirmed"] is False
+    assert replay["failure_class"] == "stale_observation"
+    assert answer["observed"]["document_id"] == obs["observed"]["document_id"]
+    assert "document_nonce" not in json.dumps(answer)
+    assert url not in repr(world.recorder.events)
+
+
 def test_finger_through_the_real_chain_keeps_document_identity_private(world):
     """FINGER-STALE-DOC: get_links -> follow_link through the real worker, host
     and hub. The worker's private per-document identity never reaches the hub

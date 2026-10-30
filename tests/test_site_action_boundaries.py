@@ -24,14 +24,14 @@ FILES = {"__init__.py", "model.py", "registry.py", "claims.py", "kernel.py", "ow
 # wire ops and chrome_observe/chrome_navigate tools: reviewed public surface,
 # still with no site-action route.
 WIRE_OPS = {"ping", "list_tabs", "get_active_tab", "get_tab", "extract_text", "get_links",
-            "open_owner_url", "switch_tab", "follow_link", "observe", "navigate"}
+            "open_owner_url", "switch_tab", "follow_link", "observe", "navigate", "interact"}
 WIRE_TAB_RULES = {"ping": "none", "list_tabs": "none", "get_active_tab": "none",
                   "get_tab": "required", "extract_text": "optional", "get_links": "optional",
                   "open_owner_url": "none", "switch_tab": "required", "follow_link": "required",
-                  "observe": "optional", "navigate": "optional"}
+                  "observe": "optional", "navigate": "optional", "interact": "required"}
 TOOLS = {"chrome_status", "chrome_list_tabs", "chrome_get_active_tab", "chrome_get_url_title",
          "chrome_extract_visible_text", "chrome_get_links", "chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link",
-         "chrome_observe", "chrome_navigate"}
+         "chrome_observe", "chrome_navigate", "chrome_interact"}
 
 # Allowed dependency edges, not a blacklist of today's browser modules.
 IMPORTS = {
@@ -303,7 +303,9 @@ def _check_routing_broker(source):
                   and any(isinstance(t, ast.Name) and t.id == "ROUTES" for t in n.targets))
     assert ast.literal_eval(routes) == {name: "navigation" if name in {
         "chrome_open_owner_url", "chrome_switch_tab", "chrome_follow_link", "chrome_navigate"} else "observation"
-        for name in TOOLS}
+        # F0 fixture interaction is outside the dormant site-task router.
+        # Its general protected-dispatch denial must still block this tool.
+        for name in TOOLS - {"chrome_interact"}}
     dispatch = methods["dispatch"]
     protected = [n for n in ast.walk(dispatch) if isinstance(n, ast.If)
                  and ast.unparse(n.test) == "origin.protected"]

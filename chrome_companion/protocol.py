@@ -40,7 +40,7 @@ import re
 import secrets
 import struct
 
-from chrome_companion import policy
+from chrome_companion import interaction, policy
 
 PROTOCOL_VERSION = 1
 HOST_NAME = "org.lumina.chrome_companion"
@@ -98,10 +98,10 @@ REQUEST_SEQ_HEX = 12
 MAX_REQUEST_SEQ = 16 ** REQUEST_SEQ_HEX - 1
 
 OPS = frozenset({"ping", "list_tabs", "get_active_tab", "get_tab", "extract_text", "get_links",
-                 "open_owner_url", "switch_tab", "follow_link", "observe", "navigate"})
+                 "open_owner_url", "switch_tab", "follow_link", "observe", "navigate", "interact"})
 # tab_id rules per op: required, optional (null = the active tab), or absent.
 # navigate: per kind (validate_request) -- only kind "url" may omit it (new tab).
-OPS_TAB_REQUIRED = frozenset({"get_tab", "switch_tab", "follow_link"})
+OPS_TAB_REQUIRED = frozenset({"get_tab", "switch_tab", "follow_link", "interact"})
 OPS_TAB_OPTIONAL = frozenset({"extract_text", "get_links", "observe", "navigate"})
 OPS_TAB_NONE = frozenset({"ping", "list_tabs", "get_active_tab", "open_owner_url"})
 OP_ARGS = {
@@ -122,7 +122,23 @@ OP_ARGS = {
     # Slice 1 generic ops; checked separately below.
     "observe": {},
     "navigate": {},
+    "interact": {},
 }
+
+
+def validate_interact_args(args: dict) -> None:
+    kind = args.get("kind")
+    required = {"kind", "window_id", "document_id", "ref", "gen", "fixture_url"}
+    if kind in {"set_checked", "set_expanded"}:
+        required.add("value")
+    if (kind not in interaction.KINDS or set(args) != required
+            or not _is_int(args.get("window_id")) or args["window_id"] < 0
+            or not _bounded_str(args.get("document_id"), 128) or not args["document_id"]
+            or not is_ref(args.get("ref"))
+            or not _is_int(args.get("gen")) or args["gen"] < 1
+            or not interaction.is_fixture_url(args.get("fixture_url"))
+            or ("value" in args and not _is_bool(args["value"]))):
+        raise ProtocolError("invalid_args", "fixture interaction identity")
 
 
 def is_ref(value) -> bool:
@@ -479,6 +495,9 @@ def validate_request(message: dict) -> dict:
     if op == "navigate":
         _validate_navigate_args(tab_id, args)
         return message
+    if op == "interact":
+        validate_interact_args(args)
+        return message
     spec = OP_ARGS[op]
     if set(args) - set(spec):
         raise ProtocolError("invalid_args", "unknown arg")
@@ -649,11 +668,20 @@ def validate_result(op: str, result):
         return result
     if op == "observe":
         return _validate_observation(result)
-    if op in {"open_owner_url", "switch_tab", "follow_link", "navigate"}:
+    if op in {"open_owner_url", "switch_tab", "follow_link", "navigate", "interact"}:
         if not isinstance(result, dict):
             raise ProtocolError("bad_result", "action")
-        _require_exact_keys(result, {"operation_id", "status", "tab_id", "window_id",
-                                     "observed_url", "load_confirmed"})
+        required = {"operation_id", "status", "tab_id", "window_id", "observed_url", "load_confirmed"}
+        if op == "interact":
+            required.update({"kind", "ref", "gen", "before", "after"})
+            if (result.get("kind") not in interaction.KINDS or not is_ref(result.get("ref"))
+                    or not _is_int(result.get("gen")) or result["gen"] < 1
+                    or any(result.get(k) is not None and not _is_bool(result[k]) for k in ("before", "after"))):
+                raise ProtocolError("bad_result", "interaction effect")
+            if result.get("status") == "browser_local_effect_observed" and (
+                    result.get("after") is None or result.get("before") is None):
+                raise ProtocolError("bad_result", "interaction observation missing")
+        _require_exact_keys(result, required)
         if not _bounded_str(result["operation_id"], 65) \
                 or not re.fullmatch(r"[0-9a-f]{32}:[0-9a-f]{32}", result["operation_id"]):
             raise ProtocolError("bad_result", "operation_id")

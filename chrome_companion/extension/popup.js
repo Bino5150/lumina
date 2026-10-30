@@ -92,6 +92,12 @@ async function renderStatus() {
     : status.navigationAllowed ? "Allowed for this connection only."
       : "Navigation is off; site reading is separate.";
   $("instance").textContent = formatId(status && status.instanceId);
+  const fixtureWorker = status && typeof status.fixtureAllowed === "boolean";
+  $("fixture").hidden = !ready || !fixtureWorker || !status.navigationAllowed;
+  $("fixture-stop").hidden = !ready || !status.fixtureAllowed;
+  $("fixture-state").textContent = status && status.fixtureAllowed
+    ? "One fixture document approved for this connection. Stop, revoke or PAUSE withdraws it."
+    : "Off. Ordinary websites and unknown controls are refused.";
   $("pair-hint").hidden = !(status && (status.lastError === "unpaired" || status.lastError === "wrong_instance"));
   const action = status && status.lastAction;
   $("action").textContent = action
@@ -145,6 +151,17 @@ async function renderTab() {
   if (revoking) showRevoking();
   showRevokeNote();
 }
+
+$("fixture").addEventListener("click", async () => {
+  const answer = await chrome.runtime.sendMessage({ kind: "allow_fixture" }).catch(() => null);
+  await renderStatus();
+  if (!answer || !answer.ok) $("fixture-state").textContent = "Not allowed. Use an inert http://127.0.0.1:<port>/ fixture with site access.";
+});
+$("fixture-stop").addEventListener("click", async () => {
+  const answer = await chrome.runtime.sendMessage({ kind: "stop_fixture" }).catch(() => null);
+  await renderStatus();
+  if (!answer || !answer.ok) $("fixture-state").textContent = "Stop was not confirmed. Use PAUSE LUMINA.";
+});
 
 // REVOKING…: the click is not the revoke. Nothing is claimed, and no other
 // site control is offered, until the worker answers.

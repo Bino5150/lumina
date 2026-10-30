@@ -17,15 +17,25 @@ disposable Playwright browser.
   out the owner's own request, among the sites the owner allowed in the popup
   or named by address in that request. Works on any website; no site
   adapter is involved.
-- Cannot click page elements (buttons or other controls), type, fill or
-  submit forms, take screenshots, or read cookies or passwords. Those capabilities do not exist
-  in this version. A password/one-time-code/card field's value is never
+- On an explicitly approved inert loopback fixture only, `chrome_interact`
+  can focus a plain text field, set a native checkbox, or expand/collapse a
+  native disclosure. This needs a separate popup grant and explicit fixture
+  mission; site reading or navigation permission does not authorize it.
+  See [fixture interactions](../docs/browser-companion.md#inert-fixture-interactions-f0).
+- Cannot interact with ordinary website controls, type, fill or
+  submit forms, take screenshots, or read cookies or passwords. A password/one-time-code/card field's value is never
   read out.
 - Never touches Firefox or any other browser.
 - The Playwright `browser_*` tools are unchanged and separate; nothing falls
   back from one to the other.
 
 ## How it fits together
+
+Source version 0.5.0 adds the F0 fixture contract. Source changes do not update
+an installed version-pinned extension or native host. Daily-profile activation,
+bundle packaging (including the new `chrome_companion/interaction.py` host
+dependency), pairing and live acceptance require a separate owner runbook and
+rollback plan. Keep the proven installation until that process completes.
 
 ```
 Lumina (chrome_* tools)
