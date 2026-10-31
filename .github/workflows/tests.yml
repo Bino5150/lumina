@@ -178,3 +178,14 @@ jobs:
       # fail-never-skip contract.
       - name: Run Qt-bound isolated recovery cockpit guards (blocking)
         run: python -m pytest tests/test_agent_backup_restore_cockpit_qt.py -v -rs -m "not castle_walls_evidence"
+      # TURN-RECOVERY-UI-01 (LUMINA-PULSE-01 P0): the "Continue interrupted
+      # turn" control in a real LuminaWindow -- one click starts at most one
+      # fenced continuation and writes no user row; double click, duplicate
+      # signal, stale generation, chat switch, a newer message, a durable
+      # transcript change, E-stop latch/re-arm, a suspension trip, a backend
+      # swap and a running turn all start nothing; relayed Telegram turns are
+      # never offered. The plain `test` job runs the Qt-free kernel and agent
+      # tests and can only skip these. Same pinned PySide6 and
+      # fail-never-skip contract.
+      - name: Run Qt-bound interrupted-turn continuation guards (blocking)
+        run: python -m pytest tests/test_turn_recovery_ui_01_qt.py -v -rs -m "not castle_walls_evidence"

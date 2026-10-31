@@ -233,6 +233,67 @@ llama.cpp at http://localhost:8080") means Lumina couldn't reach the
 server that backend is configured to use — check that the server is
 actually running and that the URL in Settings matches it.
 
+## Continuing an interrupted turn
+
+When the connection to the model drops in the middle of a desktop turn — a
+TLS/SSL error, a reset connection or a timeout, before a reply arrived or
+while the answer was streaming — the chat shows **Continue interrupted
+turn** under the error. Clicking it continues *that* turn:
+
+- It re-sends the request with the conversation exactly as it was. Nothing
+  is added to the conversation; no "Continue" message is written for you.
+- Tool actions that already ran are **not** run again; their results are
+  already in the turn. If the continued turn asks for a consequential tool
+  call with exactly the same arguments as one that already ran, that call
+  is not run, and Lumina is told so. To really repeat an action, ask for it
+  in a new message.
+- The turn's limits carry over: tool calls already made and active time
+  already spent count against **Max Tool Calls per Turn** and **Max Turn
+  Minutes** (time you spent away before clicking does not), and agent
+  rounds and the no-progress breaker continue where they were.
+- A turn can be continued at most **three** times. Each attempt appears in
+  the [Flight Recorder](security.md#flight-recorder) as
+  `turn.recovery.started`, linked to the original turn.
+- The reply is saved as a new message; the error message stays as it was.
+- It continues with the same authority the original turn had, or less.
+  It adds no message, so it never approves an image draft or grants
+  browser navigation or a website action by itself. It refuses if, since
+  the interruption, you enabled a tool, switched project, approved an image
+  draft in this conversation or turned Telegram remote access on (or off
+  and on again). This is checked when you click, when the continuation
+  starts and before each action that can change things; an action refused
+  this way is not run. An image draft you approved *before* the
+  interruption can still be used until it is generated or the draft
+  expires (10 minutes after it was proposed); there is no control to
+  withdraw an approval sooner. Disabling a tool or turning Telegram off is
+  fine and applies at once. Other settings are not covered;
+  [Security](security.md#continuing-an-interrupted-turn) lists exactly what
+  is.
+
+The button is offered only after a connection failure in a turn you typed
+at the desktop — never after an error the provider actually answered with
+(for example HTTP 429 rate-limited, 502, 401 or a malformed request),
+after a "Stopped" notice, after `/stop` or the emergency stop, or for
+Telegram, CLI or Discord turns. It is also not offered when a tool that can
+change things ran earlier in the turn and Lumina could not confirm it
+finished. Only these count as confirmed: a shell command that ran to
+completion (any exit status) or was blocked before running, a file written
+or edited, a memory, knowledge entry or Palace note saved, and a browser
+action with a verified receipt. Anything else that can change things — a
+Telegram send, image generation, a subagent, a background process, any
+error or timeout — means not offered: check what that action actually did,
+then send a new message.
+
+Clicking refuses, starts nothing and says why if anything changed since the
+interruption: another conversation is open, a new message was sent, the
+conversation or context changed, the provider or model was switched, a tool
+was enabled or the active project changed, an image draft was approved or
+Telegram remote access turned on, the emergency stop was used (even if
+re-armed since), or runaway suspension no longer admits the work. It also
+refuses if those settings, or anything else it must check, cannot be read.
+After a restart there is nothing to continue. In all of these cases send a
+new message to carry on.
+
 ## Something doesn't match this manual
 
 This manual is written directly from the current release's source, not

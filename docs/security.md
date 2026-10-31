@@ -162,6 +162,60 @@ if remote access was turned off, the emergency stop was used, or remote
 access was turned off and on again meanwhile, it never runs. Only one Lumina
 on a computer listens to a bot at a time.
 
+## Continuing an interrupted turn
+
+The desktop's **Continue interrupted turn** button (see
+[Troubleshooting](troubleshooting.md#continuing-an-interrupted-turn)) is
+a local owner control, like the Emergency Interlock: no channel, tool, page,
+peer message or model output can press it, and typing "Continue" remains an
+ordinary message. A continuation runs only with the original turn's
+authority *and* what is still valid now. When you click, it must be the
+same conversation, provider and model, with an unchanged context, no
+emergency stop since the interruption, and runaway suspension still
+admitting the work. It never re-runs a tool action that already ran, and
+it adds no message, so it never approves an image draft or grants browser
+navigation or a website action by itself.
+
+**Fenced: may only narrow.** Lumina records these when the turn is
+interrupted. The continuation refuses if any of them is wider than then:
+
+- the tools offered to the model (a tool enabled since);
+- the active project (switched since);
+- the approved image drafts in that conversation (a draft approved since);
+- Telegram remote access (turned on since, including off and on again).
+
+This is checked when you click, when the continuation starts and again
+before each action that can change things. Read-only actions are not
+re-checked. If these settings cannot be read at one of those checks, the
+continuation is refused, or that action is not run.
+
+**Revocations apply at once.** Narrowing is always allowed and takes effect
+immediately, because the tools themselves read these settings live:
+disabling a tool or turning Telegram off.
+
+**Image approvals.** An image draft you approved *before* the interruption
+may still be used by the continuation; that was the original turn's
+authority. An approval lasts until that image is generated or its draft
+expires (10 minutes after Lumina proposed it), and there is no control to
+withdraw it sooner. Runaway suspension of image generation still blocks
+it, as in any turn. A draft approved *after* the interruption is never
+used: the continuation refuses.
+
+**Outside this guarantee:**
+
+- Any other setting a tool reads when it runs is not recorded at the
+  interruption. One example is Chrome Companion pairing, which read-only
+  browser observation uses.
+- A permission granted during the original turn, before it was
+  interrupted, counts as part of the original authority.
+- An action that is already running is not re-checked while it runs, the
+  same as in any turn.
+- Matching of identical calls is a safety net, not a guarantee that
+  repeating an action would be harmless.
+
+It is not offered at all when an action that can change things ran earlier
+in the turn without a result Lumina recognizes as completed.
+
 ## Runaway suspension
 
 When a turn runs away, Lumina **suspends** that work instead of just

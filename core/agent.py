@@ -21,6 +21,7 @@ from core import flight_recorder
 from core import progress_breaker
 from core import suspension as suspension_core
 from core import suspension_runtime
+from core import turn_recovery
 from core.backend_identity import (
     LaneFuelViolation,
     OperationKind,
@@ -1181,12 +1182,172 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
             err = f"[Tool {just_ran} completed, but {detail}]"
         else:
             err = f"[Lumina error: {e}]"
+        _note_provider_interruption(agent, e, phase=phase, stage=stage, err=err)
         on_response_token = getattr(agent, "on_response_token", None)
         if callable(on_response_token):
             on_response_token(err)
         return None, err
     finally:
         release_suspension_lease()
+
+
+def _note_provider_interruption(agent, exc, *, phase: str, stage: str, err: str,
+                                partial_final_chars: int = 0) -> None:
+    """TURN-RECOVERY-UI-01 -- remember exactly which provider failure produced
+    this turn's sentinel, so chat() can decide whether the turn may be
+    continued. Observation only; never changes the failure path."""
+    cause = exc.__cause__ or exc.__context__
+    try:
+        agent._turn_interruption = turn_recovery.ProviderInterruption(
+            phase=phase, stage=stage, exception_type=type(exc).__name__,
+            cause_type=type(cause).__name__ if cause is not None else None,
+            transport=turn_recovery.is_transport_failure(exc), error_text=err,
+            partial_final_chars=partial_final_chars,
+        )
+    except Exception:
+        pass
+
+
+def _offer_turn_recovery(agent, result: str, *, turn_id, chat_id, source, token, recovery,
+                         offer_recovery: bool, reasoning_effort) -> None:
+    """TURN-RECOVERY-UI-01 -- after a failed turn, hold a "Continue
+    interrupted turn" offer only if turn_recovery.evaluate_capture() admits
+    it; otherwise record why not. Never raises: a recovery defect must not
+    change how the failed turn itself ends."""
+    try:
+        holder = getattr(agent, "_turn_recovery", None)
+        interruption = getattr(agent, "_turn_interruption", None)
+        reader = getattr(agent, "_turn_recovery_carry", None)
+        carry = reader() if callable(reader) else None
+        previous = recovery.record if recovery is not None else None
+        attempts_run = previous.next_attempt if previous is not None else 0
+        root_turn_id = previous.root_turn_id if previous is not None else turn_id
+        ctx = getattr(agent, "ctx", None)
+        history = getattr(ctx, "history", None)
+        if holder is None or not isinstance(history, list):
+            reason = turn_recovery.NOT_OWNER_DESKTOP
+        else:
+            reason = turn_recovery.evaluate_capture(
+                interruption=interruption, result=result,
+                owner=getattr(agent, "owner", False) is True, source=source,
+                desktop=offer_recovery, attempt_just_run=attempts_run,
+                history=history, carry=carry)
+        if reason is None:
+            scope = _recovery_scope_fields(agent)
+            authority = turn_recovery.capture_authority(getattr(agent, "channel_id", None), chat_id)
+            reason = _recovery_reoffer_refusal(previous, scope, authority)
+        if reason is not None:
+            if interruption is not None or previous is not None:
+                _fr_machine(agent, "turn.recovery.not_offered", turn_id=turn_id, chat_id=chat_id,
+                            severity="warning",
+                            fields={"reason": reason, "root_turn_id": root_turn_id,
+                                    "attempts_run": attempts_run})
+            return
+        record = turn_recovery.new_record(
+            chat_id=chat_id, root_turn_id=root_turn_id, turn_id=turn_id,
+            next_attempt=attempts_run + 1, source=source,
+            channel_id=getattr(agent, "channel_id", None), interruption=interruption,
+            dispatch_identity=getattr(agent, "_turn_dispatch_identity", None),
+            reasoning_effort=reasoning_effort, history_ref=history,
+            history_len=len(history), history_fp=turn_recovery.history_fingerprint(history),
+            turn_seq=getattr(ctx, "turn_seq", None), estop_epoch=emergency_stop.current_epoch(),
+            suspension_token=token, carry=carry, authority=authority, **scope,
+        )
+        holder.offer(record)
+        _fr_machine(agent, "turn.recovery.offered", turn_id=turn_id, chat_id=chat_id,
+                    severity="warning",
+                    fields={"root_turn_id": root_turn_id, "next_attempt": record.next_attempt,
+                            "max_attempts": turn_recovery.MAX_ATTEMPTS,
+                            "failure_stage": interruption.stage,
+                            "exception_type": interruption.exception_type,
+                            "cause_type": interruption.cause_type,
+                            "partial_final_chars": interruption.partial_final_chars,
+                            "candidate_pending": carry.candidate_pending,
+                            "admitted_tool_calls": carry.admitted_tool_calls})
+    except Exception as exc:
+        print(f"[TURN RECOVERY] offer skipped ({type(exc).__name__})", flush=True)
+
+
+RECOVERY_REFUSED_PREFIX = "[Lumina: could not continue the interrupted turn"
+
+
+def _schema_tool_name(schema) -> Optional[str]:
+    if not isinstance(schema, dict):
+        return None
+    function = schema.get("function")
+    return function.get("name") if isinstance(function, dict) else schema.get("name")
+
+
+def _recovery_scope_fields(agent) -> dict:
+    """The authority a continuation may only narrow: exactly the tool names a
+    WORK request offers now (registry.get_schemas(), the same call the loop
+    makes) and the active project binding."""
+    get_schemas = getattr(getattr(agent, "registry", None), "get_schemas", None)
+    enabled = (frozenset(n for n in map(_schema_tool_name, get_schemas()) if n)
+               if callable(get_schemas) else frozenset())
+    getter = getattr(getattr(agent, "project_context", None), "get", None)
+    project = getter() if callable(getter) else None
+    return {"enabled_tools": enabled,
+            "project": (project.name, project.root) if project is not None else None}
+
+
+def _recovery_reoffer_refusal(previous, scope, authority) -> Optional[str]:
+    """The authority a new offer records. Unreadable state is never offered,
+    and a continuation that failed again may record only what its own
+    record allowed, so authority widened mid-continuation never becomes the
+    next attempt's ceiling."""
+    if authority is None:
+        return turn_recovery.AUTHORITY_UNREADABLE
+    if previous is None:
+        return None
+    if not turn_recovery.scope_within(previous, scope["enabled_tools"], scope["project"]):
+        return turn_recovery.SCOPE_WIDENED
+    return turn_recovery.authority_refusal(previous.authority, authority)
+
+
+def _recovery_authority_refusal(agent, record) -> Optional[str]:
+    """Tools, project and owner authority (turn_recovery.AUTHORITY_PROBES)
+    in force now must be no wider than when the turn was interrupted. Never
+    raises: state that cannot be read (get_schemas(), the project context)
+    is a refusal, so a dispatch-time fence always closes the call it guards."""
+    try:
+        scope = _recovery_scope_fields(agent)
+        if not turn_recovery.scope_within(record, scope["enabled_tools"], scope["project"]):
+            return turn_recovery.SCOPE_WIDENED
+        return turn_recovery.authority_refusal(
+            record.authority,
+            turn_recovery.capture_authority(getattr(agent, "channel_id", None), record.chat_id))
+    except Exception:
+        return turn_recovery.AUTHORITY_UNREADABLE
+
+
+def _recovery_turn_start_refusal(agent, record) -> Optional[str]:
+    """In-turn recheck of a claimed continuation, before any dispatch: the
+    backend/model now serving this turn and the live history must still be
+    exactly the interrupted turn's, and no authority may have widened."""
+    if getattr(agent, "_turn_dispatch_identity", None) != record.dispatch_identity:
+        return turn_recovery.BACKEND_CHANGED
+    widened = _recovery_authority_refusal(agent, record)
+    if widened is not None:
+        return widened
+    history = getattr(getattr(agent, "ctx", None), "history", None)
+    if (history is not record.history_ref or len(history) != record.history_len
+            or turn_recovery.history_fingerprint(history) != record.history_fp):
+        return turn_recovery.CONTEXT_CHANGED
+    return None
+
+
+def _recovery_refused(agent, reason: str, *, turn_id, chat_id) -> str:
+    """A continuation that fails its in-turn recheck ends here, before any
+    dispatch. Fixed text only."""
+    _fr_machine(agent, "turn.recovery.refused", turn_id=turn_id, chat_id=chat_id,
+                severity="warning", fields={"reason": reason, "stage": "turn_start"})
+    text = (f"{RECOVERY_REFUSED_PREFIX} -- {turn_recovery.REASON_TEXT.get(reason, reason)}. "
+            "Nothing was sent; send a new message to carry on.]")
+    on_response_token = getattr(agent, "on_response_token", None)
+    if callable(on_response_token):
+        on_response_token(text)
+    return text
 
 
 def _gate_safe_content(content):
@@ -2142,7 +2303,7 @@ def _effective_tool_budgets(agent) -> dict:
 # to tell a failed turn from a real assistant reply — see Bug C fix,
 # LUMINA_HANDOFF_OMNIROUTE_TO_PROVIDER_FIXES_2026-08-02.md section 8.3:
 # "Suppress auto-name when the main turn fails."
-ERROR_RESPONSE_PREFIXES = ("[Lumina error:", "[Stream error:")
+ERROR_RESPONSE_PREFIXES = ("[Lumina error:", "[Stream error:", RECOVERY_REFUSED_PREFIX)
 
 # GATLING-TRIGGER-GUARD-01 -- turn-ending budget notices (see the tool
 # execution budgets near _close_cancelled_tool_calls()).
@@ -2405,6 +2566,9 @@ class LuminaAgent:
         # project_context above. Set at the top of a turn, cleared when it
         # ends -- see chat() below.
         self.turn_cancellation = TurnCancellation()
+        # TURN-RECOVERY-UI-01 -- at most one in-memory "Continue interrupted
+        # turn" offer for this agent; see core/turn_recovery.py.
+        self._turn_recovery = turn_recovery.RecoveryHolder()
         # AGENT-FLIGHT-RECORDER-01A1 -- every real (non-test-fake)
         # LuminaAgent gets a working recorder reference: the process-wide
         # default singleton unless a caller explicitly overrides it (tests
@@ -2597,7 +2761,7 @@ class LuminaAgent:
     def chat(self, user_input: str, source: str = "OWNER_DIRECT", chat_id: int = None,
              cancel_event=None, reasoning_effort: Optional[str] = None,
              attachments=None, approval_event_id: Optional[str] = None,
-             suspension_token=None) -> str:
+             suspension_token=None, recovery=None, offer_recovery: bool = False) -> str:
         """
         Main entry point. Runs tool loop with non-streaming,
         then streams the final response. Returns full response string.
@@ -2696,8 +2860,38 @@ class LuminaAgent:
         A refused turn runs nothing and adds nothing to context: the fixed
         refusal text (time and trigger only) is streamed and returned, and
         ``_turn_outcome`` is "suspended".
+
+        TURN-RECOVERY-UI-01 -- ``recovery`` is a turn_recovery.Claim the
+        desktop consumed from this agent's offer; the turn then continues the
+        interrupted one under that record's own envelope (source, chat,
+        original suspension token, reasoning effort) with no new user text,
+        so no approval word-match, navigation grant or site-action authority
+        can arise from it. ``offer_recovery`` is set only by the desktop for
+        local owner turns; every other caller leaves it False and never gets
+        an offer. Any turn drops an outstanding offer.
         """
+        if recovery is not None:
+            if not isinstance(recovery, turn_recovery.Claim):
+                raise TypeError("recovery must be a turn_recovery.Claim")
+            if approval_event_id is not None or attachments:
+                # A continuation is not a new owner event and carries nothing new.
+                raise TypeError("a continuation takes no approval event or attachments")
+            holder = getattr(self, "_turn_recovery", None)
+            if holder is None or not holder.begin(recovery):
+                # A Claim runs once, and only on the agent that issued it.
+                raise TypeError("this continuation claim was already used or was not issued here")
         _set_turn_outcome(self, None)
+        self._turn_interruption = None
+        self._turn_recovery_carry = None
+        recovery_holder = getattr(self, "_turn_recovery", None)
+        if recovery_holder is not None:
+            recovery_holder.drop()
+        if recovery is not None:
+            record = recovery.record
+            user_input, attachments = "", None
+            source, chat_id = record.source, record.chat_id
+            suspension_token = record.suspension_token
+            reasoning_effort = record.reasoning_effort
         token, refused = _admit_suspension_turn(self, suspension_token)
         if refused is not None:
             _set_turn_outcome(self, "suspended")
@@ -2731,6 +2925,29 @@ class LuminaAgent:
         turn_backend = getattr(self, "llm", None)
         turn_id = flight_recorder.new_turn_id()
         turn_telemetry = _new_turn_telemetry()
+        if recovery is not None:
+            # The ACTUAL execution identity this continuation runs on, read
+            # live -- _chat_impl() refuses before any dispatch if it differs
+            # from the interrupted turn's. Field gathering is wrapped like
+            # turn.started's: instrumentation never breaks a real turn.
+            try:
+                _llm = getattr(self, "llm", None)
+                _fr_machine(self, "turn.recovery.started", turn_id=turn_id, chat_id=chat_id,
+                            severity="warning", backend=getattr(_llm, "name", None),
+                            fields={"root_turn_id": record.root_turn_id,
+                                    "previous_turn_id": record.turn_id,
+                                    "attempt": record.next_attempt,
+                                    "max_attempts": turn_recovery.MAX_ATTEMPTS,
+                                    "failure_class": turn_recovery.FAILURE_PROVIDER_TRANSPORT,
+                                    "failure_stage": record.interruption.stage,
+                                    "exception_type": record.interruption.exception_type,
+                                    "cause_type": record.interruption.cause_type,
+                                    "admitted_tool_calls": record.carry.admitted_tool_calls,
+                                    "active_elapsed_s": round(record.carry.active_elapsed_s, 1),
+                                    **_provider_routing_fields(_llm),
+                                    **_identity_fields(self, OperationKind.FOREGROUND_CHAT)})
+            except Exception:
+                pass
         # CASTLE-WALLS-REPAIR-04 / CANNON-11 -- mint a fresh event identity
         # for this specific chat() call whenever the caller didn't supply
         # one of its own; see this method's own approval_event_id docstring
@@ -2836,6 +3053,7 @@ class LuminaAgent:
                             vision_route_ctx=vision_route_ctx,
                             attachments=attachments,
                             approval_event_id=approval_event_id,
+                            recovery=recovery,
                         )
                         duration_s = time.monotonic() - turn_started_at
                         if is_error_response(result):
@@ -2844,6 +3062,11 @@ class LuminaAgent:
                                         fields={"reason": "error_sentinel", "duration_s": duration_s,
                                                 "response_preview": result,
                                                 **_turn_telemetry_fields(turn_telemetry)})
+                            if offer_recovery or recovery is not None:
+                                _offer_turn_recovery(
+                                    self, result, turn_id=turn_id, chat_id=chat_id, source=source,
+                                    token=token, recovery=recovery, offer_recovery=offer_recovery,
+                                    reasoning_effort=reasoning_effort)
                         else:
                             _fr_machine(self, "turn.completed", turn_id=turn_id, chat_id=chat_id,
                                         fields={"duration_s": duration_s,
@@ -2851,7 +3074,8 @@ class LuminaAgent:
                                                 **_turn_telemetry_fields(turn_telemetry)})
                         return result
                 except emergency_stop.EmergencyStopError:
-                    _add_user_compat(self.ctx, user_input, source, attachments)
+                    if recovery is None:
+                        _add_user_compat(self.ctx, user_input, source, attachments)
                     _fr_machine(self, "turn.cancelled", turn_id=turn_id, chat_id=chat_id,
                                 severity="warning",
                                 fields={"reason": "emergency_stop", "duration_s": time.monotonic() - turn_started_at,
@@ -2896,7 +3120,8 @@ class LuminaAgent:
                     turn_telemetry: Optional[dict] = None,
                     vision_route_ctx: Optional[object] = None,
                     attachments=None,
-                    approval_event_id: Optional[str] = None) -> str:
+                    approval_event_id: Optional[str] = None,
+                    recovery=None) -> str:
         if turn_telemetry is None:
             turn_telemetry = _new_turn_telemetry()
         # SUBSCRIPTION-PLAN-BACKENDS-01B -- capture the dispatch identity
@@ -2978,12 +3203,55 @@ class LuminaAgent:
         # cycle must never cause a later, genuinely-first, genuinely-
         # complete candidate to trigger unnecessary reconciliation.
         turn_relevant_commentary = []
+        work_rounds_used = 0
+
+        # TURN-RECOVERY-UI-01 -- every executed call is recorded (tier, args
+        # hash, outcome) so a failed turn can prove it has no consequential
+        # call of unknown outcome. A continuation resumes the interrupted
+        # turn's carried state -- budgets, no-progress ledger, executed calls
+        # -- and never resets it. _recovery_carry() reads these cells live, so
+        # chat() sees their values at the moment this method returns.
+        executed_calls = []
+        recovery_prior_calls = frozenset()
+        turn_anchor = None
+        if recovery is not None:
+            carry = recovery.record.carry
+            admitted_tool_calls = carry.admitted_tool_calls
+            budget_clock_start = _budget_clock() - carry.active_elapsed_s
+            refused_tool_batches = carry.refused_tool_batches
+            corrective_retry_used = carry.corrective_retry_used
+            tools_used_this_turn = set(carry.tools_used)
+            tool_batch_ordinal = carry.tool_batch_ordinal
+            work_rounds_used = carry.work_rounds_used
+            if carry.progress_ledger is not None:
+                progress_ledger = carry.progress_ledger
+            executed_calls = list(carry.executed_calls)
+            recovery_prior_calls = turn_recovery.prior_consequential_hashes(carry)
+            turn_anchor = carry.anchor
+
+        def _recovery_carry():
+            return turn_recovery.TurnCarry(
+                admitted_tool_calls=admitted_tool_calls,
+                active_elapsed_s=_budget_clock() - budget_clock_start,
+                refused_tool_batches=refused_tool_batches,
+                corrective_retry_used=corrective_retry_used,
+                tools_used=frozenset(tools_used_this_turn),
+                tool_batch_ordinal=tool_batch_ordinal,
+                work_rounds_used=work_rounds_used,
+                progress_ledger=progress_ledger,
+                executed_calls=tuple(executed_calls),
+                anchor=turn_anchor,
+                candidate_pending=completion_candidate is not None,
+            )
+        self._turn_recovery_carry = _recovery_carry
 
         # Preserve the user's submitted turn even in the tiny race where /stop
         # lands before this worker gets past chat()'s prologue. Do not run any
         # background-notification bookkeeping or provider work in that case.
+        # A continuation has no new user turn to preserve.
         if _cancel_requested(cancel_event):
-            _add_user_compat(self.ctx, user_input, source, attachments)
+            if recovery is None:
+                _add_user_compat(self.ctx, user_input, source, attachments)
             raise TurnCancelled()
 
         # Background/scheduled task completions surface as a one-turn
@@ -3009,7 +3277,8 @@ class LuminaAgent:
         # __init__; this is purely so those lighter-weight fakes keep working
         # unchanged rather than needing every one of them updated.
         task_summaries = []
-        if getattr(self, "owner", False) and getattr(self, "_background_task_ids", None):
+        if (recovery is None and getattr(self, "owner", False)
+                and getattr(self, "_background_task_ids", None)):
             from core.task_queue import get_task_result
             notifications = getattr(self, "_background_task_notifications", None)
             if notifications is None:
@@ -3091,17 +3360,28 @@ class LuminaAgent:
 
             self._background_task_notifications = notifications
 
-        _add_user_compat(self.ctx, user_input, source, attachments)
+        if recovery is None:
+            _add_user_compat(self.ctx, user_input, source, attachments)
+            _history = getattr(self.ctx, "history", None)
+            turn_anchor = _history[-1] if isinstance(_history, list) and _history else None
 
-        # CASTLE-WALLS-REPAIR-01 R2, Gate 2 (word-match path) -- runs
-        # immediately after the real turn admission above, before any
-        # model inference for this turn. See _maybe_approve_pending_draft's
-        # own docstring for why this is safe against every FILE/TOOL/
-        # SPECIALIST/PEER/USER_SKILL forgery angle.
-        _maybe_approve_pending_draft(
-            user_input, source, getattr(self, "channel_id", None), chat_id,
-            approval_event_id, current_turn_seq=getattr(self.ctx, "turn_seq", None),
-        )
+            # CASTLE-WALLS-REPAIR-01 R2, Gate 2 (word-match path) -- runs
+            # immediately after the real turn admission above, before any
+            # model inference for this turn. See _maybe_approve_pending_draft's
+            # own docstring for why this is safe against every FILE/TOOL/
+            # SPECIALIST/PEER/USER_SKILL forgery angle.
+            _maybe_approve_pending_draft(
+                user_input, source, getattr(self, "channel_id", None), chat_id,
+                approval_event_id, current_turn_seq=getattr(self.ctx, "turn_seq", None),
+            )
+        else:
+            # TURN-RECOVERY-UI-01 -- no new user turn, no approval word-match.
+            # The desktop fenced this claim on the Qt thread; recheck what can
+            # still move between that click and this worker: the backend that
+            # would serve it and the live history it continues.
+            _refusal = _recovery_turn_start_refusal(self, recovery.record)
+            if _refusal is not None:
+                return _recovery_refused(self, _refusal, turn_id=turn_id, chat_id=chat_id)
 
         # MULTIMODAL-M2-BOUNDED-VISION-LANE-01 -- execute the bounded vision
         # specialist operation for routed turns. The user turn above is
@@ -3151,7 +3431,8 @@ class LuminaAgent:
         # isinstance-guarded for back-compat: many existing tests monkeypatch
         # build_skills_block to return a bare string (its pre-repair shape).
         try:
-            skills_result = build_skills_block(user_input)
+            # A continuation has no new user text to match skills against.
+            skills_result = ("", "") if recovery is not None else build_skills_block(user_input)
         except Exception as e:
             print(f"[SKILLS] build_skills_block skipped: {e}", flush=True)
             skills_result = ("", "")
@@ -3234,6 +3515,9 @@ class LuminaAgent:
                     "owner": getattr(self, "owner", None),
                     **_effective_tool_budgets(self),
                     **_identity_fields(self, OperationKind.FOREGROUND_CHAT),
+                    **({"recovery_root_turn_id": recovery.record.root_turn_id,
+                        "recovery_attempt": recovery.record.next_attempt}
+                       if recovery is not None else {}),
                 },
             )
         except Exception:
@@ -3250,7 +3534,8 @@ class LuminaAgent:
         # retries the GATE itself under the existing one-shot corrective
         # bound rather than consuming or granting a WORK slot.
         next_action = "work"
-        work_rounds_used = 0
+        # work_rounds_used starts above (carried by a TURN-RECOVERY-UI-01
+        # continuation, so WORK rounds stay cumulative across attempts).
         # Section 13's ping-pong bound: a SECOND consecutive gate:continue
         # with no real tool executed in between means the model
         # contradicted its own decision -- one contradiction gets a fresh
@@ -3878,6 +4163,39 @@ class LuminaAgent:
                         return stop
                     continue
 
+                # TURN-RECOVERY-UI-01 -- defense in depth, not an idempotency
+                # proof: a continuation never runs a consequential call whose
+                # exact name+arguments already executed before the interruption.
+                _tool_tier = TOOL_TIERS.get(name, "execute")
+                _args_hash = turn_recovery.args_hash(args)
+                if turn_recovery.is_recovery_duplicate(recovery_prior_calls, name, _tool_tier, _args_hash):
+                    self.on_tool_call(name, args)
+                    self.ctx.add_refused_tool_result(
+                        tool_id, name, turn_recovery.RECOVERY_DUPLICATE_NOTICE)
+                    self.on_tool_result(name, turn_recovery.RECOVERY_DUPLICATE_NOTICE)
+                    _fr_machine(self, "tool.recovery_duplicate_refused", turn_id=turn_id,
+                                chat_id=chat_id, severity="warning",
+                                fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,
+                                        "tool_name": name, "tool_tier": _tool_tier})
+                    continue
+                # The authority fence again at each consequential dispatch: a
+                # tool enabled, project switched, approval given or switch
+                # turned on mid-continuation is never used by it.
+                _widened = (_recovery_authority_refusal(self, recovery.record)
+                            if recovery is not None and _tool_tier != turn_recovery.READ_ONLY
+                            else None)
+                if _widened is not None:
+                    _notice = turn_recovery.refused_notice(_widened)
+                    self.on_tool_call(name, args)
+                    self.ctx.add_refused_tool_result(tool_id, name, _notice)
+                    self.on_tool_result(name, _notice)
+                    _fr_machine(self, "tool.recovery_authority_refused", turn_id=turn_id,
+                                chat_id=chat_id, severity="warning",
+                                fields={"batch_ordinal": tool_batch_ordinal, "call_ordinal": index,
+                                        "tool_name": name, "tool_tier": _tool_tier,
+                                        "reason": _widened})
+                    continue
+
                 self.on_tool_call(name, args)
                 _fr_machine(self, "tool.call", turn_id=turn_id, chat_id=chat_id,
                             fields=_tool_call_fields(tool_batch_ordinal, index, name, args))
@@ -3894,6 +4212,11 @@ class LuminaAgent:
                 _tool_success = not (isinstance(result, str) and result.startswith("[Tool error:"))
                 if name in CHROME_COMPANION_ACTION_TOOL_NAMES:
                     _tool_success = _chrome_action_receipt_success(name, result)
+                executed_calls.append(turn_recovery.ExecutedCall(
+                    name, _tool_tier, _args_hash,
+                    turn_recovery.call_outcome(
+                        name, _tool_tier, result, _tool_success,
+                        receipt_verified=name in CHROME_COMPANION_ACTION_TOOL_NAMES and _tool_success)))
                 progress = progress_ledger.observe(name, args, result, success=_tool_success)
                 _fr_machine(self, "tool.result", turn_id=turn_id, chat_id=chat_id,
                             severity="info" if _tool_success else "warning",
@@ -4227,6 +4550,9 @@ class LuminaAgent:
             # as the other backend failure types instead of falling through
             # to AgentWorker's cruder top-level handler.
             err = f"[Stream error: {e}]"
+            _note_provider_interruption(
+                self, e, phase="final_stream", stage="final_stream", err=err,
+                partial_final_chars=len("".join(full_response).strip()))
             self.on_response_token(err)
             return err
         finally:
@@ -4503,6 +4829,45 @@ class LuminaAgent:
                                    reasoning_effort=reasoning_effort, turn_id=turn_id,
                                    retain_partial_on_cancel=False, turn_started_at=turn_started_at,
                                    turn_telemetry=turn_telemetry)
+
+    # ── TURN-RECOVERY-UI-01: the desktop's only entry points to an offer ──
+
+    def interrupted_turn(self, chat_id: int):
+        """The resumable offer for this chat, or None. Read-only."""
+        return self._turn_recovery.current(chat_id)
+
+    def drop_interrupted_turn(self) -> None:
+        self._turn_recovery.drop()
+
+    def claim_interrupted_turn(self, key: str, *, chat_id: int):
+        """Consume the offer named ``key`` and fence it against live state:
+        the open chat, this context's history and admission count, the
+        backend/model that would serve it, the tools/project and owner
+        authority in force (no wider than at the interruption), Emergency
+        Stop, and the interrupted turn's own suspension token. Returns
+        turn_recovery.Claim (pass it to chat(recovery=...)) or
+        turn_recovery.Refusal. A matching key consumes the offer either way;
+        a stale key leaves the current offer untouched. Tools/project that
+        cannot be read refuse (authority_state_unreadable); never raises
+        for them."""
+        try:
+            scope = _recovery_scope_fields(self)
+        except Exception:
+            scope = {"enabled_tools": None, "project": None}
+        outcome = self._turn_recovery.claim(
+            key, chat_id=chat_id, history=self.ctx.history,
+            turn_seq=getattr(self.ctx, "turn_seq", None),
+            live_identity=identity_of_backend(getattr(self, "llm", None)),
+            estop_latched=emergency_stop.is_latched(),
+            estop_epoch=emergency_stop.current_epoch(),
+            verify_token=suspension_runtime.verify,
+            live_authority=turn_recovery.capture_authority(getattr(self, "channel_id", None), chat_id),
+            **scope,
+        )
+        if isinstance(outcome, turn_recovery.Refusal):
+            _fr_machine(self, "turn.recovery.refused", chat_id=chat_id, severity="warning",
+                        fields={"reason": outcome.reason, "stage": "claim"})
+        return outcome
 
     def clear_persona_speech_suppression(self):
         """Restore ordinary speech when no persona is active."""

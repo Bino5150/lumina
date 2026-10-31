@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QFileDialog, QScrollArea, QProgressBar
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject
+import shiboken6
 from PySide6.QtGui import QFont, QPixmap, QPainter, QBrush, QColor, QPainterPath, QIcon
 
 import os
@@ -29,6 +30,7 @@ from comms import telegram_origin_routing as origin_routing
 from core.agent import TurnCancelled, is_error_response
 from core import emergency_stop
 from core import suspension, suspension_runtime
+from core import turn_recovery
 from core.context_checkpoints import get_latest_usable_checkpoint
 from core import context_rebuild
 from core.context_reconstruction import reconstruct_chat_context, resolve_context_skip
@@ -49,7 +51,7 @@ from ui.chat_widget import ChatWidget, LiveResponseBubble
 from ui.settings import SettingsPanel
 from ui.review_panel import ReviewPanel
 from ui.owner_turn_intake import (
-    admit_dropped_text_file, owner_chat_call, package_submission,
+    admit_dropped_text_file, chat_accepts, owner_chat_call, package_submission,
 )
 from tools.memory import (
     init_chat_db, create_chat, list_chats, save_chat_message,
@@ -230,8 +232,15 @@ class AgentWorker(QThread):
     BATCH_CHARS = 12  # flush every N characters
 
     def __init__(self, agent, user_input, signals: StreamSignals, chat_id: int = None,
-                 attachments=None, approval_event_id: str = None, suspension_token=None):
+                 attachments=None, approval_event_id: str = None, suspension_token=None,
+                 offer_recovery: bool = False, recovery=None):
         super().__init__()
+        # TURN-RECOVERY-UI-01 -- offer_recovery: a local owner desktop turn
+        # whose transport failure may be offered for continuation. recovery:
+        # a fenced turn_recovery.Claim; the worker then continues that turn
+        # with no user text of its own.
+        self.offer_recovery = offer_recovery
+        self.recovery = recovery
         # AGENT-RUNAWAY-SUSPEND-01 -- captured at submit, carried unchanged.
         self.suspension_token = suspension_token
         self.agent = agent
@@ -344,14 +353,22 @@ class AgentWorker(QThread):
             # Qt-free (ui/owner_turn_intake.py) so the blocking no-PySide6 CI
             # gate executes it: attachments travel only as attachments=, never
             # fused into user_input. Pass both through exactly as returned.
-            user_input, kwargs = owner_chat_call(
-                self.agent, self.user_input,
-                chat_id=self.chat_id,
-                cancel_event=self._cancel_event,
-                attachments=self.attachments,
-                approval_event_id=self.approval_event_id,
-                suspension_token=self.suspension_token,
-            )
+            if self.recovery is not None:
+                user_input, kwargs = "", {
+                    "chat_id": self.chat_id, "cancel_event": self._cancel_event,
+                    "recovery": self.recovery, "offer_recovery": True,
+                }
+            else:
+                user_input, kwargs = owner_chat_call(
+                    self.agent, self.user_input,
+                    chat_id=self.chat_id,
+                    cancel_event=self._cancel_event,
+                    attachments=self.attachments,
+                    approval_event_id=self.approval_event_id,
+                    suspension_token=self.suspension_token,
+                )
+                if self.offer_recovery and chat_accepts(self.agent, "offer_recovery"):
+                    kwargs["offer_recovery"] = True
             runtime_token = getattr(
                 self.agent, "_telegram_origin_runtime_token", None,
             )
@@ -580,6 +597,10 @@ class LuminaWindow(QMainWindow):
         self._stt_signals.transcribed.connect(self._on_stt_done)
         self._stt_signals.error.connect(self._on_stt_error)
         self.worker = None
+        # TURN-RECOVERY-UI-01 -- the one visible "Continue interrupted turn"
+        # offer (key, chat, generation, durable spine) and its control.
+        self._turn_recovery_offer = None
+        self._turn_recovery_control = None
         self.signals = StreamSignals()
         self._site_action_dialog = None
         route = getattr(agent, "_site_action_route", None)
@@ -1147,6 +1168,9 @@ class LuminaWindow(QMainWindow):
         if not self._chat_switch_admitted():
             return
         self._context_generation.bump()
+        retire = getattr(self, "_retire_turn_recovery_offer", None)
+        if callable(retire):
+            retire(None)
         self._current_chat_id = create_chat()
         self._prefs["last_chat_id"] = self._current_chat_id  # read-cache only
         persistence.update({"last_chat_id": self._current_chat_id})
@@ -1163,6 +1187,9 @@ class LuminaWindow(QMainWindow):
         if not self._chat_switch_admitted():
             return
         self._context_generation.bump()
+        retire = getattr(self, "_retire_turn_recovery_offer", None)
+        if callable(retire):
+            retire(None)
         self.agent.ctx.clear()
         self.chat_widget.clear_messages()
         self.chat_widget.add_system_message("Chat cleared.")
@@ -1178,6 +1205,9 @@ class LuminaWindow(QMainWindow):
         if not self._chat_switch_admitted():
             return
         self._context_generation.bump()
+        retire = getattr(self, "_retire_turn_recovery_offer", None)
+        if callable(retire):
+            retire(None)
         dialog = getattr(self, "_site_action_dialog", None)
         if dialog is not None:
             dialog.reject()
@@ -2613,10 +2643,18 @@ class LuminaWindow(QMainWindow):
         # CONTEXT-LIFECYCLE-A5I: a new foreground turn invalidates any
         # in-flight deliberate_reconstruct() preparation for this chat.
         self._context_generation.bump()
+        # TURN-RECOVERY-UI-01 -- a new turn supersedes any visible offer.
+        # Only a local owner turn may later be offered for continuation; a
+        # Telegram-relayed one never is. Set as an attribute, not a
+        # constructor argument, so every existing worker double still fits.
+        retire = getattr(self, "_retire_turn_recovery_offer", None)
+        if callable(retire):
+            retire("Superseded by a new message.")
         self.worker = AgentWorker(self.agent, content, self.signals, chat_id=self._current_chat_id,
                                    attachments=attachments_for_chat,
                                    approval_event_id=approval_event_id,
                                    suspension_token=suspension_token)
+        self.worker.offer_recovery = not relayed
         self.worker.start()
         
 
@@ -2970,8 +3008,15 @@ class LuminaWindow(QMainWindow):
         complete_telegram = getattr(self, "_complete_telegram_origin", None)
         if complete_telegram is not None:
             complete_telegram(response)
+        recovery = getattr(getattr(self, "worker", None), "recovery", None)
         if self._current_chat_id and response:
-            save_chat_message(self._current_chat_id, "assistant", response)
+            # TURN-RECOVERY-UI-01 -- a continuation's reply is a NEW row,
+            # tagged with the turn it continues; nothing earlier is rewritten.
+            metadata = None
+            if recovery is not None:
+                metadata = {"turn_recovery": {"root_turn_id": recovery.record.root_turn_id,
+                                              "attempt": recovery.record.next_attempt}}
+            save_chat_message(self._current_chat_id, "assistant", response, metadata=metadata)
             self._refresh_chat_list()
             # A failed turn returns its error as plain response text instead
             # of raising (see core/agent.py chat()/_stream_final()) — it's
@@ -2981,6 +3026,9 @@ class LuminaWindow(QMainWindow):
             # endpoint (duplicate noise, potentially duplicate paid traffic
             # against a metered provider).
             if is_error_response(response):
+                present = getattr(self, "_present_turn_recovery_offer", None)
+                if callable(present):
+                    present(after_recovery=recovery is not None)
                 return
             # ── Auto-name if still has default timestamp name ──
             current_name = get_chat_name(self._current_chat_id)
@@ -3054,7 +3102,108 @@ class LuminaWindow(QMainWindow):
         complete_telegram = getattr(self, "_complete_telegram_origin", None)
         if complete_telegram is not None:
             complete_telegram(f"[Lumina error: {error}]")
-    
+
+    # ── TURN-RECOVERY-UI-01: native "Continue interrupted turn" ──
+
+    def _durable_spine(self, chat_id) -> str:
+        return reconstruct_chat_context(
+            chat_id, context_skip=resolve_context_skip(chat_id)).durable_spine_fingerprint
+
+    def _present_turn_recovery_offer(self, after_recovery: bool = False):
+        """Show the control if the agent holds an offer for the open chat.
+        The offer is bound to this chat, the current context generation and
+        the durable transcript as saved right now (the error row included)."""
+        interrupted_turn = getattr(self.agent, "interrupted_turn", None)
+        record = interrupted_turn(self._current_chat_id) if callable(interrupted_turn) else None
+        if record is None:
+            if after_recovery:
+                self.chat_widget.add_operator_message(
+                    "This interrupted turn can't be continued again. Send a new message to carry on."
+                )
+            return
+        self._turn_recovery_offer = {
+            "key": record.key, "chat_id": record.chat_id, "attempt": record.next_attempt,
+            "generation": self._context_generation.current(),
+            "spine": self._durable_spine(record.chat_id),
+        }
+        stage = ("while the answer was streaming" if record.interruption.stage == "final_stream"
+                 else "before a reply arrived")
+        self._turn_recovery_control = self.chat_widget.add_turn_recovery_control(
+            f"The connection to the model was lost {stage}. Continue this turn "
+            f"(attempt {record.next_attempt} of {turn_recovery.MAX_ATTEMPTS}): nothing is "
+            "added to the conversation, and tool actions that already ran are not repeated.",
+            self._on_continue_interrupted_turn,
+        )
+
+    def _retire_turn_recovery_offer(self, text):
+        """Drop the visible offer (and the agent's) on navigation or a new
+        turn. text=None: the control is about to be cleared with the view."""
+        self._turn_recovery_offer = None
+        control = getattr(self, "_turn_recovery_control", None)
+        self._turn_recovery_control = None
+        drop = getattr(self.agent, "drop_interrupted_turn", None)
+        if callable(drop):
+            drop()
+        if control is not None and text and shiboken6.isValid(control):
+            control.retire(text)
+
+    def _on_continue_interrupted_turn(self):
+        """One owner click -> at most one continuation. The offer is consumed
+        before any check; every fence failure is terminal and explained."""
+        offer, self._turn_recovery_offer = self._turn_recovery_offer, None
+        control, self._turn_recovery_control = self._turn_recovery_control, None
+        if offer is None:
+            return
+
+        def refuse(reason_text):
+            drop = getattr(self.agent, "drop_interrupted_turn", None)
+            if callable(drop):
+                drop()
+            message = f"Can't continue the interrupted turn: {reason_text}. Send a new message to carry on."
+            if control is not None and shiboken6.isValid(control):
+                control.retire(message)
+            else:
+                self.chat_widget.add_operator_message(message)
+
+        if self.worker is not None and self.worker.isRunning():
+            return refuse("another turn is running")
+        if self._manual_compaction_thread is not None:
+            return refuse("manual context compaction is running")
+        if emergency_stop.is_latched():
+            return refuse(turn_recovery.REASON_TEXT[turn_recovery.ESTOP_LATCHED])
+        if offer["chat_id"] != self._current_chat_id:
+            return refuse(turn_recovery.REASON_TEXT[turn_recovery.CHAT_CHANGED])
+        if offer["generation"] != self._context_generation.current():
+            return refuse(turn_recovery.REASON_TEXT[turn_recovery.CONTEXT_CHANGED])
+        try:
+            spine = self._durable_spine(offer["chat_id"])
+        except Exception:
+            spine = None
+        if spine != offer["spine"]:
+            return refuse(turn_recovery.REASON_TEXT[turn_recovery.CONTEXT_CHANGED])
+        try:
+            claim = self.agent.claim_interrupted_turn(offer["key"], chat_id=offer["chat_id"])
+        except Exception as exc:
+            print(f"[TURN RECOVERY] claim failed ({type(exc).__name__})", flush=True)
+            return refuse("the conditions for continuing it could not be checked")
+        if not isinstance(claim, turn_recovery.Claim):
+            return refuse(claim.text)
+
+        if control is not None and shiboken6.isValid(control):
+            control.retire(f"Continuing interrupted turn · attempt {offer['attempt']} of "
+                           f"{turn_recovery.MAX_ATTEMPTS}")
+        self._last_activity = time.time()
+        self._reset_dream_window_state()
+        self._operator_turn_started_at = time.time()
+        self._mark_operator_progress("processing")
+        self.chat_widget.set_turn_running(True)
+        self.status_lbl.setText("continuing...")
+        self._live_bubble = self.chat_widget.create_live_bubble()
+        self._context_generation.bump()
+        self.worker = AgentWorker(self.agent, "", self.signals, chat_id=offer["chat_id"],
+                                  recovery=claim)
+        self.worker.start()
+
     def _on_mic_pressed(self):
         if self.worker and self.worker.isRunning():
             return

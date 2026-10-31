@@ -72,10 +72,12 @@ context.reconstruction.requested context.reconstruction.swapped
 provider.dispatch provider.dispatch_failed provider.dispatch_refused
 provider.pin_mismatch provider.response provider.stream_terminal
 runtime.shutdown runtime.startup suspension.refused suspension.trip_unavailable
-suspension.tripped tool.batch tool.batch_refused tool.call tool.result
+suspension.tripped tool.batch tool.batch_refused tool.call tool.recovery_authority_refused
+tool.recovery_duplicate_refused tool.result
 turn.budget_exhausted turn.budget_warning turn.cancelled turn.commentary
 turn.completed turn.completion_gate_unresolved turn.failed turn.final
-turn.refused turn.started turn.think turn.tool_ceiling_reached turn.vision_route
+turn.recovery.not_offered turn.recovery.offered turn.recovery.refused
+turn.recovery.started turn.refused turn.started turn.think turn.tool_ceiling_reached turn.vision_route
 turn.vision_tool_capability_notice
 """.split())
 BACKENDS = frozenset("""lmstudio ollama llamacpp openai anthropic gemini
@@ -88,14 +90,24 @@ ENUM_FIELDS = {
         BadRequestError InternalServerError OperationalError DatabaseError
         JSONDecodeError CancelledError SSLError""".split()),
     "phase": frozenset(("work", "gate", "final", "stream")),
-    "stage": frozenset(("initial_request", "tool_continuation")),
+    "stage": frozenset(("initial_request", "tool_continuation", "turn_start", "claim")),
     "reason": frozenset(("exception", "error_sentinel", "emergency_stop", "cooperative_stop",
                          "suspension", "clean", "crash", "trailing_assistant_message",
                          "gate_finish", "gate_contract_violated", "continue_tool_work",
                          "control_gate_requested_more_work", "wrong_instance", "paused",
                          "not_installed", "wrong_origin", "unpaired", "wrong_peer",
                          "unsupported_version", "bad_hello", "protocol_violation",
-                         "wrong_connection", "connection_closed", "unsolicited")),
+                         "wrong_connection", "connection_closed", "unsolicited",
+                         # TURN-RECOVERY-UI-01: fixed refusal / not-offered codes
+                         "not_transport_failure", "result_is_not_the_interruption",
+                         "not_owner_desktop_turn", "attempts_exhausted",
+                         "tool_history_not_closed", "consequential_outcome_unknown",
+                         "turn_anchor_missing", "nothing_to_continue", "offer_superseded",
+                         "chat_changed", "context_changed", "newer_turn_admitted",
+                         "backend_or_model_changed", "emergency_stop_latched",
+                         "emergency_stop_rearmed_since", "suspension_refused",
+                         "tool_or_project_scope_changed",
+                         "authority_widened_since_interruption", "authority_state_unreadable")),
     "tool_tier": frozenset(("read_only", "write_local", "execute", "outbound_action", "self_modifying")),
     "state": frozenset(("listening", "stopped", "ready", "not_published", "rejected", "disconnected", "start_failed")),
     "stream_completion_state": frozenset(("completed", "incomplete", "failed", "cancelled")),
@@ -107,8 +119,9 @@ ENUM_FIELDS["cause_type"] = ENUM_FIELDS["exception_type"]
 NUMERIC_FIELDS = frozenset("""duration_s duration_ms elapsed_s limit_s start_ts
 batch_ordinal call_ordinal tool_call_count response_chars output_count
 reasoning_output_count output_limit think_step executed_calls stale_streak
-write_stale_streak admitted_tool_calls tool_iteration_limit source_round commentary_rounds""".split())
-BOOL_FIELDS = frozenset(("success", "skipped", "request_streamed"))
+write_stale_streak admitted_tool_calls tool_iteration_limit source_round commentary_rounds
+attempt next_attempt max_attempts attempts_run partial_final_chars active_elapsed_s""".split())
+BOOL_FIELDS = frozenset(("success", "skipped", "request_streamed", "candidate_pending"))
 
 README = """Lumina Support Diagnostics (schema 1)
 

@@ -744,6 +744,50 @@ class SmartInput(QTextEdit):
         cursor.insertText(replacement)
 
 
+class TurnRecoveryControl(QFrame):
+    """TURN-RECOVERY-UI-01 -- the inline "Continue interrupted turn" control.
+
+    One-shot by construction: the first click disables the button before the
+    signal is emitted, and the signal can never fire twice. Text is always
+    Lumina's own fixed wording, rendered as plain text."""
+    continue_requested = Signal()
+
+    def __init__(self, colors: dict, text: str):
+        super().__init__()
+        self._fired = False
+        self.setStyleSheet(
+            f"QFrame{{background:{colors['bg_card']};border:1px solid {colors['border_accent']};"
+            "border-radius:8px;margin:2px 24px;}"
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        self.label = QLabel(text)
+        self.label.setTextFormat(Qt.PlainText)
+        self.label.setWordWrap(True)
+        self.label.setStyleSheet(
+            f"color:{colors['text_muted']};font-size:11px;background:transparent;border:none;"
+        )
+        layout.addWidget(self.label, 1)
+        self.button = QPushButton("Continue interrupted turn")
+        self.button.setCursor(Qt.PointingHandCursor)
+        self.button.clicked.connect(self._on_clicked)
+        layout.addWidget(self.button)
+
+    def _on_clicked(self):
+        if self._fired:
+            return
+        self._fired = True
+        self.button.setEnabled(False)
+        self.continue_requested.emit()
+
+    def retire(self, text: str) -> None:
+        """Final state: no button, plain explanation."""
+        self._fired = True
+        self.button.setEnabled(False)
+        self.button.hide()
+        self.label.setText(text)
+
+
 # ── Chat Widget ────────────────────────────────────────────────────────────────
 
 class ChatWidget(QWidget):
@@ -1007,6 +1051,14 @@ class ChatWidget(QWidget):
         )
         layout.addWidget(lbl)
         self._insert(frame)
+
+    def add_turn_recovery_control(self, text: str, on_continue) -> TurnRecoveryControl:
+        """TURN-RECOVERY-UI-01 -- out-of-band like add_operator_message():
+        never written into chat history."""
+        control = TurnRecoveryControl(self.colors, text)
+        control.continue_requested.connect(on_continue)
+        self._insert(control)
+        return control
 
     def create_live_bubble(self, restored: bool = False) -> LiveResponseBubble:
         bubble = LiveResponseBubble(self.colors, avatar_path=self.avatar_path,

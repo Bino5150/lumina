@@ -53,6 +53,7 @@ __all__ = [
     "is_presented",
     "approve_draft",
     "is_approved",
+    "approved_draft_ids",
     "find_pending_draft_id",
     "try_claim_approval_event",
     "release_approval_event",
@@ -318,6 +319,21 @@ def is_approved(draft_id: str) -> bool:
     this only answers the approval question in isolation."""
     with _lock:
         return draft_id in _approvals
+
+
+def approved_draft_ids(*, channel_id: Optional[str], chat_id: Optional[int]) -> frozenset:
+    """Read-only -- does not prune or mutate. The unexpired drafts approved
+    and not yet spent in this exact (channel_id, chat_id) context: the
+    approval authority generate_image() could act on there right now.
+    TURN-RECOVERY-UI-01 snapshots it so a continued turn never gains an
+    approval given after its interruption."""
+    with _lock:
+        now = time.time()
+        return frozenset(
+            draft_id for draft_id in _approvals
+            if (draft := _drafts.get(draft_id)) is not None and draft.expires_at > now
+            and draft.channel_id == channel_id and draft.chat_id == chat_id
+        )
 
 
 def find_pending_draft_id(*, channel_id: Optional[str], chat_id: Optional[int]) -> Optional[str]:
