@@ -771,11 +771,11 @@ class LuminaWindow(QMainWindow):
     def _set_wire_wake_enabled(self, enabled: bool) -> None:
         """Settings-toggle handler: live start/stop of the W1 listener.
 
-        The pref is persisted first; the listener follows the pref. Stopping
-        is the bounded shutdown path (socket closed, threads joined ≤2s,
-        fire-and-forget unregister) — the UI never waits on Wire traffic.
+        The listener follows the pref (persisted by the Settings tab that
+        emits this signal). Stopping is the bounded shutdown path (all live
+        sockets interrupted, threads joined ≤2s, fire-and-forget unregister)
+        — the UI never waits on Wire traffic.
         """
-        persistence.update({"wire_wake_listener": bool(enabled)})
         if enabled:
             if self._wire_listener is None and not os.environ.get("LUMINA_TESTING"):
                 self._start_wire_listener()
@@ -836,9 +836,9 @@ class LuminaWindow(QMainWindow):
             telegram_bridge.begin_shutdown()
         except Exception as e:
             print(f"[TELEGRAM] shutdown request failed: {type(e).__name__}", flush=True)
-        # WIRE-WAKE-01 W1: bounded listener shutdown (watch ends on its next
-        # server timeout event; best-effort unregister; lease lapse covers
-        # any failure honestly).
+        # WIRE-WAKE-01 W1: bounded listener shutdown (all live sockets are
+        # interrupted immediately so no thread waits on Wire traffic;
+        # best-effort unregister; lease lapse covers any failure honestly).
         wire_listener = getattr(self, "_wire_listener", None)
         if wire_listener is not None:
             try:

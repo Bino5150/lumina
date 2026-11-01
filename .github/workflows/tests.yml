@@ -119,6 +119,14 @@ jobs:
       - name: Run Qt-bound site-action review guards (blocking)
         run: python -m pytest tests/test_site_action_review_qt.py -v -rs -m "not castle_walls_evidence"
 
+      # WIRE-WAKE-01 W1 (R3/R2-1) -- relay-free Qt panel guards. These classes
+      # need PySide6 but NOT the aivengers relay source; the relay-bound
+      # classes in the same module skip here by their own class-level marker.
+      # R2 shipped this step selecting one class under a module-level skip:
+      # it skipped 5/5 and exited 0 (theater, not a guard).
+      - name: Run Qt-bound Wire wake panel guards (blocking)
+        run: python -m pytest "tests/test_wire_wake_adapter_01.py::TestWirePanel" "tests/test_wire_wake_adapter_01.py::TestDefaultOffR2" "tests/test_wire_wake_adapter_01.py::TestPanelScaleR2" "tests/test_wire_wake_adapter_01.py::TestEStopDisplayR2" "tests/test_wire_wake_adapter_01.py::TestSafetyGates" -v -rs
+
       # PALACE-GUARD-01B-4 -- the trusted GUI owner approval of a Palace
       # promotion (L0/L1 placement). The real ToolsTab and review dialog are
       # driven with real Qt mouse events, and every generic approval path is

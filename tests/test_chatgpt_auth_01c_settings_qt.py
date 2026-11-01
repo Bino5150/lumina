@@ -223,8 +223,13 @@ def test_card_is_mounted_in_general_outside_selector_and_save(qapp, monkeypatch,
     monkeypatch.setattr(card_mod.ChatGPTPlanCard, "_mgr", lambda self: manager)
 
     from PySide6.QtWidgets import QWidget
+    from PySide6.QtCore import Signal  # noqa: F401 -- needed at class-creation time below
 
     class _PlainTab(QWidget):
+        # R3/R2-6 (Sonnet): SettingsPanel.__init__ connects this signal
+        # unconditionally, so every CommunicationsTab stand-in must carry it.
+        wire_wake_toggle_changed = Signal(bool)
+
         def __init__(self, *args, **kwargs):
             super().__init__()
 

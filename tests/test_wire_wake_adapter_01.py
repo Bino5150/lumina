@@ -51,9 +51,15 @@ _AIVENGERS_SRC_CANDIDATES = [
 ]
 AIVENGERS_SRC = next((p for p in _AIVENGERS_SRC_CANDIDATES if (p / "aivengers_wire").is_dir()), None)
 
-pytestmark = pytest.mark.skipif(
+# R3/R2-1 (Sonnet): the module-level skip starved the relay-free Qt classes
+# (TestWirePanel / TestDefaultOffR2 / TestPanelScaleR2 / TestEStopDisplayR2 /
+# TestSafetyGates) in the qt-security-guards CI step, which then skipped 5/5
+# and exited 0 — theater, not a guard. The relay requirement is now a
+# class-level marker on the relay-bound classes only; the relay-free classes
+# run unconditionally wherever PySide6 exists.
+_requires_relay = pytest.mark.skipif(
     AIVENGERS_SRC is None,
-    reason="aivengers release source not found; Wire adapter tests require it",
+    reason="aivengers release source not found; relay-bound W1 tests require it",
 )
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -61,6 +67,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.aivengers_wire import (  # noqa: E402
     AivengersWireClient,
     WireError,
+    WireFrameError,
     WireProtocolError,
     MAX_WAKE_LIST_LIMIT,
 )
@@ -258,6 +265,7 @@ def operator_wake(relay: Relay, *, target_session: str | None = None,
 
 # ── acceptance scenarios ──────────────────────────────────────────────────
 
+@_requires_relay
 class TestSessionLifecycle:
     def test_listener_registers_session(self, qapp, wired_relay):
         listener = make_listener(wired_relay)
@@ -388,6 +396,7 @@ class TestSessionLifecycle:
         assert live is False, "session still appears live after crash without shutdown"
 
 
+@_requires_relay
 class TestEventDelivery:
     def test_events_arrive_on_gui_thread(self, qapp, wired_relay):
         states = SlotRecorder()
@@ -502,6 +511,7 @@ class TestEventDelivery:
             listener.shutdown()
 
 
+@_requires_relay
 class TestAckAndClaim:
     def test_ack_records_receipt_and_is_idempotent(self, qapp, wired_relay):
         results = SlotRecorder()
@@ -617,6 +627,7 @@ class TestAckAndClaim:
             listener.shutdown()
 
 
+@_requires_relay
 class TestReconnectAndCatchup:
     def test_daemon_restart_recovery(self, qapp, wired_relay):
         states = SlotRecorder()
@@ -874,6 +885,7 @@ class TestWirePanel:
 
 # ── R2 regression classes (Sonnet review of 75d2b98) ─────────────────
 
+@_requires_relay
 class TestFramingR2:
     """B2: the watch() frame reader must survive fragmented and coalesced
     frames — exactly what the relay emits when replaying multiple pending
@@ -916,6 +928,8 @@ class TestFramingR2:
                     got.append(ev.get("event"))
             except WireError as exc:
                 error.append(f"{type(exc).__name__}: {exc}")
+            except BaseException as exc:  # R3/R2-3: ANY non-WireError fails
+                error.append(f"UNEXPECTED {type(exc).__name__}: {exc}")
 
         t = threading.Thread(target=serve)
         t.start()
@@ -949,9 +963,15 @@ class TestFramingR2:
                      "wake": {"wake_id": "w-frag", "state": "pending",
                               "task_ref": "T-fragmented-frames"}})
         fragments = [big[i:i + 7] for i in range(0, len(big), 7)]
-        got, error = self._fake_relay_send(tmp_path, frames + fragments, coalesce=True)
+        # R3/R2-3: end with a terminator like the real relay does — a clean
+        # EOF after the last frame now raises WireFrameError (the honest
+        # close), so a subscription must end with its timeout event.
+        got, error = self._fake_relay_send(
+            tmp_path, frames + fragments + [frame({"ok": True, "event": "timeout"})],
+            coalesce=True,
+        )
         assert not error, f"fragmented frames broke the reader: {error}"
-        assert got.count("wake") == 1
+        assert got == ["subscribed", "wake", "timeout"]
 
     def test_real_relay_multi_wake_replay_no_storm(self, qapp, wired_relay):
         """Real-relay storm regression (Sonnet e2): >=10 pending wakes with a
@@ -982,42 +1002,63 @@ class TestFramingR2:
             listener.shutdown()
 
 
+@_requires_relay
 class TestBackoffBudgetR2:
     def test_backoff_resets_only_after_valid_frame(self, qapp, wired_relay):
-        """B2: repeated subscribe-then-fail cycles must back off exponentially
-        (R1 reset the budget on every 'listening', pinning the cycle at ~0.6s)."""
+        """R3/R2-2 (Sonnet): ack-then-fail must KEEP backing off.
+
+        The R2 code treated the ``subscribed`` ack as the 'valid post-
+        subscribe frame' and reset the budget on it, so a relay that accepts
+        the subscription, delivers the ack, and then drops re-subscribed
+        every ~0.55s forever (Sonnet P1: 24 subscriptions / 12s). The budget
+        may only reset after a frame that proves the stream is alive (wake /
+        timeout / overflow / message) — never on the ack itself.
+
+        Discriminator: count ``listening`` transitions in a fixed window.
+        Honest backoff (0.5, 1, 2, 4…) allows ~3-4 cycles in 6.5s; the ack-
+        reset defect produces ~10+.
+        """
         listener = make_listener(wired_relay, watch_timeout_ms=15_000)
-        # A client whose watch connections die right after subscribe: the
-        # relay accepts the subscription then closes (post-subscribe failure).
+        states = SlotRecorder()
+        listener.signals.connection_state.connect(states)
         real_client = listener._client
 
-        class SubscribeThenDie(real_client.__class__):
+        class AckThenFail(real_client.__class__):
+            """Delivers the subscribed ack, then the stream fails."""
+
             def watch(self, **kwargs):
                 base = super().watch(**kwargs)
+                first = True
                 for event in base:
+                    if first:
+                        first = False
+                        yield event  # the subscribed ack — NOT a valid frame
+                        raise WireFrameError("relay dropped after the ack")
                     yield event
-                    return  # die after the FIRST frame (the subscribed ack)
 
-        listener._client = SubscribeThenDie(
+        listener._client = AckThenFail(
             state_dir=real_client.state_dir, timeout=real_client._timeout
         )
         listener.start()
         try:
-            time.sleep(6.0)  # R1 would have cycled ~10 times in this window
-            # With an honest backoff budget (0.5, 1, 2, 4...) the listener
-            # manages at most ~4 cycles in 6s; R1's tight loop did ~10+.
-            # Assert via the sleep budget: read the current backoff value
-            # through the loop's behavior — count connection_state flips.
-            # (Direct state introspection: the loop's local `backoff` is not
-            # exposed, so count cycles via the stop flag timing instead.)
+            # Pump the event loop while the cycles run — cross-thread signal
+            # deliveries to the recorder are queued and need the loop.
+            deadline = time.monotonic() + 6.5
+            while time.monotonic() < deadline:
+                pump(qapp, 0.1)
+            listenings = sum(1 for s in states.items if s == "listening")
+            assert listenings >= 2, (
+                f"listener stopped retrying: {listenings} cycles in 6.5s"
+            )
+            assert listenings <= 5, (
+                f"ack-then-fail reconnect storm: {listenings} subscriptions "
+                "in 6.5s — the ack reset the backoff budget (R2-2/BK1)"
+            )
         finally:
             started = time.monotonic()
             listener.shutdown()
             elapsed = time.monotonic() - started
             assert elapsed < 3.0
-        # The structural backoff pin in test_wire_wake_adapter_structure_01
-        # asserts the reset placement; this behavioral test proves shutdown
-        # stays bounded while the retry loop is churning.
 
     def test_backoff_grows_across_failures(self, qapp, wired_relay):
         """Direct budget check: with the relay down, successive backoff waits
@@ -1047,6 +1088,7 @@ class TestBackoffBudgetR2:
             listener.shutdown()
 
 
+@_requires_relay
 class TestSessionIdentityR2:
     def test_transient_outage_keeps_identity(self, qapp, wired_relay):
         """H1/S2: a short relay outage must NOT orphan the live session or
@@ -1162,6 +1204,7 @@ class TestSessionIdentityR2:
             listener.shutdown()
 
 
+@_requires_relay
 class TestClaimReleaseLifecycleR2:
     def test_claim_confirmation_gates_the_action(self, qapp):
         """H4: the panel's Claim button must pass through a confirmation
@@ -1381,6 +1424,637 @@ class TestEStopDisplayR2:
         monkeypatch.setattr(emergency_stop, "is_latched", lambda: False)
         note = wire_admission_note()
         assert "suspension ACTIVE" in note and "E-STOP" not in note
+
+
+# ── R3 regression classes (Sonnet review of 4617ff2) ─────────────────
+
+@_requires_relay
+class TestCatchupR3:
+    """R2-4: the catch-up walk must be load-bearing, retried after a
+    transient failure, and re-armed on every error-driven reconnect."""
+
+    def test_catchup_surfaces_pre_existing_wakes(self, qapp, wired_relay):
+        """CU mutant kill: catch-up removed entirely passed 59/59 on R2.
+        Pre-existing seat-level wakes must surface with source=catchup."""
+        wakes = SlotRecorder()
+        listener = make_listener(wired_relay)
+        listener.signals.wake_event.connect(wakes)
+        first = operator_wake(wired_relay, task_id="T-cu-a")["wake"]
+        second = operator_wake(wired_relay, task_id="T-cu-b")["wake"]
+        listener.start()
+        try:
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                pump(qapp, 0.1)
+                ids = {
+                    e.get("wake", {}).get("wake_id")
+                    for e in wakes.items
+                    if isinstance(e, dict) and e.get("source") == "catchup"
+                }
+                if first["wake_id"] in ids and second["wake_id"] in ids:
+                    break
+            assert {first["wake_id"], second["wake_id"]} <= ids, (
+                "pre-existing wakes never surfaced via catch-up (CU mutant)"
+            )
+        finally:
+            listener.shutdown()
+
+    def test_catchup_surfaces_delivered_wake_and_retries_after_failure(
+        self, qapp, wired_relay
+    ):
+        """R2-4: the latch must be cleared AFTER a successful walk, not
+        before it. A delivered wake (which the relay does NOT replay on
+        subscribe) must still surface when the first walk fails transiently."""
+        wakes = SlotRecorder()
+        listener = make_listener(wired_relay)
+        listener.signals.wake_event.connect(wakes)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            session_id = listener.session_id
+            assert session_id
+            wake = operator_wake(
+                wired_relay, target_session=session_id, task_id="T-cu-retry"
+            )["wake"]
+            assert wakes.wait_for(
+                lambda e: isinstance(e, dict)
+                and e.get("wake", {}).get("wake_id") == wake["wake_id"],
+                5, qapp,
+            )
+            # Receipt it: pending -> delivered. Delivered wakes are NOT
+            # replayed by the relay on resubscribe — only catch-up shows them.
+            listener._client.wake_ack(wake["wake_id"], session_id)
+            # Inject ONE transient walk failure, then force an error-driven
+            # reconnect (the watch socket close produces a WireError).
+            real_page = listener._client.wake_list_page
+            calls = {"n": 0}
+
+            def flaky_page(**kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise WireError("injected catch-up walk failure")
+                return real_page(**kw)
+
+            listener._client.wake_list_page = flaky_page
+            # Force an error-driven reconnect NOW: breaking the live watch
+            # socket produces a WireError, the latch re-arms, and the next
+            # connection walks with the flaky page (call #1 fails, the retry
+            # succeeds). Delivered wakes never replay on subscribe, so only
+            # the retried walk can surface this one.
+            sock = getattr(listener._client, "_watch_socket", None)
+            assert sock is not None, "no live watch socket to break"
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                pump(qapp, 0.1)
+                if any(
+                    isinstance(e, dict)
+                    and e.get("source") == "catchup"
+                    and e.get("wake", {}).get("wake_id") == wake["wake_id"]
+                    for e in wakes.items
+                ):
+                    break
+            assert any(
+                isinstance(e, dict)
+                and e.get("source") == "catchup"
+                and e.get("wake", {}).get("wake_id") == wake["wake_id"]
+                for e in wakes.items
+            ), (
+                "delivered wake never surfaced after a transient walk failure "
+                "— the latch was cleared before the walk (R2-4)"
+            )
+        finally:
+            listener.shutdown()
+
+    def test_error_reconnect_rewalks_catchup(self, qapp, wired_relay):
+        """R2-4/P6: a kept-identity reconnect must re-walk catch-up. The
+        relay replays only the oldest ~32 unacked pending wakes per
+        subscription; anything beyond that stays invisible without a walk."""
+        wakes = SlotRecorder()
+        listener = make_listener(wired_relay)
+        listener.signals.wake_event.connect(wakes)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            session_id = listener.session_id
+            assert session_id
+            wake = operator_wake(
+                wired_relay, target_session=session_id, task_id="T-cu-rewalk"
+            )["wake"]
+            assert wakes.wait_for(
+                lambda e: isinstance(e, dict)
+                and e.get("wake", {}).get("wake_id") == wake["wake_id"],
+                5, qapp,
+            )
+            listener._client.wake_ack(wake["wake_id"], session_id)
+            before_catchup = sum(
+                1 for e in wakes.items
+                if isinstance(e, dict) and e.get("source") == "catchup"
+            )
+            # Fail exactly one future watch subscription (simulated outage);
+            # identity is kept (transient), so no re-registration runs.
+            real_watch = listener._client.watch
+            wcalls = {"n": 0}
+
+            def flaky_watch(**kw):
+                wcalls["n"] += 1
+                if wcalls["n"] == 2:
+                    raise WireError("injected watch outage")
+                return real_watch(**kw)
+
+            listener._client.watch = flaky_watch
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                pump(qapp, 0.1)
+                after = sum(
+                    1 for e in wakes.items
+                    if isinstance(e, dict) and e.get("source") == "catchup"
+                )
+                if after > before_catchup and wcalls["n"] >= 3:
+                    break
+            assert after > before_catchup and wcalls["n"] >= 3, (
+                "kept-identity reconnect never re-walked catch-up (R2-4: "
+                "latch armed only at start/fresh registration)"
+            )
+        finally:
+            listener.shutdown()
+
+
+class TestReleaseLifecycleR3:
+    """R2-5: Release is the only permanent W1 write — its outcome, its
+    confirmation gate, and its per-session visibility are all pinned."""
+
+    def test_release_button_scoped_to_claiming_session(self, qapp):
+        """PVR mutant kill: Release visible in every state passed 59/59."""
+        from ui.wire_panel import WireWakePanel
+
+        panel = WireWakePanel(COLORS)
+        panel.set_session(
+            {"session_id": "sess-AAA", "generation": 1, "lease_live": True}
+        )
+        panel.apply_wake_event(
+            {"source": "catchup",
+             "wake": _wake_record("w-own", state="claimed",
+                                  claimed_by_session="sess-AAA")}
+        )
+        row = panel._rows["w-own"]
+        assert row._release_btn.isVisibleTo(row)
+        assert row._release_btn.isEnabled()
+        # App restart: a NEW session holds the view; the claim belongs to an
+        # earlier session, so Release must render disabled with the reason.
+        panel.set_session(
+            {"session_id": "sess-BBB", "generation": 2, "lease_live": True}
+        )
+        assert row._release_btn.isVisibleTo(row)
+        assert not row._release_btn.isEnabled()
+        assert "earlier session" in row._release_btn.toolTip()
+        # Pending rows never offer Release at all.
+        panel.apply_wake_event({"source": "live", "wake": _wake_record("w-pend")})
+        prow = panel._rows["w-pend"]
+        assert not prow._release_btn.isVisibleTo(prow)
+
+    def test_release_confirmation_gate_is_invoked(self, qapp):
+        """CFR mutant kill: removing the confirmation call passed 59/59
+        because the tests replaced _confirm_release itself."""
+        from ui.wire_panel import WireWakePanel
+
+        panel = WireWakePanel(COLORS)
+        panel.set_session(
+            {"session_id": "sess-A", "generation": 1, "lease_live": True}
+        )
+        panel.apply_wake_event(
+            {"source": "live", "wake": _wake_record("w-cfr", state="claimed",
+                                                    claimed_by_session="sess-A")}
+        )
+        row = panel._rows["w-cfr"]
+        emitted = SlotRecorder()
+        panel.release_requested.connect(emitted)
+        calls = {"n": 0}
+
+        def recording_confirm():
+            calls["n"] += 1
+            return False  # owner declines
+
+        row._confirm_release = recording_confirm
+        row._release_btn.click()
+        pump(qapp, 0.2)
+        assert calls["n"] == 1, "Release click bypassed the confirmation gate"
+        assert emitted.items == [], "release emitted despite declined confirmation"
+
+    @_requires_relay
+    def test_release_records_failed_with_note(self, qapp, wired_relay):
+        """RO mutant kill: Release recording 'completed' instead of 'failed'
+        passed 59/59 — the outcome was never asserted against the relay."""
+        results = SlotRecorder()
+        listener = make_listener(wired_relay)
+        listener.signals.wake_action_result.connect(results)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            session_id = listener.session_id
+            wake = operator_wake(
+                wired_relay, target_session=session_id, task_id="T-ro"
+            )["wake"]
+            listener.claim_wake(wake["wake_id"])
+            assert results.wait_for(
+                lambda r: r.get("action") == "claim" and r.get("ok"), 5, qapp
+            )
+            listener.release_task(wake["wake_id"], wake["task_ref"])
+            assert results.wait_for(
+                lambda r: r.get("action") == "release" and r.get("ok"), 5, qapp
+            )
+            release = next(
+                r for r in results.items
+                if r.get("action") == "release" and r.get("ok")
+            )
+            durable = listener._client.wake_status(wake["wake_id"])
+            assert durable["state"] == "failed", (
+                f"release recorded {durable['state']}, not failed (RO mutant)"
+            )
+            # The note lives on the TASK record (the wake's last_error is not
+            # the release note); the release response carries the task.
+            task_blob = json.dumps(release.get("task", {}))
+            assert "released by owner" in task_blob, (
+                f"release task record lost the release note: {task_blob[:200]}"
+            )
+        finally:
+            listener.shutdown()
+
+
+class TestPanelEvictionR3:
+    def test_cap_evicts_terminal_before_live(self, qapp):
+        """O1: with 45 live + 5 terminal rows at the cap, 10 new live wakes
+        must evict the TERMINAL rows first — never push live rows off while
+        completed rows stay rendered."""
+        from ui.wire_panel import MAX_RENDERED_ROWS, WireWakePanel
+
+        panel = WireWakePanel(COLORS)
+        for i in range(45):
+            panel.apply_wake_event(
+                {"source": "catchup",
+                 "wake": _wake_record(f"w-live-{i}",
+                                      created_at=f"2026-10-31T12:00:{i:02d}.000000Z")}
+            )
+        for i in range(5):
+            panel.apply_wake_event(
+                {"source": "catchup",
+                 "wake": _wake_record(f"w-term-{i}", state="completed",
+                                      created_at=f"2026-10-31T11:00:{i:02d}.000000Z")}
+            )
+        assert len(panel._rows) == MAX_RENDERED_ROWS
+        for i in range(10):
+            panel.apply_wake_event(
+                {"source": "catchup",
+                 "wake": _wake_record(f"w-new-{i}",
+                                      created_at=f"2026-10-31T13:00:{i:02d}.000000Z")}
+            )
+        assert len(panel._rows) <= MAX_RENDERED_ROWS
+        live = sum(1 for wid in panel._rows
+                   if wid.startswith("w-live-") or wid.startswith("w-new-"))
+        terminal = sum(1 for wid in panel._rows if wid.startswith("w-term-"))
+        assert live == 50, f"live rows evicted while terminal stayed: {live}"
+        assert terminal == 0, "terminal rows survived eviction over live rows"
+
+    def test_dialog_open_row_survives_eviction(self, qapp):
+        """O2: an incoming wake must never evict the row whose Claim/
+        Release confirmation the owner is looking at (the click would be
+        silently dropped by the nested event loop)."""
+        from ui.wire_panel import WireWakePanel
+
+        panel = WireWakePanel(COLORS)
+        for i in range(50):
+            panel.apply_wake_event(
+                {"source": "catchup",
+                 "wake": _wake_record(f"w-{i}",
+                                      created_at=f"2026-10-31T12:{i // 60:02d}:{i % 60:02d}.000000Z")}
+            )
+        panel._rows["w-0"].dialog_open = True  # owner confirming on the oldest row
+        panel.apply_wake_event(
+            {"source": "live", "wake": _wake_record("w-incoming")}
+        )
+        assert "w-0" in panel._rows, "eviction destroyed the row with an open dialog"
+        assert "w-incoming" in panel._rows
+
+    def test_all_wire_labels_render_plain_text(self, qapp):
+        """PTT/PTP mutant kill: only the NOTE label was covered by the R2
+        injection test; the task and provenance labels must also pin
+        Qt.TextFormat.PlainText."""
+        from ui.wire_panel import WireWakePanel
+
+        panel = WireWakePanel(COLORS)
+        panel.apply_wake_event(
+            {"source": "live",
+             "wake": _wake_record("w-fmt", last_error="inject <b>bold</b>")}
+        )
+        row = panel._rows["w-fmt"]
+        for label in (row._state_badge, row._task_label, row._created_label,
+                      row._provenance_label, row._note_label):
+            assert label.textFormat() == Qt.TextFormat.PlainText, (
+                "a wire-sourced label lost PlainText (PTT/PTP class)"
+            )
+
+
+@_requires_relay
+class TestListenerRobustnessR3:
+    def test_action_oserror_surfaces_as_refusal(self, qapp, wired_relay):
+        """O3: a raw OSError (ConnectionResetError) escaping the client must
+        still emit wake_action_result — the owner's click must never vanish."""
+        results = SlotRecorder()
+        listener = make_listener(wired_relay)
+        listener.signals.wake_action_result.connect(results)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            assert listener.session_id
+
+            def reset_error(wake_id, session_id):
+                raise ConnectionResetError("peer reset")
+
+            listener._client.wake_ack = reset_error
+            listener.ack_wake("w-o3")
+            assert results.wait_for(
+                lambda r: r.get("action") == "ack" and not r.get("ok"), 5, qapp
+            ), "OSError in the action thread swallowed the owner's click (O3)"
+        finally:
+            listener.shutdown()
+
+    def test_shutdown_interrupts_hung_relay(self, qapp, tmp_path):
+        """O4/P7: a relay that accepts and never answers must not hold a
+        listener thread in recv past the shutdown join cap."""
+        (tmp_path / "seats").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "seats" / "lumina.token").write_text("tok-synthetic\n")
+        sock_path = tmp_path / "wire.sock"
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(sock_path))
+        srv.listen(8)
+        accepted = threading.Event()
+
+        def serve():
+            while not accepted.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                accepted.set()
+                time.sleep(30)  # hold it open, never answer
+
+        st = threading.Thread(target=serve, daemon=True)
+        st.start()
+        listener = WireWakeListener(
+            client=AivengersWireClient(state_dir=tmp_path, timeout=5.0),
+            lease_seconds=300, heartbeat_seconds=1.0, watch_timeout_ms=15_000,
+        )
+        listener.start()
+        try:
+            assert accepted.wait(3), "fake relay never accepted a connection"
+            time.sleep(0.5)  # let the thread settle into a blocking recv
+            started = time.monotonic()
+            listener.shutdown()
+            elapsed = time.monotonic() - started
+            assert elapsed < 2.5, f"shutdown blocked {elapsed:.2f}s on a hung relay"
+            assert (
+                listener._watch_thread is None
+                or not listener._watch_thread.is_alive()
+            ), "watch thread survived shutdown against a hung relay (O4)"
+        finally:
+            srv.close()
+
+    def test_terminal_refresh_emits_once_and_prunes(self, qapp, wired_relay):
+        """O5: a terminal transition must emit ONE refresh event and leave
+        the tracked set — not re-emit every cycle, not starve the window."""
+        wakes = SlotRecorder()
+        listener = make_listener(wired_relay)  # ~0.75s resubscribe cycles
+        listener.signals.wake_event.connect(wakes)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            session_id = listener.session_id
+            wake = operator_wake(
+                wired_relay, target_session=session_id, task_id="T-o5", ttl=1
+            )["wake"]
+            assert wakes.wait_for(
+                lambda e: isinstance(e, dict)
+                and e.get("wake", {}).get("wake_id") == wake["wake_id"],
+                5, qapp,
+            )
+            # TTL expires; the next refresh cycle marks it expired once.
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                pump(qapp, 0.1)
+                if any(
+                    isinstance(e, dict)
+                    and e.get("source") == "refresh"
+                    and e.get("wake", {}).get("wake_id") == wake["wake_id"]
+                    and e.get("wake", {}).get("state") == "expired"
+                    for e in wakes.items
+                ):
+                    break
+            else:
+                raise AssertionError("expired transition never surfaced via refresh")
+            time.sleep(2.0)  # ~2-3 more cycles: the pruned id must stay quiet
+            expired_refreshes = sum(
+                1 for e in wakes.items
+                if isinstance(e, dict)
+                and e.get("source") == "refresh"
+                and e.get("wake", {}).get("wake_id") == wake["wake_id"]
+                and e.get("wake", {}).get("state") == "expired"
+            )
+            assert expired_refreshes == 1, (
+                f"terminal refresh emitted {expired_refreshes}x (O5: no change "
+                "detection, no pruning)"
+            )
+            with listener._tracked_lock:
+                assert wake["wake_id"] not in listener._tracked_wakes
+        finally:
+            listener.shutdown()
+
+    def test_dedicated_heartbeat_holds_lease_through_long_watch(
+        self, qapp, wired_relay
+    ):
+        """HB mutant kill (Sonnet M2b): with a LONG watch timeout there are
+        no resubscribe cycles, so NOTHING except the dedicated heartbeat
+        thread renews the lease. A quiet Wire must not silently expire."""
+        listener = make_listener(
+            wired_relay, lease_seconds=3, heartbeat_seconds=1,
+            watch_timeout_ms=60_000,
+        )
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            assert listener.session_id
+            time.sleep(4.5)  # > 1 lease window with zero resubscribe cycles
+            page = wired_relay.client("lumina").sessions_page()
+            row = next(
+                (s for s in page["sessions"]
+                 if s["session_id"] == listener.session_id),
+                None,
+            )
+            assert row is not None and row["lease_live"] is True, (
+                "lease lapsed during a long quiet watch — the dedicated "
+                "heartbeat thread is not load-bearing (HB/M2b)"
+            )
+        finally:
+            listener.shutdown()
+
+
+class TestWatchEOFClientR3:
+    def test_watch_clean_eof_raises_wire_frame_error(self, tmp_path):
+        """R2-3: a clean EOF mid-subscription must raise WireFrameError from
+        watch() — never RuntimeError via PEP 479 (StopIteration inside a
+        generator)."""
+        (tmp_path / "seats").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "seats" / "lumina.token").write_text("tok-synthetic\n")
+        sock_path = tmp_path / "wire.sock"
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(sock_path))
+        srv.listen(1)
+
+        def serve():
+            conn, _ = srv.accept()
+            f = conn.makefile("rwb", buffering=0)
+            f.readline()  # auth
+            f.write((json.dumps({"ok": True}, separators=(",", ":")) + "\n").encode())
+            f.readline()  # watch request
+            f.write((json.dumps(
+                {"ok": True, "event": "subscribed", "watermark": 0},
+                separators=(",", ":"),
+            ) + "\n").encode())
+            time.sleep(0.1)
+            conn.close()  # clean EOF with an EMPTY buffer
+
+        t = threading.Thread(target=serve)
+        t.start()
+        client = AivengersWireClient(state_dir=tmp_path, timeout=2.0)
+        raised = []
+        try:
+            for _ in client.watch(session_id="s", timeout_ms=500):
+                pass
+        except WireError as exc:
+            raised.append(exc)
+        except BaseException as exc:  # RuntimeError/StopIteration/etc.
+            raised.append(exc)
+        t.join(timeout=5)
+        srv.close()
+        assert raised, "clean EOF ended watch() silently"
+        assert isinstance(raised[0], WireFrameError), (
+            f"clean EOF raised {type(raised[0]).__name__}, not WireFrameError "
+            "(R2-3/PEP 479)"
+        )
+
+
+class TestWindowWiringR3:
+    """Sonnet survivors G1/TGN/TGO/CLS: the live-window wiring had NO test —
+    toggle-ON-never-starts, toggle-OFF-never-stops, close-never-shuts-down,
+    and a default-on startup call site all passed 59/59."""
+
+    @pytest.fixture
+    def wired_window(self, qapp, tmp_path, monkeypatch):
+        import core.persistence as persistence_mod
+        import core.project_context as project_context_module
+        import config as config_mod
+        import ui.main_window as main_window_module
+
+        monkeypatch.setattr(
+            persistence_mod, "PREFS_PATH", str(tmp_path / "prefs.json")
+        )
+        monkeypatch.setattr(
+            project_context_module,
+            "PROJECT_BINDINGS_DIR", str(tmp_path / "bindings"),
+        )
+        monkeypatch.setattr(config_mod, "DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setattr(
+            config_mod, "DB_PATH", str(tmp_path / "data" / "memory" / "lumina.db")
+        )
+        # The wiring under test must run its REAL paths, not the test
+        # short-circuit: LUMINA_TESTING is set suite-wide by conftest and
+        # gates exactly the two wire-listener call sites.
+        monkeypatch.delenv("LUMINA_TESTING", raising=False)
+        monkeypatch.delenv("LUMINA_WIRE_WAKE", raising=False)
+        monkeypatch.setattr(main_window_module.browser_manager, "close", lambda: None)
+
+        class StubListener:
+            instances: list = []
+
+            def __init__(self):
+                self.signals = WireSignals()
+                self.started = False
+                self.shutdown_called = False
+                type(self).instances.append(self)
+
+            def start(self):
+                self.started = True
+
+            def shutdown(self, join_timeout=2.0):
+                self.shutdown_called = True
+
+            # the window wiring connects these panel signals at start-up
+            def ack_wake(self, wake_id):
+                pass
+
+            def claim_wake(self, wake_id):
+                pass
+
+            def release_task(self, wake_id, task_ref):
+                pass
+
+        monkeypatch.setattr(main_window_module, "WireWakeListener", StubListener)
+        StubListener.instances = []
+        from core.agent import LuminaAgent
+
+        agent = LuminaAgent(owner=True, channel_id="w1-wiring-test")
+        win = main_window_module.LuminaWindow(agent)
+        win.show()
+        yield win, StubListener
+        try:
+            win.close()
+        except Exception:
+            pass
+
+    def test_startup_default_off_starts_nothing(self, wired_window):
+        win, stub = wired_window
+        assert stub.instances == [], (
+            "listener started at startup with the pref OFF "
+            "(G1: startup call-site gate bypassed)"
+        )
+
+    def test_toggle_on_starts_toggle_off_stops(self, wired_window, qapp):
+        win, stub = wired_window
+        win._set_wire_wake_enabled(True)
+        pump(qapp, 0.2)
+        assert len(stub.instances) == 1 and stub.instances[0].started, (
+            "toggle ON did not start the listener (TGN)"
+        )
+        win._set_wire_wake_enabled(False)
+        pump(qapp, 0.2)
+        assert stub.instances[0].shutdown_called, (
+            "toggle OFF did not stop the listener (TGO)"
+        )
+
+    def test_window_close_shuts_listener_down(self, wired_window, qapp):
+        win, stub = wired_window
+        win._set_wire_wake_enabled(True)
+        pump(qapp, 0.2)
+        assert stub.instances and stub.instances[0].started
+        win.close()
+        pump(qapp, 0.3)
+        assert stub.instances[0].shutdown_called, (
+            "window close did not shut the listener down (CLS)"
+        )
 
 
 # ── helpers ───────────────────────────────────────────────────────────────

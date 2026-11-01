@@ -54,6 +54,9 @@ def test_settings_promotes_one_multimodal_tab_and_removes_old_top_level_stubs(
 
     class _PlainTab(QWidget):
         backend_connection_changed = Signal()
+        # R3/R2-6 (Sonnet): SettingsPanel.__init__ connects this signal
+        # unconditionally, so every CommunicationsTab stand-in must carry it.
+        wire_wake_toggle_changed = Signal(bool)
 
         def __init__(self, *args, **kwargs):
             super().__init__()

@@ -255,6 +255,16 @@ class WireWakeListener:
         if not self._started:
             return
         self._stop.set()
+        # R3/O4 (Sonnet P7): interrupt EVERY live client socket — the watch
+        # socket plus any RPC in flight (heartbeat/ack/claim on their own
+        # short-lived sockets) — so a relay that accepts and never answers
+        # cannot hold a thread in recv past the join cap.
+        interrupt = getattr(self._client, "interrupt_sockets", None)
+        if callable(interrupt):
+            try:
+                interrupt()
+            except Exception:  # pragma: no cover - defensive
+                pass
         # Unblock the watch recv NOW instead of waiting for the server
         # timeout event (up to watch_timeout_ms away).
         watch_sock = getattr(self._client, "_watch_socket", None)
@@ -289,7 +299,10 @@ class WireWakeListener:
     def _unregister_best_effort(self, session_id: str) -> None:
         try:
             self._client.unregister_session(session_id)
-        except WireError:
+        except (WireError, OSError):
+            # R3/O3 (Sonnet): raw OSError (e.g. ConnectionResetError) escapes
+            # the client's _recv_frame; a dying unregister thread must not
+            # emit an unhandled-exception trace.
             pass
 
     # ── registration ──────────────────────────────────────────────────────
@@ -303,6 +316,10 @@ class WireWakeListener:
         seat-level wakes resolve ambiguous). The previous session id of THIS
         listener is also retired best-effort.
         """
+        # R3/O4: never open a new Wire RPC after shutdown() — a socket created
+        # after the interrupt pass would block in recv past the join cap.
+        if self._stop.is_set():
+            raise WireError("listener is shutting down; not registering")
         try:
             page = self._client.sessions_page(limit=100)
             for stale in page["sessions"]:
@@ -325,8 +342,10 @@ class WireWakeListener:
         if old is not None:
             try:
                 self._client.unregister_session(old)
-            except WireError:
+            except (WireError, OSError):
                 pass  # best-effort; the lease lapse covers it regardless
+        if self._stop.is_set():
+            raise WireError("listener is shutting down; not registering")
         session = self._client.register_session(
             adapter=self._adapter_name,
             capabilities={"notify": True, "wake_ack": True, "claim": True},
@@ -389,19 +408,30 @@ class WireWakeListener:
                 session = self._ensure_session()
                 self.signals.connection_state.emit("listening")
                 if self._catchup_needed.is_set():
-                    self._catchup_needed.clear()
+                    # R3/R2-4 (Sonnet): clear ONLY after the walk succeeded —
+                    # a WireError mid-walk leaves the latch set (and the error
+                    # handler below re-arms it), so the next connection
+                    # re-walks instead of silently losing the catch-up.
                     self._emit_catchup(session["session_id"])
-                got_frame = False
+                    self._catchup_needed.clear()
+                got_real_frame = False
                 for event in self._client.watch(
                     session_id=session["session_id"],
                     timeout_ms=self._watch_timeout_ms,
                 ):
                     if self._stop.is_set():
                         return
-                    if not got_frame:
-                        got_frame = True
-                        backoff = RECONNECT_MIN_SECONDS
                     kind = event.get("event")
+                    if not got_real_frame and kind != "subscribed":
+                        # R3/R2-2 (Sonnet): the ``subscribed`` ack is NOT a
+                        # valid post-subscribe frame — a relay that accepts
+                        # the subscription, sends the ack, and then fails
+                        # must KEEP backing off (R1's storm defect survived
+                        # in disguise when the ack reset the budget). Reset
+                        # only after the stream proves itself with a real
+                        # event (wake / timeout / overflow / message).
+                        got_real_frame = True
+                        backoff = RECONNECT_MIN_SECONDS
                     if kind == "wake":
                         wake = event.get("wake")
                         if isinstance(wake, dict):
@@ -425,6 +455,11 @@ class WireWakeListener:
                 if self._stop.is_set():
                     return
                 self.signals.connection_state.emit("disconnected")
+                # R3/R2-4: an error-driven reconnect must re-arm catch-up —
+                # the relay replays only the oldest ~32 unacked pending wakes
+                # per subscription, so pending wakes beyond that stay
+                # invisible until a catch-up walk surfaces them.
+                self._catchup_needed.set()
                 print(
                     f"[WIRE] listener: {_sanitize_log(type(exc).__name__ + ': ' + str(exc))}",
                     flush=True,
@@ -435,6 +470,7 @@ class WireWakeListener:
                 if self._stop.is_set():
                     return
                 self.signals.connection_state.emit("disconnected")
+                self._catchup_needed.set()
                 print(
                     f"[WIRE] listener: unexpected "
                     f"{_sanitize_log(type(exc).__name__ + ': ' + str(exc))}",
@@ -468,10 +504,21 @@ class WireWakeListener:
                 return
             try:
                 wake = self._client.wake_status(wake_id)
-            except WireError:
+            except (WireError, OSError):
                 continue  # relay hiccup; next cycle retries
+            new_state = str(wake.get("state", "pending"))
             with self._tracked_lock:
-                self._tracked_wakes[wake_id] = str(wake.get("state", "pending"))
+                old_state = self._tracked_wakes.get(wake_id)
+                if new_state == old_state:
+                    # R3/O5 (Sonnet): no state change — no event, no churn.
+                    continue
+                self._tracked_wakes[wake_id] = new_state
+                if new_state in ("completed", "failed", "expired", "cancelled",
+                                 "ambiguous"):
+                    # R3/O5: terminal ids leave the tracked set after their
+                    # final transition is surfaced, so the bounded per-cycle
+                    # window never starves behind dead entries.
+                    self._tracked_wakes.pop(wake_id, None)
             self.signals.wake_event.emit({"source": "refresh", "wake": wake})
 
     def _emit_catchup(self, session_id: str) -> None:
@@ -626,7 +673,7 @@ class WireWakeListener:
                     elif action == "release":
                         payload["task"] = result
                 self.signals.wake_action_result.emit(payload)
-            except WireError as exc:
+            except (WireError, OSError) as exc:
                 self.signals.wake_action_result.emit(
                     {"wake_id": wake_id, "action": action, "ok": False,
                      "error": _sanitize_log(str(exc))}

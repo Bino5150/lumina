@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -146,6 +147,13 @@ class AivengersWireClient:
             else default_state_dir()
         )
         self._timeout = timeout
+        # R3/O4 (Sonnet P7): registry of every live client socket so a
+        # shutdown hook can interrupt ALL blocked recvs (watch + any RPC in
+        # flight — heartbeat/ack/claim on their own short-lived sockets),
+        # not just the watch socket. A relay that accepts and never answers
+        # must not hold a listener thread past the shutdown join cap.
+        self._live_sockets: set[socket.socket] = set()
+        self._live_sockets_lock = threading.Lock()
 
     # ── paths ─────────────────────────────────────────────────────────────
 
@@ -278,10 +286,38 @@ class AivengersWireClient:
         sock.sendall(self._encode_frame(payload))
         return self._check(self._recv_frame(sock))
 
+    def _track_socket(self, sock: socket.socket) -> None:
+        with self._live_sockets_lock:
+            self._live_sockets.add(sock)
+
+    def _untrack_socket(self, sock: socket.socket) -> None:
+        with self._live_sockets_lock:
+            self._live_sockets.discard(sock)
+
+    def interrupt_sockets(self) -> None:
+        """Close every live client socket (R3/O4 shutdown hook).
+
+        Best-effort and idempotent: a blocked ``recv`` on any of them
+        returns/raises immediately, which unblocks whichever listener thread
+        was waiting. Safe to call from another thread while RPCs run.
+        """
+        with self._live_sockets_lock:
+            sockets = list(self._live_sockets)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     @contextmanager
     def _session(self) -> Iterator[socket.socket]:
         """Open an authenticated connection; always close it on exit."""
         sock = self._connect()
+        self._track_socket(sock)
         try:
             sock.sendall(
                 self._encode_frame({"op": "auth", "seat": SEAT, "token": self._load_token()})
@@ -289,6 +325,7 @@ class AivengersWireClient:
             self._check(self._recv_frame(sock))
             yield sock
         finally:
+            self._untrack_socket(sock)
             try:
                 sock.close()
             except OSError:
@@ -703,6 +740,7 @@ class AivengersWireClient:
         # blocking recv immediately (bounded GUI shutdown). One watch at a
         # time per client instance; cleared when the generator exits.
         self._watch_socket = sock
+        self._track_socket(sock)
         try:
             sock.connect(str(self.socket_path))
             sock.sendall(
@@ -719,7 +757,17 @@ class AivengersWireClient:
             # test caught.)
             frames_iter = self._iter_frames(sock, idle_timeout=idle_timeout_seconds)
             while True:
-                raw = next(frames_iter)
+                try:
+                    raw = next(frames_iter)
+                except StopIteration:
+                    # R3/R2-3 (Sonnet): a clean EOF with an empty buffer used
+                    # to escape watch() as ``RuntimeError: generator raised
+                    # StopIteration`` (PEP 479 — StopIteration raised inside
+                    # this generator). Surface the honest frame error instead,
+                    # matching the one-shot reader's message.
+                    raise WireFrameError(
+                        "relay closed the connection without a full frame"
+                    ) from None
                 frame = self._decode_frame(raw)
                 if frame.get("ok") is not True:
                     raise WireProtocolError(
@@ -733,6 +781,7 @@ class AivengersWireClient:
                     return
         finally:
             self._watch_socket = None
+            self._untrack_socket(sock)
             try:
                 sock.close()
             except OSError:

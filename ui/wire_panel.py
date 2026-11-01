@@ -117,6 +117,13 @@ class _WakeRow(QFrame):
         self._state = str(wake.get("state", "pending"))
         self._task_ref = str(wake.get("task_ref", "?"))
         self._task: dict[str, Any] | None = None
+        self._current_session_id: str | None = None
+        # R3/O2 (Sonnet): True while a modal confirmation dialog is open on
+        # this row. The panel's cap eviction skips dialog-open rows — an
+        # incoming wake under load must never evict the row whose Claim/
+        # Release confirmation the owner is looking at (the click would be
+        # silently dropped by the nested event loop).
+        self.dialog_open = False
 
         self.setObjectName("wireWakeRow")
         self.setStyleSheet(
@@ -214,6 +221,7 @@ class _WakeRow(QFrame):
         """Update this row in place (R2/H3: no rebuild)."""
         self._state = str(wake.get("state", self._state))
         self._task_ref = str(wake.get("task_ref", self._task_ref))
+        self._last_wake = wake
         self._state_badge.setText(_STATE_LABELS.get(self._state, self._state.upper()))
         self._state_badge.setStyleSheet(
             f"color: {_STATE_COLORS.get(self._state, self._colors['text_primary'])}; "
@@ -246,7 +254,44 @@ class _WakeRow(QFrame):
         actionable = self._state in ("pending", "delivered")
         self._ack_btn.setEnabled(actionable)
         self._claim_btn.setVisible(actionable)
-        self._release_btn.setVisible(self._state == "claimed")
+        self._update_release_button(wake)
+
+    def _update_release_button(self, wake: dict[str, Any]) -> None:
+        if self._state == "claimed":
+            # R3/R2-5 (Sonnet): a claim is held by ONE session. After an app
+            # restart the catch-up shows the earlier claim — this session
+            # cannot release it (the relay refuses: "task was not claimed by
+            # this session"), so the button renders disabled with the honest
+            # reason instead of inviting a click that cannot succeed.
+            claimant = wake.get("claimed_by_session")
+            mine = (
+                isinstance(claimant, str) and bool(claimant)
+                and self._current_session_id is not None
+                and claimant == self._current_session_id
+            )
+            self._release_btn.setVisible(True)
+            self._release_btn.setEnabled(bool(mine))
+            if mine:
+                self._release_btn.setToolTip(
+                    "Release this claimed task: records outcome=failed with the note "
+                    "'released by owner without execution'. Permanent."
+                )
+            else:
+                self._release_btn.setToolTip(
+                    "Claimed by an earlier session — this session cannot release it. "
+                    "Operator action needed on the Wire."
+                )
+        else:
+            self._release_btn.setVisible(False)
+            self._release_btn.setEnabled(False)
+
+    def set_current_session(self, session_id: str | None) -> None:
+        """Record this GUI's live session id (drives Release visibility)."""
+        self._current_session_id = session_id
+        # Re-evaluate: the row may have been rendered before the session was
+        # known (constructor runs update_wake before the panel knows its
+        # session id) — the Release button must not stay wrong.
+        self._update_release_button(getattr(self, "_last_wake", {}))
 
     def set_task(self, task: dict[str, Any]) -> None:
         """Attach the relay's task record (from the claim response)."""
@@ -264,24 +309,41 @@ class _WakeRow(QFrame):
     # ── owner actions (each behind an explicit confirmation) ──────────────
 
     def _on_claim_clicked(self) -> None:
-        if not self._confirm_claim():
+        self.dialog_open = True
+        try:
+            confirmed = self._confirm_claim()
+        finally:
+            self.dialog_open = False
+        if not confirmed:
             return
         self.claim_requested.emit(self._wake_id)
 
     def _confirm_claim(self) -> bool:
         """Confirmation gate for Claim (monkeypatchable in tests)."""
         task_bit = f"task {self._task_ref}"
-        if isinstance(self._task, dict) and self._task.get("title"):
+        has_title = isinstance(self._task, dict) and bool(self._task.get("title"))
+        if has_title:
             task_bit += f" — {self._task.get('title')}"
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("Claim Wire task?")
         box.setTextFormat(Qt.TextFormat.PlainText)
+        # R3/R2-5 (Sonnet): the relay delivers task title/scope only WITH the
+        # claim response. Say so plainly instead of implying the owner is
+        # confirming against details they cannot see yet.
+        context_note = (
+            ""
+            if has_title
+            else "\nTask title/scope are not known before claiming; the relay\n"
+            "delivers them with the claim response and they will be shown\n"
+            "on this row afterwards.\n"
+        )
         box.setText(
             f"Claim {task_bit} for this Lumina session?\n\n"
             "• Lumina becomes the EXCLUSIVE claimant on the Wire.\n"
             "• No work will start — claiming is coordination only.\n"
             "• The relay enforces lease/task fencing; a stale claim is refused."
+            f"{context_note}"
         )
         box.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
@@ -290,7 +352,12 @@ class _WakeRow(QFrame):
         return box.exec() == QMessageBox.StandardButton.Yes
 
     def _on_release_clicked(self) -> None:
-        if not self._confirm_release():
+        self.dialog_open = True
+        try:
+            confirmed = self._confirm_release()
+        finally:
+            self.dialog_open = False
+        if not confirmed:
             return
         self.release_requested.emit(self._wake_id, self._task_ref)
 
@@ -404,7 +471,17 @@ class WireWakePanel(QWidget):
 
     def set_session(self, session: dict[str, Any] | None) -> None:
         self._session = session
+        sid = self._current_session_id()
+        for row in self._rows.values():
+            row.set_current_session(sid)
         self._refresh_strip()
+
+    def _current_session_id(self) -> str | None:
+        if isinstance(self._session, dict):
+            sid = self._session.get("session_id")
+            if isinstance(sid, str) and sid:
+                return sid
+        return None
 
     def apply_wake_event(self, event: dict[str, Any]) -> None:
         """Merge one listener event into the inbox model (R2/H3: incremental)."""
@@ -497,6 +574,7 @@ class WireWakePanel(QWidget):
 
     def _insert_row(self, wake_id: str, wake: dict[str, Any]) -> None:
         row = _WakeRow(wake, self._colors)
+        row.set_current_session(self._current_session_id())
         row.ack_requested.connect(self.ack_requested)
         row.claim_requested.connect(self.claim_requested)
         row.release_requested.connect(self.release_requested)
@@ -522,16 +600,33 @@ class WireWakePanel(QWidget):
         self._order.append(wake_id)
 
     def _enforce_cap(self) -> None:
-        """Keep at most MAX_RENDERED_ROWS row widgets; count the rest honestly."""
+        """Keep at most MAX_RENDERED_ROWS row widgets; count the rest honestly.
+
+        R3/O1 (Sonnet): terminal rows are the least valuable — they are
+        evicted (oldest first) BEFORE any live row, so a burst of new pending
+        wakes can never push pending rows off the widget while old completed
+        rows stay rendered. R3/O2: rows with an open confirmation dialog are
+        never evicted (the owner's click must not be silently dropped).
+        """
         rendered = [wid for wid in self._order if wid in self._rows]
         excess = len(rendered) - MAX_RENDERED_ROWS
-        while excess > 0:
-            oldest = rendered.pop(0)
-            row = self._rows.pop(oldest, None)
-            if row is not None:
-                row.setParent(None)
-                row.deleteLater()
-            excess -= 1
+        if excess > 0:
+            terminal_set = set(_TERMINAL_STATES)
+            terminal = [
+                wid for wid in rendered
+                if self._wakes.get(wid, {}).get("state") in terminal_set
+            ]
+            live = [wid for wid in rendered if wid not in set(terminal)]
+            protected = {
+                wid for wid, row in self._rows.items()
+                if getattr(row, "dialog_open", False)
+            }
+            evict = [wid for wid in terminal + live if wid not in protected]
+            for wid in evict[:excess]:
+                row = self._rows.pop(wid, None)
+                if row is not None:
+                    row.setParent(None)
+                    row.deleteLater()
         hidden = len(self._wakes) - len(self._rows)
         if hidden > 0:
             self._more_label.setText(f"+ {hidden} older wake(s) not rendered")

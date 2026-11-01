@@ -158,6 +158,50 @@ class TestDefaultOffActivation:
         assert 'get("wire_wake_listener", False)' in text
         assert 'update({"wire_wake_listener": enabled})' in text
 
+    def test_startup_call_site_gates_on_the_pref_gate(self):
+        """G1 guard (Sonnet): the startup call site must CONJUNCT the
+        _wire_wake_enabled() gate. Replacing it with ``and True`` (default-on
+        at startup) passed every R2 test — the pins covered the gate function,
+        not the call site."""
+        import re
+
+        text = MAIN_WINDOW.read_text(encoding="utf-8")
+        match = re.search(
+            r"not os\.environ\.get\(\"LUMINA_TESTING\"\)\s*\n\s*and\s+"
+            r"self\._wire_wake_enabled\(\)",
+            text,
+        )
+        assert match, (
+            "startup call site no longer gates on _wire_wake_enabled() "
+            "(G1: default-on at startup reintroduced)"
+        )
+
+    def test_no_new_module_routes_claim_outside_the_reviewed_surface(self):
+        """NEWF guard (Sonnet): the R2 claim-caller scan covered tools/*.py
+        only; a new core/ module wrapping claim_wake would pass 59/59. The
+        whole product tree is scanned: only the listener (defines the
+        owner-only action), the client (transport), and the window wiring
+        (exactly-once, checked by its own test) may reference claim."""
+        allowed = {
+            "wire_wake_listener.py",   # defines the owner-only action
+            "aivengers_wire.py",       # defines the client transport method
+            "main_window.py",          # exactly-once checked by its own test
+        }
+        offenders = []
+        for base in (REPO_ROOT / "core", REPO_ROOT / "comms", REPO_ROOT / "ui"):
+            if not base.is_dir():
+                continue
+            for path in base.rglob("*.py"):
+                if path.name in allowed:
+                    continue
+                text = path.read_text(errors="replace")
+                if "claim_wake" in text or "WireWakeListener(" in text:
+                    offenders.append(str(path.relative_to(REPO_ROOT)))
+        assert not offenders, (
+            "new module routes claim/listener outside the reviewed surface: "
+            f"{offenders}"
+        )
+
 
 class TestPanelInjectionSafety:
     def test_panel_renders_wire_text_as_plain_text(self):
@@ -197,32 +241,42 @@ class TestShutdownAndBackoffStructure:
         assert "SHUT_RDWR" in text
 
     def test_backoff_resets_only_after_a_valid_frame(self):
-        """B2 guard: the backoff reset must live inside the frame loop
-        (after a frame arrives), not immediately after emitting listening."""
+        """R3/R2-2 guard: the backoff reset must live inside the frame loop
+        AND must be gated on a NON-subscribed frame — the ``subscribed`` ack
+        is not a valid post-subscribe frame (Sonnet P1: ack-then-fail must
+        keep backing off)."""
         text = LISTENER.read_text(encoding="utf-8")
-        listen_idx = text.index('connection_state.emit("listening")')
         loop_idx = text.index("for event in self._client.watch(")
         reset_idx = text.index("backoff = RECONNECT_MIN_SECONDS", loop_idx)
         assert reset_idx > loop_idx, (
             "backoff reset must happen after the watch loop starts consuming"
         )
-        # and the reset must sit after the got_frame latch, inside the loop
-        got_idx = text.index("got_frame = True", loop_idx)
-        assert got_idx < reset_idx
+        # the reset must sit behind the got_real_frame latch AND the
+        # non-subscribed condition (the R2 shape reset on the ack itself)
+        got_idx = text.index("got_real_frame = True", loop_idx)
+        cond_idx = text.index('kind != "subscribed"', loop_idx)
+        assert cond_idx < got_idx < reset_idx, (
+            "backoff reset must be gated on a non-subscribed real frame"
+        )
 
     def test_catchup_runs_on_connect_only(self):
-        """H3 guard: catch-up is gated behind the _catchup_needed latch, and
-        the routine timeout path must not set it."""
+        """R3/R2-4 guard: catch-up is gated behind the _catchup_needed latch,
+        the latch is cleared only AFTER the walk, and error-driven reconnects
+        re-arm it (the relay replays only the oldest ~32 unacked pending
+        wakes per subscription)."""
         text = LISTENER.read_text(encoding="utf-8")
         assert "self._catchup_needed.clear()" in text
         assert "self._catchup_needed.set()" in text
-        # The only .set() sites are start() and _register_session().
-        set_sites = [
-            i for i in range(len(text))
-            if text.startswith("self._catchup_needed.set()", i)
-        ]
-        assert len(set_sites) == 2, (
-            "catch-up latch must be armed only at start and fresh registration"
+        # clear must FOLLOW the walk (R2 cleared before it — one transient
+        # failure lost the catch-up for the life of the listener)
+        walk_idx = text.index("self._emit_catchup(session[\"session_id\"])")
+        clear_idx = text.index("self._catchup_needed.clear()", walk_idx)
+        assert clear_idx > walk_idx, "latch cleared before the walk (R2-4)"
+        # the error handlers must re-arm the latch
+        except_idx = text.index("except WireError as exc:", walk_idx)
+        rearm_idx = text.index("self._catchup_needed.set()", except_idx)
+        assert rearm_idx > except_idx, (
+            "error-driven reconnect must re-arm the catch-up latch"
         )
 
     def test_catchup_walks_live_states_only(self):
