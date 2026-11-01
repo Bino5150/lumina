@@ -28,6 +28,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from comms import telegram_origin_routing as origin_routing
 from core.agent import TurnCancelled, is_error_response
+
+# WIRE-WAKE-01 W1: native Wire wake adapter (listener + passive inbox panel).
+# Both are import-safe with no side effects: the listener connects only when
+# started, and the panel renders only what the listener surfaces.
+from comms.wire_wake_listener import WireWakeListener
+from ui.wire_panel import WireWakePanel
 from core import emergency_stop
 from core import suspension, suspension_runtime
 from core import turn_recovery
@@ -709,6 +715,40 @@ class LuminaWindow(QMainWindow):
         self.resize(w, h)
         self.setStyleSheet(APP_STYLESHEET)
 
+    def _start_wire_listener(self) -> None:
+        """Start the W1 Wire wake listener and wire its signals (GUI thread)."""
+        if self._wire_listener is not None:
+            return  # single listener per GUI process; duplicates are defects
+        listener = WireWakeListener()
+        self._wire_listener = listener
+        listener.signals.connection_state.connect(self.wire_panel.set_connection_state)
+        listener.signals.session_state.connect(self._on_wire_session_state)
+        listener.signals.wake_event.connect(self._on_wire_wake_event)
+        listener.signals.wake_action_result.connect(self.wire_panel.apply_action_result)
+        self.wire_panel.ack_requested.connect(listener.ack_wake)
+        self.wire_panel.claim_requested.connect(listener.claim_wake)
+        listener.start()
+
+    def _on_wire_session_state(self, session) -> None:
+        self.wire_panel.set_session(session)
+        self._refresh_wire_admission_note()
+
+    def _on_wire_wake_event(self, event) -> None:
+        self.wire_panel.apply_wake_event(event)
+        self._refresh_wire_admission_note()
+
+    def _refresh_wire_admission_note(self) -> None:
+        """Show the current suspension/E-stop admission truth next to task state."""
+        try:
+            status = suspension_runtime.status()
+            if status.state is suspension_runtime.State.ACTIVE:
+                note = f"suspension ACTIVE ({status.active_incidents} scope(s))"
+            else:
+                note = ""
+        except Exception:
+            note = ""
+        self.wire_panel.set_admission_note(note)
+
     def closeEvent(self, event):
         listener = getattr(self, "_suspension_listener", None)
         if listener is not None:
@@ -740,6 +780,15 @@ class LuminaWindow(QMainWindow):
             telegram_bridge.begin_shutdown()
         except Exception as e:
             print(f"[TELEGRAM] shutdown request failed: {type(e).__name__}", flush=True)
+        # WIRE-WAKE-01 W1: bounded listener shutdown (watch ends on its next
+        # server timeout event; best-effort unregister; lease lapse covers
+        # any failure honestly).
+        wire_listener = getattr(self, "_wire_listener", None)
+        if wire_listener is not None:
+            try:
+                wire_listener.shutdown()
+            except Exception as e:
+                print(f"[WIRE] shutdown failed: {type(e).__name__}", flush=True)
         self._telegram_route_closed = True
         origin_routing.unregister_runtime(self._telegram_route_token)
         if getattr(self.agent, "_telegram_origin_runtime_token", None) == self._telegram_route_token:
@@ -888,6 +937,22 @@ class LuminaWindow(QMainWindow):
 
         self.review_panel = ReviewPanel(self.agent, COLORS)
         self.review_panel.setVisible(False)
+
+        # WIRE-WAKE-01 W1: passive Wire wake inbox. The listener registers
+        # Lumina's session on the deployed W0 wake infrastructure and
+        # surfaces wake/task state here; every row displays peer/owner=false
+        # provenance, and the only actuators are the owner's Ack/Claim
+        # clicks (see comms/wire_wake_listener.py for the honesty contract).
+        # Auto-start is skipped under test harnesses so the suite never
+        # touches the production Wire, and the owner keeps a kill switch.
+        self._wire_listener: WireWakeListener | None = None
+        self.wire_panel = WireWakePanel(COLORS)
+        main.addWidget(self.wire_panel)
+        if (
+            not os.environ.get("LUMINA_TESTING")
+            and bool(self._prefs.get("wire_wake_listener", True))
+        ):
+            self._start_wire_listener()
 
         main.addWidget(self.chat_widget, 1)
         main.addWidget(self.settings_panel, 1)

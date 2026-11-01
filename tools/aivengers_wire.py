@@ -65,6 +65,11 @@ MAX_FRAME_BYTES = 65_536
 #: The relay rejects read limits above 200; pass-through, surfaced truthfully.
 MAX_READ_LIMIT = 200
 
+#: W1: wake/session listing page bound (mirrors the relay's own cap; the
+#: relay byte-bounds every page against the transport frame limit and
+#: returns truthful continuation cursors).
+MAX_WAKE_LIST_LIMIT = 100
+
 #: Same override the wire CLI honors, so tests and alternate boards isolate
 #: without touching the real clubhouse.
 STATE_DIR_ENV = "AIVENGERS_WIRE_STATE_DIR"
@@ -372,3 +377,276 @@ class AivengersWireClient:
         with self._session() as sock:
             response = self._exchange(sock, {"op": "channels"})
         return response["channels"]
+
+    # ── W1: wake-adapter session operations ───────────────────────────────
+
+    def register_session(
+        self,
+        *,
+        adapter: str,
+        capabilities: dict[str, bool] | None = None,
+        lease_seconds: int | None = None,
+        model_claim: str | None = None,
+        platform_pid: int | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Register one adapter session owned by the fixed ``lumina`` seat.
+
+        A session is a specific adapter instance (this GUI runtime), never a
+        model claim and never an OS process id. The relay assigns the
+        session id and generation; the lease must be kept alive by periodic
+        :meth:`heartbeat_session` calls or the session honestly expires.
+        """
+        if not isinstance(adapter, str) or not adapter.strip():
+            raise WireError("adapter must be a non-empty string")
+        payload: dict[str, Any] = {"op": "register", "adapter": adapter.strip()}
+        if capabilities is not None:
+            if not isinstance(capabilities, dict):
+                raise WireError("capabilities must be an object")
+            payload["capabilities"] = capabilities
+        if lease_seconds is not None:
+            if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0:
+                raise WireError("lease_seconds must be a positive integer")
+            payload["lease_seconds"] = lease_seconds
+        if model_claim is not None:
+            if not isinstance(model_claim, str) or not model_claim.strip():
+                raise WireError("model_claim must be a non-empty string when present")
+            payload["model_claim"] = model_claim.strip()
+        if platform_pid is not None:
+            if isinstance(platform_pid, bool) or not isinstance(platform_pid, int) or platform_pid <= 0:
+                raise WireError("platform_pid must be a positive integer when present")
+            payload["platform_pid"] = platform_pid
+        if meta is not None:
+            if not isinstance(meta, dict):
+                raise WireError("meta must be an object")
+            payload["meta"] = meta
+        with self._session() as sock:
+            response = self._exchange(sock, payload)
+        return response["session"]
+
+    def heartbeat_session(
+        self, session_id: str, *, state: str | None = None
+    ) -> dict[str, Any]:
+        """Renew a session's lease (and optionally update ready/busy state)."""
+        if not isinstance(session_id, str) or not session_id:
+            raise WireError("session_id must be a non-empty string")
+        payload: dict[str, Any] = {"op": "heartbeat", "session_id": session_id}
+        if state is not None:
+            if state not in ("ready", "busy", "draining"):
+                raise WireError("state must be one of ready, busy, draining")
+            payload["state"] = state
+        with self._session() as sock:
+            response = self._exchange(sock, payload)
+        return response["session"]
+
+    def unregister_session(self, session_id: str) -> dict[str, Any]:
+        """Mark a session offline; its lease and live state end immediately."""
+        if not isinstance(session_id, str) or not session_id:
+            raise WireError("session_id must be a non-empty string")
+        with self._session() as sock:
+            response = self._exchange(
+                sock, {"op": "unregister", "session_id": session_id}
+            )
+        return response["session"]
+
+    def sessions_page(
+        self,
+        *,
+        limit: int = MAX_WAKE_LIST_LIMIT,
+        after_registered_at: str | None = None,
+        after_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One bounded session-listing page with truthful continuation."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise WireError("limit must be a positive integer")
+        if limit > MAX_WAKE_LIST_LIMIT:
+            raise WireError(f"limit must not exceed {MAX_WAKE_LIST_LIMIT}")
+        payload: dict[str, Any] = {"op": "sessions", "limit": limit}
+        if (after_registered_at is None) != (after_session_id is None):
+            raise WireError(
+                "after_registered_at and after_session_id must be given together"
+            )
+        if after_registered_at is not None:
+            payload["after_registered_at"] = after_registered_at
+            payload["after_session_id"] = after_session_id
+        with self._session() as sock:
+            response = self._exchange(sock, payload)
+        return response
+
+    def wake_list_page(
+        self,
+        *,
+        state: str | None = None,
+        limit: int = MAX_WAKE_LIST_LIMIT,
+        after_created_at: str | None = None,
+        after_wake_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One bounded wake-listing page with truthful continuation cursors.
+
+        The relay byte-bounds every page against the transport frame limit;
+        dropped rows stay reachable through ``next_after``. This is the
+        adapter's ONLY catch-up path: the message ``read`` op is deliberately
+        unused because it bounds count but not serialized bytes.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise WireError("limit must be a positive integer")
+        if limit > MAX_WAKE_LIST_LIMIT:
+            raise WireError(f"limit must not exceed {MAX_WAKE_LIST_LIMIT}")
+        payload: dict[str, Any] = {"op": "wake_list", "limit": limit}
+        if state is not None:
+            payload["state"] = state
+        if (after_created_at is None) != (after_wake_id is None):
+            raise WireError("after_created_at and after_wake_id must be given together")
+        if after_created_at is not None:
+            payload["after_created_at"] = after_created_at
+            payload["after_wake_id"] = after_wake_id
+        with self._session() as sock:
+            response = self._exchange(sock, payload)
+        return response
+
+    def wake_list_iter(
+        self,
+        *,
+        state: str | None = None,
+        limit: int = MAX_WAKE_LIST_LIMIT,
+        max_pages: int = 100,
+    ) -> Iterator[dict[str, Any]]:
+        """Walk the entire wake backlog page by page via truthful cursors.
+
+        ``max_pages`` is a runaway guard, not a data bound: a healthy relay
+        terminates on ``has_more=false`` long before it.
+        """
+        cursor: dict[str, str] | None = None
+        for _ in range(max_pages):
+            page = self.wake_list_page(
+                state=state,
+                limit=limit,
+                after_created_at=cursor["created_at"] if cursor else None,
+                after_wake_id=cursor["wake_id"] if cursor else None,
+            )
+            yield page
+            if not page["has_more"] or not page["next_after"]:
+                return
+            cursor = page["next_after"]
+        raise WireError(
+            f"wake_list_iter exceeded {max_pages} pages; cursor did not terminate"
+        )
+
+    def wake_status(self, wake_id: str) -> dict[str, Any]:
+        """Fetch one wake's exact pipeline position (target/requester only)."""
+        if not isinstance(wake_id, str) or not wake_id:
+            raise WireError("wake_id must be a non-empty string")
+        with self._session() as sock:
+            response = self._exchange(sock, {"op": "wake_status", "wake_id": wake_id})
+        return response["wake"]
+
+    def wake_ack(self, wake_id: str, session_id: str) -> dict[str, Any]:
+        """Adapter receipt of a wake intent. NOT a resume, NOT execution.
+
+        The relay enforces target/lease/capability fencing server-side and
+        returns the updated wake record truthfully.
+        """
+        if not isinstance(wake_id, str) or not wake_id:
+            raise WireError("wake_id must be a non-empty string")
+        if not isinstance(session_id, str) or not session_id:
+            raise WireError("session_id must be a non-empty string")
+        with self._session() as sock:
+            response = self._exchange(
+                sock,
+                {"op": "wake_ack", "wake_id": wake_id, "session_id": session_id},
+            )
+        return response["wake"]
+
+    def claim_wake(self, wake_id: str, session_id: str) -> dict[str, Any]:
+        """Coordination claim of a wake's task for this session, exactly once.
+
+        The relay enforces lease validity, task-open state and exactly-once
+        semantics server-side; losers receive an honest refusal, never a
+        duplicate claim. A claim is a coordination fact on the Wire's task
+        table — it does NOT execute work and must never be reachable from a
+        model-facing tool path.
+        """
+        if not isinstance(wake_id, str) or not wake_id:
+            raise WireError("wake_id must be a non-empty string")
+        if not isinstance(session_id, str) or not session_id:
+            raise WireError("session_id must be a non-empty string")
+        with self._session() as sock:
+            response = self._exchange(
+                sock,
+                {"op": "claim", "wake_id": wake_id, "session_id": session_id},
+            )
+        return response
+
+    def watch(
+        self,
+        *,
+        channels: list[str] | None = None,
+        timeout_ms: int | None = None,
+        idle_timeout_seconds: float | None = None,
+        session_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Subscribe to relay events; yields frames until the subscription ends.
+
+        Mirrors the relay CLI client's contract exactly: yields the
+        ``subscribed`` ack, then every ``message`` / ``wake`` / ``timeout`` /
+        ``overflow`` event frame. The server's ``timeout`` event and an
+        ``overflow``-followed-by-close both end the iteration cleanly (the
+        generator returns without raising); any other server-side close
+        raises :class:`WireError`. ``session_id`` binds the subscription to
+        one registered session: session-targeted wakes are delivered only to
+        that session's watcher, and queued seat wakes replay immediately
+        after the ack as ``wake`` frames. Events never advance cursors.
+        """
+        if channels is not None:
+            if not channels:
+                raise WireError("channels must be a non-empty list when filtering")
+            for value in channels:
+                if not isinstance(value, str) or not value.strip():
+                    raise WireError("channel names must be non-empty strings")
+        payload: dict[str, Any] = {"op": "watch"}
+        if channels is not None:
+            payload["channels"] = list(channels)
+        if timeout_ms is not None:
+            if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
+                raise WireError("timeout_ms must be a positive integer")
+            payload["timeout_ms"] = timeout_ms
+        if session_id is not None:
+            if not isinstance(session_id, str) or not session_id:
+                raise WireError("session_id must be a non-empty string when present")
+            payload["session_id"] = session_id
+        token = self._load_token()
+        if idle_timeout_seconds is None:
+            idle_timeout_seconds = 30.0 + (timeout_ms / 1000.0 if timeout_ms else 0.0)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(idle_timeout_seconds)
+        terminated = False
+        try:
+            sock.connect(str(self.socket_path))
+            sock.sendall(
+                self._encode_frame({"op": "auth", "seat": SEAT, "token": token})
+            )
+            auth = self._recv_frame(sock)
+            self._check(auth)
+            sock.sendall(self._encode_frame(payload))
+            while True:
+                frame = self._recv_frame(sock)
+                if frame.get("ok") is not True:
+                    raise WireProtocolError(
+                        str(frame.get("error", "operation_failed")),
+                        str(frame.get("message", "")),
+                    )
+                event = frame.get("event")
+                yield frame
+                if event == "timeout" or event == "overflow":
+                    terminated = True
+                    return
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if not terminated:
+                # Non-clean exits (exceptions, generator.close()) simply close
+                # the socket; the relay treats the drop as a disconnect and
+                # replays unacked wakes on the next subscription.
+                pass
