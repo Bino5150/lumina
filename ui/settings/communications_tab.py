@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog, QLineEdit
 from PySide6.QtGui import QIcon
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -18,6 +18,10 @@ from ._widgets import _sec, _lbl, _te, _le, _btn, make_round_pixmap, _scroll_wra
 # identity file never shows up in the Personas tab at all.
 
 class CommunicationsTab(QWidget):
+    # WIRE-WAKE-01 W1 (R2/B3): the owner flipped the Wire wake-listener
+    # control; MainWindow performs the live start/stop and owns the runtime.
+    wire_wake_toggle_changed = Signal(bool)
+
     def __init__(self, agent, c: dict, parent=None):
         super().__init__(parent)
         self.agent = agent
@@ -112,6 +116,28 @@ class CommunicationsTab(QWidget):
         self._tg_status_timer = QTimer(self)
         self._tg_status_timer.timeout.connect(self._refresh_telegram_bridge_status)
         self._tg_status_timer.start(2000)
+
+        # ── Wire wake listener (WIRE-WAKE-01 W1, R2/B3) ──
+        # DEFAULT OFF: the listener registers a claim-capable session on the
+        # AIvengers Wire, so it exists only when the owner turns it on here
+        # (persisted; absent == off). Turning it on/off takes effect live;
+        # the MainWindow owns the listener runtime via the re-emitted signal.
+        wake_row = QHBoxLayout()
+        self.wire_wake_status = _lbl("Wire wake listener: off", c)
+        wake_row.addWidget(self.wire_wake_status)
+        wake_row.addStretch()
+        self.wire_wake_toggle = _btn("Turn on", c, accent=True)
+        self.wire_wake_toggle.clicked.connect(self._toggle_wire_wake)
+        wake_row.addWidget(self.wire_wake_toggle)
+        layout.addLayout(wake_row)
+        layout.addWidget(self._wlbl(
+            "Registers this desktop as a wake-capable session on the local "
+            "AIvengers Wire (peer messages only — no owner authority). When "
+            "on, Wire notifications appear in the inbox strip above the "
+            "status bar; Ack records receipt, Claim takes coordination "
+            "custody of a task (never starts work). Off by default."
+        ))
+        self._refresh_wire_wake_status()
 
         # ── Discord ──
         layout.addWidget(_sec("DISCORD", c))
@@ -317,6 +343,29 @@ class CommunicationsTab(QWidget):
         else:
             self._start_telegram_listener("switch_on")
         self._refresh_telegram_bridge_status()
+
+    # ── Wire wake listener (WIRE-WAKE-01 W1, R2/B3) ──
+
+    def _toggle_wire_wake(self) -> None:
+        """The owner's explicit Wire wake-listener switch (default OFF).
+
+        Persists the pref and emits the change; MainWindow performs the live
+        start/stop (bounded shutdown, no UI wait on Wire traffic).
+        """
+        enabled = not bool(self._prefs.get("wire_wake_listener", False))
+        persistence.update({"wire_wake_listener": enabled})
+        self._prefs = persistence.load()
+        self.wire_wake_toggle_changed.emit(enabled)
+        self._refresh_wire_wake_status()
+
+    def _refresh_wire_wake_status(self) -> None:
+        enabled = bool(self._prefs.get("wire_wake_listener", False))
+        if enabled:
+            self.wire_wake_status.setText("Wire wake listener: ON")
+            self.wire_wake_toggle.setText("Turn off")
+        else:
+            self.wire_wake_status.setText("Wire wake listener: off")
+            self.wire_wake_toggle.setText("Turn on")
 
     # ── Discord: token ──
     def _save_discord_token(self):

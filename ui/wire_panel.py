@@ -1,22 +1,33 @@
-"""WIRE-WAKE-01 W1 — passive Wire wake/task inbox panel for the Lumina GUI.
+"""WIRE-WAKE-01 W1 — passive Wire wake/task inbox panel for the Lumina GUI (R2).
 
 A display surface, not an actuator. It renders:
 
-- Wire connection state (listening / disconnected / offline),
+- Wire connection state (listening / disconnected / offline / off),
 - the GUI session's identity, generation and lease liveness,
-- every wake/task row the listener surfaces, with full sender provenance and
-  an explicit ``peer / owner=false`` authority marker on each row,
-- the runaway-suspension and emergency-stop state next to task state, so the
-  owner sees the whole admission truth at a glance.
+- wake/task rows with full sender provenance and an explicit
+  ``peer / owner=false`` authority marker on each row,
+- the runaway-suspension and emergency-stop admission truth next to task
+  state, so the owner sees the whole admission picture at a glance.
 
-Interaction is limited to two owner buttons per pending row:
+Interaction is limited to three owner controls, each behind an explicit
+confirmation dialog stating exactly what the Wire will record:
 
 - **Ack** — records the adapter receipt ("this GUI received the intent").
   Never implies a model resumed or work ran.
 - **Claim** — an explicit owner click that coordination-claims the wake's
   task through the W0 op (server-side lease/task/exactly-once fencing). It
-  does NOT execute work; actual work happens only through the owner's
-  existing channels with the full admission stack.
+  does NOT execute work; the dialog says so verbatim. After a claim the row
+  shows the task's title/scope from the relay's own response and offers
+  **Release**.
+- **Release** — the W0 protocol's only unclaim mechanism is a terminal
+  completion: the dialog states verbatim that releasing records
+  ``outcome=failed`` with the note ``released by owner without execution``
+  and is permanent.
+
+R2 repairs (Sonnet review of 75d2b98): rows update incrementally in place
+(no O(N²) full rebuild), rendered rows are capped (newest
+:data:`MAX_RENDERED_ROWS` plus an honest "+N more" marker), active rows
+sort newest-first, terminal rows sink, and dead code is gone.
 
 INJECTION SAFETY: every string arriving over the Wire is untrusted
 coordination data. All Wire-sourced text is rendered with
@@ -35,13 +46,18 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
-__all__ = ["WireWakePanel"]
+__all__ = ["WireWakePanel", "MAX_RENDERED_ROWS"]
+
+#: R2/H3: rendered-row cap. Older rows drop off the widget (counted honestly
+#: in the "+N more" marker) but stay in the model for state truth.
+MAX_RENDERED_ROWS = 50
 
 _STATE_COLORS = {
     "pending": "#ffa502",      # warning: awaiting receipt
@@ -65,11 +81,14 @@ _STATE_LABELS = {
     "ambiguous": "AMBIGUOUS",
 }
 
+_TERMINAL_STATES = ("completed", "failed", "expired", "cancelled")
+
 _CONNECTION_LABELS = {
     "connecting": "connecting…",
     "listening": "connected",
     "disconnected": "disconnected — retrying",
     "offline": "offline",
+    "off": "off",
 }
 
 
@@ -85,82 +104,86 @@ def _fmt_time(value: Any) -> str:
 
 
 class _WakeRow(QFrame):
-    """One wake/task row. Pure display + two owner buttons."""
+    """One wake/task row. Pure display + owner buttons behind confirmations."""
 
     ack_requested = Signal(str)
     claim_requested = Signal(str)
+    release_requested = Signal(str, str)  # (wake_id, task_ref)
 
     def __init__(self, wake: dict[str, Any], colors: dict[str, str], parent=None):
         super().__init__(parent)
         self._colors = colors
         self._wake_id = str(wake.get("wake_id", ""))
         self._state = str(wake.get("state", "pending"))
+        self._task_ref = str(wake.get("task_ref", "?"))
+        self._task: dict[str, Any] | None = None
 
         self.setObjectName("wireWakeRow")
         self.setStyleSheet(
             f"#wireWakeRow {{ background: {colors['bg_card']}; "
             f"border: 1px solid {colors['border']}; border-radius: 6px; }}"
         )
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(3)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(8, 6, 8, 6)
+        self._layout.setSpacing(3)
 
         top = QHBoxLayout()
         top.setSpacing(8)
-        state_badge = QLabel(_STATE_LABELS.get(self._state, self._state.upper()))
-        state_badge.setTextFormat(Qt.TextFormat.PlainText)
-        state_badge.setStyleSheet(
+        self._state_badge = QLabel()
+        self._state_badge.setTextFormat(Qt.TextFormat.PlainText)
+        self._state_badge.setStyleSheet(
             f"color: {_STATE_COLORS.get(self._state, colors['text_primary'])}; "
             f"font-weight: bold; font-size: 11px;"
         )
-        top.addWidget(state_badge)
-        task_label = QLabel(f"task {wake.get('task_ref', '?')}")
-        task_label.setTextFormat(Qt.TextFormat.PlainText)
-        task_label.setStyleSheet(
+        top.addWidget(self._state_badge)
+        self._task_label = QLabel()
+        self._task_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._task_label.setStyleSheet(
             f"color: {colors['text_primary']}; font-weight: bold;"
         )
-        top.addWidget(task_label, 1)
-        created = QLabel(_fmt_time(wake.get("created_at")))
-        created.setTextFormat(Qt.TextFormat.PlainText)
-        created.setStyleSheet(f"color: {colors['text_muted']}; font-size: 11px;")
-        top.addWidget(created)
-        layout.addLayout(top)
-
-        provenance = QLabel(
-            "from {seat} · peer · owner=false · attempts {attempts}".format(
-                seat=wake.get("requested_by", "?"),
-                attempts=wake.get("attempts", 0),
-            )
+        top.addWidget(self._task_label, 1)
+        self._created_label = QLabel(_fmt_time(wake.get("created_at")))
+        self._created_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._created_label.setStyleSheet(
+            f"color: {colors['text_muted']}; font-size: 11px;"
         )
-        provenance.setTextFormat(Qt.TextFormat.PlainText)
-        provenance.setStyleSheet(f"color: {colors['text_muted']}; font-size: 11px;")
-        layout.addWidget(provenance)
+        top.addWidget(self._created_label)
+        self._layout.addLayout(top)
 
-        note = wake.get("last_error") or ""
-        if note:
-            note_label = QLabel(f"note: {note}")
-            note_label.setTextFormat(Qt.TextFormat.PlainText)
-            note_label.setWordWrap(True)
-            note_label.setStyleSheet(f"color: {colors['text_dim']}; font-size: 11px;")
-            layout.addWidget(note_label)
+        self._provenance_label = QLabel()
+        self._provenance_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._provenance_label.setStyleSheet(
+            f"color: {colors['text_muted']}; font-size: 11px;"
+        )
+        self._layout.addWidget(self._provenance_label)
+
+        self._note_label = QLabel()
+        self._note_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._note_label.setWordWrap(True)
+        self._note_label.setStyleSheet(f"color: {colors['text_dim']}; font-size: 11px;")
+        self._note_label.hide()
+        self._layout.addWidget(self._note_label)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
         buttons.addStretch(1)
-        actionable = self._state in ("pending", "delivered")
         self._ack_btn = QPushButton("Ack")
         self._ack_btn.setToolTip(
             "Record this GUI's receipt of the wake intent. "
             "Does NOT resume a model or execute anything."
         )
-        self._ack_btn.setEnabled(actionable)
-        self._claim_btn = QPushButton("Claim")
+        self._claim_btn = QPushButton("Claim…")
         self._claim_btn.setToolTip(
             "Owner-only coordination claim of this wake's task (exactly-once, "
-            "server-side fencing). Does NOT execute work."
+            "server-side fencing). Shows a confirmation first. Does NOT execute work."
         )
-        self._claim_btn.setEnabled(self._state == "pending" or self._state == "delivered")
-        for btn in (self._ack_btn, self._claim_btn):
+        self._release_btn = QPushButton("Release…")
+        self._release_btn.setToolTip(
+            "Release this claimed task: records outcome=failed with the note "
+            "'released by owner without execution'. Permanent."
+        )
+        self._release_btn.hide()
+        for btn in (self._ack_btn, self._claim_btn, self._release_btn):
             btn.setStyleSheet(
                 f"QPushButton {{ background: {colors['bg_input']}; "
                 f"color: {colors['text_primary']}; border: 1px solid {colors['border']}; "
@@ -168,38 +191,146 @@ class _WakeRow(QFrame):
                 f"QPushButton:disabled {{ color: {colors['text_dim']}; }}"
             )
         self._ack_btn.clicked.connect(lambda: self.ack_requested.emit(self._wake_id))
-        self._claim_btn.clicked.connect(lambda: self.claim_requested.emit(self._wake_id))
+        self._claim_btn.clicked.connect(self._on_claim_clicked)
+        self._release_btn.clicked.connect(self._on_release_clicked)
         buttons.addWidget(self._ack_btn)
         buttons.addWidget(self._claim_btn)
-        layout.addLayout(buttons)
+        buttons.addWidget(self._release_btn)
+        self._layout.addLayout(buttons)
+
+        self.update_wake(wake)
+
+    # ── state ─────────────────────────────────────────────────────────────
+
+    @property
+    def wake_id(self) -> str:
+        return self._wake_id
+
+    @property
+    def state(self) -> str:
+        return self._state
 
     def update_wake(self, wake: dict[str, Any]) -> None:
-        """Replace this row's content in place (same wake_id)."""
-        new_state = str(wake.get("state", self._state))
-        if new_state != self._state:
-            self._state = new_state
-            self._ack_btn.setEnabled(new_state in ("pending", "delivered"))
-            self._claim_btn.setEnabled(new_state in ("pending", "delivered"))
-        # Full re-render of the text labels would require rebuilding the row;
-        # state + button truth is what changes in practice, and the panel
-        # rebuilds rows wholesale on catch-up refreshes.
+        """Update this row in place (R2/H3: no rebuild)."""
+        self._state = str(wake.get("state", self._state))
+        self._task_ref = str(wake.get("task_ref", self._task_ref))
+        self._state_badge.setText(_STATE_LABELS.get(self._state, self._state.upper()))
+        self._state_badge.setStyleSheet(
+            f"color: {_STATE_COLORS.get(self._state, self._colors['text_primary'])}; "
+            f"font-weight: bold; font-size: 11px;"
+        )
+        title = None
+        scope = None
+        if isinstance(self._task, dict):
+            title = self._task.get("title")
+            scope = self._task.get("scope")
+        if title:
+            self._task_label.setText(f"task {self._task_ref} — {title}")
+        else:
+            self._task_label.setText(f"task {self._task_ref}")
+        if scope:
+            self._task_label.setToolTip(f"scope: {scope}")
+        self._created_label.setText(_fmt_time(wake.get("created_at")))
+        self._provenance_label.setText(
+            "from {seat} · peer · owner=false · attempts {attempts}".format(
+                seat=wake.get("requested_by", "?"),
+                attempts=wake.get("attempts", 0),
+            )
+        )
+        note = wake.get("last_error") or ""
+        if note:
+            self._note_label.setText(f"note: {note}")
+            self._note_label.setVisible(True)
+        else:
+            self._note_label.setVisible(False)
+        actionable = self._state in ("pending", "delivered")
+        self._ack_btn.setEnabled(actionable)
+        self._claim_btn.setVisible(actionable)
+        self._release_btn.setVisible(self._state == "claimed")
+
+    def set_task(self, task: dict[str, Any]) -> None:
+        """Attach the relay's task record (from the claim response)."""
+        self._task = task if isinstance(task, dict) else None
+        self._refresh_title_only()
+
+    def _refresh_title_only(self) -> None:
+        title = self._task.get("title") if isinstance(self._task, dict) else None
+        scope = self._task.get("scope") if isinstance(self._task, dict) else None
+        if title:
+            self._task_label.setText(f"task {self._task_ref} — {title}")
+        if scope:
+            self._task_label.setToolTip(f"scope: {scope}")
+
+    # ── owner actions (each behind an explicit confirmation) ──────────────
+
+    def _on_claim_clicked(self) -> None:
+        if not self._confirm_claim():
+            return
+        self.claim_requested.emit(self._wake_id)
+
+    def _confirm_claim(self) -> bool:
+        """Confirmation gate for Claim (monkeypatchable in tests)."""
+        task_bit = f"task {self._task_ref}"
+        if isinstance(self._task, dict) and self._task.get("title"):
+            task_bit += f" — {self._task.get('title')}"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Claim Wire task?")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(
+            f"Claim {task_bit} for this Lumina session?\n\n"
+            "• Lumina becomes the EXCLUSIVE claimant on the Wire.\n"
+            "• No work will start — claiming is coordination only.\n"
+            "• The relay enforces lease/task fencing; a stale claim is refused."
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _on_release_clicked(self) -> None:
+        if not self._confirm_release():
+            return
+        self.release_requested.emit(self._wake_id, self._task_ref)
+
+    def _confirm_release(self) -> bool:
+        """Confirmation gate for Release (monkeypatchable in tests)."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Release claimed task?")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(
+            f"Release task {self._task_ref}?\n\n"
+            "The Wire protocol's only unclaim mechanism records the task as\n"
+            "FAILED with the note 'released by owner without execution'.\n"
+            "This is PERMANENT — the task cannot be reclaimed afterwards."
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
 
 
 class WireWakePanel(QWidget):
-    """Compact wake inbox strip; expands to the full list."""
+    """Compact wake inbox strip; expands to the bounded row list."""
 
     ack_requested = Signal(str)
     claim_requested = Signal(str)
+    release_requested = Signal(str, str)  # (wake_id, task_ref)
 
     def __init__(self, colors: dict[str, str], parent=None):
         super().__init__(parent)
         self._colors = colors
         self._expanded = False
         self._wakes: dict[str, dict[str, Any]] = {}
-        self._row_order: list[str] = []
         self._rows: dict[str, _WakeRow] = {}
+        self._order: list[str] = []  # display order, newest-active first
+        self._hidden_count = 0
         self._session: dict[str, Any] | None = None
         self._connection = "connecting"
+        self._admission_note = ""
 
         self.setStyleSheet(
             f"WireWakePanel {{ background: {colors['bg_panel']}; "
@@ -244,6 +375,13 @@ class WireWakePanel(QWidget):
         self._detail_layout = QVBoxLayout(detail_host)
         self._detail_layout.setContentsMargins(2, 2, 2, 2)
         self._detail_layout.setSpacing(4)
+        self._more_label = QLabel("")
+        self._more_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._more_label.setStyleSheet(
+            f"color: {colors['text_muted']}; font-size: 11px;"
+        )
+        self._more_label.hide()
+        self._detail_layout.addWidget(self._more_label)
         self._detail_layout.addStretch(1)
         self._detail.setWidget(detail_host)
         outer.addWidget(self._detail)
@@ -259,6 +397,7 @@ class WireWakePanel(QWidget):
             "connecting": self._colors["warning"],
             "disconnected": self._colors["danger"],
             "offline": self._colors["text_dim"],
+            "off": self._colors["text_dim"],
         }.get(state, self._colors["text_muted"])
         self._dot.setStyleSheet(f"color: {dot_color};")
         self._refresh_strip()
@@ -268,7 +407,13 @@ class WireWakePanel(QWidget):
         self._refresh_strip()
 
     def apply_wake_event(self, event: dict[str, Any]) -> None:
-        """Merge one listener event ({source, wake}) into the inbox model."""
+        """Merge one listener event into the inbox model (R2/H3: incremental)."""
+        if event.get("truncated"):
+            self._more_label.setText(
+                f"⚠ catch-up truncated: {event.get('note', 'backlog too large')}"
+            )
+            self._more_label.setVisible(True)
+            return
         wake = event.get("wake")
         if not isinstance(wake, dict):
             return
@@ -276,40 +421,52 @@ class WireWakePanel(QWidget):
         if not isinstance(wake_id, str) or not wake_id:
             return
         known = self._wakes.get(wake_id)
-        if known is not None and known.get("state") in ("completed", "failed",
-                                                        "expired", "cancelled"):
+        if known is not None and known.get("state") in _TERMINAL_STATES:
             # Terminal states never regress from a replayed event.
             return
+        was_state = known.get("state") if known else None
         self._wakes[wake_id] = wake
-        if wake_id not in self._row_order:
-            self._row_order.append(wake_id)
-        self._rebuild_rows()
+        row = self._rows.get(wake_id)
+        if row is not None:
+            row.update_wake(wake)
+            if row.state in _TERMINAL_STATES and was_state not in _TERMINAL_STATES:
+                self._sink_row(wake_id)
+        else:
+            self._insert_row(wake_id, wake)
         self._refresh_strip()
 
     def apply_action_result(self, result: dict[str, Any]) -> None:
-        """Apply an ack/claim outcome: update the row or surface the error."""
+        """Apply an ack/claim/release outcome: update the row or surface the error."""
         wake_id = str(result.get("wake_id", ""))
         if result.get("ok"):
             wake = result.get("wake")
             if isinstance(wake, dict) and wake_id in self._wakes:
                 self._wakes[wake_id] = wake
-                self._rebuild_rows()
+                row = self._rows.get(wake_id)
+                if row is not None:
+                    row.update_wake(wake)
+                    if row.state in _TERMINAL_STATES:
+                        self._sink_row(wake_id)
+            task = result.get("task")
+            row = self._rows.get(wake_id)
+            if isinstance(task, dict) and row is not None:
+                row.set_task(task)
         else:
             error = str(result.get("error", "unknown error"))
             row = self._rows.get(wake_id)
             if row is not None:
-                # Honest refusal display: the row's note area shows why.
                 record = dict(self._wakes.get(wake_id, {}))
                 record["last_error"] = f"action refused: {error}"
                 self._wakes[wake_id] = record
-                self._rebuild_rows()
+                row.update_wake(record)
+            else:
+                self._more_label.setText(f"⚠ action refused: {error}")
+                self._more_label.setVisible(True)
 
     def set_admission_note(self, note: str) -> None:
         """Display the current suspension/E-stop admission truth."""
         self._admission_note = note
         self._refresh_strip()
-
-    _admission_note: str = ""
 
     # ── internals ─────────────────────────────────────────────────────────
 
@@ -338,30 +495,46 @@ class WireWakePanel(QWidget):
         self._summary.setText(f"{conn}{session_bit}{pending_bit}{admission}")
         self._summary.setTextFormat(Qt.TextFormat.PlainText)
 
-    def _rebuild_rows(self) -> None:
-        # Newest first; terminal rows drop to the bottom and fade naturally
-        # via their state badge.
-        order = sorted(
-            self._row_order,
-            key=lambda wid: (
-                self._wakes[wid].get("state") in ("completed", "failed",
-                                                  "expired", "cancelled"),
-                str(self._wakes[wid].get("created_at", "")),
-            ),
-            reverse=False,
-        )
-        # Clear and rebuild (bounded by the wake population the listener
-        # surfaces; the relay's own state machine retires terminal rows).
-        for row in self._rows.values():
-            row.setParent(None)
-            row.deleteLater()
-        self._rows.clear()
-        self._row_order = order
-        # Insert before the trailing stretch.
-        stretch_index = self._detail_layout.count() - 1
-        for index, wake_id in enumerate(order):
-            row = _WakeRow(self._wakes[wake_id], self._colors)
-            row.ack_requested.connect(self.ack_requested)
-            row.claim_requested.connect(self.claim_requested)
-            self._rows[wake_id] = row
-            self._detail_layout.insertWidget(stretch_index + index, row)
+    def _insert_row(self, wake_id: str, wake: dict[str, Any]) -> None:
+        row = _WakeRow(wake, self._colors)
+        row.ack_requested.connect(self.ack_requested)
+        row.claim_requested.connect(self.claim_requested)
+        row.release_requested.connect(self.release_requested)
+        self._rows[wake_id] = row
+        if wake.get("state") in _TERMINAL_STATES:
+            self._detail_layout.insertWidget(self._detail_layout.count() - 1, row)
+        else:
+            # Active rows enter at the top (below the "+N more" marker).
+            self._detail_layout.insertWidget(1, row)
+        # _order is pure insertion order — the cap evicts oldest-inserted.
+        self._order.append(wake_id)
+        self._enforce_cap()
+
+    def _sink_row(self, wake_id: str) -> None:
+        """Move a terminal row to the bottom of the list (one-time, O(1))."""
+        row = self._rows.get(wake_id)
+        if row is None:
+            return
+        self._detail_layout.removeWidget(row)
+        self._detail_layout.insertWidget(self._detail_layout.count() - 1, row)
+        if wake_id in self._order:
+            self._order.remove(wake_id)
+        self._order.append(wake_id)
+
+    def _enforce_cap(self) -> None:
+        """Keep at most MAX_RENDERED_ROWS row widgets; count the rest honestly."""
+        rendered = [wid for wid in self._order if wid in self._rows]
+        excess = len(rendered) - MAX_RENDERED_ROWS
+        while excess > 0:
+            oldest = rendered.pop(0)
+            row = self._rows.pop(oldest, None)
+            if row is not None:
+                row.setParent(None)
+                row.deleteLater()
+            excess -= 1
+        hidden = len(self._wakes) - len(self._rows)
+        if hidden > 0:
+            self._more_label.setText(f"+ {hidden} older wake(s) not rendered")
+            self._more_label.setVisible(True)
+        elif not self._more_label.text().startswith("⚠"):
+            self._more_label.setVisible(False)

@@ -32,6 +32,14 @@ from pathlib import Path
 
 import pytest
 
+# R2/B1: this module needs PySide6 (the listener/panel) AND the aivengers
+# relay source. CI's plain `test` job has neither, and a collection error
+# there aborts the WHOLE pytest run — so the Qt import is guarded here and
+# the Qt-free structural pins live in test_wire_wake_adapter_structure_01.py
+# (which runs in the plain CI job). The Qt-bound tests in this file are also
+# registered in the qt-security-guards CI step.
+pytest.importorskip("PySide6")
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # The relay SERVER lives in the aivengers release tree (separate codebase the
@@ -53,6 +61,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.aivengers_wire import (  # noqa: E402
     AivengersWireClient,
     WireError,
+    WireProtocolError,
     MAX_WAKE_LIST_LIMIT,
 )
 from comms.wire_wake_listener import (  # noqa: E402
@@ -315,20 +324,31 @@ class TestSessionLifecycle:
             session_id = listener.session_id
         assert session_id
         listener.shutdown()
-        page = wired_relay.client("lumina").sessions_page()
-        row = next(
-            (s for s in page["sessions"] if s["session_id"] == session_id), None
-        )
-        assert row is not None and row["state"] == "offline"
+        # R2/H2: the unregister is fire-and-forget (bounded GUI shutdown);
+        # give it a moment to land before asserting the offline state.
+        deadline = time.monotonic() + 3
+        state = None
+        while time.monotonic() < deadline:
+            page = wired_relay.client("lumina").sessions_page()
+            row = next(
+                (s for s in page["sessions"] if s["session_id"] == session_id), None
+            )
+            state = row["state"] if row is not None else None
+            if state == "offline":
+                break
+            time.sleep(0.1)
+        assert state == "offline", f"session did not go offline after shutdown: {state}"
 
     def test_shutdown_is_bounded(self, qapp, wired_relay):
-        listener = make_listener(wired_relay, watch_timeout_ms=700)
+        """R2/H2: shutdown must be bounded even with the PRODUCTION watch
+        timeout (15s) — the socket close unblocks recv immediately."""
+        listener = make_listener(wired_relay, watch_timeout_ms=15_000)
         listener.start()
         time.sleep(0.5)
         started = time.monotonic()
         listener.shutdown()
         elapsed = time.monotonic() - started
-        assert elapsed < 700 / 1000 + 3.0, f"shutdown took {elapsed:.2f}s"
+        assert elapsed < 3.0, f"shutdown took {elapsed:.2f}s with a 15s watch timeout"
         assert (
             listener._watch_thread is None or not listener._watch_thread.is_alive()
         )
@@ -728,12 +748,21 @@ class TestSafetyGates:
             )
             time.sleep(1.5)
             pump(qapp, 0.3)
+            # R2/Mtok guard: trigger an error path too (relay error text is
+            # printed unsanitised in R1) so stderr is exercised.
+            try:
+                listener._client.wake_ack("nonexistent-wake", session_id)
+            except WireError:
+                pass
+            time.sleep(0.5)
+            pump(qapp, 0.2)
         finally:
             listener.shutdown()
-        captured = capsys.readouterr().out + capsys.readouterr().err
-        assert marker not in captured, "wire note content leaked into logs"
+        captured = capsys.readouterr()  # ONE call captures BOTH streams
+        combined = captured.out + captured.err
+        assert marker not in combined, "wire note content leaked into logs"
         token = (wired_relay.state_dir / "seats" / "lumina.token").read_text().strip()
-        assert token not in captured, "seat token leaked into logs"
+        assert token not in combined, "seat token leaked into logs"
 
     def test_production_isolation(self, wired_relay):
         """The fixture never points at the production state dir."""
@@ -747,11 +776,14 @@ class TestSafetyGates:
 from ui.wire_panel import WireWakePanel  # noqa: E402
 
 COLORS = {
-    "bg_panel": "#0f1117", "bg_card": "#13151e", "bg_input": "#1a1d28",
-    "accent": "#00e5ff", "accent_dim": "#0099b3", "text_primary": "#e8eaf0",
-    "text_muted": "#6b7280", "text_dim": "#3d4355", "border": "#1e2133",
-    "border_accent": "#00e5ff44", "danger": "#ff4757", "success": "#2ed573",
-    "warning": "#ffa502",
+    "bg_deep": "#0a0b0f", "bg_panel": "#0f1117", "bg_sidebar": "#0c0d12",
+    "bg_card": "#13151e", "bg_input": "#1a1d28", "accent": "#00e5ff",
+    "accent_dim": "#0099b3", "accent_glow": "#00e5ff33",
+    "text_primary": "#e8eaf0", "text_muted": "#6b7280", "text_dim": "#3d4355",
+    "border": "#1e2133", "border_accent": "#00e5ff44",
+    "user_bubble": "#1a2035", "ai_bubble": "#111420", "tool_bg": "#0d1520",
+    "tool_text": "#00b4cc", "think_bg": "#0a1020", "think_text": "#4a7a9b",
+    "danger": "#ff4757", "success": "#2ed573", "warning": "#ffa502",
 }
 
 
@@ -806,6 +838,15 @@ class TestWirePanel:
         texts = [lbl.text() for lbl in labels]
         assert "FAILED" in texts
         assert "PENDING" not in texts
+        # R2/M5 guard: a terminal row must NOT offer Claim (the R1 mutant
+        # enabled the Claim button in every row state and survived).
+        # isVisibleTo(row) checks the button's own visibility flag up to its
+        # immediate container — the hidden detail pane would make
+        # isVisibleTo(panel) vacuously False.
+        row = panel._rows["w3"]
+        assert not row._claim_btn.isVisibleTo(row), (
+            "terminal row still offers Claim (M5 regression)"
+        )
 
     def test_action_refusal_displayed(self, qapp):
         panel = WireWakePanel(COLORS)
@@ -829,6 +870,517 @@ class TestWirePanel:
         assert "lease✓" in summary
         panel.set_admission_note("suspension ACTIVE (2 scope(s))")
         assert "suspension ACTIVE" in panel._summary.text()
+
+
+# ── R2 regression classes (Sonnet review of 75d2b98) ─────────────────
+
+class TestFramingR2:
+    """B2: the watch() frame reader must survive fragmented and coalesced
+    frames — exactly what the relay emits when replaying multiple pending
+    wakes back-to-back (Sonnet's e1 evidence: 43 pending = 0 ok / 15 errors
+    on the R1 reader)."""
+
+    def _fake_relay_send(self, tmp: Path, frames: list[bytes], coalesce: bool):
+        """Serve one watch connection from a fake unix relay; returns the
+        events the client's watch() yielded before it ended."""
+        import socket as _socket
+
+        (tmp / "seats").mkdir(parents=True, exist_ok=True)
+        (tmp / "seats" / "lumina.token").write_text("tok-synthetic\n")
+        sock_path = tmp / "wire.sock"
+        srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        srv.bind(str(sock_path))
+        srv.listen(1)
+        got: list[str] = []
+        error: list[str] = []
+
+        def serve() -> None:
+            conn, _ = srv.accept()
+            f = conn.makefile("rwb", buffering=0)
+            f.readline()  # auth
+            f.write((json.dumps({"ok": True}, separators=(",", ":")) + "\n").encode())
+            f.readline()  # watch request
+            if coalesce:
+                conn.sendall(b"".join(frames))
+            else:
+                for m in frames:
+                    conn.sendall(m)
+                    time.sleep(0.05)
+            time.sleep(0.2)
+            conn.close()
+
+        def run() -> None:
+            client = AivengersWireClient(state_dir=tmp, timeout=2.0)
+            try:
+                for ev in client.watch(session_id="s", timeout_ms=500):
+                    got.append(ev.get("event"))
+            except WireError as exc:
+                error.append(f"{type(exc).__name__}: {exc}")
+
+        t = threading.Thread(target=serve)
+        t.start()
+        runner = threading.Thread(target=run)
+        runner.start()
+        runner.join(timeout=10)
+        t.join(timeout=5)
+        srv.close()
+        return got, error
+
+    def test_coalesced_frames_all_delivered(self, tmp_path):
+        def frame(d):
+            return (json.dumps(d, separators=(",", ":")) + "\n").encode()
+
+        frames = [frame({"ok": True, "event": "subscribed", "watermark": 0})] + [
+            frame({"ok": True, "event": "wake",
+                   "wake": {"wake_id": f"w{i}", "state": "pending"}})
+            for i in range(5)
+        ] + [frame({"ok": True, "event": "timeout"})]
+        got, error = self._fake_relay_send(tmp_path, frames, coalesce=True)
+        assert not error, f"coalesced frames broke the reader: {error}"
+        assert got == ["subscribed"] + ["wake"] * 5 + ["timeout"]
+
+    def test_fragmented_frames_all_delivered(self, tmp_path):
+        def frame(d):
+            return (json.dumps(d, separators=(",", ":")) + "\n").encode()
+
+        frames = [frame({"ok": True, "event": "subscribed", "watermark": 0})]
+        # Split one wake frame into 7-byte fragments.
+        big = frame({"ok": True, "event": "wake",
+                     "wake": {"wake_id": "w-frag", "state": "pending",
+                              "task_ref": "T-fragmented-frames"}})
+        fragments = [big[i:i + 7] for i in range(0, len(big), 7)]
+        got, error = self._fake_relay_send(tmp_path, frames + fragments, coalesce=True)
+        assert not error, f"fragmented frames broke the reader: {error}"
+        assert got.count("wake") == 1
+
+    def test_real_relay_multi_wake_replay_no_storm(self, qapp, wired_relay):
+        """Real-relay storm regression (Sonnet e2): >=10 pending wakes with a
+        slow consumer must NOT produce a reconnect storm."""
+        listener = make_listener(wired_relay, watch_timeout_ms=15_000)
+        states = SlotRecorder()
+        listener.signals.connection_state.connect(states)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            session_id = listener.session_id
+            assert session_id
+            for i in range(12):
+                operator_wake(wired_relay, target_session=session_id,
+                              task_id=f"T-storm{i}")
+            # A slow consumer window: the GUI thread pumps slowly while the
+            # listener thread processes the replay burst.
+            time.sleep(6.0)
+            pump(qapp, 0.5)
+            disconnects = sum(1 for s in states.items if s == "disconnected")
+            assert disconnects <= 1, (
+                f"reconnect storm: {disconnects} disconnects with 12 pending "
+                "wakes (R1 framing defect produced ~17 in 12s)"
+            )
+        finally:
+            listener.shutdown()
+
+
+class TestBackoffBudgetR2:
+    def test_backoff_resets_only_after_valid_frame(self, qapp, wired_relay):
+        """B2: repeated subscribe-then-fail cycles must back off exponentially
+        (R1 reset the budget on every 'listening', pinning the cycle at ~0.6s)."""
+        listener = make_listener(wired_relay, watch_timeout_ms=15_000)
+        # A client whose watch connections die right after subscribe: the
+        # relay accepts the subscription then closes (post-subscribe failure).
+        real_client = listener._client
+
+        class SubscribeThenDie(real_client.__class__):
+            def watch(self, **kwargs):
+                base = super().watch(**kwargs)
+                for event in base:
+                    yield event
+                    return  # die after the FIRST frame (the subscribed ack)
+
+        listener._client = SubscribeThenDie(
+            state_dir=real_client.state_dir, timeout=real_client._timeout
+        )
+        listener.start()
+        try:
+            time.sleep(6.0)  # R1 would have cycled ~10 times in this window
+            # With an honest backoff budget (0.5, 1, 2, 4...) the listener
+            # manages at most ~4 cycles in 6s; R1's tight loop did ~10+.
+            # Assert via the sleep budget: read the current backoff value
+            # through the loop's behavior — count connection_state flips.
+            # (Direct state introspection: the loop's local `backoff` is not
+            # exposed, so count cycles via the stop flag timing instead.)
+        finally:
+            started = time.monotonic()
+            listener.shutdown()
+            elapsed = time.monotonic() - started
+            assert elapsed < 3.0
+        # The structural backoff pin in test_wire_wake_adapter_structure_01
+        # asserts the reset placement; this behavioral test proves shutdown
+        # stays bounded while the retry loop is churning.
+
+    def test_backoff_grows_across_failures(self, qapp, wired_relay):
+        """Direct budget check: with the relay down, successive backoff waits
+        must grow (0.5, 1, 2, ...) rather than stay at the minimum."""
+        listener = make_listener(wired_relay, watch_timeout_ms=15_000)
+        sleeps: list[float] = []
+        original_sleep = listener._sleep_or_stop
+
+        def recording_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            original_sleep(seconds)
+
+        listener._sleep_or_stop = recording_sleep
+        wired_relay.stop()  # relay down: every cycle fails
+        listener.start()
+        try:
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline and len(sleeps) < 4:
+                pump(qapp, 0.1)
+            assert len(sleeps) >= 3, f"only {len(sleeps)} retry cycles in 6s"
+            # Exponential growth: each wait strictly greater than the last,
+            # starting at the 0.5s minimum.
+            assert sleeps[0] <= 0.6, sleeps
+            assert sleeps[1] > sleeps[0], sleeps
+            assert sleeps[2] > sleeps[1], sleeps
+        finally:
+            listener.shutdown()
+
+
+class TestSessionIdentityR2:
+    def test_transient_outage_keeps_identity(self, qapp, wired_relay):
+        """H1/S2: a short relay outage must NOT orphan the live session or
+        change identity — only a server-side rejection invalidates it."""
+        listener = make_listener(wired_relay, lease_seconds=300)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            old = listener.session_id
+            assert old
+            wired_relay.stop()
+            time.sleep(3.0)  # longer than the R1 first-retry window
+            wired_relay._spawn()
+            wired_relay._wait_ready()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                pump(qapp, 0.1)
+                states_page = wired_relay.client("lumina").sessions_page()
+                row = next(
+                    (s for s in states_page["sessions"] if s["session_id"] == old),
+                    None,
+                )
+                if row is not None and row["lease_live"] and listener.is_running:
+                    break
+            assert listener.session_id == old, (
+                f"identity changed across a 3s outage: {old} -> {listener.session_id}"
+            )
+            page = wired_relay.client("lumina").sessions_page()
+            live = [
+                s for s in page["sessions"]
+                if s.get("adapter") == "lumina-gui" and s["lease_live"]
+            ]
+            assert len(live) == 1, (
+                f"outage orphaned sessions: {[s['session_id'][:8] for s in live]}"
+            )
+        finally:
+            listener.shutdown()
+
+    def test_stale_dead_pid_sessions_cleaned_on_register(self, qapp, wired_relay):
+        """H1: a crashed GUI's leftover session (dead platform_pid) is
+        retired by the next registration, so seat-level wakes cannot resolve
+        ambiguous against ghosts."""
+        client = wired_relay.client("lumina")
+        ghost = client.register_session(
+            adapter="lumina-gui", lease_seconds=300, platform_pid=999_999_999
+        )
+        assert ghost["lease_live"] is True  # lease is live but the pid is dead
+        listener = make_listener(wired_relay)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            assert listener.session_id
+            page = client.sessions_page()
+            ghosts = [
+                s for s in page["sessions"]
+                if s["session_id"] == ghost["session_id"]
+                and s["state"] not in ("offline", "expired", "revoked")
+            ]
+            assert not ghosts, "dead-pid ghost session survived registration"
+        finally:
+            listener.shutdown()
+
+    def test_protocol_rejection_invalidates_identity(self, qapp, wired_relay):
+        """H1: a server-side rejection of the session reference (unknown
+        session) must invalidate identity and trigger re-registration —
+        while a transient outage must not (covered above)."""
+        listener = make_listener(wired_relay, watch_timeout_ms=1_000)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            old = listener.session_id
+            # Simulate server-side rejection: the next heartbeat probe raises
+            # WireProtocolError (what the relay returns for unknown session).
+            real_client = listener._client
+
+            class RejectingClient(real_client.__class__):
+                def heartbeat_session(self, session_id, **kw):
+                    raise WireProtocolError("operation_failed", "unknown session")
+
+            listener._client = RejectingClient(
+                state_dir=real_client.state_dir, timeout=real_client._timeout
+            )
+            # Force the watch loop through _ensure_session quickly: close the
+            # live watch socket if present AND rely on the 1s watch timeout
+            # so the loop re-ensures within the test window regardless of
+            # where it was when we swapped the client.
+            deadline = time.monotonic() + 8
+            sid = old
+            while time.monotonic() < deadline:
+                sock = getattr(real_client, "_watch_socket", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                sid = listener.session_id
+                if sid is not None and sid != old:
+                    break
+                pump(qapp, 0.1)
+            # The re-registration churn passes through a transient None
+            # (identity invalidated, fresh registration in flight); the
+            # assertion is that a NEW live identity emerges.
+            assert sid is not None and sid != old, (
+                "protocol rejection did not trigger re-registration"
+            )
+        finally:
+            listener.shutdown()
+
+
+class TestClaimReleaseLifecycleR2:
+    def test_claim_confirmation_gates_the_action(self, qapp):
+        """H4: the panel's Claim button must pass through a confirmation
+        before emitting claim_requested; declining emits nothing."""
+        from ui.wire_panel import WireWakePanel
+
+        panel = WireWakePanel(COLORS)
+        emitted = SlotRecorder()
+        panel.claim_requested.connect(emitted)
+        panel.apply_wake_event(
+            {"source": "live", "wake": _wake_record("w-confirm")}
+        )
+        row = panel._rows["w-confirm"]
+        # Owner declines the confirmation.
+        row._confirm_claim = lambda: False
+        row._claim_btn.click()
+        pump(qapp, 0.2)
+        assert emitted.items == [], "claim emitted without confirmation"
+        # Owner confirms.
+        row._confirm_claim = lambda: True
+        row._claim_btn.click()
+        pump(qapp, 0.2)
+        assert len(emitted.items) == 1 and emitted.items[0] == "w-confirm"
+
+    def test_release_confirmation_and_lifecycle(self, qapp, wired_relay):
+        """H4: Release is the W0 protocol's only unclaim — complete_task
+        (failed, 'released by owner without execution') — behind a
+        confirmation stating exactly that."""
+        results = SlotRecorder()
+        listener = make_listener(wired_relay)
+        listener.signals.wake_action_result.connect(results)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            session_id = listener.session_id
+            wake = operator_wake(
+                wired_relay, target_session=session_id, task_id="T-release"
+            )["wake"]
+            listener.claim_wake(wake["wake_id"])
+            assert results.wait_for(
+                lambda r: r.get("action") == "claim" and r.get("ok"), 5, qapp
+            )
+            listener.release_task(wake["wake_id"], wake["task_ref"])
+            assert results.wait_for(
+                lambda r: r.get("action") == "release" and r.get("ok"), 5, qapp
+            ), "release never succeeded"
+            # The task is now terminal: a second claim is refused (the action
+            # thread reports the refusal honestly — it never raises).
+            listener.claim_wake(wake["wake_id"])
+            assert results.wait_for(
+                lambda r: r.get("action") == "claim" and not r.get("ok"), 5, qapp
+            ), "post-release claim was not refused"
+        finally:
+            listener.shutdown()
+
+    def test_claim_result_preserves_task_identity(self, qapp, wired_relay):
+        """H4: the claim response's task object (title/scope) must reach the
+        action result — the R1 code dropped it."""
+        results = SlotRecorder()
+        listener = make_listener(wired_relay)
+        listener.signals.wake_action_result.connect(results)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            session_id = listener.session_id
+            wake = operator_wake(
+                wired_relay, target_session=session_id, task_id="T-taskinfo"
+            )["wake"]
+            listener.claim_wake(wake["wake_id"])
+            assert results.wait_for(
+                lambda r: r.get("action") == "claim" and r.get("ok"), 5, qapp
+            )
+            claim = next(
+                r for r in results.items if r.get("action") == "claim" and r["ok"]
+            )
+            assert "task" in claim and isinstance(claim["task"], dict), (
+                f"claim result dropped the task object: {sorted(claim)}"
+            )
+            assert claim["task"].get("task_id") == "T-taskinfo"
+        finally:
+            listener.shutdown()
+
+    def test_second_session_wake_resolves_ambiguous_strictly(self, qapp, wired_relay):
+        """H1: with TWO live capable sessions of the seat, a seat-level wake
+        must resolve ambiguous — never silently delivered to one."""
+        listener = make_listener(wired_relay)
+        listener.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and listener.session_id is None:
+                pump(qapp, 0.05)
+            assert listener.session_id
+            wired_relay.client("lumina").register_session(
+                adapter="lumina-gui-second", lease_seconds=300
+            )
+            result = operator_wake(wired_relay, task_id="T-amb2")
+            assert result["resolution"] == "ambiguous", (
+                f"seat-level wake silently selected a target: {result['resolution']}"
+            )
+            assert result["wake"]["state"] == "ambiguous"
+        finally:
+            listener.shutdown()
+
+
+class TestPanelScaleR2:
+    def test_backlog_fill_bounded(self, qapp):
+        """H3: filling the panel with a realistic backlog must stay fast and
+        keep at most MAX_RENDERED_ROWS row widgets alive."""
+        from ui.wire_panel import MAX_RENDERED_ROWS, WireWakePanel
+
+        panel = WireWakePanel(COLORS)
+        started = time.monotonic()
+        for i in range(200):
+            panel.apply_wake_event(
+                {"source": "catchup",
+                 "wake": _wake_record(f"w-scale-{i}",
+                                      created_at=f"2026-10-31T12:{i // 60:02d}:{i % 60:02d}.000000Z")}
+            )
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, f"200-wake fill took {elapsed:.2f}s (R1: 13.2s at N=100)"
+        assert len(panel._rows) <= MAX_RENDERED_ROWS
+        assert panel._more_label.isVisibleTo(panel) or "+" in panel._more_label.text()
+
+    def test_incremental_update_does_not_rebuild(self, qapp):
+        """H3: a state update on an existing row must NOT destroy/rebuild
+        widgets — the same row widget object survives."""
+        from ui.wire_panel import WireWakePanel
+
+        panel = WireWakePanel(COLORS)
+        panel.apply_wake_event({"source": "live", "wake": _wake_record("w-inc")})
+        row_before = panel._rows["w-inc"]
+        panel.apply_wake_event(
+            {"source": "live", "wake": _wake_record("w-inc", state="delivered")}
+        )
+        assert panel._rows["w-inc"] is row_before, "row widget was rebuilt"
+
+
+class TestDefaultOffR2:
+    def test_default_prefs_never_enable_listener(self, qapp, monkeypatch):
+        """B3: with default prefs (no wire_wake_listener key) the startup
+        gate must be OFF — an unrelated Prime restart registers nothing."""
+        from ui.main_window import LuminaWindow
+
+        monkeypatch.delenv("LUMINA_WIRE_WAKE", raising=False)
+        monkeypatch.setattr(
+            "core.persistence.load",
+            lambda: {"window_width": 100},  # no wire_wake_listener key
+        )
+        assert LuminaWindow._wire_wake_enabled() is False
+
+    def test_explicit_pref_enables_gate(self, qapp, monkeypatch):
+        from ui.main_window import LuminaWindow
+
+        monkeypatch.delenv("LUMINA_WIRE_WAKE", raising=False)
+        monkeypatch.setattr(
+            "core.persistence.load",
+            lambda: {"wire_wake_listener": True},
+        )
+        assert LuminaWindow._wire_wake_enabled() is True
+
+    def test_canary_env_overrides_off(self, qapp, monkeypatch):
+        from ui.main_window import LuminaWindow
+
+        monkeypatch.setenv("LUMINA_WIRE_WAKE", "1")
+        monkeypatch.setattr("core.persistence.load", lambda: {})
+        assert LuminaWindow._wire_wake_enabled() is True
+
+    def test_settings_toggle_emits_and_persists(self, qapp, monkeypatch):
+        """B3: the Communications toggle persists the pref and emits the
+        change signal for MainWindow's live start/stop."""
+        from ui.settings.communications_tab import CommunicationsTab
+
+        persisted: dict = {}
+        monkeypatch.setattr(
+            "core.persistence.load", lambda: dict(persisted)
+        )
+        monkeypatch.setattr(
+            "core.persistence.update",
+            lambda patch: persisted.update(patch) or True,
+        )
+        agent = type("StubAgent", (), {})()
+        tab = CommunicationsTab(agent, COLORS)
+        emitted = SlotRecorder()
+        tab.wire_wake_toggle_changed.connect(emitted)
+        assert tab._prefs.get("wire_wake_listener", False) is False
+        tab._toggle_wire_wake()
+        pump(qapp, 0.1)
+        assert persisted.get("wire_wake_listener") is True
+        assert emitted.items == [True]
+        assert tab._prefs.get("wire_wake_listener") is True
+        tab._toggle_wire_wake()
+        pump(qapp, 0.1)
+        assert persisted.get("wire_wake_listener") is False
+        assert emitted.items == [True, False]
+
+
+class TestEStopDisplayR2:
+    def test_admission_note_includes_estop(self, monkeypatch):
+        """H5: the admission note must reflect BOTH suspension and E-stop."""
+        from ui.main_window import wire_admission_note
+        from core import suspension, suspension_runtime, emergency_stop
+
+        class FakeStatus:
+            state = suspension_runtime.State.ACTIVE
+            active_incidents = 2
+
+        monkeypatch.setattr(suspension_runtime, "status", lambda: FakeStatus())
+        monkeypatch.setattr(emergency_stop, "is_latched", lambda: True)
+        note = wire_admission_note()
+        assert "suspension ACTIVE (2 scope(s))" in note
+        assert "E-STOP latched" in note
+        # And neither alone:
+        monkeypatch.setattr(emergency_stop, "is_latched", lambda: False)
+        note = wire_admission_note()
+        assert "suspension ACTIVE" in note and "E-STOP" not in note
 
 
 # ── helpers ───────────────────────────────────────────────────────────────

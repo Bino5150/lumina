@@ -594,6 +594,29 @@ def _refuse_telegram_origin_for_authority(request) -> None:
         )
 
 
+def wire_admission_note() -> str:
+    """The Wire panel's admission truth: suspension + E-stop, one line.
+
+    Module-level so the panel's honesty display is directly testable without
+    constructing a LuminaWindow (R2/H5).
+    """
+    parts: list[str] = []
+    try:
+        status = suspension_runtime.status()
+        if status.state is suspension_runtime.State.ACTIVE:
+            parts.append(f"suspension ACTIVE ({status.active_incidents} scope(s))")
+    except Exception:
+        pass
+    try:
+        from core import emergency_stop
+
+        if emergency_stop.is_latched():
+            parts.append("E-STOP latched")
+    except Exception:
+        pass
+    return " · ".join(parts)
+
+
 class LuminaWindow(QMainWindow):
     def __init__(self, agent, stt=None):
         super().__init__()
@@ -715,6 +738,21 @@ class LuminaWindow(QMainWindow):
         self.resize(w, h)
         self.setStyleSheet(APP_STYLESHEET)
 
+    @staticmethod
+    def _wire_wake_enabled() -> bool:
+        """R2/B3: the W1 listener is OFF unless the owner explicitly enables it.
+
+        Two explicit paths, both deliberate owner actions:
+        - the persisted pref ``wire_wake_listener`` set true
+          (Settings → Communications toggle; absent == off), or
+        - the ``LUMINA_WIRE_WAKE=1`` canary environment override.
+        An unrelated Prime restart on a tree containing W1 therefore never
+        registers a wake session silently.
+        """
+        if os.environ.get("LUMINA_WIRE_WAKE") == "1":
+            return True
+        return bool(persistence.load().get("wire_wake_listener", False))
+
     def _start_wire_listener(self) -> None:
         """Start the W1 Wire wake listener and wire its signals (GUI thread)."""
         if self._wire_listener is not None:
@@ -727,7 +765,33 @@ class LuminaWindow(QMainWindow):
         listener.signals.wake_action_result.connect(self.wire_panel.apply_action_result)
         self.wire_panel.ack_requested.connect(listener.ack_wake)
         self.wire_panel.claim_requested.connect(listener.claim_wake)
+        self.wire_panel.release_requested.connect(listener.release_task)
         listener.start()
+
+    def _set_wire_wake_enabled(self, enabled: bool) -> None:
+        """Settings-toggle handler: live start/stop of the W1 listener.
+
+        The pref is persisted first; the listener follows the pref. Stopping
+        is the bounded shutdown path (socket closed, threads joined ≤2s,
+        fire-and-forget unregister) — the UI never waits on Wire traffic.
+        """
+        persistence.update({"wire_wake_listener": bool(enabled)})
+        if enabled:
+            if self._wire_listener is None and not os.environ.get("LUMINA_TESTING"):
+                self._start_wire_listener()
+            else:
+                self.wire_panel.set_connection_state(
+                    "connecting" if self._wire_listener is not None else "off"
+                )
+        else:
+            listener = self._wire_listener
+            self._wire_listener = None
+            if listener is not None:
+                try:
+                    listener.shutdown()
+                except Exception as e:
+                    print(f"[WIRE] shutdown failed: {type(e).__name__}", flush=True)
+            self.wire_panel.set_connection_state("off")
 
     def _on_wire_session_state(self, session) -> None:
         self.wire_panel.set_session(session)
@@ -738,16 +802,8 @@ class LuminaWindow(QMainWindow):
         self._refresh_wire_admission_note()
 
     def _refresh_wire_admission_note(self) -> None:
-        """Show the current suspension/E-stop admission truth next to task state."""
-        try:
-            status = suspension_runtime.status()
-            if status.state is suspension_runtime.State.ACTIVE:
-                note = f"suspension ACTIVE ({status.active_incidents} scope(s))"
-            else:
-                note = ""
-        except Exception:
-            note = ""
-        self.wire_panel.set_admission_note(note)
+        """Show the current suspension AND E-stop admission truth (R2/H5)."""
+        self.wire_panel.set_admission_note(wire_admission_note())
 
     def closeEvent(self, event):
         listener = getattr(self, "_suspension_listener", None)
@@ -934,32 +990,42 @@ class LuminaWindow(QMainWindow):
         self.settings_panel.backend_connection_changed.connect(
             self._on_backend_connection_changed
         )
+        # WIRE-WAKE-01 W1 (R2/B3): the Settings toggle owns the live
+        # start/stop; the startup gate above only reads the persisted pref.
+        self.settings_panel.wire_wake_toggle_changed.connect(
+            self._set_wire_wake_enabled
+        )
 
         self.review_panel = ReviewPanel(self.agent, COLORS)
         self.review_panel.setVisible(False)
 
-        # WIRE-WAKE-01 W1: passive Wire wake inbox. The listener registers
-        # Lumina's session on the deployed W0 wake infrastructure and
-        # surfaces wake/task state here; every row displays peer/owner=false
-        # provenance, and the only actuators are the owner's Ack/Claim
-        # clicks (see comms/wire_wake_listener.py for the honesty contract).
-        # Auto-start is skipped under test harnesses so the suite never
-        # touches the production Wire, and the owner keeps a kill switch.
+        # WIRE-WAKE-01 W1 (R2/B3): passive Wire wake inbox, DEFAULT OFF.
+        # The listener starts only when the owner explicitly enables it
+        # (Settings → Communications toggle, persisted as
+        # prefs["wire_wake_listener"], absent == off) or via the
+        # LUMINA_WIRE_WAKE=1 canary override. When disabled: no client is
+        # constructed, no socket is touched, no session is registered — the
+        # panel shows a static "off" strip so the feature is discoverable
+        # without being active. Under test harnesses the listener never
+        # auto-starts regardless.
         self._wire_listener: WireWakeListener | None = None
         self.wire_panel = WireWakePanel(COLORS)
-        main.addWidget(self.wire_panel)
-        if (
-            not os.environ.get("LUMINA_TESTING")
-            and bool(self._prefs.get("wire_wake_listener", True))
-        ):
-            self._start_wire_listener()
 
         main.addWidget(self.chat_widget, 1)
         main.addWidget(self.settings_panel, 1)
         main.addWidget(self.review_panel, 1)
+        main.addWidget(self.wire_panel)
 
         self.status_bar = StatusBar()
         main.addWidget(self.status_bar)
+
+        if (
+            not os.environ.get("LUMINA_TESTING")
+            and self._wire_wake_enabled()
+        ):
+            self._start_wire_listener()
+        else:
+            self.wire_panel.set_connection_state("off")
 
         container = QWidget()
         container.setLayout(main)
@@ -1729,6 +1795,12 @@ class LuminaWindow(QMainWindow):
 
     def _on_suspension_event(self, kind: str, payload):
         self.safety_banner.refresh(suspension_runtime.status())
+        # R2/H5: keep the Wire panel's admission note truthful on every
+        # suspension lifecycle event (trip, resume, clear).
+        try:
+            self._refresh_wire_admission_note()
+        except Exception:
+            pass
         if self._suspension_dialog is not None and self._suspension_dialog.isVisible():
             self._suspension_dialog.refresh()
         if kind != "trip" or payload is None:

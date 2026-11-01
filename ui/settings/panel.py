@@ -21,6 +21,9 @@ from .coming_soon_tab import ComingSoonTab
 class SettingsPanel(QWidget):
     persona_applied = Signal(str, str)  # (agent_name, avatar_path)
     backend_connection_changed = Signal()  # UI-TRUST-01B: relayed from GeneralTab
+    # WIRE-WAKE-01 W1 (R2/B3): relayed from CommunicationsTab so MainWindow
+    # can start/stop the listener live when the owner flips the control.
+    wire_wake_toggle_changed = Signal(bool)
     def __init__(self, agent, colors: dict, parent=None):
         super().__init__(parent)
         self.agent = agent
@@ -72,8 +75,15 @@ class SettingsPanel(QWidget):
         # Compatibility alias for existing internal/tests code.  The page is
         # promoted in place; there is not a second TTS surface.
         self.tts_tab = self.multimodal_tab
+        self.comms_tab = CommunicationsTab(self.agent, c)
+        # WIRE-WAKE-01 W1 (R2/B3): the owner's explicit Wire wake-listener
+        # control lives in Communications; the runtime start/stop happens in
+        # MainWindow (wired through this re-emitted signal).
+        self.comms_tab.wire_wake_toggle_changed.connect(
+            self.wire_wake_toggle_changed
+        )
         tabs.addTab(self.personas_tab,              "🎭  Personas")
-        tabs.addTab(CommunicationsTab(self.agent, c), "📡  Communications")
+        tabs.addTab(self.comms_tab,                 "📡  Communications")
         tabs.addTab(MemoryTab(self.agent, c),       "🧠  Memory")
         tabs.addTab(KnowledgeTab(self.agent, c),    "📚  Knowledge")
         tabs.addTab(SkillsTab(self.agent, c),       "🧩  Skills")

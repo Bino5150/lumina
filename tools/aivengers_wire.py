@@ -197,6 +197,50 @@ class AivengersWireClient:
             )
         return data
 
+    @staticmethod
+    def _iter_frames(
+        sock: socket.socket, *, max_frame: int = MAX_FRAME_BYTES, idle_timeout: float
+    ) -> Iterator[bytes]:
+        """Yield complete newline-delimited frames from a streaming socket.
+
+        Handles both failure modes a bare ``recv()`` reader has:
+
+        - **fragmented** — one frame split across several ``recv`` returns;
+        - **coalesced** — several frames arriving in one ``recv`` (exactly
+          what the relay emits when it replays multiple pending wakes
+          back-to-back with no await between writes).
+
+        A persistent buffer is carried across reads and split on ``\\n``;
+        complete frames are yielded one at a time and the remainder stays
+        buffered for the next frame. R2/B2.
+        """
+        buf = bytearray()
+        while True:
+            nl = buf.find(b"\n")
+            if nl != -1:
+                frame = bytes(buf[:nl])
+                del buf[: nl + 1]
+                yield frame
+                continue
+            if len(buf) > max_frame:
+                raise WireFrameError(
+                    f"frame exceeds {max_frame} bytes without a newline terminator"
+                )
+            try:
+                chunk = sock.recv(65_536)
+            except socket.timeout as exc:
+                raise WireUnavailableError(
+                    f"AIvengers Wire relay at {sock} did not deliver a frame "
+                    f"within the {idle_timeout:g}s watch idle timeout"
+                ) from exc
+            if not chunk:
+                if buf:
+                    raise WireFrameError(
+                        "relay closed the connection mid-frame (incomplete frame buffered)"
+                    )
+                return
+            buf.extend(chunk)
+
     def _recv_frame(self, sock: socket.socket) -> dict[str, Any]:
         buf = bytearray()
         while True:
@@ -577,6 +621,41 @@ class AivengersWireClient:
             )
         return response
 
+    def complete_task(
+        self,
+        task_ref: str,
+        session_id: str,
+        *,
+        outcome: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a terminal outcome for a claimed task (owner GUI action).
+
+        The relay enforces claimant identity and task state server-side. W1
+        uses this ONLY for the owner's explicit Release control (outcome
+        ``failed`` with an explicit released-without-execution note) — never
+        for autonomous completion of work.
+        """
+        if outcome not in ("completed", "failed"):
+            raise WireError("outcome must be 'completed' or 'failed'")
+        if not isinstance(task_ref, str) or not task_ref:
+            raise WireError("task_ref must be a non-empty string")
+        if not isinstance(session_id, str) or not session_id:
+            raise WireError("session_id must be a non-empty string")
+        payload: dict[str, Any] = {
+            "op": "complete",
+            "task_ref": task_ref,
+            "session_id": session_id,
+            "outcome": outcome,
+        }
+        if note is not None:
+            if not isinstance(note, str):
+                raise WireError("note must be a string")
+            payload["note"] = note
+        with self._session() as sock:
+            response = self._exchange(sock, payload)
+        return response
+
     def watch(
         self,
         *,
@@ -620,6 +699,10 @@ class AivengersWireClient:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(idle_timeout_seconds)
         terminated = False
+        # R2/H2 shutdown hook: the listener closes this socket to unblock a
+        # blocking recv immediately (bounded GUI shutdown). One watch at a
+        # time per client instance; cleared when the generator exits.
+        self._watch_socket = sock
         try:
             sock.connect(str(self.socket_path))
             sock.sendall(
@@ -628,8 +711,16 @@ class AivengersWireClient:
             auth = self._recv_frame(sock)
             self._check(auth)
             sock.sendall(self._encode_frame(payload))
+            # R2/B2: ONE frame-decoder instance for the whole subscription —
+            # its buffer carries coalesced/fragmented remainders across
+            # frames. (Calling _iter_frames inside the loop would create a
+            # fresh empty buffer per frame and silently drop everything
+            # after the first coalesced batch — the exact bug the framing
+            # test caught.)
+            frames_iter = self._iter_frames(sock, idle_timeout=idle_timeout_seconds)
             while True:
-                frame = self._recv_frame(sock)
+                raw = next(frames_iter)
+                frame = self._decode_frame(raw)
                 if frame.get("ok") is not True:
                     raise WireProtocolError(
                         str(frame.get("error", "operation_failed")),
@@ -641,6 +732,7 @@ class AivengersWireClient:
                     terminated = True
                     return
         finally:
+            self._watch_socket = None
             try:
                 sock.close()
             except OSError:
@@ -650,3 +742,18 @@ class AivengersWireClient:
                 # the socket; the relay treats the drop as a disconnect and
                 # replays unacked wakes on the next subscription.
                 pass
+
+    #: R2/H2: the live watch connection while a watch() generator is active,
+    #: else None. The listener's shutdown closes it to unblock recv() — this
+    #: is a deliberate shutdown hook, not general-purpose API.
+    _watch_socket: socket.socket | None = None
+
+    @staticmethod
+    def _decode_frame(raw: bytes) -> dict[str, Any]:
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WireFrameError(f"relay frame is not valid JSON: {exc}") from exc
+        if not isinstance(value, dict):
+            raise WireFrameError("relay frame must be a JSON object")
+        return value

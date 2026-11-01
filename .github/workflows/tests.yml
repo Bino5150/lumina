@@ -135,6 +135,18 @@ jobs:
       - name: Run Qt-bound ChatGPT sign-in settings guards (blocking)
         run: python -m pytest tests/test_chatgpt_auth_01c_settings_qt.py tests/test_chatgpt_auth_01c_r2_qt.py -v -rs -m "not castle_walls_evidence"
 
+      # WIRE-WAKE-01 W1 -- the native wake adapter's behavioral guards: the
+      # passive inbox panel renders peer content as inert plain text with
+      # owner=false provenance, terminal states never regress, action
+      # refusals display honestly, and the panel scales under backlog
+      # pressure. The relay-dependent listener integration tests in the same
+      # file SKIP here (runners have no aivengers checkout) — the relay-free
+      # structural pins for this slice run in the plain `test` job as
+      # tests/test_wire_wake_adapter_structure_01.py. Same pinned PySide6
+      # and fail-never-skip contract.
+      - name: Run Qt-bound Wire wake panel guards (blocking)
+        run: python -m pytest tests/test_wire_wake_adapter_01.py::TestWirePanel -v -rs -m "not castle_walls_evidence"
+
       # OPERATOR-INGRESS-PROVENANCE-01 -- operator commands are desktop
       # authority. The real LuminaWindow is driven through its real chat
       # input (Enter key) and its real Telegram origin queue, so only Qt can
