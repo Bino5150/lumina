@@ -299,34 +299,30 @@ def register_file_edit_tools(registry, project_state=None):
         name="edit_file",
         fn=_tool_edit_file,
         description=(
-            "Surgically edit an existing UTF-8 text file by replacing exact "
-            "text spans. Each old_text must match the file's current contents "
-            "exactly once; all edits in one call apply atomically — either "
-            "every hunk lands or none do. Optionally pass expected_sha256 to "
-            "require the file's current contents match before editing."
+            "Replace exact spans in an existing UTF-8 file. Each old_text must match exactly once; all edits apply atomically or none do. expected_sha256 optionally rejects changed file bytes before writing."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to an existing regular file to edit. Supports ~ expansion. Must not be a symlink."
+                    "description": "Existing regular file; expands ~; symlinks refused."
                 },
                 "edits": {
                     "type": "array",
-                    "description": "Ordered list of surgical edits, applied atomically. Each old_text must match exactly once in the file.",
+                    "description": "Ordered edits; applied atomically. Each old_text must match exactly once.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "old_text": {"type": "string", "description": "Exact text to replace. Must be non-empty and match exactly once in the current file."},
-                            "new_text": {"type": "string", "description": "Replacement text. Use an empty string to delete old_text."}
+                            "old_text": {"type": "string", "description": "Nonempty exact text; must match once in current file."},
+                            "new_text": {"type": "string", "description": "Replacement text; empty string deletes old_text."}
                         },
                         "required": ["old_text", "new_text"]
                     }
                 },
                 "expected_sha256": {
                     "type": "string",
-                    "description": "Optional SHA-256 hex digest of the file's exact current bytes. If given and it doesn't match, nothing is written."
+                    "description": "Optional SHA-256 hex of current bytes; mismatch writes nothing."
                 }
             },
             "required": ["path", "edits"]

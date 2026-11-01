@@ -85,25 +85,21 @@ def register_git_branches_tool(registry, project_state: Optional[ProjectContextS
     registry.register(
         name="git_branches",
         fn=_tool_git_branches,
-        description="List all local and remote branches in a git repository, showing which is currently active. "
-                     "If repo_path is omitted, defaults to the active Project's root — which must still be an "
-                     "allowlisted Git repository (a Project binding alone does not authorize a repo for Git tools).",
+        description="List local/remote Git branches and mark the active branch. Omit repo_path for active Project root; allowlist still applies and Project binding grants no Git authority.",
         parameters={
             "type": "object",
             "properties": {
                 "repo_path": {
                     "type": "string",
-                    "description": "Path to local git repo. Must be one of the allowlisted project roots: "
-                                    "~/lumina, ~/lumina-release. If omitted, defaults to the active Project's root "
-                                    "(still subject to the same allowlist)."
+                    "description": "Allowlisted repo only: ~/lumina or ~/lumina-release. Omit for active Project root; Project binding grants no Git authority."
                 },
                 "remote": {
                     "type": "boolean",
-                    "description": "If True, also show remote-tracking branches (default False)."
+                    "description": "Include remote-tracking branches; default false."
                 },
                 "filter": {
                     "type": "string",
-                    "description": "Optional substring to filter branches by."
+                    "description": "Optional branch-name substring."
                 }
             },
             "required": []

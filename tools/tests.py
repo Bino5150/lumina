@@ -467,12 +467,7 @@ def register_tests_tools(registry, project_state=None, cancel_state=None):
         name="run_tests",
         fn=run_tests,
         description=(
-            "Run the repository's pytest suite (or specific selectors) through "
-            "Lumina's structured, managed pytest kernel and report a truthful "
-            "execution result. Owner-only. Does not authorize commit, push, or "
-            "any durable checkpoint -- checkpoint_bindable only describes "
-            "whether this run's observed repository state could later qualify "
-            "as machine evidence."
+            "Owner-only managed pytest: run the configured repository suite or literal selectors and report observed execution. No commit, push or durable-checkpoint authority; checkpoint_bindable only indicates whether this run's observed repository state could later qualify as machine evidence."
         ),
         parameters={
             "type": "object",
@@ -482,23 +477,20 @@ def register_tests_tools(registry, project_state=None, cancel_state=None):
                     "items": {"type": "string"},
                     "maxItems": test_runner.MAX_SELECTORS,
                     "description": (
-                        "Optional literal pytest selectors (paths, ::node ids). "
-                        "Omit or leave empty to run the repository's normal "
-                        "configured suite."
+                        "Literal pytest paths/::node IDs; omit or empty for configured repository suite."
                     ),
                 },
                 "cwd": {
                     "type": "string",
                     "description": (
-                        "Optional absolute or ~-relative working directory. "
-                        "Omit to use the active Project root."
+                        "Absolute or ~-relative cwd; omit for active Project root."
                     ),
                 },
                 "timeout_seconds": {
                     "type": "integer",
                     "minimum": MIN_TIMEOUT_SECONDS,
                     "maximum": MAX_TIMEOUT_SECONDS,
-                    "description": f"Execution timeout in seconds; default {DEFAULT_TIMEOUT_SECONDS}.",
+                    "description": f"Execution timeout; default {DEFAULT_TIMEOUT_SECONDS} seconds.",
                 },
             },
             "additionalProperties": False,

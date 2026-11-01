@@ -92,17 +92,13 @@ def register_git_status_tool(registry, project_state: Optional[ProjectContextSta
     registry.register(
         name="git_status",
         fn=_tool_git_status,
-        description="Show current working tree state: branch, commits ahead/behind, staged/unstaged/untracked files. "
-                     "If repo_path is omitted, defaults to the active Project's root — which must still be an "
-                     "allowlisted Git repository (a Project binding alone does not authorize a repo for Git tools).",
+        description="Read Git branch, ahead/behind counts and staged/unstaged/untracked files. Omit repo_path for active Project root; allowlist still applies and Project binding grants no Git authority.",
         parameters={
             "type": "object",
             "properties": {
                 "repo_path": {
                     "type": "string",
-                    "description": "Path to local git repo. Must be one of the allowlisted project roots: "
-                                    "~/lumina, ~/lumina-release. If omitted, defaults to the active Project's root "
-                                    "(still subject to the same allowlist)."
+                    "description": "Allowlisted repo only: ~/lumina or ~/lumina-release. Omit for active Project root; Project binding grants no Git authority."
                 }
             },
             "required": []

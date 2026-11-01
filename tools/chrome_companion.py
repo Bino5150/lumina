@@ -408,10 +408,7 @@ def register_chrome_companion_tools(registry, *, data_dir=None, hub=None, agent=
         }, "required": []})
     registry.register(
         "chrome_observe", chrome_observe,
-        "See a page in Lumina's own Chrome the way a person scans it: the visible links, buttons, fields and "
-        "toggles (in view first) with a stable [ref] each, plus headings and scroll position. Works on any "
-        "site the owner allowed; no site-specific support needed. Optional: query (filter by name), scroll "
-        "(up/down/top/bottom first; viewport only), since_gen (only elements not shown before). Read-only.",
+        "Read an owner-allowed page in Lumina's Chrome: visible links, buttons, fields and toggles (in-view first), stable [ref] values, headings and scroll position. Works on any owner-allowed site. Optional query filters names; scroll (applied first) moves only the viewport; since_gen returns elements not shown before. Read-only.",
         {"type": "object", "properties": {
             "tab_id": tab_arg,
             "query": {"type": "string", "description": "Only elements whose name or link contains this text"},

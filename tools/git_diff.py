@@ -103,34 +103,29 @@ def register_git_diff_tool(registry, project_state: Optional[ProjectContextState
     registry.register(
         name="git_diff",
         fn=_tool_git_diff,
-        description="Show the diff of changes in a specific commit, or between two refs (branches, tags, SHAs) in a "
-                     "local git repository. If repo_path is omitted, defaults to the active Project's root — which "
-                     "must still be an allowlisted Git repository (a Project binding alone does not authorize a "
-                     "repo for Git tools).",
+        description="Show a commit's diff or a two-ref diff in an allowlisted local Git repo. Omit repo_path for active Project root; Project binding grants no Git authority.",
         parameters={
             "type": "object",
             "properties": {
                 "repo_path": {
                     "type": "string",
-                    "description": "Path to local git repo. Must be one of the allowlisted project roots: "
-                                    "~/lumina, ~/lumina-release. If omitted, defaults to the active Project's root "
-                                    "(still subject to the same allowlist)."
+                    "description": "Allowlisted repo only: ~/lumina or ~/lumina-release. Omit for active Project root; Project binding grants no Git authority."
                 },
                 "commit": {
                     "type": "string",
-                    "description": "Show the diff introduced by this single commit (hash/ref). Mutually exclusive with ref_a/ref_b."
+                    "description": "Single-commit diff (hash/ref); not with ref_a/ref_b."
                 },
                 "ref_a": {
                     "type": "string",
-                    "description": "Start of range. Requires ref_b. Mutually exclusive with commit."
+                    "description": "Range start; requires ref_b; not with commit."
                 },
                 "ref_b": {
                     "type": "string",
-                    "description": "End of range. Requires ref_a. Mutually exclusive with commit."
+                    "description": "Range end; requires ref_a; not with commit."
                 },
                 "max_lines": {
                     "type": "integer",
-                    "description": "Maximum diff lines to return (default 300, max 2000)."
+                    "description": "Diff line cap; default 300, maximum 2000."
                 }
             },
             "required": []

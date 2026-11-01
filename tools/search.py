@@ -261,19 +261,15 @@ def register_search_tools(registry, project_state=None):
     registry.register(
         name="search_code",
         fn=search_code,
-        description="Recursively search source code for a literal string or regex pattern, "
-                     "returning exact file:line locations with surrounding source context. "
-                     "Use to find definitions/uses of a symbol, TODOs, or any text pattern "
-                     "across a directory tree or a single file. Case-sensitive. For "
-                     "filename-only lookups, use search_files instead.",
+        description="Search a file or directory tree for a case-sensitive literal string or Python regex; return exact file:line locations and surrounding source. Use for symbol definitions/uses, TODOs or text patterns. For filename-only lookups, use search_files.",
         parameters={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Literal text or regex pattern to search for. Case-sensitive."},
-                "path": {"type": "string", "description": "File or directory to search. Default current dir (or active Project root)."},
-                "glob": {"type": "string", "description": "Optional filename glob to filter matched files, e.g. '*.py'. Applies to a single-file path too: if that file doesn't match, no matches are found."},
-                "regex": {"type": "boolean", "description": "If true, treat query as a Python regular expression. Default false (literal substring)."},
-                "context_lines": {"type": "integer", "description": "Lines of context shown around each match, 0-10. Default 2."}
+                "query": {"type": "string", "description": "Case-sensitive literal string or regex."},
+                "path": {"type": "string", "description": "File/directory; defaults to active Project root or current directory."},
+                "glob": {"type": "string", "description": "Filename glob; also applies to a single-file path (a non-matching file yields no matches)."},
+                "regex": {"type": "boolean", "description": "Python regex if true; default false (literal substring)."},
+                "context_lines": {"type": "integer", "description": "Context lines per match, 0-10; default 2."}
             },
             "required": ["query"]
         }

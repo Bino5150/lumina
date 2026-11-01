@@ -59,12 +59,7 @@ def register_vision_tools(registry):
         name="view_image",
         fn=view_image,
         description=(
-            "Check whether a file path points to a real, valid image. IMPORTANT: this does NOT "
-            "let you see the image's contents -- no tool call can load pixel data into your "
-            "context, on any backend. If the user references an image by file path, call this "
-            "once to confirm it exists, then ask them to attach/drag it into the chat UI instead "
-            "-- that is the only way you can actually view an image. Do not try read_file, "
-            "run_python, or any other tool to work around this; none of them can succeed either."
+            "Check that a path exists, is a file and has an image extension; report its size. This never loads pixels into model context on any backend. For a path reference, confirm it once, then ask the user to attach/drag the image into chat. Do not use read_file, run_python or other tools to work around this; none can succeed."
         ),
         parameters={
             "type": "object",

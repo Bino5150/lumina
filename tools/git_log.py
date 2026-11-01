@@ -99,30 +99,25 @@ def register_git_log_tool(registry, project_state: Optional[ProjectContextState]
     registry.register(
         name="git_log",
         fn=_tool_git_log,
-        description="Show recent git commit history for a local repository. Returns a formatted log with hash, "
-                     "author, date, and message. If repo_path is omitted, defaults to the active Project's root — "
-                     "which must still be an allowlisted Git repository (a Project binding alone does not authorize "
-                     "a repo for Git tools).",
+        description="Read local Git history: hash, author, date and message. Omit repo_path for active Project root; allowlist still applies and Project binding grants no Git authority.",
         parameters={
             "type": "object",
             "properties": {
                 "repo_path": {
                     "type": "string",
-                    "description": "Path to local git repo. Must be one of the allowlisted project roots: "
-                                    "~/lumina, ~/lumina-release. If omitted, defaults to the active Project's root "
-                                    "(still subject to the same allowlist)."
+                    "description": "Allowlisted repo only: ~/lumina or ~/lumina-release. Omit for active Project root; Project binding grants no Git authority."
                 },
                 "max_count": {
                     "type": "integer",
-                    "description": "Number of commits to show (default 20, max 100)."
+                    "description": "Commit count; default 20, maximum 100."
                 },
                 "branch": {
                     "type": "string",
-                    "description": "Optional branch name to filter by."
+                    "description": "Optional branch filter."
                 },
                 "author": {
                     "type": "string",
-                    "description": "Optional author pattern to filter by."
+                    "description": "Optional author pattern."
                 }
             },
             "required": []

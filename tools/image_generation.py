@@ -372,12 +372,7 @@ def register_image_generation_tools(registry, agent):
         name="estimate_image_generation",
         fn=_estimate,
         description=(
-            "Get a cost estimate for generating an image via Lumina's configured "
-            "image_generation route (see the media-generation skill). Never spends money "
-            "or submits a job -- it only resolves the owner's persisted provider/model and "
-            "returns a real cost estimate plus a draft_id. Always call this first, present "
-            "the estimate to the owner in plain language, and wait for their explicit "
-            "approval before calling generate_image with the returned draft_id."
+            "Cost estimate for image generation via the owner's saved provider/model; never spends money or submits a job. Always call this first, present the cost plainly, and wait for explicit owner approval before calling generate_image with the returned draft_id. See the media-generation skill."
         ),
         parameters={
             "type": "object",
@@ -389,8 +384,7 @@ def register_image_generation_tools(registry, agent):
                 "settings": {
                     "type": "object",
                     "description": (
-                        "Optional provider-specific extras (e.g. resolution, "
-                        "aspect_ratio, batch_size). Omit unless the owner specified one."
+                        "Provider extras (e.g. resolution, aspect_ratio, batch_size); omit unless owner specified."
                     ),
                 },
             },

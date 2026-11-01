@@ -436,29 +436,23 @@ def register_skills_tools(registry):
         name="save_skill",
         fn=_save_skill_tool,
         description=(
-            "Save a procedural skill document so you can recall it in future sessions. "
-            "Use this when you've solved a complex or reusable workflow and want to remember how. "
-            "Skills are markdown docs — include procedure steps, pitfalls, and verification."
+            "Save a reusable Markdown workflow for later recall, with procedure, pitfalls and verification. Use after solving a complex or reusable workflow."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Short descriptive skill name, e.g. 'Scrape and summarize a webpage'"
+                    "description": "Short descriptive skill name."
                 },
                 "description": {
                     "type": "string",
-                    "description": "One-sentence summary used for retrieval matching — be specific."
+                    "description": "Specific one-sentence retrieval summary."
                 },
                 "content": {
                     "type": "string",
                     "description": (
-                        "Full skill document in markdown. Should include: "
-                        "## Procedure (numbered steps), "
-                        "## Pitfalls (gotchas to avoid), "
-                        "## Verification (how to confirm it worked). "
-                        "Start with # Skill: <name> header."
+                        "Markdown starting with # Skill: <name>; include ## Procedure (numbered steps), ## Pitfalls and ## Verification."
                     )
                 }
             },

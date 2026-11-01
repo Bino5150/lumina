@@ -377,9 +377,9 @@ def register_projects_tools(registry, project_state=None):
         parameters={
             "type": "object",
             "properties": {
-                "name":        {"type": "string", "description": "Short project identifier: letters, digits, '-', '_' only, starting with a letter or digit. e.g. 'lumina-dev'"},
+                "name":        {"type": "string", "description": "Project identifier: letters, digits, '-' or '_'; starts with letter/digit (e.g. lumina-dev)."},
                 "description": {"type": "string", "description": "One-line description of the project."},
-                "root_path":   {"type": "string", "description": "Absolute path to the project's source root on this machine. e.g. '~/lumina'. Used only to create a machine-local execution-root binding — never written into tracked project files."}
+                "root_path":   {"type": "string", "description": "Absolute source root (supports ~); used only for the machine-local execution-root binding, never written to tracked project files."}
             },
             "required": ["name", "description", "root_path"]
         }
@@ -421,8 +421,8 @@ def register_projects_tools(registry, project_state=None):
             "properties": {
                 "name":         {"type": "string", "description": "Project name."},
                 "root_path":    {"type": "string", "description": "Root directory to index."},
-                "extensions":   {"type": "array",  "items": {"type": "string"}, "description": "Optional list of file extensions to include e.g. ['.py', '.md']. Default: all files."},
-                "exclude_dirs": {"type": "array",  "items": {"type": "string"}, "description": "Optional list of directory names to skip. Defaults to common noise dirs."}
+                "extensions":   {"type": "array",  "items": {"type": "string"}, "description": "Extensions to include (e.g. ['.py','.md']); omitted = all files."},
+                "exclude_dirs": {"type": "array",  "items": {"type": "string"}, "description": "Directory names to skip; defaults to common noise directories."}
             },
             "required": ["name", "root_path"]
         }
