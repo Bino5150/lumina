@@ -51,6 +51,13 @@ _AIVENGERS_SRC_CANDIDATES = [
 ]
 AIVENGERS_SRC = next((p for p in _AIVENGERS_SRC_CANDIDATES if (p / "aivengers_wire").is_dir()), None)
 
+# R4/R3-1 (Sonnet): repeatable relay-absent CI-parity sim. Setting
+# AIVENGERS_WIRE_SRC_SIM_ABSENT=1 forces AIVENGERS_SRC to None so the exact
+# qt-security-guards selector can be exercised locally under the same
+# skip-decisions a GitHub runner makes (no aivengers checkout there).
+if os.environ.get("AIVENGERS_WIRE_SRC_SIM_ABSENT") == "1":
+    AIVENGERS_SRC = None
+
 # R3/R2-1 (Sonnet): the module-level skip starved the relay-free Qt classes
 # (TestWirePanel / TestDefaultOffR2 / TestPanelScaleR2 / TestEStopDisplayR2 /
 # TestSafetyGates) in the qt-security-guards CI step, which then skipped 5/5
@@ -744,7 +751,10 @@ class TestSafetyGates:
         # tool registry never registers a claim wrapper.
         assert not offenders, f"model-facing tool path reaches claim: {offenders}"
 
+    @_requires_relay
     def test_token_never_logged(self, qapp, wired_relay, capsys):
+        """R4/R3-1 (Sonnet): relay-bound — must SKIP, not ERROR, on a runner
+        with no aivengers checkout."""
         listener = make_listener(wired_relay)
         listener.start()
         try:
@@ -775,8 +785,13 @@ class TestSafetyGates:
         token = (wired_relay.state_dir / "seats" / "lumina.token").read_text().strip()
         assert token not in combined, "seat token leaked into logs"
 
+    @_requires_relay
     def test_production_isolation(self, wired_relay):
-        """The fixture never points at the production state dir."""
+        """The fixture never points at the production state dir.
+
+        R4/R3-1 (Sonnet): relay-bound — must SKIP, not ERROR, on a runner
+        with no aivengers checkout.
+        """
         wired_relay.assert_isolated()
         listener = make_listener(wired_relay)
         assert listener._client.state_dir == wired_relay.state_dir
@@ -1634,8 +1649,12 @@ class TestReleaseLifecycleR3:
                                                     claimed_by_session="sess-A")}
         )
         row = panel._rows["w-cfr"]
-        emitted = SlotRecorder()
-        panel.release_requested.connect(emitted)
+        # R4/R3-2 (Sonnet): release_requested is Signal(str, str) — a 1-arg
+        # recorder raises TypeError on emit and the items list stays empty,
+        # which made the "not emitted" assertion unable to fail (mutant CFR2
+        # survived: confirmation result ignored). Record full arg tuples.
+        released = []
+        panel.release_requested.connect(lambda *args: released.append(args))
         calls = {"n": 0}
 
         def recording_confirm():
@@ -1646,7 +1665,7 @@ class TestReleaseLifecycleR3:
         row._release_btn.click()
         pump(qapp, 0.2)
         assert calls["n"] == 1, "Release click bypassed the confirmation gate"
-        assert emitted.items == [], "release emitted despite declined confirmation"
+        assert released == [], "release emitted despite declined confirmation"
 
     @_requires_relay
     def test_release_records_failed_with_note(self, qapp, wired_relay):
