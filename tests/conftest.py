@@ -210,6 +210,41 @@ def _drain_qt_events_after_each_test(_retained_qapplication):
         _retained_qapplication.processEvents()
 
 
+@pytest.fixture(autouse=True)
+def _retire_lumina_windows_after_each_test(_retained_qapplication):
+    """PULSE-QT-TEST-LIFECYCLE-01: no LuminaWindow a test built keeps working
+    after it.
+
+    A window's own fixture closes it, but close() stops none of its timers,
+    and the process-wide Companion routing broker keeps every presenter
+    window (and through it, its agent) reachable for the life of the
+    process -- correct for the one window a real launch has, which ends the
+    event loop when it closes. The pytest session instead builds a hundred
+    or more windows in one retained QApplication, so each closed window's
+    once-a-minute Dreaming idle check kept running. Once a test window had
+    been idle for DREAM_IDLE_MINUTES (20 by default), it started a
+    `_run_dream_sweep` thread during whichever later test was pumping
+    events -- a failed thread-count assertion in one run, a full-suite hang
+    in another. Every surviving window has every timer it owns stopped here,
+    after the test's own fixtures have torn down.
+
+    The window itself is deliberately NOT deleted: deleting it from Qt's
+    side (deleteLater plus a DeferredDelete flush) made a later Qt timer
+    event land on a freed object, and the full suite segfaulted in the
+    drain above in three runs out of three; the base passed the same
+    prefix. Which object it was was not identified.
+    """
+    yield
+    window_module = sys.modules.get("ui.main_window")
+    if _retained_qapplication is None or window_module is None:
+        return
+    from PySide6.QtCore import QTimer
+    for window in _retained_qapplication.topLevelWidgets():
+        if isinstance(window, window_module.LuminaWindow):
+            for timer in window.findChildren(QTimer):
+                timer.stop()
+
+
 @pytest.fixture
 def telegram_remote_access_on(monkeypatch):
     """TELEGRAM-MASTER-SWITCH-01: Telegram remote access defaults to OFF.

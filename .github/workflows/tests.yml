@@ -189,3 +189,12 @@ jobs:
       # fail-never-skip contract.
       - name: Run Qt-bound interrupted-turn continuation guards (blocking)
         run: python -m pytest tests/test_turn_recovery_ui_01_qt.py -v -rs -m "not castle_walls_evidence"
+      # PULSE-QT-TEST-LIFECYCLE-01: no LuminaWindow a test builds keeps
+      # working after that test. A closed test window past the Dreaming idle
+      # threshold used to start a sweep thread during a later, unrelated test;
+      # conftest now stops every timer a surviving window owns after each
+      # test (without deleting the window). The plain `test` job has no Qt
+      # and can only skip this. Same pinned PySide6 and fail-never-skip
+      # contract.
+      - name: Run Qt test-window lifecycle guards (blocking)
+        run: python -m pytest tests/test_pulse_qt_test_lifecycle_01_qt.py -v -rs -m "not castle_walls_evidence"
