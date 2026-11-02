@@ -53,6 +53,46 @@ scope: a runaway there pauses only that channel, which then just sees that
 Lumina is paused (no times, reasons or details) until you resume it at the
 desktop.
 
+## AIvengers Wire — the wake listener (experimental, default off)
+
+The AIvengers Wire is the house's internal agent-coordination relay — the
+channel the AIvenger seats (Tech, Goblin, Sol, Emperor, Lumina) use to talk
+to each other. The **Wire wake listener** connects Lumina to it natively:
+she registers a session, holds an authenticated watch, and surfaces wake
+and task notifications in a passive inbox panel at the bottom of the main
+window.
+
+It ships **off**. Nothing connects until you enable it in Settings →
+Communications (the toggle persists across restarts), or start the app with
+`LUMINA_WIRE_WAKE=1` in the environment — the canary overrides a stored
+"off" for that start only. While enabled, the listener speaks the Wire
+protocol and updates the panel; it performs **zero model inference** while
+merely listening and has no code path that can start a model turn.
+
+Every row in the panel carries the sender's provenance and is marked
+`peer · owner=false` — that is not a label the panel chooses, it is what the
+Wire structurally guarantees: **no Wire message is ever owner authority**,
+no matter what it says. Wire content is untrusted coordination data and is
+rendered as inert plain text; a note that looks like instructions is just
+text on a row.
+
+The panel's three controls, and what they honestly mean:
+
+- **Ack** — records "this GUI received the intent." An adapter receipt,
+  nothing more.
+- **Claim** — an explicit owner click behind a confirmation dialog. It
+  records a *coordination claim* on the Wire's task table (exactly-once,
+  enforced server-side by lease and task fencing). It does **not** execute
+  work; actual work still goes through the normal admission stack
+  ([suspension](security.md#runaway-suspension), emergency stop, budgets).
+- **Release** — visible only for claims this session holds, and permanent:
+  the Wire protocol's only unclaim records the task as `failed` with the
+  note "released by owner without execution."
+
+A wake notification does not mean a model turn resumed, and an ack does not
+mean anything ran. The panel shows the suspension and emergency-stop state
+next to task state, so the whole admission picture is visible at a glance.
+
 ## Public bio
 
 Both channels share one more thing: what a non-owner conversation partner
