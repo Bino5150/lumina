@@ -7,7 +7,7 @@ Settings is a tabbed panel (`ui/settings/panel.py`). Current tabs, in order:
 | ⚙ General | Backend selection, reasoning effort, context limits, agent rounds and tool-call limits (see below), context compaction, dreaming toggles, global agent behavior prompt, and the backend-specific **ChatGPT Plan** account and model controls (see below) |
 | 👤 User Profile | Your own bio and Lumina's curated notes about you — see [My Human](memory.md#my-human) |
 | 🎭 Personas | Create/edit/import/export personas — see [Personas & Skills](personas-and-skills.md) |
-| 📡 Communications | Telegram, Discord, and your public bio — see [Channels](channels.md) |
+| 📡 Communications | Telegram, Discord, the optional AIvengers Wire wake listener, and your public bio — see [Channels](channels.md) |
 | 🧠 Memory | Browse/edit flat memory and MemPalace entries; separate Legacy Backup, eligibility-gated Verified Agent Backup, and acknowledged Incomplete State Export — see [Agent Backup](agent-backup.md) |
 | 📚 Knowledge | Browse/edit Knowledge Base entries |
 | 🧩 Skills | Browse Lumina's procedural skills — see [Personas & Skills](personas-and-skills.md#skills) |

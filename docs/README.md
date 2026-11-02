@@ -28,7 +28,7 @@ for the full model.
 - [Reforge](reforge.md) — the transactional context-reconstruction architecture behind `/context reforge` (alias `/context rebuild`), including empirical validation results
 - [Multimodal](multimodal.md) — Voice (TTS), Speech Input (STT), Vision, Image Generation
 - [Browser Companion](browser-companion.md) — the Chrome bridge's authorization model
-- [Channels](channels.md) — Telegram and Discord
+- [Channels](channels.md) — Telegram, Discord, and the optional AIvengers Wire listener
 - [Telegram Setup](telegram-setup.md) — full step-by-step Telegram walkthrough, plus troubleshooting
 - [Personas & Skills](personas-and-skills.md) — persona system, Skills, Projects
 - [Security & Authority](security.md) — trust model, tool tiers, guardrails, Emergency Interlock, Flight Recorder

@@ -75,6 +75,7 @@ in-checkout state also requires review rather than automatic migration.
 | `LUMINA_SECRETS_PATH` | Overrides where credentials (API keys, Higgsfield keys, Telegram token) are stored, outside `prefs.json` and outside version control (default `~/.config/lumina/credentials.json`, mode `0600`). |
 | `LUMINA_CHATGPT_AUTH_DIR` | Overrides where ChatGPT sign-in sessions are stored (default `~/.config/lumina/chatgpt/`, owner-only, never inside the data directory). |
 | `LUMINA_TESTING` | Test-harness only — do not set this for normal use. |
+| `LUMINA_WIRE_WAKE` | Set to `1` to enable the AIvengers Wire wake listener for this start, overriding a stored off preference (the listener ships off; the Wire itself is optional — see [Channels](channels.md)). |
 
 ## First-run notice
 

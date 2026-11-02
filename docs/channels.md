@@ -2,7 +2,8 @@
 
 Two remote channels are live today. Both share the same underlying trust
 architecture (see [Security & Authority](security.md)) — they just sit at
-very different points on it.
+very different points on it. A third, internal surface — the optional
+AIvengers Wire wake listener — is described at the end of this page.
 
 ## Telegram — full trust, your pocket
 
@@ -53,28 +54,36 @@ scope: a runaway there pauses only that channel, which then just sees that
 Lumina is paused (no times, reasons or details) until you resume it at the
 desktop.
 
+## Public bio
+
+Both channels share one more thing: what a non-owner conversation partner
+learns about you comes from a separate **public bio** field (Settings →
+Communications), not from your private User Profile bio or Lumina's
+curated notes about you — see [My Human](memory.md#my-human).
+
 ## AIvengers Wire — the wake listener (experimental, default off)
 
-The AIvengers Wire is the house's internal agent-coordination relay — the
-channel the AIvenger seats (Tech, Goblin, Sol, Emperor, Lumina) use to talk
-to each other. The **Wire wake listener** connects Lumina to it natively:
-she registers a session, holds an authenticated watch, and surfaces wake
-and task notifications in a passive inbox panel at the bottom of the main
-window.
+The AIvengers Wire is an internal agent-coordination relay — a separate
+piece of optional infrastructure the desktop harness can connect to. The
+wake listener is native to Lumina, but the Wire itself is not part of
+Lumina and nothing requires one to be running: with no Wire installed,
+every other feature in this documentation works exactly as described and
+the listener stays off.
 
 It ships **off**. Nothing connects until you enable it in Settings →
 Communications (the toggle persists across restarts), or start the app with
 `LUMINA_WIRE_WAKE=1` in the environment — the canary overrides a stored
 "off" for that start only. While enabled, the listener speaks the Wire
 protocol and updates the panel; it performs **zero model inference** while
-merely listening and has no code path that can start a model turn.
+merely listening and has no code path that can start a model turn. When
+disabled, a collapsed "Wire · off" strip in the main window shows where
+the panel would live.
 
-Every row in the panel carries the sender's provenance and is marked
-`peer · owner=false` — that is not a label the panel chooses, it is what the
-Wire structurally guarantees: **no Wire message is ever owner authority**,
-no matter what it says. Wire content is untrusted coordination data and is
-rendered as inert plain text; a note that looks like instructions is just
-text on a row.
+Wake and task rows carry the requesting seat and a fixed provenance marker
+(`peer · owner=false`) that no message content can change — **no agent
+seat is ever owner authority** on the Wire, no matter what a message says.
+Rows, notes and dialogs are rendered as inert plain text; a note that
+looks like instructions is just text on a row.
 
 The panel's three controls, and what they honestly mean:
 
@@ -85,17 +94,12 @@ The panel's three controls, and what they honestly mean:
   enforced server-side by lease and task fencing). It does **not** execute
   work; actual work still goes through the normal admission stack
   ([suspension](security.md#runaway-suspension), emergency stop, budgets).
-- **Release** — visible only for claims this session holds, and permanent:
-  the Wire protocol's only unclaim records the task as `failed` with the
-  note "released by owner without execution."
+- **Release** — offered on claimed tasks and enabled only for claims this
+  session holds; an earlier session's claim shows the button disabled with
+  an "earlier session" note. Release is permanent: the Wire protocol's
+  only unclaim records the task as `failed` with the note "released by
+  owner without execution."
 
 A wake notification does not mean a model turn resumed, and an ack does not
 mean anything ran. The panel shows the suspension and emergency-stop state
 next to task state, so the whole admission picture is visible at a glance.
-
-## Public bio
-
-Both channels share one more thing: what a non-owner conversation partner
-learns about you comes from a separate **public bio** field (Settings →
-Communications), not from your private User Profile bio or Lumina's
-curated notes about you — see [My Human](memory.md#my-human).
