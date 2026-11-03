@@ -63,6 +63,13 @@ DEFAULT_READ_LIMIT = 100
 #: than this are refused client-side before touching the socket.
 MAX_FRAME_BYTES = 65_536
 
+#: Incoming responses AND watch events, including their newline terminator.
+MAX_RESPONSE_FRAME_BYTES = 131_072
+
+#: Bounded channel enumeration: refuse incomplete inventories at this bound.
+MAX_CHANNELS_LIMIT = 500
+MAX_CHANNEL_PAGES = 100
+
 #: The relay rejects read limits above 200; pass-through, surfaced truthfully.
 MAX_READ_LIMIT = 200
 
@@ -207,7 +214,7 @@ class AivengersWireClient:
 
     @staticmethod
     def _iter_frames(
-        sock: socket.socket, *, max_frame: int = MAX_FRAME_BYTES, idle_timeout: float
+        sock: socket.socket, *, max_frame: int = MAX_RESPONSE_FRAME_BYTES, idle_timeout: float
     ) -> Iterator[bytes]:
         """Yield complete newline-delimited frames from a streaming socket.
 
@@ -226,11 +233,13 @@ class AivengersWireClient:
         while True:
             nl = buf.find(b"\n")
             if nl != -1:
+                if nl + 1 > max_frame:
+                    raise WireFrameError(f"relay frame exceeds {max_frame} bytes")
                 frame = bytes(buf[:nl])
                 del buf[: nl + 1]
                 yield frame
                 continue
-            if len(buf) > max_frame:
+            if len(buf) >= max_frame:
                 raise WireFrameError(
                     f"frame exceeds {max_frame} bytes without a newline terminator"
                 )
@@ -239,7 +248,7 @@ class AivengersWireClient:
             except socket.timeout as exc:
                 raise WireUnavailableError(
                     f"AIvengers Wire relay at {sock} did not deliver a frame "
-                    f"within the {idle_timeout:g}s watch idle timeout"
+                    f"within the {idle_timeout:g}s receive timeout"
                 ) from exc
             if not chunk:
                 if buf:
@@ -250,29 +259,12 @@ class AivengersWireClient:
             buf.extend(chunk)
 
     def _recv_frame(self, sock: socket.socket) -> dict[str, Any]:
-        buf = bytearray()
-        while True:
-            try:
-                chunk = sock.recv(4096)
-            except socket.timeout as exc:
-                raise WireUnavailableError(
-                    f"AIvengers Wire relay at {self.socket_path} did not respond "
-                    f"within {self._timeout}s"
-                ) from exc
-            if not chunk:
-                raise WireFrameError("relay closed the connection without a full frame")
-            buf.extend(chunk)
-            if len(buf) > MAX_FRAME_BYTES:
-                raise WireFrameError("relay response exceeds maximum frame size")
-            if buf.endswith(b"\n"):
-                break
+        frames = self._iter_frames(sock, idle_timeout=self._timeout)
         try:
-            value = json.loads(bytes(buf[:-1]).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise WireFrameError(f"relay response is not valid JSON: {exc}") from exc
-        if not isinstance(value, dict):
-            raise WireFrameError("relay response must be a JSON object")
-        return value
+            raw = next(frames)
+        except StopIteration:
+            raise WireFrameError("relay closed the connection without a full frame") from None
+        return self._decode_frame(raw)
 
     @staticmethod
     def _check(response: dict[str, Any]) -> dict[str, Any]:
@@ -392,13 +384,80 @@ class AivengersWireClient:
         channel: str = DEFAULT_CHANNEL,
         limit: int = DEFAULT_READ_LIMIT,
     ) -> list[dict[str, Any]]:
-        """Read messages with canonical id > ``after``, without cursor use."""
+        """Read up to ``limit`` messages after ``after``, without cursor use.
+
+        Follow byte-trimmed pages until the requested count or end of history.
+        Older relays without continuation metadata return their one complete
+        count-limited response. Malformed/incomplete reads raise WireError;
+        partial lists are never presented as successful reads.
+        """
         _validated_nonnegative_int(after, "after")
         with self._session() as sock:
+            return self._read_messages(sock, after=after, channel=channel, limit=limit)
+
+    @staticmethod
+    def _listing_page(
+        response: dict[str, Any], *, rows_key: str, key: str,
+        after: int | str | None, limit: int, allow_legacy: bool,
+    ) -> tuple[list[dict[str, Any]], bool | None, int | str | None]:
+        """Validate keyset order and continuation before using any page.
+
+        A continuation must name exactly the last included row, never an
+        unseen row. Global message id gaps are legal; only order matters.
+        None for has_more means an older, metadata-free protocol response.
+        """
+        rows = response.get(rows_key)
+        if not isinstance(rows, list) or len(rows) > limit:
+            raise WireFrameError(f"invalid {rows_key} page")
+        previous = after
+        for row in rows:
+            value = row.get(key) if isinstance(row, dict) else None
+            if key == "id":
+                valid = type(value) is int and value > 0
+            else:
+                valid = (
+                    isinstance(value, str) and 1 <= len(value) <= 64
+                    and all(c in "abcdefghijklmnopqrstuvwxyz0123456789._-" for c in value)
+                    and value[0].isalnum() and value[-1].isalnum()
+                )
+            if not valid or (previous is not None and value <= previous):
+                raise WireFrameError(f"invalid or non-increasing {rows_key} key")
+            previous = value
+        if "has_more" not in response and "next_after" not in response and allow_legacy:
+            return rows, None, None
+        more = response.get("has_more")
+        cursor = response.get("next_after")
+        if type(more) is not bool or "next_after" not in response:
+            raise WireFrameError(f"invalid {rows_key} continuation metadata")
+        if more:
+            # Exact type also excludes bool cursors masquerading as id 1.
+            if not rows or type(cursor) is not type(previous) or cursor != previous:
+                raise WireFrameError(f"invalid or stalled {rows_key} continuation cursor")
+        elif cursor is not None:
+            raise WireFrameError(f"unexpected terminal {rows_key} cursor")
+        return rows, more, cursor
+
+    def _read_messages(
+        self, sock: socket.socket, *, after: int, channel: str, limit: int,
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        for page_index in range(MAX_READ_LIMIT):
+            # Keep invalid caller limits relay-validated, as in the public V0 API.
+            remaining = limit if not messages else limit - len(messages)
             response = self._exchange(
-                sock, {"op": "read", "channel": channel, "after": after, "limit": limit}
+                sock, {"op": "read", "channel": channel, "after": after, "limit": remaining}
             )
-        return response["messages"]
+            if type(limit) is not int or not 1 <= limit <= MAX_READ_LIMIT:
+                raise WireFrameError("relay accepted an invalid read limit")
+            rows, more, cursor = self._listing_page(
+                response, rows_key="messages", key="id", after=after,
+                limit=remaining, allow_legacy=page_index == 0,
+            )
+            messages.extend(rows)
+            if more is not True or len(messages) == limit:
+                return messages
+            after = cursor
+        raise WireFrameError("message pagination exceeded its page bound")
 
     def read_unseen(
         self,
@@ -417,11 +476,10 @@ class AivengersWireClient:
         """
         with self._session() as sock:
             cursor_response = self._exchange(sock, {"op": "cursor", "channel": channel})
-            after = cursor_response["last_message_id"]
-            read_response = self._exchange(
-                sock, {"op": "read", "channel": channel, "after": after, "limit": limit}
-            )
-            messages = read_response["messages"]
+            after = cursor_response.get("last_message_id")
+            if type(after) is not int or after < 0:
+                raise WireFrameError("invalid durable message cursor")
+            messages = self._read_messages(sock, after=after, channel=channel, limit=limit)
             cursor = after
             advanced = False
             if advance and messages:
@@ -454,10 +512,52 @@ class AivengersWireClient:
         return response["last_message_id"]
 
     def channels(self) -> list[dict[str, Any]]:
-        """List channels with message counts and latest canonical ids."""
+        """List all channels, following at most 100 pages of up to 500 rows.
+
+        Old relays rejecting ``limit`` get one legacy request on a fresh
+        connection. Any failure or page-bound exhaustion raises WireError
+        rather than returning an apparently complete partial inventory.
+        """
+        return self._channels_paged()
+
+    def _channels_legacy(self) -> list[dict[str, Any]]:
+        # A protocol refusal closes the old relay connection. Never reuse it.
         with self._session() as sock:
             response = self._exchange(sock, {"op": "channels"})
-        return response["channels"]
+        rows, more, _ = self._listing_page(
+            response, rows_key="channels", key="channel", after=None,
+            limit=MAX_RESPONSE_FRAME_BYTES, allow_legacy=True,
+        )
+        if more is True:
+            raise WireFrameError("legacy channel response is incomplete")
+        return rows
+
+    def _channels_paged(self) -> list[dict[str, Any]]:
+        channels: list[dict[str, Any]] = []
+        after = None
+        with self._session() as sock:
+            for page_index in range(MAX_CHANNEL_PAGES):
+                payload: dict[str, Any] = {"op": "channels", "limit": MAX_CHANNELS_LIMIT}
+                if after is not None:
+                    payload["after"] = after
+                try:
+                    response = self._exchange(sock, payload)
+                except WireProtocolError as exc:
+                    if (
+                        page_index == 0 and exc.error_code == "invalid_request"
+                        and exc.message == "unknown fields: limit"
+                    ):
+                        return self._channels_legacy()
+                    raise
+                rows, more, cursor = self._listing_page(
+                    response, rows_key="channels", key="channel", after=after,
+                    limit=MAX_CHANNELS_LIMIT, allow_legacy=False,
+                )
+                channels.extend(rows)
+                if more is False:
+                    return channels
+                after = cursor
+        raise WireFrameError("channel pagination exceeded its page bound")
 
     # ── W1: wake-adapter session operations ───────────────────────────────
 
@@ -799,9 +899,12 @@ class AivengersWireClient:
 
     @staticmethod
     def _decode_frame(raw: bytes) -> dict[str, Any]:
+        def reject_constant(value: str) -> Any:
+            raise ValueError(f"non-finite JSON number: {value}")
+
         try:
-            value = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            value = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise WireFrameError(f"relay frame is not valid JSON: {exc}") from exc
         if not isinstance(value, dict):
             raise WireFrameError("relay frame must be a JSON object")

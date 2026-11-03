@@ -46,6 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # adapter consumes). Tests shell out to it read-only; if it is absent the
 # whole module skips — the adapter is meaningless without a Wire to talk to.
 _AIVENGERS_SRC_CANDIDATES = [
+    *([Path(os.environ["AIVENGERS_WIRE_SRC"])] if os.environ.get("AIVENGERS_WIRE_SRC") else []),
     Path("/home/bino/aivengers-release/src"),
     Path("/home/bino/aivengers/src"),
 ]

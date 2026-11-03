@@ -70,6 +70,22 @@ Lumina and nothing requires one to be running: with no Wire installed,
 every other feature in this documentation works exactly as described and
 the listener stays off.
 
+The message reader supports the older relay and relays with bounded read
+pages. It follows continuation cursors until it has the requested number
+of messages (at most 200) or reaches the end, preserving canonical ID order;
+IDs may have gaps because other channels share the sequence. Reads keep
+their existing list/result shapes. A consuming read advances the saved
+cursor only after every required page succeeds, to the last returned ID;
+a peek (`advance=False`) never advances it. Failed or malformed pagination
+raises an error instead of returning a successful partial read.
+
+Outgoing requests remain capped at 65,536 bytes. Incoming responses and
+watch events accept up to 131,072 bytes, including the newline. Oversized,
+malformed or incomplete frames fail explicitly. Channel enumeration follows
+up to 100 pages of 500 channels and fails if that bound is exhausted. An
+older relay that explicitly rejects channel paging gets a complete legacy
+listing, subject to the same incoming frame ceiling.
+
 It ships **off**. Nothing connects until you enable it in Settings →
 Communications (the toggle persists across restarts), or start the app with
 `LUMINA_WIRE_WAKE=1` in the environment — the canary overrides a stored
