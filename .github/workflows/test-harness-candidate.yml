@@ -11,8 +11,6 @@ jobs:
   bounded-candidate:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      LUMINA_TEST_RESULTS: ${{ runner.temp }}/lumina-test-results
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,19 +36,19 @@ jobs:
         run: pip install pytest==9.1.1 requests==2.34.2 platformdirs==4.10.0 pyenchant==3.3.0 python-telegram-bot==22.8 PySide6==6.11.1 PyJWT==2.8.0 cryptography==46.0.5
 
       - name: Reconcile the maintained inventory
-        run: scripts/lumina-test --results "$LUMINA_TEST_RESULTS" list
+        run: scripts/lumina-test --results "$RUNNER_TEMP/lumina-test-results" list
 
       - name: Run bounded developer smoke
-        run: scripts/lumina-test --results "$LUMINA_TEST_RESULTS" smoke
+        run: scripts/lumina-test --results "$RUNNER_TEMP/lumina-test-results" smoke
 
       - name: Qualify a Qt shard containing Castle Walls regression guards
-        run: scripts/lumina-test --results "$LUMINA_TEST_RESULTS" --profile qt shard 8
+        run: scripts/lumina-test --results "$RUNNER_TEMP/lumina-test-results" --profile qt shard 8
 
       - name: Upload candidate receipts and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lumina-test-receipts
-          path: ${{ env.LUMINA_TEST_RESULTS }}
+          path: ${{ runner.temp }}/lumina-test-results
           if-no-files-found: warn
           retention-days: 7
