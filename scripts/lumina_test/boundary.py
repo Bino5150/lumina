@@ -32,7 +32,7 @@ def swap_totals():
     return tuple(int(fields[name]) for name in ("pswpin", "pswpout"))
 
 
-def host_sample(previous, *, admission=False, memory=MEMORY):
+def host_sample(previous, *, before_launch=False, memory=MEMORY):
     now = time.monotonic()
     swap = swap_totals()
     counters = [end - start for end, start in zip(swap, previous[1])]
@@ -42,7 +42,7 @@ def host_sample(previous, *, admission=False, memory=MEMORY):
     psi_row = next(line for line in Path("/proc/pressure/memory").read_text().splitlines()
                    if line.startswith("some "))
     psi = float(dict(field.split("=") for field in psi_row.split()[1:])["avg10"])
-    floor = MIN_AVAILABLE_KIB + (memory // 1024 + 256 * 1024 if admission else 0)
+    floor = MIN_AVAILABLE_KIB + (memory // 1024 + 256 * 1024 if before_launch else 0)
     sample = {"available_kib": available, "psi_some_avg10": psi, "swap_pages_per_second": swap_rate}
     if (available < floor or not math.isfinite(psi) or not 0 <= psi <= MAX_PSI
             or min(counters) < 0 or swap_rate > MAX_SWAP_RATE):
@@ -181,7 +181,7 @@ def run(env, scratch, settings, log, receipt, *, timeout=180, memory=MEMORY):
         raise BoundaryError("workload limits exceed the supported range")
     previous = (time.monotonic(), swap_totals())
     time.sleep(3)
-    previous, receipt["admission"] = host_sample(previous, admission=True, memory=memory)
+    previous, receipt["admission"] = host_sample(previous, before_launch=True, memory=memory)
     supervisor = scratch / "supervisor"
     supervisor.mkdir()
     atomic_json(supervisor / "settings.json", settings)
