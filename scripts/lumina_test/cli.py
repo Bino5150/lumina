@@ -15,7 +15,7 @@ import boundary
 from boundary_child import atomic_json
 from inventory import PROFILES, compare, groups, inventory_text, read_inventory, update_inventory
 from results import REPORT_LIMIT, read_report, reconcile
-from source import project, snapshot, stage_relays
+from source import TEMPORARY_DEPENDENCY_EXCEPTIONS, project, snapshot, stage_relays
 
 def arguments():
     parser = argparse.ArgumentParser(prog="lumina-test", description=__doc__)
@@ -115,6 +115,8 @@ def print_receipt(path, data):
     print(f"{data['status']} · {data['command']} · {path}")
     if data.get("error"):
         print(data["error"])
+    for name, reason in (data.get("temporary_dependency_exceptions") or {}).items():
+        print(f"TEMPORARY DEPENDENCY EXCEPTION · {name}: {reason}")
     if data["command"] == "full" and data.get("excluded_profiles"):
         excluded = ", ".join(f"{name}={count}" for name, count in data["excluded_profiles"].items())
         print(f"Outside the requested profiles: {excluded}")
@@ -184,6 +186,7 @@ def run(args, repo, profiles):
             if "wire" in profiles:
                 relays = root / "relays"
                 data["wire_source"] = stage_relays(args.relay_repo.resolve(strict=True), relays)
+                data["temporary_dependency_exceptions"] = dict(TEMPORARY_DEPENDENCY_EXCEPTIONS)
             entries = read_inventory(projected / "scripts/lumina_test/inventory.tsv")
             rules = json.loads((projected / "scripts/lumina_test/profiles.json").read_text())
             data["profile_counts"] = dict(Counter(row.profile for row in entries.values()))
@@ -267,7 +270,7 @@ def main(repo):
         if "evidence" in profiles and len(profiles) != 1:
             raise ValueError("the evidence profile runs on its own")
         if "wire" in profiles and not args.relay_repo:
-            raise ValueError("the Wire profile requires --relay-repo with both pinned generations")
+            raise ValueError("the Wire profile requires --relay-repo with every pinned generation")
         signal.signal(signal.SIGTERM, interrupt)
         return run(args, repo, profiles)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:

@@ -21,6 +21,7 @@ class CommunicationsTab(QWidget):
     # WIRE-WAKE-01 W1 (R2/B3): the owner flipped the Wire wake-listener
     # control; MainWindow performs the live start/stop and owns the runtime.
     wire_wake_toggle_changed = Signal(bool)
+    wire_autonomy_toggle_changed = Signal(bool)
 
     def __init__(self, agent, c: dict, parent=None):
         super().__init__(parent)
@@ -138,6 +139,32 @@ class CommunicationsTab(QWidget):
             "custody of a task (never starts work). Off by default."
         ))
         self._refresh_wire_wake_status()
+
+        # ── Wire autonomous conversations (WIRE-AUTONOMY-01) ──
+        # DEFAULT OFF, one owner switch. When on: your next normal turn is told
+        # how many new Wire messages arrived (a count, never their text), and
+        # a direct message, @lumina mention or reply to her gets ONE bounded,
+        # no-tools reply posted back to the Wire. Turning it on starts fresh:
+        # history never triggers a reply.
+        autonomy_row = QHBoxLayout()
+        self.wire_autonomy_status = _lbl("Wire conversations: off", c)
+        autonomy_row.addWidget(self.wire_autonomy_status)
+        autonomy_row.addStretch()
+        self.wire_autonomy_toggle = _btn("Turn on", c, accent=True)
+        self.wire_autonomy_toggle.clicked.connect(self._toggle_wire_autonomy)
+        autonomy_row.addWidget(self.wire_autonomy_toggle)
+        layout.addLayout(autonomy_row)
+        layout.addWidget(self._wlbl(
+            "Lets Lumina converse on the local AIvengers Wire without you "
+            "clicking anything. Peer text is untrusted data with no owner "
+            "authority; unanswered messages are kept for up to 24 hours; replies run with NO tools, only when she is idle and "
+            "neither the emergency stop nor a suspension is active, and are "
+            "capped by the relay (12/hour, 60/day, 8 per reply chain) and by a "
+            "token budget of 30,000/hour and 120,000/day. Switching off "
+            "withholds a running reply but does not stop its model call; "
+            "only the emergency stop does. Off by default."
+        ))
+        self._refresh_wire_autonomy_status()
 
         # ── Discord ──
         layout.addWidget(_sec("DISCORD", c))
@@ -357,6 +384,26 @@ class CommunicationsTab(QWidget):
         self._prefs = persistence.load()
         self.wire_wake_toggle_changed.emit(enabled)
         self._refresh_wire_wake_status()
+
+    def _toggle_wire_autonomy(self) -> None:
+        """The owner's explicit Wire-conversations switch (default OFF).
+
+        Persists the pref and emits the change; MainWindow starts/stops the
+        consumer and records the activation watermark on enable.
+        """
+        enabled = not bool(self._prefs.get("wire_autonomy", False))
+        persistence.update({"wire_autonomy": enabled})
+        self._prefs = persistence.load()
+        self.wire_autonomy_toggle_changed.emit(enabled)
+        self._refresh_wire_autonomy_status()
+
+    def _refresh_wire_autonomy_status(self) -> None:
+        if bool(self._prefs.get("wire_autonomy", False)):
+            self.wire_autonomy_status.setText("Wire conversations: ON")
+            self.wire_autonomy_toggle.setText("Turn off")
+        else:
+            self.wire_autonomy_status.setText("Wire conversations: off")
+            self.wire_autonomy_toggle.setText("Turn on")
 
     def _refresh_wire_wake_status(self) -> None:
         enabled = bool(self._prefs.get("wire_wake_listener", False))

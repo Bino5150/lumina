@@ -225,8 +225,12 @@ def _run_session_idle_sweep(chat_id: int, expected_epoch: int = None) -> str:
                 from core import emergency_stop
                 if not emergency_stop.execution_permitted(expected_epoch):
                     return  # discard stale/latched curation output before saving
-            prefs["human_profile_curated"] = updated.strip()
-            save_prefs(prefs)
+            # WIRE-AUTONOMY-01: write only this key, fresh-loaded (PREFS-STALE-
+            # WRITE-01 shape). The snapshot loaded above predates a long LLM
+            # call and must never be republished: it could silently put an
+            # owner toggle (e.g. Wire conversations) or the spend ledger back.
+            from core.persistence import update as update_prefs
+            update_prefs({"human_profile_curated": updated.strip()})
             print(f"[DREAMING] human profile curated", flush=True)
 
     _last_dream_sweep[chat_id] = datetime.now().isoformat()

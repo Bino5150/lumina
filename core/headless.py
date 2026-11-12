@@ -139,9 +139,11 @@ def suspension_scope_for(channel_id: str, owner: bool):
     if owner:
         return suspension.OWNER_SCOPE
     transport, sep, ident = str(channel_id).partition("-")
-    if sep and transport == "discord" and ident:
+    # WIRE-AUTONOMY-01: an autonomous Wire conversation is isolated in its own
+    # per-channel scope exactly like a public Discord channel.
+    if sep and transport in ("discord", "wire") and ident:
         try:
-            return suspension.channel_scope("discord", ident)
+            return suspension.channel_scope(transport, ident)
         except ValueError:
             return None
     return None
@@ -286,9 +288,17 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
                        force_tools_profile: str = None,
                        trace: bool = False,
                        approval_event_id: str = None,
-                       suspension_token=None) -> dict:
+                       suspension_token=None,
+                       require_zero_tools: bool = False) -> dict:
     """Never raises — a bot listener should always get something to relay
     back, even on failure.
+
+    require_zero_tools (WIRE-AUTONOMY-01): enforced IN CODE, after the tool
+    profile has been applied and inside the channel's turn lock, immediately
+    before the model is called: every registered tool is disabled and the turn
+    is refused if any still is enabled. A tool profile is an owner-editable
+    file (the Tools tab can save over it, or shadow it with a same-named
+    profile), so for peer-driven turns "zero tools" must not depend on it.
 
     suspension_token (AGENT-RUNAWAY-SUSPEND-01): the token the caller
     captured where the work was created, before its asynchronous handoff
@@ -326,6 +336,10 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
                     suspension_runtime.verify(suspension_token)
                 except suspension_runtime.SuspensionRefused as refused:
                     return {"success": False, "outcome": "suspended", "response": refused.text}
+            if require_zero_tools:
+                agent.registry.set_disabled(list(agent.registry.all_tool_names()))
+                if agent.registry.list_enabled():
+                    return {"success": False, "error": "zero-tool turn refused: tools remain enabled"}
             previous_on_tool_call = agent.on_tool_call
             previous_on_tool_result = agent.on_tool_result
 

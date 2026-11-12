@@ -9,6 +9,20 @@ import tarfile
 RELAY_REVISIONS = {
     "merged": ("9dff48fc4916f6764fa3ce664e58a0257031c212", "6278d5e2489bd20dbbe353e31129db2521c26905"),
     "old": ("1ac89dfd990053c8f60f9489dd88df88df921345", "27b0520a258dc884ce2235fc86eeaf94f5ee2701"),
+    # WIRE-AUTONOMY-01: the relay that creates attention events (the "second ping").
+    # Lumina's autonomous-conversation tests run against it. See the exception below.
+    "attention": ("08b06feedf2cf8968837cfa70d3a986ca65096a3", "830c77850c5eaa4f8268e6c015f37c8a28955e82"),
+}
+#: Pins that are honest but not yet reproducible elsewhere. Every entry is printed
+#: in each Wire-profile receipt until it is deleted.
+TEMPORARY_DEPENDENCY_EXCEPTIONS = {
+    "attention": (
+        "pinned to an AIvengers Wire commit that exists only in the local Wire checkout; it is "
+        "not on GitHub until the owner publishes it, so CI and other machines cannot stage this "
+        "generation. Resolve by publishing the commit (a merge commit keeps its SHA; if it is "
+        "squashed, repin to the new commit, whose src tree must equal the pinned tree), then "
+        "delete this entry."
+    ),
 }
 SCREENSHOTS = "memory/browser_screenshots"
 NEW_SOURCE_EXTENSIONS = {".py", ".ini", ".cfg", ".toml", ".js", ".mjs", ".cjs", ".ts", ".css", ".html", ".ui"}

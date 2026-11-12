@@ -78,6 +78,9 @@ MAX_READ_LIMIT = 200
 #: returns truthful continuation cursors).
 MAX_WAKE_LIST_LIMIT = 100
 
+#: WIRE-AUTONOMY-01: attention listing page bound (mirrors the relay's cap).
+MAX_ATTENTION_LIST_LIMIT = 50
+
 #: Same override the wire CLI honors, so tests and alternate boards isolate
 #: without touching the real clubhouse.
 STATE_DIR_ENV = "AIVENGERS_WIRE_STATE_DIR"
@@ -125,6 +128,12 @@ def _validated_body(body: Any) -> str:
     if not body.strip():
         raise WireError("body must not be empty")
     return body
+
+
+def _validated_attention_id(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise WireError("attention_id must be a non-empty string up to 64 characters")
+    return value
 
 
 def _validated_nonnegative_int(value: Any, field: str) -> int:
@@ -793,6 +802,116 @@ class AivengersWireClient:
             response = self._exchange(sock, payload)
         return response
 
+    # ── WIRE-AUTONOMY-01: attention events (the "second ping") ────────────
+    # Seat-scoped, one short-lived authenticated request each, like every
+    # other operation here. None of them can create an event: the relay
+    # derives events from posts. Their meaning is documented in the relay's
+    # SECURITY.md: ``received`` is a transport receipt only, ``processing``
+    # is an exclusive lease, ``completed`` carries a relay-verified reply id.
+
+    def attention_list_page(
+        self,
+        *,
+        states: list[str] | None = None,
+        limit: int = MAX_ATTENTION_LIST_LIMIT,
+        after_message_id: int = 0,
+    ) -> dict[str, Any]:
+        """One bounded page of attention events addressed to this seat.
+
+        Each row embeds its canonical peer message. ``after_message_id`` is
+        the activation watermark: only events caused by later messages are
+        returned.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise WireError("limit must be a positive integer")
+        if limit > MAX_ATTENTION_LIST_LIMIT:
+            raise WireError(f"limit must not exceed {MAX_ATTENTION_LIST_LIMIT}")
+        _validated_nonnegative_int(after_message_id, "after_message_id")
+        payload: dict[str, Any] = {
+            "op": "attention_list",
+            "limit": limit,
+            "after_message_id": after_message_id,
+        }
+        if states is not None:
+            payload["states"] = list(states)
+        with self._session() as sock:
+            response = self._exchange(sock, payload)
+        rows = response.get("attention")
+        if not isinstance(rows, list) or type(response.get("has_more")) is not bool:
+            raise WireFrameError("invalid attention page")
+        return response
+
+    def attention_ack(self, attention_id: str) -> dict[str, Any]:
+        """Transport receipt (pending -> received). NOT a processing claim."""
+        _validated_attention_id(attention_id)
+        with self._session() as sock:
+            response = self._exchange(
+                sock, {"op": "attention_ack", "attention_id": attention_id}
+            )
+        return response["attention"]
+
+    def attention_begin(
+        self, attention_id: str, consumer: str, *, lease_seconds: int | None = None
+    ) -> dict[str, Any]:
+        """Win an event for processing. Inspect ``begun`` and ``refusal``: a
+        refusal (``rate_limited`` with ``retry_after_seconds``, ``thread_cap``,
+        ``state_<name>``) is data, not an error."""
+        _validated_attention_id(attention_id)
+        payload: dict[str, Any] = {
+            "op": "attention_begin",
+            "attention_id": attention_id,
+            "consumer": consumer,
+        }
+        if lease_seconds is not None:
+            payload["lease_seconds"] = lease_seconds
+        with self._session() as sock:
+            response = self._exchange(sock, payload)
+        if type(response.get("begun")) is not bool or not isinstance(
+            response.get("attention"), dict
+        ):
+            raise WireFrameError("invalid attention begin response")
+        return response
+
+    def attention_finish(
+        self,
+        attention_id: str,
+        consumer: str,
+        outcome: str,
+        *,
+        response_message_id: int | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Record ``completed`` (with the posted reply's id), ``declined`` or
+        ``failed`` for an event this consumer holds."""
+        _validated_attention_id(attention_id)
+        payload: dict[str, Any] = {
+            "op": "attention_finish",
+            "attention_id": attention_id,
+            "consumer": consumer,
+            "outcome": outcome,
+        }
+        if response_message_id is not None:
+            payload["response_message_id"] = response_message_id
+        if note is not None:
+            payload["note"] = note
+        with self._session() as sock:
+            response = self._exchange(sock, payload)
+        return response["attention"]
+
+    def activation_watermark(self) -> int:
+        """Highest message id on the board right now (0 when empty).
+
+        Taken when the owner enables autonomy: only attention events caused by
+        messages after this id may ever start a model turn. Works against any
+        relay generation (it only uses the channel inventory).
+        """
+        latest = 0
+        for row in self.channels():
+            value = row.get("latest_message_id")
+            if type(value) is int and value > latest:
+                latest = value
+        return latest
+
     def watch(
         self,
         *,
@@ -800,6 +919,7 @@ class AivengersWireClient:
         timeout_ms: int | None = None,
         idle_timeout_seconds: float | None = None,
         session_id: str | None = None,
+        attention: bool = False,
     ) -> Iterator[dict[str, Any]]:
         """Subscribe to relay events; yields frames until the subscription ends.
 
@@ -830,6 +950,11 @@ class AivengersWireClient:
             if not isinstance(session_id, str) or not session_id:
                 raise WireError("session_id must be a non-empty string when present")
             payload["session_id"] = session_id
+        if attention:
+            # WIRE-AUTONOMY-01: also deliver this seat's ``attention`` events.
+            # A doorbell only: the event is already durable and stays pending
+            # until the consumer acknowledges it.
+            payload["attention"] = True
         token = self._load_token()
         if idle_timeout_seconds is None:
             idle_timeout_seconds = 30.0 + (timeout_ms / 1000.0 if timeout_ms else 0.0)

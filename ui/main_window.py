@@ -34,6 +34,14 @@ from core.agent import TurnCancelled, is_error_response
 # started, and the panel renders only what the listener surfaces.
 from comms.wire_wake_listener import WireWakeListener
 from ui.wire_panel import WireWakePanel
+# WIRE-AUTONOMY-01: autonomous Wire conversations (owner toggle, default OFF).
+from comms.wire_autonomy import (
+    PREF_ENABLED as WIRE_AUTONOMY_PREF,
+    PREF_WATERMARK as WIRE_AUTONOMY_WATERMARK_PREF,
+    WireAutonomy,
+    build_unread_digest,
+)
+from tools.aivengers_wire import AivengersWireClient
 from core import emergency_stop
 from core import suspension, suspension_runtime
 from core import turn_recovery
@@ -793,6 +801,77 @@ class LuminaWindow(QMainWindow):
                     print(f"[WIRE] shutdown failed: {type(e).__name__}", flush=True)
             self.wire_panel.set_connection_state("off")
 
+    # ── WIRE-AUTONOMY-01: autonomous Wire conversations ───────────────────
+
+    @staticmethod
+    def _wire_autonomy_enabled() -> bool:
+        """The owner's one setting; absent == OFF. No env override."""
+        return bool(persistence.load().get(WIRE_AUTONOMY_PREF, False))
+
+    def _wire_agent_busy(self) -> bool:
+        """Idle gate for the consumer thread: the GUI agent is mid-turn."""
+        worker = getattr(self, "worker", None)
+        return worker is not None and worker.isRunning()
+
+    def _start_wire_autonomy(self, *, fresh: bool) -> None:
+        if self._wire_autonomy is not None:
+            return  # one consumer per process; duplicates are defects
+        autonomy = WireAutonomy(is_busy=self._wire_agent_busy)
+        if fresh or autonomy.watermark() is None:
+            # GUI thread: a short per-round timeout so a dead relay cannot
+            # hold the window; records the activation watermark.
+            autonomy.enable(AivengersWireClient(timeout=1.5))
+        self._wire_autonomy = autonomy
+        autonomy.start()
+
+    def _set_wire_autonomy_enabled(self, enabled: bool) -> None:
+        """Settings-toggle handler (live start/stop; the pref is already saved)."""
+        if enabled:
+            if not os.environ.get("LUMINA_TESTING"):
+                self._start_wire_autonomy(fresh=True)
+            return
+        autonomy = self._wire_autonomy
+        self._wire_autonomy = None
+        self._wire_unread_pending = None
+        if autonomy is not None:
+            try:
+                autonomy.disable()
+            except Exception as e:
+                print(f"[WIRE-AUTONOMY] shutdown failed: {type(e).__name__}", flush=True)
+        # Forget the watermark even if the consumer never started, so the next
+        # enable always takes a fresh one.
+        persistence.update({WIRE_AUTONOMY_WATERMARK_PREF: None})
+
+    def _wire_unread_attachment(self):
+        """Unread Wire messages for THIS normal turn, or None. Never raises.
+
+        Qt thread: the build has a 2 s wall-clock budget checked before every
+        relay call, and each call uses a short socket timeout, so an
+        unresponsive relay can hold the window for only a few seconds. Cursors
+        do not move here.
+        """
+        autonomy = self._wire_autonomy
+        if autonomy is None or not autonomy.enabled():
+            return None
+        mark = autonomy.watermark()
+        if mark is None:
+            return None
+        try:
+            return build_unread_digest(AivengersWireClient(timeout=1.5), watermark=mark)
+        except Exception as e:
+            print(f"[WIRE-AUTONOMY] unread digest skipped: {type(e).__name__}", flush=True)
+            return None
+
+    def _commit_wire_unread(self, digest) -> None:
+        """Advance the read cursors past what the finished turn saw (off-thread)."""
+        def run() -> None:
+            try:
+                digest.commit()
+            except Exception as e:
+                print(f"[WIRE-AUTONOMY] cursor not advanced: {type(e).__name__}", flush=True)
+
+        threading.Thread(target=run, name="wire-unread-commit", daemon=True).start()
+
     def _on_wire_session_state(self, session) -> None:
         self.wire_panel.set_session(session)
         self._refresh_wire_admission_note()
@@ -845,6 +924,14 @@ class LuminaWindow(QMainWindow):
                 wire_listener.shutdown()
             except Exception as e:
                 print(f"[WIRE] shutdown failed: {type(e).__name__}", flush=True)
+        # WIRE-AUTONOMY-01: stop the consumer (sockets interrupted, join capped).
+        # Shutdown only; the owner's setting and watermark stay as they are.
+        wire_autonomy = getattr(self, "_wire_autonomy", None)
+        if wire_autonomy is not None:
+            try:
+                wire_autonomy.shutdown()
+            except Exception as e:
+                print(f"[WIRE-AUTONOMY] shutdown failed: {type(e).__name__}", flush=True)
         self._telegram_route_closed = True
         origin_routing.unregister_runtime(self._telegram_route_token)
         if getattr(self.agent, "_telegram_origin_runtime_token", None) == self._telegram_route_token:
@@ -995,6 +1082,11 @@ class LuminaWindow(QMainWindow):
         self.settings_panel.wire_wake_toggle_changed.connect(
             self._set_wire_wake_enabled
         )
+        # WIRE-AUTONOMY-01: same shape; the tab persists the pref, this starts
+        # or stops the consumer and (on enable) records the activation watermark.
+        self.settings_panel.wire_autonomy_toggle_changed.connect(
+            self._set_wire_autonomy_enabled
+        )
 
         self.review_panel = ReviewPanel(self.agent, COLORS)
         self.review_panel.setVisible(False)
@@ -1010,6 +1102,11 @@ class LuminaWindow(QMainWindow):
         # auto-starts regardless.
         self._wire_listener: WireWakeListener | None = None
         self.wire_panel = WireWakePanel(COLORS)
+        # WIRE-AUTONOMY-01: one owner setting (prefs["wire_autonomy"], absent
+        # == OFF). Nothing below constructs a client or touches a socket unless
+        # it is on; under test harnesses it never auto-starts.
+        self._wire_autonomy: WireAutonomy | None = None
+        self._wire_unread_pending = None
 
         main.addWidget(self.chat_widget, 1)
         main.addWidget(self.settings_panel, 1)
@@ -1026,6 +1123,9 @@ class LuminaWindow(QMainWindow):
             self._start_wire_listener()
         else:
             self.wire_panel.set_connection_state("off")
+
+        if not os.environ.get("LUMINA_TESTING") and self._wire_autonomy_enabled():
+            self._start_wire_autonomy(fresh=False)
 
         container = QWidget()
         container.setLayout(main)
@@ -2738,6 +2838,28 @@ class LuminaWindow(QMainWindow):
         content, attachments_for_chat, attachment_markers = package_submission(
             content, self._pending_text_attachments,
         )
+        # WIRE-AUTONOMY-01: this owner-tools turn carries a COUNT-ONLY Wire
+        # notice (fixed words + an integer, never any peer-authored text),
+        # as an attachment and never fused into the owner's text; the notice
+        # cursors move only when the turn finishes without an error.
+        self._wire_unread_pending = None  # a notice an earlier, abandoned turn carried is void
+        # (Stand-in windows in older tests do not carry the builder.)
+        build_wire_notice = getattr(self, "_wire_unread_attachment", None)
+        wire_digest = build_wire_notice() if callable(build_wire_notice) else None
+        if wire_digest is not None and wire_digest.count == 0:
+            # Only her own posts were unread: nothing to show, let the cursor pass.
+            self._commit_wire_unread(wire_digest)
+            wire_digest = None
+        if wire_digest is not None:
+            attachments_for_chat = list(attachments_for_chat or []) + [
+                (wire_digest.label, wire_digest.text)
+            ]
+            # The owner's receipt: the model was told a COUNT, never any text.
+            wire_marker = f"[📡 Wire: {wire_digest.count} new, count only]"
+            attachment_markers = (
+                f"{attachment_markers} {wire_marker}" if attachment_markers else wire_marker
+            )
+            self._wire_unread_pending = wire_digest
         if attachments_for_chat:
             display_text = (
                 f"{display_text}  {attachment_markers}" if display_text else attachment_markers
@@ -3131,7 +3253,12 @@ class LuminaWindow(QMainWindow):
             self._live_bubble.add_think_timing(duration_s)
 
     def _on_finished(self, response: str):
-        
+        pending_wire = getattr(self, "_wire_unread_pending", None)
+        if pending_wire is not None:
+            self._wire_unread_pending = None
+            # Only a turn that really answered counts as having read them.
+            if not is_error_response(response or ""):
+                self._commit_wire_unread(pending_wire)
 
         if self._live_bubble:
             self._live_bubble.finalize()
@@ -3183,12 +3310,15 @@ class LuminaWindow(QMainWindow):
                       persist_partial_response: bool = True):
         """Finish cancelled-turn presentation without overclaiming durability.
 
+        A Wire notice this turn carried is not committed: the turn did not finish.
+
         The default preserves the established ordinary-stream behavior for
         direct callers and older tests. Reconciliation cancellation arrives
         with ``persist_partial_response=False``: already-streamed text remains
         visible in the live bubble, but no assistant row is written for later
         reconstruction.
         """
+        self._wire_unread_pending = None
         partial_response = (partial_response or "").strip()
         if self._live_bubble:
             if partial_response:
@@ -3227,6 +3357,7 @@ class LuminaWindow(QMainWindow):
         )
 
     def _on_error(self, error: str):
+        self._wire_unread_pending = None  # the turn failed: its Wire notice stays uncommitted
         if self._live_bubble:
             self._live_bubble.append_response_token(f"[Error: {error}]")
             self._live_bubble.finalize()

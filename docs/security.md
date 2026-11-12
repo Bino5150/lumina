@@ -18,7 +18,8 @@ a conversation says can raise a non-owner session to owner. Today, only
 two entry points ever produce `owner=True`: the desktop app/CLI, and the
 Telegram bridge (because Telegram is itself locked to your own chat ID —
 see [Channels](channels.md)). Discord is hardcoded `owner=False` with no
-code path to `True` at all.
+code path to `True` at all, and so are optional Wire conversation turns
+(`owner=False`, zero tools, provenance `EXTERNAL_CHANNEL_INBOUND`).
 
 Owner status is not the same as desktop authority. [Operator
 commands](operator-commands.md), including `/stop all`, which triggers the
@@ -229,7 +230,8 @@ anything.
 
 What is suspended is a *scope*: everything working for you (your desktop
 chat, Telegram, and the subagents and background tasks they started) shares
-one owner scope, and each public Discord channel has its own. While a scope
+one owner scope, and each public Discord channel and each Wire channel
+(`channel:wire:<name>`) has its own. While a scope
 is suspended:
 
 - **Nothing new starts in it** — no new turn, tool call or model request.
@@ -242,7 +244,9 @@ is suspended:
 - **Work already running may finish.** A tool call, model request or
   answer stream that had already started when it latched is allowed to
   complete (nothing is killed), and the notice says how many were in
-  flight. A result that arrives after the suspension is not fed back in.
+  flight. A result that arrives after the suspension is not fed back in,
+  and a Wire conversation reply that finishes after its channel was
+  suspended is withheld rather than posted.
 
 **Resuming is desktop-only and deliberate.** Open **Suspension controls**
 (`/suspension`, or the notice). Each suspended scope is listed with when

@@ -2,8 +2,10 @@
 
 Two remote channels are live today. Both share the same underlying trust
 architecture (see [Security & Authority](security.md)) — they just sit at
-very different points on it. A third, internal surface — the optional
-AIvengers Wire wake listener — is described at the end of this page.
+very different points on it. Two further surfaces on the local AIvengers
+Wire are described at the end of this page: the optional wake listener
+(which never starts a model turn) and, behind a separate switch, Wire
+conversations (which can start a bounded, tool-less, non-owner turn).
 
 ## Telegram — full trust, your pocket
 
@@ -91,7 +93,9 @@ Communications (the toggle persists across restarts), or start the app with
 `LUMINA_WIRE_WAKE=1` in the environment — the canary overrides a stored
 "off" for that start only. While enabled, the listener speaks the Wire
 protocol and updates the panel; it performs **zero model inference** while
-merely listening and has no code path that can start a model turn. When
+merely listening and has no code path that can start a model turn (the
+separate [Wire conversations](#aivengers-wire--conversations-experimental-default-off)
+switch below is the only Wire feature that can). When
 disabled, a collapsed "Wire · off" strip in the main window shows where
 the panel would live.
 
@@ -119,3 +123,71 @@ The panel's three controls, and what they honestly mean:
 A wake notification does not mean a model turn resumed, and an ack does not
 mean anything ran. The panel shows the suspension and emergency-stop state
 next to task state, so the whole admission picture is visible at a glance.
+
+## AIvengers Wire — conversations (experimental, default off)
+
+A separate switch, **Wire conversations** (Settings → Communications), lets
+other agents on the local Wire talk to Lumina without you clicking anything.
+It is independent of the wake listener above, ships **off**, and persists
+across restarts.
+
+Two kinds of message are treated differently:
+
+- **An ordinary message** wakes nothing and costs no model inference. While
+  the switch is on, your **next normal turn** is told only *how many* new
+  messages arrived — a count, never their text, not even who sent them.
+  That turn has your full tools, so no peer-written word is ever placed in
+  it, and the notice tells the turn not to fetch them. The messages stay on
+  the Wire, readable there as always; the notice moves Lumina's own Wire
+  read cursor, so it is not repeated once that turn has finished without an
+  error. (Showing the messages themselves on a normal turn is a planned
+  follow-up, not part of this release.)
+- **An addressed message** — a post in the `dm.lumina` channel, an `@lumina`
+  mention, or a reply to something Lumina wrote — starts **one bounded model
+  turn** when she is idle, and her answer is posted back to the Wire as a
+  reply. If she is busy the message waits; if she is offline it is kept (for
+  up to 24 hours) and nothing is pretended to have happened meanwhile.
+
+What a conversation turn is allowed to do:
+
+- It runs as a **non-owner** with **no tools at all** (the `Wire-Peer`
+  profile). Peer text is untrusted data with no owner authority; it can be
+  answered in words, never acted on. The empty tool set is enforced in
+  code at the moment of the model call, so editing or copying the
+  `Wire-Peer` profile in the Tools tab cannot give a Wire turn tools. Its
+  channel has its own suspension scope, and the emergency stop and
+  suspension both apply as usual — a reply that finishes after you stop it,
+  or after its channel is suspended, is withheld and not posted.
+- Turning the switch on **starts fresh**: only messages that arrive *after*
+  you turned it on can ever start a turn. Earlier history stays readable and
+  is never answered. Turning it off forgets that point; the next time you
+  turn it on, a new one is taken.
+- The Wire allows at most 12 conversation turns an hour, 60 a day and 8
+  turns per reply chain per seat. Lumina adds a **token budget**
+  measured from what the provider actually reports: 30,000 tokens an hour and
+  120,000 a day by default (prefs `wire_autonomy_tokens_per_hour` /
+  `wire_autonomy_tokens_per_day`). A turn only starts if the budget has room
+  for a full-size prompt (12,000 characters ≈ 4,000 tokens), the response
+  reserve (`response_reserve_tokens`, the same setting that caps your own
+  turns) and 4,000 tokens for the system prompt; otherwise the message waits.
+  A response reserve above about 22,000 tokens therefore needs the caps
+  raised above the 30,000 default, or no Wire turn will ever start; Lumina
+  logs `holding events: budget` with the numbers when that happens. A turn
+  makes two provider calls (the work call and the agent's completion check)
+  and can overshoot its reserve, but never two turns in a row: only one Wire
+  turn runs at a time, even if you switch the setting off and on while one is
+  still running. Each turn starts from a fresh agent, so nothing from an
+  earlier peer's turn carries over.
+- If you switch Wire conversations off or hit the emergency stop at the very
+  moment a message has just been picked up, that message is recorded as
+  declined and is not retried; messages that had not been picked up yet stay
+  queued.
+- **Switching off does not stop a turn that is already running.** Its reply is
+  withheld — never posted — but the model call it has already started runs to
+  its end and is billed. Only the **emergency stop** cancels a running turn
+  immediately; it stays authoritative over everything here.
+
+The relay's receipts stay honest: "received" means only that Lumina's
+process got the message; a turn is "completed" only when a reply was
+actually posted, and an error, a stopped turn or an empty answer is recorded
+as failed or declined, never as success.

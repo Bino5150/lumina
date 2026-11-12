@@ -20,10 +20,14 @@ Each pytest process gets private HOME, runtime and network namespaces, short dis
 | --- | --- |
 | `core` | Ordinary tests without a required Qt or historical relay fixture. Smoke uses this profile by default. |
 | `qt` | Headless GUI and Qt-dependent test files. A failed Qt preflight or unexpected skip blocks. |
-| `wire` | Historical relay integration, including Qt-dependent Wire tests. Provide a local AIvengers Wire Git checkout containing both pinned source generations. The runner exports the exact package trees and starts disposable local socket fixtures. |
+| `wire` | Historical relay integration, including Qt-dependent Wire tests. Provide a local AIvengers Wire Git checkout containing every pinned source generation (two historical relays and the attention-capable relay that Lumina's autonomous Wire conversations are tested against). The runner exports the exact package trees and starts disposable local socket fixtures. |
 | `evidence` | Frozen Castle Walls reproductions. Run alone with `--profile evidence shard 29`. Their failures and native exit are recorded as evidence, with a nonzero command status. |
 
 `full` reconciles the entire inventory first, then runs the core and Qt shards in order. Use `--profile core full` for discovery scoped to core test files and newly found test files, without a Qt preflight. Supplying `--relay-repo /path/to/aivengers-release` also includes Wire unless a profile is explicitly selected. Report receipts record which profiles were included, the source fingerprint, native status, pytest outcomes, timing, cgroup peak memory and cleanup. They live under `${XDG_STATE_HOME:-$HOME/.local/state}/lumina-test`. Use `--results PATH` before the command to change the location. `report` fails if the most recent receipt belongs to different source bytes. Use each stage's `pytest.log` and `report.jsonl` to investigate failures.
+
+## Temporary dependency exception: the attention relay
+
+The `attention` Wire generation is pinned to a commit that so far exists only in the local AIvengers Wire checkout (it is not on GitHub until the owner publishes it), so CI and other machines cannot stage it yet. Every Wire-profile receipt prints this as `TEMPORARY DEPENDENCY EXCEPTION` and records it under `temporary_dependency_exceptions`; the text lives in `TEMPORARY_DEPENDENCY_EXCEPTIONS` in `scripts/lumina_test/source.py`. Resolve it by publishing the commit (a merge commit keeps its SHA; if it is squashed, repin to the new commit, whose `src/aivengers_wire` tree must equal the pinned tree) and then delete the entry. Tests that need that relay are not skipped: they run in the Wire profile against the pinned tree.
 
 ## Updating selectors
 

@@ -2,7 +2,7 @@
 App persistence — saves avatar paths, window state, preferences.
 Uses a simple JSON file so nothing is lost between sessions.
 """
-import json, os
+import json, os, threading
 import config
 from core.test_isolation import refuse_if_production_path
 
@@ -19,6 +19,13 @@ _defaults = {
     "tts_voice": "af_bella",
     "tts_speed": 1.0,
 }
+
+# WIRE-AUTONOMY-01: a background consumer now writes prefs (its spend ledger)
+# while the GUI thread writes owner toggles. Every in-process writer takes this
+# one re-entrant lock (update() -> save() re-enters it), so two writers can
+# never interleave on the temp file or overwrite each other's keys.
+_update_lock = threading.RLock()
+
 
 def load() -> dict:
     refuse_if_production_path(PREFS_PATH)
@@ -37,30 +44,30 @@ def save(prefs: dict) -> bool:
     the swap is atomic at the filesystem level; the old file stays intact
     until the new one is fully flushed and ready."""
     refuse_if_production_path(PREFS_PATH)
-    tmp_path = PREFS_PATH + ".tmp"
-    try:
-        os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
-        with open(tmp_path, "w") as f:
-            json.dump(prefs, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, PREFS_PATH)
-        return True
-    except Exception as e:
-        print(f"[PERSISTENCE] save failed: {e}", flush=True)
+    with _update_lock:
+        # A temp name no other writer in this process (or another process) shares.
+        tmp_path = f"{PREFS_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        return False
+            os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
+            with open(tmp_path, "w") as f:
+                json.dump(prefs, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, PREFS_PATH)
+            return True
+        except Exception as e:
+            print(f"[PERSISTENCE] save failed: {e}", flush=True)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return False
 
 def get(key: str):
     return load().get(key, _defaults.get(key))
 
 def set(key: str, value):
-    prefs = load()
-    prefs[key] = value
-    save(prefs)
+    update({key: value})
 
 def update(mapping: dict) -> bool:
     """PREFS-STALE-WRITE-01 repair primitive: fresh-load -> mutate owned keys
@@ -77,6 +84,7 @@ def update(mapping: dict) -> bool:
     after the caller's snapshot can never be reverted. Callers may keep a
     local prefs dict as a READ cache, but must never persistence.save() it
     whole. Returns True on success (save()'s convention)."""
-    prefs = load()
-    prefs.update(mapping)
-    return save(prefs)
+    with _update_lock:
+        prefs = load()
+        prefs.update(mapping)
+        return save(prefs)

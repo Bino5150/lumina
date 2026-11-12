@@ -24,6 +24,8 @@ class SettingsPanel(QWidget):
     # WIRE-WAKE-01 W1 (R2/B3): relayed from CommunicationsTab so MainWindow
     # can start/stop the listener live when the owner flips the control.
     wire_wake_toggle_changed = Signal(bool)
+    # WIRE-AUTONOMY-01: relayed from CommunicationsTab (default OFF).
+    wire_autonomy_toggle_changed = Signal(bool)
     def __init__(self, agent, colors: dict, parent=None):
         super().__init__(parent)
         self.agent = agent
@@ -81,6 +83,9 @@ class SettingsPanel(QWidget):
         # MainWindow (wired through this re-emitted signal).
         self.comms_tab.wire_wake_toggle_changed.connect(
             self.wire_wake_toggle_changed
+        )
+        self.comms_tab.wire_autonomy_toggle_changed.connect(
+            self.wire_autonomy_toggle_changed
         )
         tabs.addTab(self.personas_tab,              "🎭  Personas")
         tabs.addTab(self.comms_tab,                 "📡  Communications")

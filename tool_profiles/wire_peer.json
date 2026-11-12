@@ -1,0 +1,5 @@
+{
+  "name": "Wire-Peer",
+  "description": "Autonomous AIvengers Wire peer conversations (WIRE-AUTONOMY-01). NO tools: a peer's text is untrusted data and may only be answered in words, never acted on. Applied by code (comms/wire_autonomy.py) on every turn as force_tools_profile, never read from a persona or from Wire content. Owner-only tools are additionally stripped by owner=False.",
+  "enabled": []
+}

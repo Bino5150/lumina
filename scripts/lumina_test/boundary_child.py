@@ -106,7 +106,8 @@ def sandbox(settings):
     if settings["relays"]:
         environment.update(AIVENGERS_WIRE_SRC="/relays/merged",
                            AIVENGERS_WIRE_MERGED_SRC="/relays/merged",
-                           AIVENGERS_WIRE_OLD_SRC="/relays/old")
+                           AIVENGERS_WIRE_OLD_SRC="/relays/old",
+                           AIVENGERS_WIRE_ATTENTION_SRC="/relays/attention")
     for name, value in environment.items():
         args.extend(("--setenv", name, value))
     proof = {"namespaces": namespace_ids(), "cgroup": cgroup}

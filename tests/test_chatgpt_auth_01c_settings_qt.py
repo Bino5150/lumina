@@ -229,6 +229,7 @@ def test_card_is_mounted_in_general_outside_selector_and_save(qapp, monkeypatch,
         # R3/R2-6 (Sonnet): SettingsPanel.__init__ connects this signal
         # unconditionally, so every CommunicationsTab stand-in must carry it.
         wire_wake_toggle_changed = Signal(bool)
+        wire_autonomy_toggle_changed = Signal(bool)  # WIRE-AUTONOMY-01, connected unconditionally too
 
         def __init__(self, *args, **kwargs):
             super().__init__()

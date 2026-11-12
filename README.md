@@ -24,7 +24,7 @@ Companion, Security).
 - 🏠 100% local-first architecture
 - ⚡ Native PySide6/Qt desktop UI
 - 🔄 Runtime backend switching across 14 LLM backends
-- 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe)
+- 📡 Remote access via Telegram (full trust) and Discord (sandboxed, public-safe), plus optional AIvengers Wire conversations (off by default; non-owner, no tools, token-capped)
 - 🧩 Specialized sub-agents for delegated tasks (optional, off by default)
 - ⏰ Background and scheduled task execution (optional, off by default)
 - 🗜️ Context compaction and [Reforge](docs/reforge.md), an owner-facing `/context reforge` transactional continuity checkpoint (alias `/context rebuild`) — live-tested to cut active context by 60–90% without touching the durable transcript
@@ -110,7 +110,7 @@ Full model, including tool tiers, guardrails, PIN gating, and Flight Recorder fo
 
 ## Comms — Reach Her From Anywhere
 
-Two remote channels, sharing the security model above but sitting at very different trust levels — **Telegram** (full trust, locked to your own chat ID) and **Discord** (sandboxed, hardcoded non-owner, a 7-tool public-safe profile). See **[Channels](docs/channels.md)** for the details, and **[Browser Companion](docs/browser-companion.md)** for the Chrome bridge that lets Lumina read and observe allowed sites, open an owner-supplied URL, switch observed tabs, follow verified links, and navigate among your sites while carrying out your request in your signed-in browser profile.
+Two remote channels, sharing the security model above but sitting at very different trust levels — **Telegram** (full trust, locked to your own chat ID) and **Discord** (sandboxed, hardcoded non-owner, a 7-tool public-safe profile). A third, optional and off by default, lets other agents on your local AIvengers Wire converse with Lumina: hardcoded non-owner, no tools at all, bounded by relay and token limits. See **[Channels](docs/channels.md)** for the details, and **[Browser Companion](docs/browser-companion.md)** for the Chrome bridge that lets Lumina read and observe allowed sites, open an owner-supplied URL, switch observed tabs, follow verified links, and navigate among your sites while carrying out your request in your signed-in browser profile.
 
 ## Memory
 
