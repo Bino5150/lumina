@@ -120,6 +120,7 @@ def test_start_omitted_cwd_without_project_uses_home(monkeypatch):
         ("~", os.path.expanduser("~")),
         ("relative-dir", os.path.abspath("relative-dir")),
     ],
+    ids=["absolute", "tilde", "relative"],
 )
 def test_start_explicit_cwd_without_project_resolves_from_lumina(
         monkeypatch, supplied, expected):
@@ -138,7 +139,9 @@ def test_start_omitted_cwd_with_active_project_uses_project_root(monkeypatch, tm
 
 
 @pytest.mark.parametrize(
-    "supplied", [os.path.abspath(os.path.join("absolute", "path")), "~", "relative-dir"]
+    "supplied",
+    [os.path.abspath(os.path.join("absolute", "path")), "~", "relative-dir"],
+    ids=["absolute", "~", "relative-dir"],
 )
 def test_start_explicit_cwd_overrides_active_project(monkeypatch, tmp_path, supplied):
     project_root = tmp_path / "project"

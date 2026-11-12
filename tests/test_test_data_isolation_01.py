@@ -171,9 +171,12 @@ def test_symlinked_root_toward_production_fails_closed(tmp_path, monkeypatch):
     """M6: a test root that itself symlinks into the real owner data dir
     must not slip past a plain string-prefix check -- the guard resolves
     realpath() before comparing."""
+    import platformdirs
+
+    owner_data = tmp_path / "owner-data" / "lumina"
+    monkeypatch.setattr(platformdirs, "user_data_dir", lambda *_args, **_kwargs: str(owner_data))
+    owner_data.mkdir(parents=True)
     real_data_dir = _real_data_dir()
-    if not os.path.isdir(real_data_dir):
-        pytest.skip("real owner data dir does not exist on this machine")
     fake_root = tmp_path / "escape-via-symlink"
     os.symlink(real_data_dir, fake_root)
     monkeypatch.setattr(persistence, "PREFS_PATH", str(fake_root / "memory" / "prefs.json"))

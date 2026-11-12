@@ -374,8 +374,6 @@ def test_real_old_and_merged_public_contracts(relay_client):
 @pytest.mark.parametrize("method", ["read_since", "peek", "read_unseen"])
 def test_real_twenty_10k_messages_across_byte_trimmed_pages(relay_client, monkeypatch, method):
     kind, client = relay_client
-    if kind != "merged":
-        pytest.skip("byte-trimmed pagination is a merged-relay feature")
     messages = []
     for i in range(20):
         messages.append(canonical(client.post(f"{i}:" + "x" * 10240)))
@@ -390,25 +388,47 @@ def test_real_twenty_10k_messages_across_byte_trimmed_pages(relay_client, monkey
         return result
 
     monkeypatch.setattr(client, "_exchange", exchange)
+    # Eight 10 KiB messages exceed 64 KiB but fit the client's 128 KiB cap.
+    # The old relay returns them in one unpaged response.
+    limit = 8 if kind == "old" else 20
+    expected = messages[:limit]
     if method == "read_since":
-        result = client.read_since(0, limit=20)
+        result = client.read_since(0, limit=limit)
     else:
-        result = client.read_unseen(limit=20, advance=method != "peek")["messages"]
-    assert result == messages
-    assert len(pages) >= 4
-    assert all(len(encoded(response)) <= 65536 for _, response in pages)
-    assert all(response["next_after"] == response["messages"][-1]["id"]
-               for _, response in pages if response["has_more"])
-    assert client.cursor() == (messages[-1]["id"] if method == "read_unseen" else 0)
+        result = client.read_unseen(limit=limit, advance=method != "peek")["messages"]
+    assert result == expected
+    if kind == "old":
+        request = {"op": "read", "channel": "general", "after": 0, "limit": limit}
+        response = {"ok": True, "messages": expected}
+        assert pages == [(request, response)]
+        assert 65536 < len(encoded(response)) <= 131072
+    else:
+        assert len(pages) >= 4
+        assert all(len(encoded(response)) <= 65536 for _, response in pages)
+        assert all(response["next_after"] == response["messages"][-1]["id"]
+                   for _, response in pages if response["has_more"])
+    assert client.cursor() == (expected[-1]["id"] if method == "read_unseen" else 0)
     if method == "read_unseen":
         client.post("late arrival")
-        assert [m["body"] for m in client.read_unseen()["messages"]] == ["late arrival"]
+        assert [m["body"] for m in client.read_unseen()["messages"]] == [
+            *[m["body"] for m in messages[limit:]], "late arrival",
+        ]
 
 
 def test_real_large_legal_message_response_read_and_watch(relay_client):
     kind, client = relay_client
-    if kind != "merged":
-        pytest.skip("expanded response ceiling is a merged-relay feature")
+    if kind == "old":
+        # Bypass the Lumina outbound guard to verify the historical relay's
+        # own request limit with a body still within its character limit.
+        oversized = encoded({"op": "post", "channel": "general", "body": "é" * 32768})
+        assert len(oversized) > 65536
+        with client._session() as sock:
+            sock.sendall(oversized)
+            refusal = client._recv_frame(sock)
+        assert refusal == {
+            "ok": False, "error": "invalid_request", "message": "request exceeds maximum frame size",
+        }
+        assert client.read_since(0) == []
     events = client.watch(channels=["general"], timeout_ms=10000)
     try:
         assert next(events)["event"] == "subscribed"
@@ -417,6 +437,15 @@ def test_real_large_legal_message_response_read_and_watch(relay_client):
         message = canonical(client.post(body))
         assert len(encoded({"ok": True, "message": message})) > 65536
         assert client.read_since(0) == [message]
+        if kind == "old":
+            # The old relay can send this large response without paging or
+            # promising the merged relay's expanded response bound.
+            with client._session() as sock:
+                response = client._exchange(
+                    sock, {"op": "read", "channel": "general", "after": 0, "limit": 1},
+                )
+            assert response == {"ok": True, "messages": [message]}
+            assert len(encoded(response)) > 65536
         event = next(events)
         assert event["message"] == message
         assert 65536 < len(encoded(event)) <= 131072
@@ -428,10 +457,17 @@ def test_real_large_legal_message_response_read_and_watch(relay_client):
 @pytest.mark.parametrize("failure", ["disconnect", "malformed", "loop"])
 def test_real_pagination_failure_preserves_durable_cursor(relay_client, monkeypatch, failure):
     kind, client = relay_client
-    if kind != "merged":
-        pytest.skip("byte-trimmed pagination is a merged-relay feature")
-    for _ in range(20):
-        client.post("x" * 10240)
+    if kind == "old":
+        # Old read is a single response. Seed a nonzero cursor to test both
+        # preservation and rejection of a repeated cursor row on that response.
+        seen = canonical(client.post("already read"))
+        assert client.advance(last_message_id=seen["id"]) == seen["id"]
+        after = seen["id"]
+        expected = [canonical(client.post(f"unseen {i}")) for i in range(20)]
+    else:
+        after = 0
+        for _ in range(20):
+            client.post("x" * 10240)
     original = client._exchange
     reads = 0
     advances = []
@@ -442,31 +478,61 @@ def test_real_pagination_failure_preserves_durable_cursor(relay_client, monkeypa
             advances.append(payload)
         if payload["op"] == "read":
             reads += 1
-            if reads == 2:
+            if reads == (1 if kind == "old" else 2):
                 if failure == "disconnect":
                     sock.shutdown(socket.SHUT_RDWR)
                     return client._recv_frame(sock)
                 elif failure == "malformed":
                     return {"messages": "not a page"}
+                elif kind == "old":
+                    return {"ok": True, "messages": [seen]}
                 else:
                     return page([payload["after"]], True, payload["after"])
         return original(sock, payload)
 
     monkeypatch.setattr(client, "_exchange", exchange)
-    with pytest.raises(wire.WireError):
-        client.read_unseen(limit=20)
+    if kind == "old":
+        error = {
+            "disconnect": "relay closed the connection without a full frame",
+            "malformed": "invalid messages page",
+            "loop": "invalid or non-increasing messages key",
+        }[failure]
+        with pytest.raises(wire.WireFrameError, match=error):
+            client.read_unseen(limit=20)
+        assert reads == 1
+    else:
+        with pytest.raises(wire.WireError):
+            client.read_unseen(limit=20)
     assert not advances
-    assert client.cursor() == 0
+    assert client.cursor() == after
     monkeypatch.setattr(client, "_exchange", original)
-    assert len(client.read_unseen(limit=20)["messages"]) == 20
+    if kind == "old":
+        assert client.read_unseen(limit=20) == {
+            "messages": expected, "cursor": expected[-1]["id"], "advanced": True,
+        }
+        assert client.cursor() == expected[-1]["id"]
+    else:
+        assert len(client.read_unseen(limit=20)["messages"]) == 20
 
 
 def test_real_legacy_response_over_64k(relay_client):
     kind, client = relay_client
-    if kind != "old":
-        pytest.skip("merged relay byte-trims multi-message responses to 64 KiB")
     expected = [canonical(client.post("x" * 10240)) for _ in range(8)]
     assert 65536 < len(encoded({"ok": True, "messages": expected})) <= 131072
+    if kind == "merged":
+        with client._session() as sock:
+            request = {"op": "read", "channel": "general", "after": 0, "limit": 8}
+            first = client._exchange(sock, request)
+            # Six rows fit and seven exceed the complete 64 KiB frame budget.
+            assert first == {
+                "ok": True, "messages": expected[:6], "has_more": True, "next_after": expected[5]["id"],
+            }
+            assert len(encoded(first)) <= 65536
+            last = client._exchange(sock, {**request, "after": first["next_after"], "limit": 2})
+            assert last == {
+                "ok": True, "messages": expected[6:], "has_more": False, "next_after": None,
+            }
+            assert len(encoded(last)) <= 65536
     assert client.read_since(0, limit=8) == expected
 
 

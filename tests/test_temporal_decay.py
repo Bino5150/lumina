@@ -13,7 +13,7 @@ Fix: tau is now kept in the same "days" unit lambda_rate is documented in
 in decay_weight() rather than folding an 86400 factor into tau itself.
 """
 import math
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -53,15 +53,23 @@ def _clamp(weight: float) -> float:
 @pytest.mark.parametrize("lambda_rate,days", [
     (0.0083, 30), (0.0083, 60), (0.0083, 90), (0.05, 30), (0.5, 30),
 ])
-def test_decay_weight_matches_the_clamped_formula(lambda_rate, days):
+def test_decay_weight_matches_the_clamped_formula(lambda_rate, days, monkeypatch):
     """Proves the implementation computes w(t)=e^(-lt), t in days, in the
     right units -- not the docstring's numbers specifically (that's the
     separate test below). ground_truth is clamped the same [0.01, 1.0] way
     decay_weight() itself clamps, since the 0.5/30d case's raw value
     (~3e-7) is intentionally below the floor -- that's the floor doing its
     documented job, not a units bug."""
+    now = datetime(2026, 11, 9, 6, 30, tzinfo=UTC)
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromtimestamp(now.timestamp(), tz=tz)
+
+    monkeypatch.setattr("tools.temporal_decay.datetime", FixedClock)
     engine = TemporalDecayEngine(lambda_rate=lambda_rate)
-    timestamp = _timestamp_days_ago(days)
+    timestamp = (now - timedelta(days=days)).isoformat()
 
     weight = engine.decay_weight(timestamp)
 

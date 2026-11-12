@@ -45,3 +45,5 @@ roadmap, not the dev build, not what used to be true. Where a capability
 exists in code but has no way for you to reach it yet (no tool, no
 Settings control, no UI button), that's stated explicitly rather than
 described as a feature.
+
+Developers can use the [bounded local test runner](local-test-runner.md) to run smoke tests and maintained shards.
