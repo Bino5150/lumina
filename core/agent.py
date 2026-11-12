@@ -255,6 +255,94 @@ def _nonnegative_int(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+class TurnBudgetRefused(RuntimeError):
+    """The turn's token allowance cannot support another provider call."""
+
+
+class TurnTokenBudget:
+    """WIRE-AUTONOMY-01 -- a HARD token allowance for ONE autonomous turn.
+
+    The Wire responder sets this as ``agent.token_budget``; ``None`` (every other
+    turn of every other transport) changes nothing. It is enforced where a request
+    leaves for the provider -- ``_provider_chat_or_error`` (the work call and the
+    completion gate) and ``_stream_final`` (a streamed final):
+
+    * a call is sent with ``max_tokens = min(max_output, the call's own limit)``,
+      so the provider stops generating there. The owner's general response
+      reserve is only ever lowered by this, never widened;
+    * a call is REFUSED, and nothing is sent, unless its estimated input plus that
+      output cap still fits in what is left of ``total`` after the calls already
+      made (provider-reported usage, or the call's worst case when none arrived).
+      With ``followup_tokens`` set, the FIRST call must also leave room for its
+      follow-up (the completion gate: the same prompt, this call's output and that
+      many tokens of overhead), so a turn that cannot be finished is not started.
+
+    The output cap is enforced by the provider (a backend that does not enforce
+    one is refused, see ``_budgeted_max_tokens``). The input side is an ESTIMATE:
+    ASCII bytes / 3 plus one token per other byte, which holds for ordinary text
+    but not for adversarial token-dense ASCII, so the real total can pass
+    ``total`` by an under-estimate of the (size-limited) prompt. Callers charge
+    the provider-reported usage, never the estimate.
+    """
+
+    BYTES_PER_TOKEN = 3
+
+    def __init__(self, total: int, max_output: int, followup_tokens: Optional[int] = None) -> None:
+        self.total = int(total)
+        self.max_output = int(max_output)
+        self.followup_tokens = followup_tokens
+        self.spent = 0
+        self._inflight = 0  # worst case of the one call sent and not yet settled
+        self._calls = 0     # calls authorized so far
+
+    def charged(self) -> int:
+        """Tokens accounted so far, counting an unsettled call at its worst case."""
+        return self.spent + self._inflight
+
+    def _estimate_input(self, messages, tools) -> int:
+        try:
+            blob = json.dumps([messages, tools], default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            blob = repr((messages, tools))
+        raw = blob.encode("utf-8", "replace")
+        ascii_bytes = len(blob.encode("ascii", "ignore"))
+        # Rare and multibyte characters cost up to about one token per byte.
+        return ascii_bytes // self.BYTES_PER_TOKEN + (len(raw) - ascii_bytes) + 1
+
+    def authorize(self, messages, tools, limit: int) -> int:
+        """The ``max_tokens`` to send for one call, or raise TurnBudgetRefused."""
+        self.spent += self._inflight  # a call whose usage never arrived counts in full
+        self._inflight = 0
+        cap = max(1, min(self.max_output, int(limit)))
+        cost = self._estimate_input(messages, tools) + cap
+        need = cost
+        if self.followup_tokens is not None and self._calls == 0:
+            need += cost + cap + self.followup_tokens
+        if self.spent + need > self.total:
+            raise TurnBudgetRefused("this turn's token allowance cannot support another model call")
+        self._calls += 1
+        self._inflight = cost
+        return cap
+
+    def settle(self, usage) -> None:
+        """Replace the in-flight call's worst case with its provider-reported total."""
+        total = _nonnegative_int(usage.get("total_tokens")) if isinstance(usage, dict) else None
+        if total is None or not self._inflight:
+            return
+        self.spent += total
+        self._inflight = 0
+
+
+def _budgeted_max_tokens(agent, messages, tools, limit: int) -> int:
+    """``limit`` unchanged, unless this agent runs under a TurnTokenBudget."""
+    budget = getattr(agent, "token_budget", None)
+    if not isinstance(budget, TurnTokenBudget):
+        return limit
+    if getattr(getattr(agent, "llm", None), "enforces_output_token_limit", True) is False:
+        raise TurnBudgetRefused("this model backend does not enforce an output token limit")
+    return budget.authorize(messages, tools, limit)
+
+
 def _accumulate_provider_telemetry(agent, telemetry: dict, turn_telemetry: Optional[dict],
                                    phase: str) -> None:
     """Fold one provider-normalized telemetry payload into this turn.
@@ -263,6 +351,9 @@ def _accumulate_provider_telemetry(agent, telemetry: dict, turn_telemetry: Optio
     gate, and final-producing request).  Utility calls never reach this helper.
     Missing or malformed usage is ignored rather than estimated.
     """
+    budget = getattr(agent, "token_budget", None)
+    if isinstance(budget, TurnTokenBudget) and isinstance(telemetry, dict):
+        budget.settle(telemetry.get("usage"))
     if turn_telemetry is None or not isinstance(telemetry, dict):
         return
     usage = telemetry.get("usage")
@@ -1050,7 +1141,11 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
     (format_provider_error()/format_gemini_error()/format_anthropic_error(),
     every concrete backend's convention) represents an actual received
     provider response. `stage`/wording below now branch on the real
-    exception class instead of collapsing every failure into "rejected"."""
+    exception class instead of collapsing every failure into "rejected".
+
+    WIRE-AUTONOMY-01 -- an agent running under a TurnTokenBudget has its
+    max_tokens lowered to the turn's output cap here, and a call the turn's
+    remaining allowance cannot support is refused before anything is sent."""
     try:
         dispatch_fields = _dispatch_measurements(chat_kwargs)
     except Exception:
@@ -1095,6 +1190,20 @@ def _provider_chat_or_error(agent, chat_kwargs: dict, cancel_event, tools_used_t
         if callable(on_response_token):
             on_response_token(err)
         return None, err
+    if isinstance(getattr(agent, "token_budget", None), TurnTokenBudget):
+        # Last gate before the request is built for dispatch, so a call refused
+        # earlier (lane, suspension) is never counted against the turn's allowance.
+        try:
+            chat_kwargs["max_tokens"] = _budgeted_max_tokens(
+                agent, chat_kwargs.get("messages"), chat_kwargs.get("tools"),
+                chat_kwargs.get("max_tokens") or config.RESPONSE_RESERVE_TOKENS)
+        except TurnBudgetRefused as refused:
+            release_suspension_lease()
+            err = f"[Lumina error: {refused}.]"
+            on_response_token = getattr(agent, "on_response_token", None)
+            if callable(on_response_token):
+                on_response_token(err)
+            return None, err
     _llm = getattr(agent, "llm", None)
     _configured_model = getattr(_llm, "configured_model", None)
     _fr_machine(
@@ -2599,6 +2708,9 @@ class LuminaAgent:
         self.on_final_ttft = on_final_ttft or (lambda t: None)
         self.on_time_to_first_answer = on_time_to_first_answer or (lambda t: None)
         self.on_token_usage = on_token_usage or (lambda usage: None)
+        # WIRE-AUTONOMY-01 -- None for every ordinary turn; the Wire responder
+        # sets a TurnTokenBudget for the one autonomous turn it runs.
+        self.token_budget = None
         self.on_think_timing = on_think_timing or (lambda duration: None)
         self.tts = tts
         # Persona-local speech policy. This stays independent of the
@@ -4394,10 +4506,16 @@ class LuminaAgent:
             if suspended is not None:
                 self.on_response_token(suspended)
                 return suspended
+            # WIRE-AUTONOMY-01 -- a turn under a TurnTokenBudget has this stream's
+            # max_tokens capped, or the stream refused (TurnBudgetRefused is a
+            # RuntimeError: rendered as "[Stream error: ...]" below, nothing sent,
+            # and the lease above is released in finally).
+            stream_max_tokens = _budgeted_max_tokens(
+                self, messages, None, config.RESPONSE_RESERVE_TOKENS)
             final_request_dispatch_at = time.monotonic()
             stream = iter(self.llm.chat_stream(
                 messages=messages,
-                max_tokens=config.RESPONSE_RESERVE_TOKENS,
+                max_tokens=stream_max_tokens,
                 reasoning_effort=reasoning_effort,
             ))
 

@@ -94,11 +94,12 @@ Its two token caps have no Settings fields. Change them in `prefs.json`
 | `wire_autonomy_tokens_per_hour` | 30000 | Provider-reported tokens Wire conversation turns may use in a rolling hour |
 | `wire_autonomy_tokens_per_day` | 120000 | The same over a rolling day |
 
-A turn starts only if the remaining budget covers about 4,000 tokens for a
-full-size prompt, the **response reserve** (`response_reserve_tokens`, the
-setting that also caps your own turns) and 4,000 for the system prompt. If you
-raise the response reserve above about 22,000 tokens, raise these caps with it,
-or no Wire turn will start; the Lumina console logs `holding events: budget`.
+A Wire turn runs under its own hard allowance of about 20,000 tokens, with
+every model call capped at 1,024 output tokens, and starts only if the remaining
+budget covers that. It does not use your **response reserve**
+(`response_reserve_tokens`, the setting that caps your own turns), so changing
+the reserve never changes it. If the caps are set below the allowance, no Wire
+turn will start; the Lumina console logs `holding events: budget`.
 
 ## Backend Abstraction
 

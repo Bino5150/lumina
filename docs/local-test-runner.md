@@ -29,6 +29,23 @@ Each pytest process gets private HOME, runtime and network namespaces, short dis
 
 The `attention` Wire generation is pinned to a commit that so far exists only in the local AIvengers Wire checkout (it is not on GitHub until the owner publishes it), so CI and other machines cannot stage it yet. Every Wire-profile receipt prints this as `TEMPORARY DEPENDENCY EXCEPTION` and records it under `temporary_dependency_exceptions`; the text lives in `TEMPORARY_DEPENDENCY_EXCEPTIONS` in `scripts/lumina_test/source.py`. Resolve it by publishing the commit (a merge commit keeps its SHA; if it is squashed, repin to the new commit, whose `src/aivengers_wire` tree must equal the pinned tree) and then delete the entry. Tests that need that relay are not skipped: they run in the Wire profile against the pinned tree.
 
+## Known failing units on release main (recorded, not waived)
+
+Six shard units do not pass on pristine release `main` `a2f38c1` (the parent of the WIRE-AUTONOMY-01 commits), measured with this runner. They fail identically with and without those commits (same test IDs, same counts), they have no entry in `allowed_skips`, and they are still in the inventory, so they keep failing runs until someone fixes them. Their causes have not been investigated here.
+
+| Unit | Result on `a2f38c1` | IDs |
+| --- | --- | --- |
+| core 005 | native exit 1, 1 failure | `tests/test_agent_runaway_suspend_01_c1b.py::test_the_eval_harness_never_initializes_outside_its_scratch_root` |
+| core 013 | native exit 1, 1 failure | `tests/test_eval_scratch_dir.py::test_run_eval_wipes_stale_scratch_dir_before_any_project_import` |
+| core 019 | native exit 1, 3 failures | `tests/test_run_eval_persona.py::test_run_task_resolves_and_threads_named_persona`, `::test_run_task_unknown_persona_name_falls_back_gracefully`, `::test_run_task_without_persona_key_passes_none_unchanged` |
+| core 020 | native exit 1, 7 failures | `tests/test_sandbox.py::test_exception_captured_not_raised`, `::test_memory_rlimit_blocks_large_allocation`, `::test_no_output_case`, `::test_normal_execution`, `::test_secrets_not_inherited_from_app_env`, `::test_timeout_clamped_to_max`, `::test_timeout_is_actually_enforced` |
+| core 021 | native exit 1, 1 failure and a "missing or repeated structured pytest collection" error | `tests/test_site_action_claims.py::test_spawned_processes_have_one_durable_winner` |
+| qt 028 | native exit 0, runner status FAIL: 3 unexpected skips | `tests/test_wire_wake_adapter_01.py::TestReleaseLifecycleR3::test_release_records_failed_with_note`, `::TestSafetyGates::test_production_isolation`, `::TestSafetyGates::test_token_never_logged` |
+
+The qt 028 skips all report "aivengers release source not found; relay-bound W1 tests require it": they are relay-bound tests listed under the `qt` profile, where no relay is staged.
+
+A run can also end with `host resource admission refused` (available memory below the runner's floor, or swap pressure). That ran no test and is not a result: free memory and rerun the unit.
+
 ## Updating selectors
 
 `scripts/lumina_test/inventory.tsv` lists every maintained node ID, shard and profile. Existing assignments were seeded from W1. Historical manifests and evidence have separate archival custody.

@@ -70,6 +70,8 @@ from tools.aivengers_wire import (
 
 __all__ = [
     "PREF_ENABLED",
+    "TURN_TOKEN_BUDGET",
+    "WIRE_MAX_OUTPUT_TOKENS",
     "WIRE_PEER_PROFILE",
     "SpendLedger",
     "UnreadDigest",
@@ -88,7 +90,6 @@ PREF_TOKENS_PER_DAY = "wire_autonomy_tokens_per_day"
 #: Constant, never read from a persona, a message or a pref.
 WIRE_PEER_PROFILE = "Wire-Peer"
 CHANNEL_ID_PREFIX = "wire-"
-SUSPENSION_TRANSPORT = "wire"
 
 #: Actual model-spend caps (provider-reported total tokens), owner-adjustable.
 DEFAULT_TOKENS_PER_HOUR = 30_000
@@ -96,13 +97,31 @@ DEFAULT_TOKENS_PER_DAY = 120_000
 MAX_LEDGER_ENTRIES = 500
 #: The relay's largest read page (protocol.MAX_READ_LIMIT).
 MAX_READ_WINDOW = 200
-#: A turn is never started unless the budget could absorb its worst case:
-#: prompt + the configured response reserve + this allowance for the system
-#: prompt and context the agent adds around it.
+#: The system prompt and context the agent adds around the fenced prompt.
 SYSTEM_ALLOWANCE_TOKENS = 4_000
 CHARS_PER_TOKEN = 3
 
 DEFAULT_CONTEXT_CHARS = 12_000
+#: Each provider call of a Wire turn is sent with at most this many completion
+#: tokens (the provider enforces it). This is the Wire responder's own allowance:
+#: the owner's general response reserve (``response_reserve_tokens``) is never
+#: used for it, and the turn can only ever lower it, never widen it.
+WIRE_MAX_OUTPUT_TOKENS = 1_024
+#: The completion gate's own instruction, its two control-tool schemas and the
+#: message framing around them.
+GATE_OVERHEAD_TOKENS = 1_000
+#: The hard token allowance of one Wire turn, and what the budget must have free
+#: before a turn starts: two calls (the work call and the completion gate), each
+#: with a full-size prompt, the system allowance and the output cap, plus the
+#: first call's output carried into the second call's input and the gate's
+#: overhead. A call the remaining allowance cannot support is refused at the
+#: provider-call boundary (core.agent.TurnTokenBudget), so this is a cap on the
+#: turn, not a reserve.
+TURN_TOKEN_BUDGET = (
+    2 * (SYSTEM_ALLOWANCE_TOKENS + DEFAULT_CONTEXT_CHARS // CHARS_PER_TOKEN + WIRE_MAX_OUTPUT_TOKENS)
+    + WIRE_MAX_OUTPUT_TOKENS
+    + GATE_OVERHEAD_TOKENS
+)
 DEFAULT_THREAD_DEPTH = 6
 DEFAULT_MAX_REPLY_CHARS = 4_000
 #: A turn must finish inside its lease; a reply that would land after the relay
@@ -390,8 +409,20 @@ def _default_turn(*, prompt: str, channel_id: str, suspension_token: Any, on_usa
     agent = headless.get_headless_agent(
         channel_id, False, force_tools_profile=WIRE_PEER_PROFILE
     )
+    from core.agent import TurnTokenBudget
+
     previous = getattr(agent, "on_token_usage", None)
-    agent.on_token_usage = on_usage
+    budget = TurnTokenBudget(
+        total=TURN_TOKEN_BUDGET, max_output=WIRE_MAX_OUTPUT_TOKENS, followup_tokens=GATE_OVERHEAD_TOKENS
+    )
+    reported: dict[str, Any] = {}
+
+    def relay(usage: Any) -> None:
+        if isinstance(usage, dict):
+            reported.update(usage)
+        on_usage(usage)
+
+    agent.on_token_usage = relay
     try:
         return headless.run_headless_turn(
             task=prompt,
@@ -401,9 +432,19 @@ def _default_turn(*, prompt: str, channel_id: str, suspension_token: Any, on_usa
             suspension_token=suspension_token,
             # The profile is an owner-editable file; zero tools is enforced in code.
             require_zero_tools=True,
+            # Hard allowance for this turn only, attached to the agent that runs it:
+            # every provider call is capped at WIRE_MAX_OUTPUT_TOKENS and refused
+            # once the allowance cannot support it.
+            token_budget=budget,
         )
     finally:
         agent.on_token_usage = previous
+        # The ledger is charged the larger of the provider's report and the
+        # budget's own accounting (a call whose usage never arrived counts at
+        # its worst case; a turn that sent nothing counts zero), so neither a
+        # backend that under-reports nor an unsent call distorts the spend.
+        seen = reported.get("total_tokens")
+        on_usage({"total_tokens": max(seen if type(seen) is int else 0, budget.charged())})
 
 
 class WireAutonomy:
@@ -513,22 +554,16 @@ class WireAutonomy:
                 return "busy"
         except Exception:
             return "busy"
-        try:
-            import config
-
-            reserve = config.RESPONSE_RESERVE_TOKENS
-        except Exception:
-            reserve = 4_096
-        # Worst case for one turn: a full-size prompt, the configured response
-        # reserve, and the agent's own system context. Starting a turn only
-        # with that much headroom means the cap can be overshot by at most the
-        # gap between this reserve and a turn's real usage, never by a second turn.
-        needed = self._context_chars // CHARS_PER_TOKEN + reserve + SYSTEM_ALLOWANCE_TOKENS
+        # A turn runs under a hard allowance (TURN_TOKEN_BUDGET, enforced on every
+        # provider call), so it is started only with that much headroom: the caps
+        # can then be exceeded by at most an under-estimated prompt, never by a
+        # second turn. The owner's general response reserve plays no part in it.
+        needed = TURN_TOKEN_BUDGET
         remaining = self._ledger.remaining()
         if remaining < needed:
             self._gate_detail = (
-                f" - a turn needs {needed} tokens of headroom ({reserve} of them the response "
-                f"reserve) and {remaining} are left under the cap"
+                f" - a turn needs {needed} tokens of headroom and {remaining} are left "
+                "under the cap"
             )
             return "budget"
         return None
@@ -637,9 +672,15 @@ class WireAutonomy:
 
     @staticmethod
     def _capture_suspension(channel: str):
-        from core import suspension, suspension_runtime
+        # core.suspension may be imported only by its designated participants (see
+        # tests/test_agent_runaway_suspend_01_c1a.py); the headless runner is one and
+        # builds the very same per-channel scope a public Discord channel gets.
+        from core import headless, suspension_runtime
 
-        return suspension_runtime.capture(suspension.channel_scope(SUSPENSION_TRANSPORT, channel))
+        scope = headless.suspension_scope_for(f"{CHANNEL_ID_PREFIX}{channel}", False)
+        if scope is None:
+            raise ValueError("this Wire channel has no suspension scope")
+        return suspension_runtime.capture(scope)
 
     def _reply_chain(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         chain: list[dict[str, Any]] = []
@@ -766,14 +807,8 @@ class WireAutonomy:
             if type(total) is int and total >= 0:
                 self._ledger.record(total, estimated=False)
             elif prompt_chars:
-                import config
-
-                estimate = (
-                    prompt_chars // CHARS_PER_TOKEN
-                    + config.RESPONSE_RESERVE_TOKENS
-                    + SYSTEM_ALLOWANCE_TOKENS
-                )
-                self._ledger.record(estimate, estimated=True)
+                # No usage reported at all: charge the turn's whole allowance.
+                self._ledger.record(TURN_TOKEN_BUDGET, estimated=True)
         except Exception as exc:
             self._log(f"spend ledger not updated: {type(exc).__name__}")
 

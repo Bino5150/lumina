@@ -285,13 +285,14 @@ def test_an_exhausted_spend_budget_queues_instead_of_calling_the_model():
     prefs = FakePrefs(**{PREF_ENABLED: True, PREF_WATERMARK: 0,
                          WA.PREF_TOKENS_PER_DAY: 9_000})
     auto, wire, turn, _ = make(prefs=prefs, wire=FakeWire([ev]))
-    # headroom 9,000 < worst-case reserve (12,000//3 + 4,096 + 4,000): not enough for one turn
+    # headroom 9,000 < the turn's hard allowance (WA.TURN_TOKEN_BUDGET): not enough for one turn
     assert auto.drain_once() == 0
     assert ev["state"] == "received" and turn.calls == [] and auto.last_gate == "budget"
 
 
 def test_actual_usage_is_charged_and_the_cap_stops_the_next_turn():
-    prefs = FakePrefs(**{PREF_ENABLED: True, PREF_WATERMARK: 0, WA.PREF_TOKENS_PER_HOUR: 16_000})
+    prefs = FakePrefs(**{PREF_ENABLED: True, PREF_WATERMARK: 0,
+                         WA.PREF_TOKENS_PER_HOUR: WA.TURN_TOKEN_BUDGET + 2_000})
     first, second = event("a" * 8, 5), event("b" * 8, 6)
     auto, wire, turn, prefs = make(prefs=prefs, wire=FakeWire([first, second]),
                                    turn=Script(tokens=9_000))
@@ -306,7 +307,7 @@ def test_a_backend_that_reports_no_usage_is_charged_a_conservative_estimate():
     auto, wire, turn, prefs = make(wire=FakeWire([event("a" * 8, 5)]), turn=Script(tokens=None))
     assert auto.drain_once() == 1
     tokens, estimated = prefs.data[PREF_SPEND][0][1:]
-    assert estimated is True and tokens >= 8_000
+    assert estimated is True and tokens == WA.TURN_TOKEN_BUDGET, "the turn's whole allowance"
 
 
 def test_ledger_ignores_malformed_and_expired_rows():
@@ -731,6 +732,110 @@ def test_each_default_turn_starts_from_a_fresh_agent_so_nothing_carries_over(
     assert len(seen) == 2 and seen[0] is not seen[1]
 
 
+def test_default_turn_runs_under_its_own_hard_token_budget_and_clears_it(
+        real_agent_cache, monkeypatch):
+    from core.agent import LuminaAgent, TurnTokenBudget
+    seen = {}
+
+    def chat(self, text, **kw):
+        seen["agent"], seen["budget"] = self, self.token_budget
+        self.on_token_usage({"total_tokens": 100})
+        return "ok"
+
+    monkeypatch.setattr(LuminaAgent, "chat", chat)
+    auto, wire, _, _ = make(wire=FakeWire([event("a" * 8, 5)]), turn=WA._default_turn)
+    auto._turn_fn = WA._default_turn
+    assert auto.drain_once() == 1
+    budget = seen["budget"]
+    assert isinstance(budget, TurnTokenBudget)
+    assert (budget.total, budget.max_output) == (WA.TURN_TOKEN_BUDGET, WA.WIRE_MAX_OUTPUT_TOKENS)
+    assert budget.followup_tokens == WA.GATE_OVERHEAD_TOKENS, "the first call must leave room for the gate"
+    assert seen["agent"].token_budget is None, "the allowance belongs to that one turn"
+
+
+def test_a_turn_that_sent_nothing_is_charged_nothing(real_agent_cache, monkeypatch):
+    """No provider call authorized (refused, suspended, failed before dispatch): the ledger
+    records 0, not the whole allowance."""
+    from core.agent import LuminaAgent
+    monkeypatch.setattr(LuminaAgent, "chat", lambda self, text, **kw: "ok")
+    auto, wire, _, prefs = make(wire=FakeWire([event("a" * 8, 5)]), turn=WA._default_turn)
+    auto._turn_fn = WA._default_turn
+    assert auto.drain_once() == 1
+    assert prefs.data[PREF_SPEND][0][1:] == [0, False]
+
+
+def test_run_headless_turn_attaches_the_budget_to_the_agent_that_runs_the_turn_and_clears_it(
+        real_agent_cache, monkeypatch):
+    from core.agent import LuminaAgent, TurnTokenBudget
+    headless = real_agent_cache
+    seen = []
+
+    def chat(self, text, **kw):
+        seen.append((self, self.token_budget))
+        return "ok"
+
+    monkeypatch.setattr(LuminaAgent, "chat", chat)
+    budget = TurnTokenBudget(total=1_000, max_output=100)
+    out = headless.run_headless_turn("hi", "wire-dm.lumina", False, force_tools_profile=WA.WIRE_PEER_PROFILE,
+                                     require_zero_tools=True, token_budget=budget)
+    assert out["success"] and seen[0][1] is budget
+    assert seen[0][0].token_budget is None, "removed again when the turn ends"
+    out = headless.run_headless_turn("hi", "wire-dm.other", False, force_tools_profile=WA.WIRE_PEER_PROFILE,
+                                     require_zero_tools=True)
+    assert out["success"] and seen[1][1] is None, "every caller that passes no budget is untouched"
+
+
+def test_the_ledger_is_charged_the_larger_of_reported_usage_and_the_budgets_accounting(
+        real_agent_cache, monkeypatch):
+    """A call whose usage never arrived counts at its worst case, so a backend that
+    under-reports cannot hide spend from the hourly/daily cap."""
+    from core.agent import LuminaAgent, TurnTokenBudget
+    messages = [{"role": "user", "content": "x" * 300}]
+
+    def chat(self, text, **kw):
+        self.token_budget.authorize(messages, None, 25_000)  # sent; its usage never comes back
+        self.on_token_usage({"total_tokens": 10})
+        return "ok"
+
+    monkeypatch.setattr(LuminaAgent, "chat", chat)
+    auto, wire, _, prefs = make(wire=FakeWire([event("a" * 8, 5)]), turn=WA._default_turn)
+    auto._turn_fn = WA._default_turn
+    assert auto.drain_once() == 1
+    worst_case = TurnTokenBudget(1, 1)._estimate_input(messages, None) + WA.WIRE_MAX_OUTPUT_TOKENS
+    assert prefs.data[PREF_SPEND][0][1:] == [worst_case, False]
+    assert worst_case > 10
+
+
+def test_only_the_wire_responder_ever_hands_an_agent_a_turn_token_budget():
+    """Ordinary owner, Telegram and Discord turns must be untouched: the only caller that
+    passes a TurnTokenBudget is the Wire responder's own turn, and the only non-None
+    assignment of ``token_budget`` is the lock-protected one in run_headless_turn."""
+    assigned, passed = set(), set()
+    roots = [REPO_ROOT / name for name in ("core", "comms", "ui", "tools")]
+    paths = [path for root in roots for path in root.rglob("*.py")] + list(REPO_ROOT.glob("*.py"))
+    for path in paths:
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets, value = [node.target], node.value
+            for target in targets:
+                if (isinstance(target, ast.Attribute) and target.attr == "token_budget"
+                        and not (isinstance(value, ast.Constant) and value.value is None)):
+                    assigned.add(rel)
+            if isinstance(node, ast.Call):
+                if (isinstance(node.func, ast.Name) and node.func.id == "setattr" and len(node.args) >= 2
+                        and isinstance(node.args[1], ast.Constant) and node.args[1].value == "token_budget"):
+                    assigned.add(rel)
+                if any(kw.arg == "token_budget" for kw in node.keywords):
+                    passed.add(rel)
+    assert assigned == {"core/headless.py"}, assigned
+    assert passed == {"comms/wire_autonomy.py"}, passed
+
+
 def test_the_wire_peer_profile_really_resolves_to_an_empty_set():
     from core.tool_profiles import find_profile_by_name, resolve_enabled_set
     assert find_profile_by_name(WA.WIRE_PEER_PROFILE) is not None
@@ -1109,7 +1214,7 @@ def test_pings_queued_while_lumina_was_offline_are_answered_after_activation_onl
 
 @needs_relay
 def test_spend_cap_holds_the_second_ping_queued_not_dropped(relay):
-    prefs = FakePrefs(**{PREF_ENABLED: True, WA.PREF_TOKENS_PER_HOUR: 16_000})
+    prefs = FakePrefs(**{PREF_ENABLED: True, WA.PREF_TOKENS_PER_HOUR: WA.TURN_TOKEN_BUDGET + 2_000})
     with Live(relay, turn=Script("ok", tokens=9_000), prefs=prefs) as live:
         a = relay.tech_post("@lumina one")
         wait_for(lambda: relay.lumina_reply_to(a["id"]))
@@ -1542,18 +1647,33 @@ def test_a_non_wire_error_from_finish_is_logged_not_raised():
     assert auto.drain_once() == 1  # the drain survives; the lease lapse settles the event
 
 
-def test_a_closed_gate_is_logged_once_per_change_with_the_numbers(monkeypatch):
-    import config
-    monkeypatch.setattr(config, "RESPONSE_RESERVE_TOKENS", 25_000)  # Lumina Prime's own setting
+def test_a_closed_gate_is_logged_once_per_change_with_the_numbers():
     lines = []
-    prefs = FakePrefs(**{PREF_ENABLED: True, PREF_WATERMARK: 0})
+    prefs = FakePrefs(**{PREF_ENABLED: True, PREF_WATERMARK: 0, WA.PREF_TOKENS_PER_HOUR: 9_000})
     auto = WireAutonomy(client=FakeWire([event("a" * 8, 5)]), turn_fn=Script(), prefs=prefs,
                         is_busy=lambda: False, log=lines.append)
     assert auto.drain_once() == 0 and auto.drain_once() == 0
     held = [line for line in lines if line.startswith("holding events: budget")]
     assert len(held) == 1, lines
-    assert "needs 33000 tokens" in held[0] and "response reserve" in held[0]
+    assert f"needs {WA.TURN_TOKEN_BUDGET} tokens of headroom and 9000 are left" in held[0]
+    assert "reserve" not in held[0], "the general response reserve plays no part in admission"
     assert auto.last_gate == "budget"
+
+
+def test_the_owners_general_response_reserve_no_longer_closes_the_gate(monkeypatch):
+    """Lumina Prime sets response_reserve_tokens=25000. Before the Wire turn had its
+    own bounded allowance that made admission need 33,000 tokens against the default
+    30,000/hour cap, so no turn could ever start."""
+    import config
+    monkeypatch.setattr(config, "RESPONSE_RESERVE_TOKENS", 25_000)
+    auto, wire, turn, _ = make(wire=FakeWire([event("a" * 8, 5)]))  # default 30k/h, 120k/day caps
+    assert WA.DEFAULT_TOKENS_PER_HOUR == 30_000 and WA.DEFAULT_TOKENS_PER_DAY == 120_000
+    assert auto.drain_once() == 1 and len(turn.calls) == 1
+    assert auto.last_gate is None
+
+
+def test_the_turn_allowance_is_inside_the_default_hourly_and_daily_caps():
+    assert WA.TURN_TOKEN_BUDGET < WA.DEFAULT_TOKENS_PER_HOUR < WA.DEFAULT_TOKENS_PER_DAY
 
 
 def test_the_notice_tells_the_owner_turn_not_to_fetch_the_messages():

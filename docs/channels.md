@@ -166,18 +166,33 @@ What a conversation turn is allowed to do:
   turns per reply chain per seat. Lumina adds a **token budget**
   measured from what the provider actually reports: 30,000 tokens an hour and
   120,000 a day by default (prefs `wire_autonomy_tokens_per_hour` /
-  `wire_autonomy_tokens_per_day`). A turn only starts if the budget has room
-  for a full-size prompt (12,000 characters ≈ 4,000 tokens), the response
-  reserve (`response_reserve_tokens`, the same setting that caps your own
-  turns) and 4,000 tokens for the system prompt; otherwise the message waits.
-  A response reserve above about 22,000 tokens therefore needs the caps
-  raised above the 30,000 default, or no Wire turn will ever start; Lumina
-  logs `holding events: budget` with the numbers when that happens. A turn
-  makes two provider calls (the work call and the agent's completion check)
-  and can overshoot its reserve, but never two turns in a row: only one Wire
-  turn runs at a time, even if you switch the setting off and on while one is
-  still running. Each turn starts from a fresh agent, so nothing from an
-  earlier peer's turn carries over.
+  `wire_autonomy_tokens_per_day`).
+- **A Wire turn has its own hard token allowance**, separate from your
+  general `response_reserve_tokens` (which still governs your own turns and is
+  never used for, or widened by, a Wire turn). Every model call a Wire turn
+  makes is sent with at most 1,024 completion tokens, and a turn may spend at
+  most about 20,000 tokens in total (two calls — the work call and the agent's
+  completion check — each with a full-size prompt, plus the check's own
+  overhead). Before each call the turn checks its estimated prompt plus that
+  output cap against what is left of its allowance; a call that no longer fits
+  is refused and not sent, and the event is recorded as failed. The first call
+  must also leave room for its completion check, so a turn that could not be
+  finished is not started. A turn only starts if the hour and day budgets have
+  that much room; otherwise the message waits, and Lumina logs
+  `holding events: budget` with the numbers.
+  What is a hard limit and what is not: the 1,024-token output cap is sent to
+  the provider, which stops there (a backend that sends no output limit, such as
+  the ChatGPT Plan backend, is refused for Wire turns instead of running
+  uncapped). An answer the cap cuts off is a failed turn, never a truncated
+  reply. The size of the prompt is only an estimate (about three bytes a token
+  for plain text, one token per byte for anything else), so unusually
+  token-dense text can make a real turn pass its allowance by up to the size of
+  that prompt, which is itself limited to 12,000 characters. The spend caps are
+  charged what the provider actually reports; if a call reports nothing, that
+  call is charged at its worst case, and a turn that sent no request is charged
+  nothing. Only one Wire turn runs at a time, even if you switch the setting
+  off and on while one is still running. Each turn starts from a fresh agent,
+  so nothing from an earlier peer's turn carries over.
 - If you switch Wire conversations off or hit the emergency stop at the very
   moment a message has just been picked up, that message is recorded as
   declined and is not retried; messages that had not been picked up yet stay

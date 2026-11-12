@@ -289,7 +289,8 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
                        trace: bool = False,
                        approval_event_id: str = None,
                        suspension_token=None,
-                       require_zero_tools: bool = False) -> dict:
+                       require_zero_tools: bool = False,
+                       token_budget=None) -> dict:
     """Never raises — a bot listener should always get something to relay
     back, even on failure.
 
@@ -299,6 +300,12 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
     is refused if any still is enabled. A tool profile is an owner-editable
     file (the Tools tab can save over it, or shadow it with a same-named
     profile), so for peer-driven turns "zero tools" must not depend on it.
+
+    token_budget (WIRE-AUTONOMY-01): a core.agent.TurnTokenBudget attached, inside
+    the channel's turn lock, to the very agent that runs this turn (not to a
+    separately fetched object) and removed again afterwards. Every provider call
+    of the turn is then capped and refused against it. None (every other caller)
+    leaves the agent exactly as before.
 
     suspension_token (AGENT-RUNAWAY-SUSPEND-01): the token the caller
     captured where the work was created, before its asynchronous handoff
@@ -368,6 +375,8 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
 
             agent.on_tool_call = _capture_call
             agent.on_tool_result = _capture_result
+            if token_budget is not None:
+                agent.token_budget = token_budget
             try:
                 # REDDIT-INGRESS-AUTHORITY-01: the cached agent's immutable
                 # authority owns provenance, not this call's requested owner
@@ -408,6 +417,8 @@ def run_headless_turn(task: str, channel_id: str, owner: bool,
             finally:
                 agent.on_tool_call = previous_on_tool_call
                 agent.on_tool_result = previous_on_tool_result
+                if token_budget is not None:
+                    agent.token_budget = None
 
         outcome = getattr(agent, "_turn_outcome", None)
         if outcome in STOP_OUTCOMES:

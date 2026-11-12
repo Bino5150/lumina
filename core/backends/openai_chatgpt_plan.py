@@ -305,6 +305,10 @@ class ChatGPTPlanBackend(OpenAIBackend):
     default_url = "https://api.openai.com/v1"
     endpoint_configurable = False
     supports_required_tool_choice = False
+    # WIRE-AUTONOMY-01 -- this backend sends no output limit (see
+    # _apply_output_token_limit), so a turn that depends on a hard completion
+    # cap (core.agent.TurnTokenBudget) is refused on it rather than uncapped.
+    enforces_output_token_limit = False
     KNOWN_MODELS = ()
 
     def __init__(self, base_url: Optional[str] = None, manager=None):
