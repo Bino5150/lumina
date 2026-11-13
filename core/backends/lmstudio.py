@@ -702,9 +702,9 @@ class LMStudioBackend(BaseLLMBackend):
             if not line:
                 continue
             line = line.decode("utf-8")
-            if not line.startswith("data: "):
+            if not line.startswith("data:"):
                 continue
-            data = line[6:]
+            data = line[5:].removeprefix(" ")
             if data == "[DONE]":
                 break
             try:
@@ -923,8 +923,8 @@ class LMStudioBackend(BaseLLMBackend):
             if not line:
                 continue
             line = line.decode("utf-8")
-            if line.startswith("data: "):
-                data = line[6:]
+            if line.startswith("data:"):
+                data = line[5:].removeprefix(" ")
                 if data == "[DONE]":
                     break
                 try:
