@@ -3,7 +3,7 @@ scrubbing, resource limits."""
 import os
 import time
 import pytest
-from tools.sandbox import register_sandbox_tools
+from tools import sandbox
 
 
 class _CapturingRegistry:
@@ -16,10 +16,9 @@ class _CapturingRegistry:
 
 @pytest.fixture
 def run_python(tmp_path, monkeypatch):
-    import config
-    monkeypatch.setattr(config, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(sandbox, "SANDBOX_CWD", str(tmp_path / "sandbox_tmp"))
     reg = _CapturingRegistry()
-    register_sandbox_tools(reg)
+    sandbox.register_sandbox_tools(reg)
     return reg.fns["run_python"]
 
 

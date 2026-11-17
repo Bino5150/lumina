@@ -8,6 +8,14 @@ import threading
 
 NAMESPACES = ("user", "pid", "mnt", "net", "ipc", "uts")
 SCREENSHOTS = "/work/memory/browser_screenshots"
+PASSWD = "/etc/passwd"
+EVAL_ROOT = "/work/eval"
+EVAL_FILES = ("run_eval.py", "score_eval.py", "scratch_dir.py", "tasks.json")
+EVAL_TMPFS_BYTES = 16 * 1024**2
+
+
+def private_passwd():
+    return f"lumina-test:x:{os.getuid()}:{os.getgid()}:Lumina test user:/h:/bin/bash\n"
 
 
 def namespace_ids():
@@ -43,10 +51,23 @@ def verify_namespace(expected):
         raise RuntimeError("namespace retained privileges")
     if Path.cwd() != Path("/work") or Path.home() != Path("/h"):
         raise RuntimeError("private workspace or HOME differs")
-    for path in ("/", "/work", "/controls", "/sys/fs/cgroup"):
+    for path in ("/", "/work", "/controls", "/sys/fs/cgroup", PASSWD):
         if "ro" not in mounts[path][0]:
             raise RuntimeError(f"required mount is writable: {path}")
-    for path in ("/h", "/tmp", "/dev/shm", SCREENSHOTS):
+    if Path(PASSWD).read_text(encoding="ascii") != private_passwd():
+        raise RuntimeError("private workload identity differs")
+    private_mounts = ("/h", "/tmp", "/dev/shm", SCREENSHOTS)
+    eval_mounts = ()
+    if expected.get("eval_scratch"):
+        private_mounts += (EVAL_ROOT,)
+        eval_mounts = (EVAL_ROOT, *(f"{EVAL_ROOT}/{name}" for name in EVAL_FILES))
+        stats = os.statvfs(EVAL_ROOT)
+        if (stats.f_blocks * stats.f_frsize != EVAL_TMPFS_BYTES
+                or (Path(EVAL_ROOT).stat().st_mode & 0o777) != 0o700
+                or {p.name for p in Path(EVAL_ROOT).iterdir()} != set(EVAL_FILES)
+                or any("ro" not in mounts[path][0] for path in eval_mounts[1:])):
+            raise RuntimeError("private eval scratch or read-only eval files differ")
+    for path in private_mounts:
         flags, kind = mounts[path]
         if kind != "tmpfs" or not {"rw", "nodev", "nosuid"} <= set(flags):
             raise RuntimeError(f"missing private scratch mount: {path}")
@@ -59,7 +80,7 @@ def verify_namespace(expected):
         raise RuntimeError("mount size, type or manager isolation differs")
     return {"namespaces": namespaces, "cgroup": expected["cgroup"], "mounts": {
         key: mounts[key] for key in ("/", "/work", "/controls", "/sys/fs/cgroup",
-                                    "/tmp", "/h", "/proc", "/out", SCREENSHOTS)
+                                    "/tmp", "/h", "/proc", "/out", SCREENSHOTS, PASSWD, *eval_mounts)
     }}
 
 
@@ -89,8 +110,20 @@ def sandbox(settings):
                  "--ro-bind", settings["project"], "/work",
                  "--perms", "0700", "--size", str(4 * 1024**2), "--tmpfs", SCREENSHOTS,
                  "--ro-bind", settings["controls"], "/controls",
+                 "--ro-bind", str(Path(settings["controls"]) / "passwd"), PASSWD,
                  "--ro-bind", host_cgroup, "/sys/fs/cgroup",
                  "--bind", settings["output"], "/out"))
+    if settings.get("eval_scratch"):
+        eval_source = Path(settings["project"]) / "eval"
+        if {p.name for p in eval_source.iterdir()} != set(EVAL_FILES):
+            raise RuntimeError("projected eval layout differs from the read-only file list")
+        # The real reset deletes and recreates _scratch_data beneath this parent.
+        args.extend(("--perms", "0700", "--size", str(EVAL_TMPFS_BYTES), "--tmpfs", EVAL_ROOT))
+        for name in EVAL_FILES:
+            file = eval_source / name
+            if file.is_symlink() or not file.is_file():
+                raise RuntimeError(f"invalid projected eval file: {name}")
+            args.extend(("--ro-bind", str(file), f"{EVAL_ROOT}/{name}"))
     if settings["relays"]:
         args.extend(("--ro-bind", settings["relays"], "/relays"))
     environment = {
@@ -110,7 +143,8 @@ def sandbox(settings):
                            AIVENGERS_WIRE_ATTENTION_SRC="/relays/attention")
     for name, value in environment.items():
         args.extend(("--setenv", name, value))
-    proof = {"namespaces": namespace_ids(), "cgroup": cgroup}
+    proof = {"namespaces": namespace_ids(), "cgroup": cgroup,
+             "eval_scratch": settings.get("eval_scratch", False)}
     return [*args, "--chdir", "/work", "--remount-ro", "/", "--",
             settings["python"], "-I", "-S", "-B", "/controls/boundary_child.py",
             "inside", json.dumps(proof)]

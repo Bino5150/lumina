@@ -12,10 +12,17 @@ import subprocess
 import tempfile
 
 import boundary
-from boundary_child import atomic_json
+from boundary_child import atomic_json, private_passwd
 from inventory import PROFILES, compare, groups, inventory_text, read_inventory, update_inventory
 from results import REPORT_LIMIT, read_report, reconcile
 from source import TEMPORARY_DEPENDENCY_EXCEPTIONS, project, snapshot, stage_relays
+
+EVAL_SCRATCH_TEST_FILES = {
+    "tests/test_agent_runaway_suspend_01_c1b.py",
+    "tests/test_eval_scratch_dir.py",
+    "tests/test_run_eval_persona.py",
+}
+
 
 def arguments():
     parser = argparse.ArgumentParser(prog="lumina-test", description=__doc__)
@@ -74,6 +81,7 @@ def execute_stage(root, saved, projected, relays, env, rules, entries, selected,
     try:
         controls = scratch / "controls"
         controls.mkdir()
+        (controls / "passwd").write_text(private_passwd(), encoding="ascii")
         output = scratch / "out"
         output.mkdir()
         for name in ("boundary_child.py", "pytest_entry.py"):
@@ -81,7 +89,8 @@ def execute_stage(root, saved, projected, relays, env, rules, entries, selected,
         atomic_json(controls / "pytest.json", {"targets": targets, "selection": selection, "rules": rules,
                                                "collect": collecting, "require_qt": require_qt})
         settings = {**runtime, "project": str(projected), "controls": str(controls), "output": str(output),
-                    "relays": str(relays) if relays else None, "require_qt": require_qt}
+                    "relays": str(relays) if relays else None, "require_qt": require_qt,
+                    "eval_scratch": not collecting and not EVAL_SCRATCH_TEST_FILES.isdisjoint(targets)}
         try:
             smoke = receipt["shard"] == "smoke"
             memory_mib = 768 if smoke else 1024 if collecting else 2000

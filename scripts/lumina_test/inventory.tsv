@@ -9666,10 +9666,10 @@
 028	wire	tests/test_wire_wake_adapter_01.py::TestReconnectAndCatchup::test_daemon_restart_recovery
 028	qt	tests/test_wire_wake_adapter_01.py::TestReleaseLifecycleR3::test_release_button_scoped_to_claiming_session
 028	qt	tests/test_wire_wake_adapter_01.py::TestReleaseLifecycleR3::test_release_confirmation_gate_is_invoked
-028	qt	tests/test_wire_wake_adapter_01.py::TestReleaseLifecycleR3::test_release_records_failed_with_note
+028	wire	tests/test_wire_wake_adapter_01.py::TestReleaseLifecycleR3::test_release_records_failed_with_note
 028	qt	tests/test_wire_wake_adapter_01.py::TestSafetyGates::test_claim_unreachable_from_model_facing_tools
-028	qt	tests/test_wire_wake_adapter_01.py::TestSafetyGates::test_production_isolation
-028	qt	tests/test_wire_wake_adapter_01.py::TestSafetyGates::test_token_never_logged
+028	wire	tests/test_wire_wake_adapter_01.py::TestSafetyGates::test_production_isolation
+028	wire	tests/test_wire_wake_adapter_01.py::TestSafetyGates::test_token_never_logged
 028	qt	tests/test_wire_wake_adapter_01.py::TestSafetyGates::test_zero_inference_structural
 028	wire	tests/test_wire_wake_adapter_01.py::TestSessionIdentityR2::test_protocol_rejection_invalidates_identity
 028	wire	tests/test_wire_wake_adapter_01.py::TestSessionIdentityR2::test_stale_dead_pid_sessions_cleaned_on_register
