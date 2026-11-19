@@ -73,6 +73,7 @@ from tools.aivengers_wire import (
     AivengersWireClient,
     WireError,
     WireProtocolError,
+    WireSeatQuarantinedError,
     WireUnavailableError,
 )
 
@@ -99,6 +100,11 @@ DEFAULT_WATCH_TIMEOUT_MS = 15_000
 #: back off exponentially instead of looping at ~0.6s.
 RECONNECT_MIN_SECONDS = 0.5
 RECONNECT_MAX_SECONDS = 30.0
+
+#: W-B1: while this data root may not use the Wire seat, both threads
+#: re-check at this fixed cadence (no reconnect spin, no backoff growth).
+#: The adapter refuses before any socket, so a re-check is one directory scan.
+SEAT_LOCK_RECHECK_SECONDS = 60.0
 
 #: Registration lease must always outlive several heartbeat periods; refuse
 #: misconfiguration that could let a healthy listener expire silently.
@@ -145,7 +151,8 @@ class WireSignals(QObject):
 
     #: A wake/task-relevant event or catch-up snapshot row arrived.
     wake_event = Signal(object)
-    #: Connection lifecycle: "connecting" | "listening" | "disconnected" | "offline".
+    #: Connection lifecycle: "connecting" | "listening" | "disconnected" | "offline"
+    #: | "locked" (W-B1: this data root may not use the Wire seat).
     connection_state = Signal(str)
     #: Current session record (dict) or None when unregistered/expired.
     session_state = Signal(object)
@@ -205,6 +212,10 @@ class WireWakeListener:
         #: session is registered or after a connection loss, cleared once
         #: walked. Routine watch-timeout resubscribes do NOT re-walk.
         self._catchup_needed = threading.Event()
+        #: W-B1: shared by the watch and heartbeat threads so "locked" is
+        #: reported once per state change, not once per thread or cycle.
+        self._seat_locked = threading.Event()
+        self._seat_lock_mutex = threading.Lock()
         #: R2: wake_ids this listener has surfaced in a non-terminal state.
         #: Refreshed via wake_status on each resubscribe cycle so terminal
         #: transitions that happen between catch-ups (operator cancellation,
@@ -332,6 +343,8 @@ class WireWakeListener:
                         self._client.unregister_session(stale["session_id"])
                     except WireError:
                         pass
+        except WireSeatQuarantinedError:
+            raise  # W-B1: not a sweep problem; the watch loop reports the lock once
         except WireError as exc:
             print(
                 f"[WIRE] stale-session sweep skipped: "
@@ -406,6 +419,7 @@ class WireWakeListener:
         while not self._stop.is_set():
             try:
                 session = self._ensure_session()
+                self._leave_seat_lock()
                 self.signals.connection_state.emit("listening")
                 if self._catchup_needed.is_set():
                     # R3/R2-4 (Sonnet): clear ONLY after the walk succeeded —
@@ -451,6 +465,13 @@ class WireWakeListener:
                 # Clean end (timeout/overflow): brief pause, then resubscribe
                 # with the SAME session (no churn, no catch-up re-walk).
                 self._sleep_or_stop(0.05)
+            except WireSeatQuarantinedError as exc:
+                # W-B1: not a relay outage. No "disconnected", no catch-up
+                # re-arm, no backoff growth: report once, re-check slowly.
+                if self._stop.is_set():
+                    return
+                self._enter_seat_lock(exc)
+                self._sleep_or_stop(SEAT_LOCK_RECHECK_SECONDS)
             except WireError as exc:
                 if self._stop.is_set():
                     return
@@ -571,7 +592,9 @@ class WireWakeListener:
         traffic. A quiet Wire must not silently expire Lumina's session: this
         thread fires on a clock, not on events."""
         while not self._stop.is_set():
-            if self._stop.wait(timeout=self._heartbeat_seconds):
+            wait = (SEAT_LOCK_RECHECK_SECONDS if self._seat_locked.is_set()
+                    else self._heartbeat_seconds)
+            if self._stop.wait(timeout=wait):
                 return
             session_id = self.session_id
             if session_id is None:
@@ -579,6 +602,8 @@ class WireWakeListener:
             try:
                 session = self._client.heartbeat_session(session_id)
                 self.signals.session_state.emit(session)
+            except WireSeatQuarantinedError as exc:
+                self._enter_seat_lock(exc)
             except WireUnavailableError:
                 continue  # relay down; watch loop owns reconnection
             except WireError as exc:
@@ -698,6 +723,24 @@ class WireWakeListener:
         thread.start()
 
     # ── helpers ───────────────────────────────────────────────────────────
+
+    def _enter_seat_lock(self, exc: WireSeatQuarantinedError) -> None:
+        """Report the W-B1 seat lock once per state change (either thread)."""
+        with self._seat_lock_mutex:
+            if self._seat_locked.is_set():
+                return
+            self._seat_locked.set()
+        self.signals.connection_state.emit("locked")
+        print(f"[WIRE] Wire seat locked ({_sanitize_log(str(exc.reason))}); "
+              f"re-checking every {SEAT_LOCK_RECHECK_SECONDS:g}s", flush=True)
+
+    def _leave_seat_lock(self) -> None:
+        """The seat is usable again: one catch-up walk, exactly once."""
+        with self._seat_lock_mutex:
+            if not self._seat_locked.is_set():
+                return
+            self._seat_locked.clear()
+        self._catchup_needed.set()
 
     def _sleep_or_stop(self, seconds: float) -> None:
         """Sleep in small slices so shutdown stays bounded even mid-backoff."""

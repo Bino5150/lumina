@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
-from core import persistence
+from core import persistence, wire_seat_gate
 
 from ._widgets import _sec, _lbl, _te, _le, _btn, make_round_pixmap, _scroll_wrap, ButtonFeedback, safe_error_detail
 
@@ -380,6 +380,8 @@ class CommunicationsTab(QWidget):
         start/stop (bounded shutdown, no UI wait on Wire traffic).
         """
         enabled = not bool(self._prefs.get("wire_wake_listener", False))
+        if enabled and self._wire_seat_refused(self.wire_wake_status, self.wire_wake_toggle):
+            return  # W-B1: nothing persisted, nothing emitted
         persistence.update({"wire_wake_listener": enabled})
         self._prefs = persistence.load()
         self.wire_wake_toggle_changed.emit(enabled)
@@ -392,16 +394,32 @@ class CommunicationsTab(QWidget):
         consumer and records the activation watermark on enable.
         """
         enabled = not bool(self._prefs.get("wire_autonomy", False))
+        if enabled and self._wire_seat_refused(self.wire_autonomy_status, self.wire_autonomy_toggle):
+            return  # W-B1: nothing persisted, nothing emitted
         persistence.update({"wire_autonomy": enabled})
         self._prefs = persistence.load()
         self.wire_autonomy_toggle_changed.emit(enabled)
         self._refresh_wire_autonomy_status()
 
+    @staticmethod
+    def _wire_seat_refused(status_label, toggle) -> bool:
+        """W-B1: True (and the label shows why) when this data root may not
+        use the Wire seat. Turning a Wire feature OFF never asks."""
+        verdict = wire_seat_gate.process_seat_verdict()
+        if verdict.allowed:
+            toggle.setEnabled(True)
+            return False
+        status_label.setText(wire_seat_gate.describe(verdict))
+        toggle.setText("Turn on")
+        toggle.setEnabled(False)
+        return True
+
     def _refresh_wire_autonomy_status(self) -> None:
         if bool(self._prefs.get("wire_autonomy", False)):
             self.wire_autonomy_status.setText("Wire conversations: ON")
             self.wire_autonomy_toggle.setText("Turn off")
-        else:
+            self.wire_autonomy_toggle.setEnabled(True)
+        elif not self._wire_seat_refused(self.wire_autonomy_status, self.wire_autonomy_toggle):
             self.wire_autonomy_status.setText("Wire conversations: off")
             self.wire_autonomy_toggle.setText("Turn on")
 
@@ -410,7 +428,8 @@ class CommunicationsTab(QWidget):
         if enabled:
             self.wire_wake_status.setText("Wire wake listener: ON")
             self.wire_wake_toggle.setText("Turn off")
-        else:
+            self.wire_wake_toggle.setEnabled(True)
+        elif not self._wire_seat_refused(self.wire_wake_status, self.wire_wake_toggle):
             self.wire_wake_status.setText("Wire wake listener: off")
             self.wire_wake_toggle.setText("Turn on")
 

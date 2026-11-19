@@ -42,6 +42,7 @@ from comms.wire_autonomy import (
     build_unread_digest,
 )
 from tools.aivengers_wire import AivengersWireClient
+from core import wire_seat_gate
 from core import emergency_stop
 from core import suspension, suspension_runtime
 from core import turn_recovery
@@ -765,9 +766,12 @@ class LuminaWindow(QMainWindow):
         """Start the W1 Wire wake listener and wire its signals (GUI thread)."""
         if self._wire_listener is not None:
             return  # single listener per GUI process; duplicates are defects
+        if not self._wire_seat_allowed():
+            return  # W-B1: this data root may not use the Wire seat
         listener = WireWakeListener()
         self._wire_listener = listener
         listener.signals.connection_state.connect(self.wire_panel.set_connection_state)
+        listener.signals.connection_state.connect(self._on_wire_seat_state)
         listener.signals.session_state.connect(self._on_wire_session_state)
         listener.signals.wake_event.connect(self._on_wire_wake_event)
         listener.signals.wake_action_result.connect(self.wire_panel.apply_action_result)
@@ -775,6 +779,27 @@ class LuminaWindow(QMainWindow):
         self.wire_panel.claim_requested.connect(listener.claim_wake)
         self.wire_panel.release_requested.connect(listener.release_task)
         listener.start()
+
+    def _wire_seat_allowed(self) -> bool:
+        """W-B1: may this data root use the Wire seat? When not, the Wire
+        panel shows "locked" with the plain reason and nothing is started.
+        Consulted at the top of _start_wire_listener/_start_wire_autonomy,
+        which every start path (startup, both toggles) goes through and
+        which are never reached under LUMINA_TESTING; the adapter refuses on
+        its own regardless."""
+        verdict = wire_seat_gate.process_seat_verdict()
+        if verdict.allowed:
+            return True
+        self.wire_panel.set_lock_reason(wire_seat_gate.describe(verdict))
+        self.wire_panel.set_connection_state("locked")
+        print(f"[WIRE] Wire seat locked ({verdict.reason}); Wire features not started", flush=True)
+        return False
+
+    def _on_wire_seat_state(self, state: str) -> None:
+        """A running listener reported the seat lock: show the reason."""
+        if state == "locked":
+            self.wire_panel.set_lock_reason(
+                wire_seat_gate.describe(wire_seat_gate.process_seat_verdict()))
 
     def _set_wire_wake_enabled(self, enabled: bool) -> None:
         """Settings-toggle handler: live start/stop of the W1 listener.
@@ -816,6 +841,8 @@ class LuminaWindow(QMainWindow):
     def _start_wire_autonomy(self, *, fresh: bool) -> None:
         if self._wire_autonomy is not None:
             return  # one consumer per process; duplicates are defects
+        if not self._wire_seat_allowed():
+            return  # W-B1: this data root may not use the Wire seat
         autonomy = WireAutonomy(is_busy=self._wire_agent_busy)
         if fresh or autonomy.watermark() is None:
             # GUI thread: a short per-round timeout so a dead relay cannot

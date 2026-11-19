@@ -89,6 +89,7 @@ _CONNECTION_LABELS = {
     "disconnected": "disconnected — retrying",
     "offline": "offline",
     "off": "off",
+    "locked": "Wire seat locked",
 }
 
 
@@ -398,6 +399,8 @@ class WireWakePanel(QWidget):
         self._session: dict[str, Any] | None = None
         self._connection = "connecting"
         self._admission_note = ""
+        #: W-B1: plain reason text shown while the connection state is "locked".
+        self._lock_reason = ""
 
         self.setStyleSheet(
             f"WireWakePanel {{ background: {colors['bg_panel']}; "
@@ -465,8 +468,14 @@ class WireWakePanel(QWidget):
             "disconnected": self._colors["danger"],
             "offline": self._colors["text_dim"],
             "off": self._colors["text_dim"],
+            "locked": self._colors["danger"],
         }.get(state, self._colors["text_muted"])
         self._dot.setStyleSheet(f"color: {dot_color};")
+        self._refresh_strip()
+
+    def set_lock_reason(self, text: str) -> None:
+        """W-B1: why the Wire seat is locked (plain text; shown only while locked)."""
+        self._lock_reason = str(text or "")
         self._refresh_strip()
 
     def set_session(self, session: dict[str, Any] | None) -> None:
@@ -569,7 +578,9 @@ class WireWakePanel(QWidget):
         pending = self._pending_count()
         pending_bit = f" · {pending} pending" if pending else ""
         admission = f" · {self._admission_note}" if self._admission_note else ""
-        self._summary.setText(f"{conn}{session_bit}{pending_bit}{admission}")
+        lock = (f" · {self._lock_reason}"
+                if self._connection == "locked" and self._lock_reason else "")
+        self._summary.setText(f"{conn}{lock}{session_bit}{pending_bit}{admission}")
         self._summary.setTextFormat(Qt.TextFormat.PlainText)
 
     def _insert_row(self, wake_id: str, wake: dict[str, Any]) -> None:

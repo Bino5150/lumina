@@ -65,6 +65,7 @@ from tools.aivengers_wire import (
     AivengersWireClient,
     WireError,
     WireProtocolError,
+    WireSeatQuarantinedError,
     WireUnavailableError,
 )
 
@@ -132,6 +133,9 @@ LEASE_MARGIN_SECONDS = 15
 WATCH_TIMEOUT_MS = 10_000
 RECONNECT_MIN_SECONDS = 0.5
 RECONNECT_MAX_SECONDS = 30.0
+#: W-B1: fixed re-check cadence while this data root may not use the Wire
+#: seat (the adapter refuses before any socket; a re-check is one dir scan).
+SEAT_LOCK_RECHECK_SECONDS = 60.0
 MAX_NOTE_CHARS = 160
 
 PEER_PREAMBLE = (
@@ -487,6 +491,8 @@ class WireAutonomy:
         self._thread: threading.Thread | None = None
         self._retry_at = 0.0
         self._started = False
+        #: W-B1: this data root may not use the Wire seat (logged once per change).
+        self._seat_locked = False
         #: Why the last drain declined to run a turn (for tests and the log).
         self.last_gate: str | None = None
         self._gate_detail = ""
@@ -872,11 +878,26 @@ class WireAutonomy:
                     if self._stop.is_set():
                         return
                     backoff = RECONNECT_MIN_SECONDS
+                    if self._seat_locked:
+                        self._seat_locked = False
+                        self._log("Wire seat available again")
                     kind = frame.get("event")
                     if kind == "subscribed":
                         self._adopt_watermark(frame)
                     if kind in ("subscribed", "attention", "timeout"):
                         self.drain_once()
+            except WireSeatQuarantinedError as exc:
+                # W-B1: not an outage. Log once, re-check at a fixed slow
+                # cadence; no backoff growth and no socket while locked.
+                if self._stop.is_set():
+                    return
+                if not self._seat_locked:
+                    self._seat_locked = True
+                    self._log(f"Wire seat locked ({_clean(exc.reason)}); "
+                              f"re-checking every {SEAT_LOCK_RECHECK_SECONDS:g}s")
+                if self._stop.wait(SEAT_LOCK_RECHECK_SECONDS):
+                    return
+                continue
             except WireUnavailableError:
                 pass  # relay down: wait and retry quietly
             except WireError as exc:

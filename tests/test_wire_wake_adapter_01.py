@@ -1997,6 +1997,9 @@ class TestWindowWiringR3:
             "PROJECT_BINDINGS_DIR", str(tmp_path / "bindings"),
         )
         monkeypatch.setattr(config_mod, "DATA_DIR", str(tmp_path / "data"))
+        # W-B1 (disclosed adaptation): the Wire seat gate requires LUMINA_DATA_DIR
+        # and config.DATA_DIR to agree, as they always do in a real launch.
+        monkeypatch.setenv("LUMINA_DATA_DIR", str(tmp_path / "data"))
         monkeypatch.setattr(
             config_mod, "DB_PATH", str(tmp_path / "data" / "memory" / "lumina.db")
         )

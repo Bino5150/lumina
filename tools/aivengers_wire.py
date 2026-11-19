@@ -41,6 +41,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from core import wire_seat_gate
+
 __all__ = [
     "AivengersWireClient",
     "DEFAULT_CHANNEL",
@@ -48,6 +50,7 @@ __all__ = [
     "WireError",
     "WireFrameError",
     "WireProtocolError",
+    "WireSeatQuarantinedError",
     "WireUnavailableError",
     "default_state_dir",
 ]
@@ -92,6 +95,23 @@ class WireError(Exception):
 
 class WireUnavailableError(WireError):
     """The relay could not be reached (offline, missing socket, timeout)."""
+
+
+class WireSeatQuarantinedError(WireUnavailableError):
+    """This data root may not use the Wire seat (W-B1).
+
+    Raised before any token read or socket: a restored copy whose seat has
+    not been released by the owner, or a root whose evidence cannot be
+    checked. Subclasses :class:`WireUnavailableError`, so every existing
+    "Wire offline" handler stays fail-safe; ``reason`` is the stable code
+    from :mod:`core.wire_seat_gate`.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(
+            f"Wire seat locked ({reason}): this data root may not use the {SEAT} seat"
+        )
 
 
 class WireProtocolError(WireError):
@@ -187,7 +207,23 @@ class AivengersWireClient:
 
     # ── transport ─────────────────────────────────────────────────────────
 
+    def _gate(self) -> None:
+        """W-B1 seat quarantine: refuse before any token read or socket.
+
+        Evaluated on every call, for this process's data root; there is no
+        parameter, attribute or environment switch that skips it. Anything
+        unexpected refuses.
+        """
+        try:
+            verdict = wire_seat_gate.process_seat_verdict()
+            allowed, reason = verdict.allowed is True, verdict.reason
+        except Exception:
+            allowed, reason = False, wire_seat_gate.GATE_ERROR
+        if not allowed:
+            raise WireSeatQuarantinedError(str(reason))
+
     def _load_token(self) -> str:
+        self._gate()
         try:
             token = self.token_path.read_text(encoding="utf-8").strip()
         except OSError as exc:
@@ -199,6 +235,7 @@ class AivengersWireClient:
         return token
 
     def _connect(self) -> socket.socket:
+        self._gate()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self._timeout)
         try:
@@ -317,6 +354,7 @@ class AivengersWireClient:
     @contextmanager
     def _session(self) -> Iterator[socket.socket]:
         """Open an authenticated connection; always close it on exit."""
+        self._gate()
         sock = self._connect()
         self._track_socket(sock)
         try:
@@ -933,6 +971,7 @@ class AivengersWireClient:
         that session's watcher, and queued seat wakes replay immediately
         after the ack as ``wake`` frames. Events never advance cursors.
         """
+        self._gate()
         if channels is not None:
             if not channels:
                 raise WireError("channels must be a non-empty list when filtering")
