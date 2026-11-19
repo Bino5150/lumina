@@ -30,6 +30,7 @@ import copy
 import hashlib
 import io
 import os
+import re
 import stat
 import struct
 import unicodedata
@@ -68,8 +69,26 @@ REFUSALS = frozenset({
     "ARCHIVE_NAMESPACE_INVALID",
     "ARCHIVE_UNDECLARED_MEMBER",
     "ARCHIVE_INTEGRITY_FAILED",    # verifier failed and no member damage explains it
+    "ARCHIVE_SIDE_COPY_MEMBER",    # owner decision D2: a ".bak" side copy in a manifest archive
     "LEGACY_LAYOUT_UNRECOGNIZED",
 })
+
+# Owner decision D2 (2026-11-18): an owner side copy ("<name>.bak", ".bak_x",
+# ".bak.1", ".bak~", ".bak-x", any case) must never enter a Verified or
+# Selective recovery, where it could carry preferences or a database past the
+# filters. Every canonical member name of format 1, 2.0 and 2.1 is outside
+# this pattern, so no archive those formats can validly hold is affected.
+# Overlay and custom-tool names are install content with their own rules
+# and are not matched. Legacy Recovery keeps its existing handling: a side
+# copy there is counted as unclassified and never offered or restored.
+_SIDE_COPY_LEAF = re.compile(r"\.bak(?:[_.~-]|$)", re.IGNORECASE)
+_SIDE_COPY_EXEMPT = ("overlay/", "state/custom_tools/", "custom_tools/", "projects/")
+
+
+def is_side_copy_member(path):
+    """True for a D2 side-copy name in a data-root state namespace."""
+    return (type(path) is str and not path.startswith(_SIDE_COPY_EXEMPT)
+            and bool(_SIDE_COPY_LEAF.search(path.rsplit("/", 1)[-1])))
 
 # Prerequisites a future activation slice must satisfy; listed in every
 # preview so no caller can read a preview as permission to proceed.
@@ -93,6 +112,9 @@ _UNIT_POLICY = {
     "primary_database": ("recover", "Chats, messages, memories, Palace, Knowledge Base and the Skills "
                                     "index, as one coherent database"),
     "flight_recorder": ("recover", "Flight Recorder telemetry history"),
+    "generation_artifacts": ("recover", "Generated images and their manifests, each hash-checked against "
+                                        "its database row; image paths are rebound to the restored "
+                                        "folder, never to the source"),
     "preferences": ("recover", "Portable preference content only; security and credential fields are dropped"),
     "skills": ("recover", "Skill Markdown files with their index rows"),
     "personas": ("recover", "Persona files"),
@@ -113,13 +135,14 @@ _UNIT_POLICY = {
 }
 
 # Members that need the primary database to mean anything once restored.
-_NEEDS_PRIMARY_DB = ("overlay.skills.",)
+_NEEDS_PRIMARY_DB = ("overlay.skills.", "state.artifacts.generation.")
 
 # Destination targets, relative to the data folder ("data") or install
 # folder ("base"). Only lstat is ever applied to them.
 _DATA_TARGETS = {
     "primary_database": ["memory/lumina.db"],
     "flight_recorder": ["telemetry/flight_recorder.db"],
+    "generation_artifacts": ["artifacts/generation"],
     "preferences": ["memory/prefs.json"],
     "knowledge_pack_installation": ["knowledge_packs_installed.json"],
     "audit_and_pending_actions": ["memory/tool_audit.log", "memory/pending_actions.json",
@@ -268,6 +291,8 @@ def _unit_of(logical_id):
         return fixed[logical_id]
     if logical_id.startswith("state.custom_tools."):
         return "custom_tools"
+    if abx.generation_member_kind(logical_id):
+        return "generation_artifacts"
     if logical_id.startswith("state.audit."):
         return "audit_and_pending_actions"
     for family in ("skills", "personas", "avatars", "voices", "tool_profiles"):
@@ -319,11 +344,13 @@ def _prefs_note(raw):
     if raw is None:
         return {}
     try:
-        _clean, omitted, unknown = abx._scrub_preferences(raw)
+        _clean, counts = abx._scrub_preferences_counts(raw)
     except ab.AgentBackupError:
         return {"availability_override": "unavailable", "prefs_policy": "types_invalid"}
-    return {"security_fields_dropped": omitted - unknown, "unclassified_keys_omitted": unknown,
-            "telegram_remote_access": "forced_off"}
+    return {"security_fields_dropped": counts["omitted"] - counts["unclassified"] - counts["destination_local"],
+            "unclassified_keys_omitted": counts["unclassified"],
+            "installation_local_keys_omitted": counts["destination_local"],
+            "telegram_remote_access": "forced_off", "wire_autonomy_and_wake": "absent_off"}
 
 
 def _apply_overrides(units):
@@ -384,6 +411,10 @@ def _intake_manifest_archive(raw, z, infos):
     report = (ab.verify_agent_backup(io.BytesIO(raw), resident_bytes_hint=len(raw)) if v1
               else abx.verify_export(io.BytesIO(raw), resident_bytes_hint=len(raw)))
     names = {i.filename for i in infos} - {"manifest.json"}
+    declared = [m.get("archive_path") for m in manifest.get("members", [])
+                if type(m) is dict] if type(manifest) is dict and type(manifest.get("members")) is list else []
+    if any(is_side_copy_member(n) for n in list(names) + declared):
+        raise _Refused("ARCHIVE_SIDE_COPY_MEMBER")
     if not report["valid"]:
         # Selective recovery needs an intact manifest, the canonical physical
         # layout and namespace; any doubt there rejects the whole archive.
@@ -393,7 +424,8 @@ def _intake_manifest_archive(raw, z, infos):
         if ab._validate_zip_physical_structure(raw, infos):
             raise _Refused("ZIP_STRUCTURE_UNSAFE", "not the canonical Agent Backup layout")
         if ab._check_path_and_identity_rules([{"archive_path": n, "logical_id": f"<physical:{n}>"}
-                                              for n in names]):
+                                              for n in names],
+                                             () if v1 else abx.EXTRA_ARCHIVE_PREFIXES):
             raise _Refused("ARCHIVE_NAMESPACE_INVALID")
         if names - {m["archive_path"] for m in manifest["members"]}:
             raise _Refused("ARCHIVE_UNDECLARED_MEMBER")
@@ -424,6 +456,8 @@ def _intake_manifest_archive(raw, z, infos):
                          else "not_recorded"),
         "unsupported_required_features": list(manifest.get("required_features", [])),
         "unclassified_preferences_omitted_at_export": observations.get("prefs_unclassified_count"),
+        "generated_images": (observations["generation_artifacts"]["status"]
+                             if "generation_artifacts" in observations else "not_captured_by_format"),
         "source_overlays": "captured",
     }
     provenance = "archive_declared_hash_consistent"

@@ -344,17 +344,28 @@ def test_altered_official_skill_bytes_still_fail_closed(tmp_path, monkeypatch):
 
 def _fake_artifact_env(monkeypatch, tmp_path):
     import core.generation_artifact as ga
-    monkeypatch.setattr(ga, "_artifact_storage_root", lambda: str(tmp_path))
+    # AGENT-BACKUP-RESTORE-PHASE-B S3 (RB-4): get_artifact_bytes opens only
+    # the canonical <DATA_DIR>/artifacts/generation/<id[:2]>/<id> file, so
+    # the fake installation uses that real layout under tmp_path.
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(ga, "_artifact_storage_root",
+                        lambda: str(tmp_path / "artifacts" / "generation"))
     return ga
+
+
+def _canonical(tmp_path, artifact_id):
+    path = tmp_path / "artifacts" / "generation" / artifact_id[:2] / artifact_id
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def test_canonical_generated_artifact_renders(tmp_path, monkeypatch):
     ga = _fake_artifact_env(monkeypatch, tmp_path)
-    real_path = tmp_path / "aa" / "aabbcc"
-    real_path.parent.mkdir(parents=True)
+    real_path = _canonical(tmp_path, "aa" + "b" * 30)
     real_path.write_bytes(b"\x89PNG\r\n\x1a\n")
     monkeypatch.setattr(ga, "get_generation_artifact",
                          lambda aid: SimpleNamespace(
+                             artifact_id=real_path.name,
                              local_path=str(real_path),
                              sha256=hashlib.sha256(b"\x89PNG\r\n\x1a\n").hexdigest(),
                          ))
@@ -423,11 +434,11 @@ def test_manifest_path_substitution_after_ingestion_does_not_render(tmp_path, mo
     comparison defeats a post-ingestion substitution, not just a
     never-ingested file."""
     ga = _fake_artifact_env(monkeypatch, tmp_path)
-    real_path = tmp_path / "aa" / "aabbcc"
-    real_path.parent.mkdir(parents=True)
+    real_path = _canonical(tmp_path, "aa" + "b" * 30)
     real_path.write_bytes(b"\x89PNG\r\n\x1a\n")
     monkeypatch.setattr(ga, "get_generation_artifact",
                          lambda aid: SimpleNamespace(
+                             artifact_id=real_path.name,
                              local_path=str(real_path),
                              sha256=hashlib.sha256(b"\x89PNG\r\n\x1a\n").hexdigest(),
                          ))
@@ -448,14 +459,14 @@ def test_valid_artifact_renders_after_simulated_restart(tmp_path, monkeypatch):
     """Confirms the check depends only on durable DB/filesystem state, not
     any transient in-memory ingestion-time cache."""
     ga = _fake_artifact_env(monkeypatch, tmp_path)
-    real_path = tmp_path / "bb" / "bbccdd"
-    real_path.parent.mkdir(parents=True)
+    real_path = _canonical(tmp_path, "bb" + "c" * 30)
     real_path.write_bytes(b"\xff\xd8\xff\xdb")  # JPEG magic
 
     def _lookup(aid):
         # Simulates a fresh DB connection/process -- no shared state with
         # whatever ingested this artifact originally.
         return SimpleNamespace(
+            artifact_id=real_path.name,
             local_path=str(real_path),
             sha256=hashlib.sha256(b"\xff\xd8\xff\xdb").hexdigest(),
         )

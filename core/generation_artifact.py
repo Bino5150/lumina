@@ -57,7 +57,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -79,6 +81,7 @@ __all__ = [
     "GenerationArtifactError",
     "IngestionError",
     "ArtifactNotFound",
+    "ArtifactPathRefused",
     "init_generation_artifact_db",
     "ingest_artifact",
     "get_generation_artifact",
@@ -103,6 +106,17 @@ class IngestionError(GenerationArtifactError):
 
 class ArtifactNotFound(GenerationArtifactError):
     """No generation_artifacts row exists for this artifact_id."""
+
+
+class ArtifactPathRefused(GenerationArtifactError):
+    """The row does not name this installation's own canonical file for its
+    artifact id (AGENT-BACKUP-RESTORE-PHASE-B S3, RB-4). Raised before any
+    file is opened; a link anywhere under the data root is refused too."""
+
+
+_ARTIFACT_ID = re.compile(r"[0-9a-f]{32}")
+_NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_NOFOLLOW_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
 
 
 @dataclass(frozen=True)
@@ -358,13 +372,47 @@ def get_generation_artifact(artifact_id: str) -> GeneratedArtifact:
     return _row_to_record(row)
 
 
+def _open_owned_artifact(record) -> int:
+    """RB-4: open the record's blob only if it is this installation's own
+    canonical file. The stored local_path must be exactly the path derived
+    from the artifact id under the active config.DATA_DIR (a restored copy
+    whose rows still name the source installation is refused, never
+    followed). The data root is resolved once; every component below it is
+    opened with O_NOFOLLOW, so no link can lead the read out of the root."""
+    artifact_id = record.artifact_id
+    if not (isinstance(artifact_id, str) and _ARTIFACT_ID.fullmatch(artifact_id)):
+        raise ArtifactPathRefused("artifact id is not one ingest writes")
+    if record.local_path != _artifact_path(artifact_id):
+        raise ArtifactPathRefused(
+            f"artifact {artifact_id} names a file outside this installation's data root")
+    fd = os.open(os.path.realpath(config.DATA_DIR), os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        for part in ("artifacts", "generation", artifact_id[:2]):
+            child = os.open(part, _NOFOLLOW_DIR, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        blob = os.open(artifact_id, _NOFOLLOW_FILE, dir_fd=fd)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ArtifactPathRefused(f"artifact {artifact_id} is not a plain file under the data root: "
+                                  f"{type(exc).__name__}") from None
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(os.fstat(blob).st_mode):
+        os.close(blob)
+        raise ArtifactPathRefused(f"artifact {artifact_id} is not a regular file")
+    return blob
+
+
 def get_artifact_bytes(artifact_id: str) -> bytes:
     """Reads the owned bytes back off disk, re-verifying the recorded hash
     so silent on-disk corruption/tampering is caught at read time rather
-    than trusted forever after ingestion."""
+    than trusted forever after ingestion. Only this installation's own
+    canonical file is ever opened (see _open_owned_artifact)."""
     record = get_generation_artifact(artifact_id)
     refuse_if_production_path(record.local_path)
-    with open(record.local_path, "rb") as f:
+    with os.fdopen(_open_owned_artifact(record), "rb") as f:
         data = f.read()
     if hashlib.sha256(data).hexdigest() != record.sha256:
         raise IngestionError(

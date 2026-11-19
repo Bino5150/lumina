@@ -12,6 +12,7 @@ module's existing test convention (tests/test_diff_bubble_coloring.py).
 import os
 import hashlib
 
+import config
 import core.generation_artifact as ga
 from core.chat_render import md_to_html
 
@@ -31,9 +32,15 @@ def _register_fake_artifacts(monkeypatch, tmp_path, *paths):
     coverage of the real pipeline."""
     from types import SimpleNamespace
 
-    monkeypatch.setattr(ga, "_artifact_storage_root", lambda: str(tmp_path))
+    # AGENT-BACKUP-RESTORE-PHASE-B S3 (RB-4): get_artifact_bytes now opens
+    # only the canonical <DATA_DIR>/artifacts/generation/<id[:2]>/<id> file
+    # a real ingest writes, so the fake records use that real shape.
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(ga, "_artifact_storage_root",
+                        lambda: str(tmp_path / "artifacts" / "generation"))
     records = {
         os.path.basename(str(p)): SimpleNamespace(
+            artifact_id=os.path.basename(str(p)),
             local_path=str(p), sha256=hashlib.sha256(p.read_bytes()).hexdigest()
         )
         for p in paths
@@ -47,8 +54,15 @@ def _register_fake_artifacts(monkeypatch, tmp_path, *paths):
     monkeypatch.setattr(ga, "get_generation_artifact", _fake_get)
 
 
+def _canonical_image(tmp_path, n):
+    artifact_id = f"{n:032x}"
+    path = tmp_path / "artifacts" / "generation" / artifact_id[:2] / artifact_id
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def test_local_image_with_real_file_renders_as_img_tag(tmp_path, monkeypatch):
-    img_path = tmp_path / "generated.png"
+    img_path = _canonical_image(tmp_path, 1)
     img_path.write_bytes(b"\x89PNG\r\n\x1a\n")  # real PNG magic bytes -- content is now sniffed
     _register_fake_artifacts(monkeypatch, tmp_path, img_path)
 
@@ -108,8 +122,8 @@ def test_ordinary_link_markdown_still_renders_as_anchor(tmp_path):
 
 
 def test_multiple_local_images_all_render(tmp_path, monkeypatch):
-    img1 = tmp_path / "one.png"
-    img2 = tmp_path / "two.png"
+    img1 = _canonical_image(tmp_path, 1)
+    img2 = _canonical_image(tmp_path, 2)
     img1.write_bytes(b"\x89PNG\r\n\x1a\n")
     img2.write_bytes(b"\x89PNG\r\n\x1a\n")
     _register_fake_artifacts(monkeypatch, tmp_path, img1, img2)

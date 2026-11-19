@@ -195,6 +195,10 @@ REFUSAL_GUIDE = {
                                   "The archive holds a member its manifest does not declare."),
     "ARCHIVE_INTEGRITY_FAILED": (INVALID_ARCHIVE, "The archive failed its integrity check",
                                  "Damage that cannot be isolated to individual units."),
+    "GENERATION_REFERENCES_INVALID": (INVALID_ARCHIVE, "Generated images do not match their records",
+                                      "An image, its database row or its path failed the check, so nothing was published."),
+    "ARCHIVE_SIDE_COPY_MEMBER": (INVALID_ARCHIVE, "The archive holds a .bak side copy",
+                                 "Agent Backups never carry .bak side copies, so this one is refused."),
     "LEGACY_LAYOUT_UNRECOGNIZED": (INVALID_ARCHIVE, "Not a recognised legacy backup",
                                    "It has no manifest and none of the files a Backup Memory ZIP holds."),
 }
@@ -830,6 +834,8 @@ def describe_checks(verification):
         "no_live_authority_names": "No live authority or C1 filenames are present",
         "no_live_project_bindings": "No live project root bindings are present",
         "prefs_fenced": "Preferences hold no credentials and Telegram remote access is off",
+        "wire_settings_absent": "Wire autonomy and the wake listener are absent (off)",
+        "generation_references": "Every image path is in this folder and every recovered image matches its record",
         "c1_restore_trace": "C1 restore trace present (first-run Initialize refused)",
     }
     lines = [f"[{'PASS' if ok else 'FAIL'}] {names.get(key, safe_text(key, 60))}"

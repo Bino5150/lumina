@@ -1,4 +1,10 @@
-"""Verified-export candidate, format 2.1; no Restore or live C1 snapshot API.
+"""Verified-export candidate, format 2.2; no Restore or live C1 snapshot API.
+
+Format 2.2 (AGENT-BACKUP-RESTORE-PHASE-B S3) adds, for new exports only:
+generated-image blobs and their manifest sidecars as hash-bound members,
+checked row by row against the archived database; the data-root inventory
+and its owner-declared exclusions (D1-D4) in export_observations; and the
+installation-local preference count. 2.0 and 2.1 stay readable unchanged.
 
 The old v1 builder/verifier remain unchanged by default. The small private v2
 hooks in agent_backup reuse its collectors, immutable capture, ZIP grammar,
@@ -17,17 +23,41 @@ import io
 import json
 import os
 import re
+import sqlite3
 import stat
 import tempfile
 from datetime import datetime, timezone
 import zipfile
 
 from core import agent_backup as ab
+from core import agent_backup_inventory as inv
+from core import agent_backup_references as refs
 from core import suspension_backup as c1
 from core.test_isolation import refuse_if_production_path
 
-VERSION = {"major": 2, "minor": 1}
-READ_VERSIONS = ({"major": 2, "minor": 0}, VERSION)
+V21 = {"major": 2, "minor": 1}
+VERSION = {"major": 2, "minor": 2}
+READ_VERSIONS = ({"major": 2, "minor": 0}, V21, VERSION)
+# Namespace the 2.x verifier accepts beyond v1's (v1 itself never does).
+EXTRA_ARCHIVE_PREFIXES = (inv.GENERATION_ARCHIVE_PREFIX,)
+GENERATION_BLOB_POLICY = {
+    "state_class": "REQUIRED_AGENT_STATE", "content_kind": "binary", "required": True,
+    "portable": "PORTABLE_WITH_REBIND",
+    "restore_policy": "restore_into_isolated_root_hash_verified_against_row",
+    "rebind_policy": "rebind_local_path_to_destination_root_by_artifact_id",
+}
+GENERATION_MANIFEST_POLICY = {
+    "state_class": "REQUIRED_AGENT_STATE", "content_kind": "json", "required": True,
+    "portable": "PORTABLE", "restore_policy": "preserve_verbatim_provenance_never_rewritten",
+}
+_GEN_ID = re.compile(r"state\.artifacts\.generation\.([0-9a-f]{32})(\.manifest_json)?")
+GENERATION_STATUSES = ("complete", "blocked", "unavailable")
+_GEN_FINDING_CODES = frozenset({refs.MISSING_BLOB, refs.NOT_A_FILE, refs.SIZE_MISMATCH,
+                                refs.HASH_MISMATCH, refs.UNSAFE_ID, refs.UNEXPECTED_ENTRY,
+                                refs.FOREIGN_LOCAL_PATH, refs.ORPHAN_FILE, refs.TMP_LEFTOVER,
+                                "changed_during_capture", "manifest_invalid"})
+_GEN_BLOCKING = refs.BLOCKING | {"changed_during_capture", "manifest_invalid"}
+MAX_GENERATION_MANIFEST_BYTES = 1 << 20
 HISTORICAL_CLAIMS = {
     "version": 1,
     "export_observations": "builder_observed_at_capture_then_archive_declared",
@@ -70,6 +100,17 @@ _DROP_PREFS = frozenset({
     "pin_hash", "pin_salt", "telegram_remote_access",
     "telegram_remote_access_on_since", "telegram_remote_access_off_reason",
     "telegram_owner_chat_id", "telegram_chat_id", "owner_chat_id",
+})
+# Installation-local Wire state (owner decision W-A, 2026-11-19). These keys
+# belong to the installation that holds the Wire seat, so they are never
+# archived and never restored. Absent means OFF (comms/wire_autonomy.py
+# PREF_ENABLED; ui/main_window.py _wire_wake_enabled), so a recovered
+# installation starts with Wire autonomy and the wake listener off, and
+# enabling either later captures a fresh activation watermark. Any other
+# wire_* key stays unclassified: this list is exact, not a prefix rule.
+_DESTINATION_LOCAL_PREFS = frozenset({
+    "wire_autonomy", "wire_autonomy_watermark", "wire_autonomy_spend",
+    "wire_autonomy_tokens_per_hour", "wire_autonomy_tokens_per_day", "wire_wake_listener",
 })
 
 
@@ -216,15 +257,28 @@ def _valid_c1_record(record):
 
 
 def _scrub_preferences(raw):
+    """(scrubbed bytes, omitted, unclassified). See _scrub_preferences_counts."""
+    data, counts = _scrub_preferences_counts(raw)
+    return data, counts["omitted"], counts["unclassified"]
+
+
+def _scrub_preferences_counts(raw):
+    """Scrubbed bytes and counts. `omitted` counts every key left out;
+    `unclassified` and `destination_local` are the parts of it that were
+    unknown and installation-local respectively."""
     try:
         prefs = ab._strict_json_loads(raw)
     except (ValueError, UnicodeError) as exc:
         raise ab.AgentBackupError("EXPORT_PREFS_INVALID") from exc
     if type(prefs) is not dict:
         raise ab.AgentBackupError("EXPORT_PREFS_INVALID")
-    result, omitted, unknown = {}, 0, 0
+    result, omitted, unknown, local = {}, 0, 0, 0
     for key, value in prefs.items():
         lower = key.lower()
+        if key in _DESTINATION_LOCAL_PREFS:
+            omitted += 1
+            local += 1
+            continue
         if key in _DROP_PREFS or any(t in lower for t in ("api_key", "token", "secret", "password")):
             omitted += 1
             continue
@@ -246,7 +300,8 @@ def _scrub_preferences(raw):
     # A recovered file cannot re-enable communications. PIN/owner setup is a
     # destination-local requirement, not an archived owner credential.
     result["telegram_remote_access"] = False
-    return _json_bytes(result), omitted, unknown
+    return _json_bytes(result), {"omitted": omitted, "unclassified": unknown,
+                                 "destination_local": local}
 
 
 def _marker_records(raw):
@@ -270,13 +325,113 @@ def _marker_records(raw):
         raise ab.AgentBackupError("EXPORT_INSTALLATION_MARKER_INVALID") from exc
 
 
+def generation_member_kind(logical_id):
+    """("blob" | "manifest", artifact_id, archive_path) for a 2.2 generation
+    member id, else None. The archive path is derived, never taken as given."""
+    match = _GEN_ID.fullmatch(logical_id) if type(logical_id) is str else None
+    if match is None:
+        return None
+    artifact_id = match.group(1)
+    path = inv.GENERATION_ARCHIVE_PREFIX + f"{artifact_id[:2]}/{artifact_id}"
+    if match.group(2):
+        return "manifest", artifact_id, path + refs.MANIFEST_SUFFIX
+    return "blob", artifact_id, path
+
+
+def _manifest_names(raw, artifact_id):
+    """A sidecar is a JSON object that, if it names an artifact, names its
+    own one (S3 review S3-05). Other content is provenance, kept verbatim."""
+    doc = ab._strict_json_loads(raw)
+    return type(doc) is dict and doc.get("artifact_id", artifact_id) == artifact_id
+
+
+def _empty_generation_observation(status):
+    return {"status": status, "rows": 0, "captured_blobs": 0, "captured_manifests": 0,
+            "hashes_verified": False, "findings": {}}
+
+
+def _capture_generation(members, data_dir, staging_root, forbidden, warnings, budget):
+    """Blob and manifest members for every row whose blob verifies, plus the
+    observation that says what was and was not captured. The reference check
+    reads a private copy of the exact database bytes being archived, so rows
+    and blobs describe the same generation. Each file is then captured once
+    through A2's capture boundary and re-hashed: bytes that changed since the
+    check are never archived under the row's hash."""
+    db = [m for m in members if m["logical_id"] == "state.databases.lumina_db"]
+    if len(db) != 1:
+        return [], _empty_generation_observation("unavailable")
+    check_dir = tempfile.mkdtemp(prefix=".generation_check_", dir=staging_root)
+    snapshot = os.path.join(check_dir, "lumina.db")
+    with open(snapshot, "xb") as fh:
+        fh.write(db[0]["data"])
+    try:
+        report = refs.generation_references(snapshot, data_dir, verify_hashes=True)
+    except refs.ReferenceUnavailable:
+        return [], _empty_generation_observation("unavailable")
+    findings = {}
+    for f in report.findings:
+        findings[f.code] = findings.get(f.code, 0) + 1
+    out, blobs_ok, manifests = [], set(), 0
+    canonical_root = os.path.realpath(data_dir)
+    for item in report.capture:
+        artifact_id = item.relpath.rsplit("/", 1)[-1].split(".", 1)[0]
+        if item.role == "manifest" and artifact_id not in blobs_ok:
+            continue
+        data, staged = ab._stage_physical_state_file(
+            os.path.join(data_dir, item.relpath), staging_root, item.archive_path, canonical_root,
+            forbidden, "generated image" if item.role == "blob" else "generated image manifest",
+            warnings, budget=budget)
+        if data is None:
+            findings[refs.MISSING_BLOB if item.role == "blob" else "changed_during_capture"] = \
+                findings.get(refs.MISSING_BLOB if item.role == "blob" else "changed_during_capture", 0) + 1
+            continue
+        if len(data) != item.size or (item.role == "blob" and hashlib.sha256(data).hexdigest() != item.sha256):
+            findings["changed_during_capture"] = findings.get("changed_during_capture", 0) + 1
+            continue
+        if item.role == "manifest":
+            try:
+                if len(data) > MAX_GENERATION_MANIFEST_BYTES or not _manifest_names(data, artifact_id):
+                    raise ValueError()
+            except (ValueError, UnicodeError):
+                findings["manifest_invalid"] = findings.get("manifest_invalid", 0) + 1
+                continue
+            manifests += 1
+            logical_id = f"state.artifacts.generation.{artifact_id}.manifest_json"
+            policy = GENERATION_MANIFEST_POLICY
+        else:
+            blobs_ok.add(artifact_id)
+            logical_id = f"state.artifacts.generation.{artifact_id}"
+            policy = GENERATION_BLOB_POLICY
+        out.append({"logical_id": logical_id, "archive_path": item.archive_path, **policy,
+                    "data": data, "staged_path": staged})
+    # A manifest whose blob failed after it was captured is dropped with it.
+    out = [m for m in out if generation_member_kind(m["logical_id"])[1] in blobs_ok]
+    manifests = sum(1 for m in out if m["logical_id"].endswith(".manifest_json"))
+    blocked = any(code in _GEN_BLOCKING for code in findings) or len(blobs_ok) != report.rows
+    return out, {"status": "blocked" if blocked else "complete", "rows": report.rows,
+                 "captured_blobs": len(blobs_ok), "captured_manifests": manifests,
+                 "hashes_verified": report.hashes_verified, "findings": dict(sorted(findings.items()))}
+
+
+def _observe_inventory(data_dir):
+    """In-line inventory at export time: the D1-D4 declarations as the
+    receipt block, and how many entries still block. Unobservable is said
+    so, never read as clean."""
+    try:
+        report = inv.inventory(data_dir)
+    except inv.InventoryUnavailable:
+        return {"status": "unavailable", "blocking_entries": 0}, None
+    return ({"status": "observed", "blocking_entries": len(report.blockers)},
+            report.exclusion_receipt())
+
+
 def prepare_export_members(members, data_dir, staging_root, forbidden, warnings, budget):
     """Transform already-captured bytes, then add one bound control member."""
     members = [dict(m) for m in members]
-    omitted = unknown = 0
+    counts = {"omitted": 0, "unclassified": 0, "destination_local": 0}
     for member in members:
         if member["logical_id"] == "state.preferences.prefs_json":
-            member["data"], omitted, unknown = _scrub_preferences(member["data"])
+            member["data"], counts = _scrub_preferences_counts(member["data"])
             member["restore_policy"] = _PREFS_POLICY
     marker_source = os.path.join(data_dir, "knowledge_packs_installed.json")
     raw, _staged = ab._stage_physical_state_file(
@@ -290,11 +445,20 @@ def prepare_export_members(members, data_dir, staging_root, forbidden, warnings,
     budget.charge(len(marker_bytes), "installation-control record")
     members.append({"logical_id": MARKER_ID, **MARKER_POLICY, "data": marker_bytes,
                     "staged_path": None})
+    generation, generation_observation = _capture_generation(
+        members, data_dir, staging_root, forbidden, warnings, budget)
+    members.extend(generation)
+    inventory_observation, exclusions = _observe_inventory(data_dir)
     return members, {"suspension": ("unavailable_present" if forbidden.exclusion.status == "present_excluded"
                                       else "unavailable_no_trace"),
                      "c1_exclusion": forbidden.exclusion.manifest_record(),
                      "installation_marker": payload["source_status"],
-                     "prefs_omitted_count": omitted, "prefs_unclassified_count": unknown}
+                     "prefs_omitted_count": counts["omitted"],
+                     "prefs_unclassified_count": counts["unclassified"],
+                     "prefs_installation_local_count": counts["destination_local"],
+                     "generation_artifacts": generation_observation,
+                     "inventory": inventory_observation,
+                     "declared_exclusions": exclusions}
 
 
 def apply_export_contract(manifest, observations):
@@ -338,6 +502,153 @@ def _validate_v21_control_records(manifest):
     return errors
 
 
+_V22_OBSERVATIONS = frozenset({"prefs_installation_local_count", "generation_artifacts",
+                               "inventory", "declared_exclusions"})
+_GEN_OBS_FIELDS = {"status", "rows", "captured_blobs", "captured_manifests", "hashes_verified", "findings"}
+
+
+def _nonneg_int(value):
+    return type(value) is int and value >= 0
+
+
+def _valid_exclusion_receipt(value):
+    """The inventory's declared-exclusion block: constants and counts only."""
+    if (type(value) is not dict or set(value) != {"schema", "version", "paths_listed",
+                                                  "originals_modified", "decisions"}
+            or value["schema"] != inv.RECEIPT_SCHEMA or not _same_contract(value["version"], 1)
+            or value["paths_listed"] is not False or value["originals_modified"] is not False
+            or type(value["decisions"]) is not list
+            or [d.get("decision") if type(d) is dict else None for d in value["decisions"]] != list(inv.DECISIONS)):
+        return False
+    for record in value["decisions"]:
+        fixed = inv.DECISIONS[record["decision"]]
+        keys = {"decision", "status", "entries", "items", "bytes", *fixed}
+        if record["decision"] == "D3" and "uninspectable_processes" in record:
+            keys.add("uninspectable_processes")
+            if not _nonneg_int(record["uninspectable_processes"]):
+                return False
+        if (set(record) != keys or any(not _same_contract(record[k], v) for k, v in fixed.items())
+                or record["status"] not in ("excluded", "absent", "blocked")
+                or not all(_nonneg_int(record[k]) for k in ("entries", "items", "bytes"))):
+            return False
+    return True
+
+
+def _valid_v22_observations(observations):
+    gen, inventory = observations["generation_artifacts"], observations["inventory"]
+    if not _nonneg_int(observations["prefs_installation_local_count"]):
+        return False
+    if (type(gen) is not dict or set(gen) != _GEN_OBS_FIELDS or gen["status"] not in GENERATION_STATUSES
+            or not all(_nonneg_int(gen[k]) for k in ("rows", "captured_blobs", "captured_manifests"))
+            or type(gen["hashes_verified"]) is not bool or type(gen["findings"]) is not dict
+            or any(k not in _GEN_FINDING_CODES or not _nonneg_int(v) or v == 0 for k, v in gen["findings"].items())
+            or gen["captured_manifests"] > gen["captured_blobs"] or gen["captured_blobs"] > gen["rows"]):
+        return False
+    if gen["status"] == "complete" and (gen["captured_blobs"] != gen["rows"] or not gen["hashes_verified"]
+                                        or any(k in _GEN_BLOCKING for k in gen["findings"])):
+        return False
+    if gen["status"] == "unavailable" and gen != _empty_generation_observation("unavailable"):
+        return False
+    if (type(inventory) is not dict or set(inventory) != {"status", "blocking_entries"}
+            or inventory["status"] not in ("observed", "unavailable")
+            or not _nonneg_int(inventory["blocking_entries"])):
+        return False
+    if inventory["status"] == "unavailable":
+        return inventory["blocking_entries"] == 0 and observations["declared_exclusions"] is None
+    return _valid_exclusion_receipt(observations["declared_exclusions"])
+
+
+def _generation_member_errors(members):
+    """Exact policy, derived path and a blob for every manifest (2.2 only)."""
+    if type(members) is not list:
+        return []
+    errors, blobs, manifests = [], set(), set()
+    for m in members:
+        if type(m) is not dict:
+            continue
+        kind = generation_member_kind(m.get("logical_id"))
+        if kind is None:
+            continue
+        role, artifact_id, path = kind
+        policy = GENERATION_BLOB_POLICY if role == "blob" else GENERATION_MANIFEST_POLICY
+        fields = {"logical_id", "archive_path", "sha256", "size", *policy}
+        if "extensions" in m:
+            fields.add("extensions")
+            if not _valid_extensions(m["extensions"]):
+                errors.append("EXPORT_MEMBER_EXTENSIONS_INVALID")
+        if (set(m) != fields or m["archive_path"] != path
+                or any(not _same_contract(m.get(k), v) for k, v in policy.items())
+                or not _nonneg_int(m.get("size")) or (role == "blob" and m["size"] == 0)
+                or type(m.get("sha256")) is not str or not ab._SHA256_RE.fullmatch(m["sha256"])):
+            errors.append("EXPORT_GENERATION_MEMBER_INVALID")
+        (blobs if role == "blob" else manifests).add(artifact_id)
+    if manifests - blobs:
+        errors.append("EXPORT_GENERATION_MANIFEST_WITHOUT_BLOB")
+    return errors
+
+
+def _generation_rows(db_bytes):
+    """{artifact_id: (sha256, size_bytes)} from archived database bytes, read
+    in memory with the untrusted schema disabled; {} when the table is
+    absent. Raises on anything that is not a plain table."""
+    data = bytes(db_bytes)
+    if len(data) >= 20 and data[18] == 2 and data[19] == 2:
+        data = data[:18] + b"\x01\x01" + data[20:]   # in-memory copy cannot open WAL mode
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.deserialize(data)
+        conn.execute("PRAGMA trusted_schema=OFF")
+        kinds = {k for (k,) in conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'generation_artifacts'")}
+        if not kinds:
+            return {}
+        if kinds != {"table"}:
+            raise ValueError("generation_artifacts is not a table")
+        rows = conn.execute("SELECT artifact_id, sha256, size_bytes FROM generation_artifacts "
+                            "LIMIT ?", (refs.MAX_ROWS + 1,)).fetchall()
+    finally:
+        conn.close()
+    if len(rows) > refs.MAX_ROWS or len({r[0] for r in rows}) != len(rows):
+        raise ValueError("generation_artifacts rows out of bounds or duplicated")
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def validate_export_archive(manifest, zf):
+    """2.2 cross-member rules, from the archived bytes themselves: every
+    captured blob matches its row's sha256 and size in the archived
+    database, the observation counts match the members, and "complete"
+    means every row's blob is in the archive."""
+    if type(manifest) is not dict or not _same_contract(manifest.get("format_version"), VERSION):
+        return []
+    try:
+        members = [m for m in manifest["members"] if type(m) is dict]
+        blobs = {}
+        manifests = 0
+        for m in members:
+            kind = generation_member_kind(m.get("logical_id"))
+            if kind and kind[0] == "blob":
+                blobs[kind[1]] = (m["sha256"], m["size"])
+            elif kind:
+                manifests += 1
+        gen = manifest["export_observations"]["generation_artifacts"]
+        db = [m for m in members if m.get("logical_id") == "state.databases.lumina_db"]
+        rows = _generation_rows(zf.read(db[0]["archive_path"])) if len(db) == 1 else None
+        if rows is None:
+            return ["EXPORT_GENERATION_CROSSCHECK_UNAVAILABLE"]
+        errors = []
+        if gen["captured_blobs"] != len(blobs) or gen["captured_manifests"] != manifests:
+            errors.append("EXPORT_GENERATION_OBSERVATION_MISMATCH")
+        if gen["status"] != "unavailable" and gen["rows"] != len(rows):
+            errors.append("EXPORT_GENERATION_OBSERVATION_MISMATCH")
+        if any(rows.get(i) != v for i, v in blobs.items()):
+            errors.append("EXPORT_GENERATION_ROW_MISMATCH")
+        if gen["status"] == "complete" and set(blobs) != set(rows):
+            errors.append("EXPORT_GENERATION_INCOMPLETE_CLAIM")
+        return errors
+    except Exception:
+        return ["EXPORT_GENERATION_CROSSCHECK_UNAVAILABLE"]
+
+
 def validate_export_schema(manifest):
     """Validate new mandatory policy first, then reuse v1's base-member rules.
 
@@ -352,7 +663,8 @@ def validate_export_schema(manifest):
                       "source_data_root", "backup_mode", "hash_algorithm", "compatibility", "members",
                       "regenerate", "exclusions", "warnings", "recovery_contract", "export_observations", "coverage"}
     version = manifest.get("format_version")
-    modern = _same_contract(version, VERSION)
+    v22 = _same_contract(version, VERSION)
+    modern = v22 or _same_contract(version, V21)
     if modern:
         errors.extend(_validate_v21_control_records(manifest))
         expected_roots.update({"extensions", "required_features", "historical_claims"})
@@ -391,12 +703,15 @@ def validate_export_schema(manifest):
         errors.append("EXPORT_RECOVERY_POLICY_MISMATCH")
     observations = manifest.get("export_observations")
     expected = {"suspension", "installation_marker", "prefs_omitted_count", "prefs_unclassified_count"}
+    if v22:
+        expected |= _V22_OBSERVATIONS
     if type(observations) is not dict or set(observations) != expected:
         errors.append("EXPORT_COVERAGE_OBSERVATIONS_INVALID")
     elif (observations["suspension"] not in {"unavailable_present", "unavailable_no_trace"}
           or observations["installation_marker"] not in {"present", "missing_unknown"}
           or any(type(observations[k]) is not int or observations[k] < 0
-                 for k in ("prefs_omitted_count", "prefs_unclassified_count"))):
+                 for k in ("prefs_omitted_count", "prefs_unclassified_count"))
+          or (v22 and not _valid_v22_observations(observations))):
         errors.append("EXPORT_COVERAGE_OBSERVATIONS_INVALID")
     compat = manifest.get("compatibility")
     if type(compat) is not dict or any(not _same_contract(compat.get(k), version) for k in
@@ -411,6 +726,10 @@ def validate_export_schema(manifest):
     base["backup_mode"] = "full"
     base["members"] = [m for m in base.get("members", [])
                        if not (type(m) is dict and m.get("logical_id") == MARKER_ID)]
+    if v22:
+        errors.extend(_generation_member_errors(manifest.get("members")))
+        base["members"] = [m for m in base["members"]
+                           if not (type(m) is dict and generation_member_kind(m.get("logical_id")))]
     for member in base["members"]:
         if type(member) is not dict:
             continue
@@ -481,6 +800,14 @@ def validate_export_payload(member, raw, manifest):
                 _marker_records(_json_bytes(payload["records"]))
             elif payload["source_status"] != "missing_unknown" or payload["records"] is not None:
                 return ["EXPORT_INSTALLATION_PAYLOAD_INVALID"]
+        elif generation_member_kind(member.get("logical_id")):
+            kind = generation_member_kind(member.get("logical_id"))[0]
+            if kind == "blob" and not raw:
+                return ["EXPORT_GENERATION_PAYLOAD_INVALID"]
+            if kind == "manifest" and (len(raw) > MAX_GENERATION_MANIFEST_BYTES
+                                       or not _manifest_names(raw, generation_member_kind(
+                                           member.get("logical_id"))[1])):
+                return ["EXPORT_GENERATION_PAYLOAD_INVALID"]
         elif member.get("logical_id") == "state.preferences.prefs_json":
             cleaned, _, unknown = _scrub_preferences(raw)
             if ab._strict_json_loads(cleaned) != ab._strict_json_loads(raw) or unknown:
@@ -575,6 +902,11 @@ def _coverage(manifest):
                                **({"exclusion": copy.deepcopy(manifest["c1_exclusion"])}
                                   if "c1_exclusion" in manifest else {})},
         "recovery_acceptance": {"status": "not_proven", "restore_input_accepted": False},
+        **({"generation_artifacts": copy.deepcopy(observations["generation_artifacts"]),
+            "inventory": copy.deepcopy(observations["inventory"]),
+            "declared_exclusions": copy.deepcopy(observations["declared_exclusions"]),
+            "installation_local_preferences_omitted": observations["prefs_installation_local_count"]}
+           if "generation_artifacts" in observations else {}),
     }
 
 
@@ -588,6 +920,12 @@ def _receipt(result):
         blockers.append("installation_marker")
     if observations["prefs_unclassified_count"]:
         blockers.append("unclassified_preferences")
+    if "generation_artifacts" in observations:
+        if observations["generation_artifacts"]["status"] != "complete":
+            blockers.append("generation_artifacts")
+        if (observations["inventory"]["status"] != "observed"
+                or observations["inventory"]["blocking_entries"]):
+            blockers.append("inventory")
     return {**_coverage(report["manifest"]),
             "historical_claims": copy.deepcopy(report["manifest"].get("historical_claims")),
             "archive_integrity": {"status": "PASS", "scope": "structure_hashes_sqlite"},

@@ -143,7 +143,7 @@ def test_v1_agent_backup_is_verified_input_with_older_coverage(v1):
 
 def test_v2_export_is_verified_input_and_adopts_installation_history(v2):
     intake = ri.intake_archive(v2)
-    assert intake["kind"] == ri.VERIFIED and intake["format"] == "agent_export_v2.1"
+    assert intake["kind"] == ri.VERIFIED and intake["format"] == "agent_export_v2.2"  # S3: new exports are 2.2
     assert intake["coverage"]["installation_history"] == "present"
     assert intake["coverage"]["c1_at_source"] == "absent_unknown"
     assert units(intake)["knowledge_pack_installation"]["availability"] == "complete"

@@ -10,6 +10,17 @@ from core import agent_backup_export as ex
 from test_agent_backup_verified_export_01 import source, build_review, read_zip
 
 
+
+def strip_v22(m):
+    """S3: a genuine 2.0/2.1 archive predates the 2.2 additions; remove them
+    when a test relabels a freshly built manifest as an older format."""
+    for key in ("prefs_installation_local_count", "generation_artifacts", "inventory", "declared_exclusions"):
+        m["export_observations"].pop(key, None)
+    for key in ("generation_artifacts", "inventory", "declared_exclusions",
+                "installation_local_preferences_omitted"):
+        m["coverage"].pop(key, None)
+    m["members"] = [x for x in m["members"] if not x["archive_path"].startswith("state/artifacts/generation/")]
+
 def rewritten(source, change, *, padding=0):
     payloads = read_zip(source[2])
     manifest = json.loads(payloads["manifest.json"])
@@ -141,6 +152,7 @@ def test_v20_remains_structurally_readable_without_extensions(source):
     build_review(source)
     def downgrade(m):
         m["format_version"] = {"major": 2, "minor": 0}
+        strip_v22(m)
         for key in ("min_supported_format_version", "max_known_format_version"):
             m["compatibility"][key] = dict(m["format_version"])
         for key in ("extensions", "required_features", "historical_claims"):

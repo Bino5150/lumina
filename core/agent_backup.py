@@ -4839,7 +4839,10 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
         if _export_v2:
             from core.agent_backup_export import apply_export_contract
             apply_export_contract(manifest, export_observations)
-        _validate_namespace(public_members)
+            from core.agent_backup_export import EXTRA_ARCHIVE_PREFIXES
+            _validate_namespace(public_members, EXTRA_ARCHIVE_PREFIXES)
+        else:
+            _validate_namespace(public_members)
 
         dest_dir = os.path.dirname(os.path.abspath(dest_path)) or "."
         os.makedirs(dest_dir, exist_ok=True)
@@ -5131,21 +5134,24 @@ def _rmtree_best_effort(path: str) -> None:
         pass
 
 
-def _validate_namespace(public_members: list[dict]) -> None:
+def _validate_namespace(public_members: list[dict], extra_prefixes: tuple = ()) -> None:
     """Fail fast, before ever writing a zip, on a namespace that
     verify_agent_backup would reject anyway -- duplicate/collision on
     archive_path or logical_id, an unsafe path shape, or a physical
     payload outside the allowed v1 namespace."""
-    errors = _check_path_and_identity_rules(public_members)
+    errors = _check_path_and_identity_rules(public_members, extra_prefixes)
     if errors:
         raise AgentBackupError(f"member namespace is invalid, refusing to build: {errors}")
 
 
-def _check_path_and_identity_rules(members: list[dict]) -> list[str]:
+def _check_path_and_identity_rules(members: list[dict], extra_prefixes: tuple = ()) -> list[str]:
     """Path-shape safety, duplicate/Unicode-collision detection, and the
     forbidden-namespace allowlist (Section 8/9) -- shared between the
     build-time fail-fast check and the strict verifier, so both enforce
-    exactly the same rules."""
+    exactly the same rules. `extra_prefixes` is passed only by the v2
+    export path (core.agent_backup_export.EXTRA_ARCHIVE_PREFIXES); v1 is
+    called without it and keeps exactly its own namespace."""
+    allowed_prefixes = _ALLOWED_ARCHIVE_PREFIXES + tuple(extra_prefixes)
     errors = []
     seen_paths = set()
     seen_nfc = {}
@@ -5219,7 +5225,7 @@ def _check_path_and_identity_rules(members: list[dict]) -> list[str]:
         else:
             seen_logical_ids.add(logical_id)
 
-        if not any(archive_path.startswith(prefix) for prefix in _ALLOWED_ARCHIVE_PREFIXES):
+        if not any(archive_path.startswith(prefix) for prefix in allowed_prefixes):
             errors.append(f"archive member outside the allowed v1 namespace: {archive_path!r}")
 
         basename = segments[-1] if segments else archive_path
@@ -6518,7 +6524,11 @@ def _verify_agent_backup_inner(archive_source, resident_bytes_hint: int = 0, *,
         try:
             physical_as_members = [{"archive_path": n, "logical_id": f"<physical:{n}>"}
                                     for n in raw_names if n != "manifest.json"]
-            errors.extend(_check_path_and_identity_rules(physical_as_members))
+            if _export_v2:
+                from core.agent_backup_export import EXTRA_ARCHIVE_PREFIXES
+                errors.extend(_check_path_and_identity_rules(physical_as_members, EXTRA_ARCHIVE_PREFIXES))
+            else:
+                errors.extend(_check_path_and_identity_rules(physical_as_members))
         except Exception as e:
             errors.append(f"could not validate physical archive namespace: {e}")
 
@@ -6585,6 +6595,11 @@ def _verify_agent_backup_inner(archive_source, resident_bytes_hint: int = 0, *,
             undeclared = names - declared
             if undeclared:
                 errors.append(f"archive contains undeclared physical member(s): {sorted(undeclared)}")
+            if _export_v2:
+                # Cross-member rules (generation blobs against the archived
+                # database rows) belong to the export format, not to v1.
+                from core.agent_backup_export import validate_export_archive
+                errors.extend(validate_export_archive(manifest, zf))
 
     # Section 14: structured evidence the receipt should derive counts
     # from, rather than re-deriving trust from raw manifest arrays after

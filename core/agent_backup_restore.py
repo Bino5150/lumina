@@ -63,6 +63,8 @@ from datetime import datetime, timezone
 
 from core import agent_backup as ab
 from core import agent_backup_export as abx
+from core import agent_backup_inventory as inv
+from core import agent_backup_references as refs
 from core import agent_backup_restore_intake as ri
 from core import suspension_backup as c1
 
@@ -113,6 +115,7 @@ REFUSALS = frozenset({
     "INSTALL_FILE_LIMIT",               # more install files than the journal is built for
     "COMMIT_PRIMITIVE_UNAVAILABLE",
     "WRITE_FAILED",
+    "GENERATION_REFERENCES_INVALID",    # image rows or blobs fail the post-rebind check
 })
 
 # Live filenames whose presence would make restored history act as authority.
@@ -255,7 +258,20 @@ def _sha256_file(path):
 def _placement(archive_path, restore_id):
     """(root, rel, transform) for one member; root is "data", "install" or
     None (recorded, never written). Raises on a path no unit should hold."""
+    if ri.is_side_copy_member(archive_path):
+        # Owner decision D2: no unit of any input class may place a side copy.
+        # Legacy intake never offers one, so its handling is unchanged.
+        raise RestoreRefused("MEMBER_INVALID", "owner side copy (D2) is never restored")
     history = f"{HISTORY_DIRNAME}/{restore_id}"
+    if archive_path.startswith(inv.GENERATION_ARCHIVE_PREFIX):
+        # Generated images: only the exact derived layout, into the data
+        # root's own artifacts/generation tree, byte for byte.
+        parts = archive_path[len(inv.GENERATION_ARCHIVE_PREFIX):].split("/")
+        leaf = parts[-1].removesuffix(refs.MANIFEST_SUFFIX)
+        if (len(parts) == 2 and re.fullmatch(r"[0-9a-f]{32}", leaf) and parts[0] == leaf[:2]
+                and parts[1] in (leaf, leaf + refs.MANIFEST_SUFFIX)):
+            return "data", archive_path[len("state/"):], "generation_verbatim"
+        raise RestoreRefused("MEMBER_INVALID", f"no placement for {archive_path}")
     fixed = {
         "state/databases/lumina.db": ("data", "memory/lumina.db", "primary_database"),
         "memory/lumina.db": ("data", "memory/lumina.db", "primary_database"),
@@ -335,7 +351,12 @@ def _resolve_selection(intake, units, selection):
     unknown = set(selection) - candidates
     if unknown:
         raise RestoreRefused("SELECTION_INVALID", f"not recoverable here: {sorted(unknown)}")
-    return {name: selection.get(name, "skip") for name in sorted(candidates)}
+    choices = {name: selection.get(name, "skip") for name in sorted(candidates)}
+    # Images are only meaningful against their rows (S3 review S3-01): refuse
+    # at plan time rather than fail the approved plan late.
+    if choices.get("generation_artifacts", "skip") != "skip" and choices.get("primary_database", "skip") == "skip":
+        raise RestoreRefused("SELECTION_INVALID", "generated images need the primary database")
+    return choices
 
 
 def plan_restore(archive_path, data_dir, base_dir, *, selection=None, restore_id=None):
@@ -450,11 +471,13 @@ def plan_restore(archive_path, data_dir, base_dir, *, selection=None, restore_id
 
 def _prefs_bytes(raw, base_dir, personas_after):
     try:
-        clean, omitted, unknown = abx._scrub_preferences(raw)
+        clean, counts = abx._scrub_preferences_counts(raw)
     except ab.AgentBackupError as exc:
         raise RestoreRefused("MEMBER_INVALID", str(exc)) from None
     prefs = json.loads(clean)
-    note = {"security_fields_dropped": omitted - unknown, "unclassified_keys_omitted": unknown}
+    note = {"security_fields_dropped": counts["omitted"] - counts["unclassified"] - counts["destination_local"],
+            "unclassified_keys_omitted": counts["unclassified"],
+            "installation_local_keys_omitted": counts["destination_local"]}
     persona = prefs.get("last_persona")
     if type(persona) is str and persona:
         name = persona.replace("\\", "/").rsplit("/", 1)[-1]
@@ -808,7 +831,58 @@ def _tracked_official_names(base_dir):
     return names
 
 
-def _finalize_sqlite(path, base_dir, tracked, primary):
+def _rebind_generation(conn, data_dir):
+    """RB-2/RB-3: inside the staged database copy only, point every image
+    row at its canonical path under the destination root, derived from the
+    artifact id and never from the archived path. Rows whose image was not
+    recovered are rebound too, so the restored app fails closed rather than
+    reading the source installation's file. An id ingest could not have
+    written refuses the restore."""
+    kinds = {k for (k,) in conn.execute("SELECT type FROM sqlite_master WHERE name = 'generation_artifacts'")}
+    if not kinds:
+        return {"rows": 0, "rebound": 0}
+    if kinds != {"table"}:
+        raise RestoreRefused("GENERATION_REFERENCES_INVALID", "generation_artifacts is not a table")
+    rows = conn.execute("SELECT artifact_id, local_path FROM generation_artifacts LIMIT ?",
+                        (refs.MAX_ROWS + 1,)).fetchall()
+    if len(rows) > refs.MAX_ROWS:
+        raise RestoreRefused("GENERATION_REFERENCES_INVALID", "too many image rows")
+    if len({r[0] for r in rows}) != len(rows):
+        raise RestoreRefused("GENERATION_REFERENCES_INVALID", "duplicate image ids")
+    rebound = 0
+    for artifact_id, old in rows:
+        if not (type(artifact_id) is str and re.fullmatch(r"[0-9a-f]{32}", artifact_id)):
+            raise RestoreRefused("GENERATION_REFERENCES_INVALID", "unsafe image id")
+        new = os.path.join(data_dir, *refs.blob_relpath(artifact_id).split("/"))
+        if old != new:
+            conn.execute("UPDATE generation_artifacts SET local_path=? WHERE artifact_id=?", (new, artifact_id))
+            rebound += 1
+    return {"rows": len(rows), "rebound": rebound}
+
+
+def _verify_generation_staged(staging, data_dir, rows):
+    """RB-7 before publishing: the staged images are checked against the
+    rebound rows (hash, size, canonical path under the destination). Only a
+    row whose image was not recovered may be missing; anything else, an
+    image without a row included, refuses."""
+    db = os.path.join(staging, "memory", "lumina.db")
+    tree = os.path.lexists(os.path.join(staging, "artifacts"))
+    if not rows and not tree:
+        return {"rows": 0, "rebound": 0, "recovered": 0, "unrecoverable": 0}
+    if not os.path.lexists(db):
+        raise RestoreRefused("GENERATION_REFERENCES_INVALID", "images without their database")
+    try:
+        report = refs.generation_references(db, staging, verify_hashes=True, expected_root=data_dir)
+    except refs.ReferenceUnavailable as exc:
+        raise RestoreRefused("GENERATION_REFERENCES_INVALID", str(exc)) from None
+    bad = sorted({f.code for f in report.findings} - {refs.MISSING_BLOB})
+    if bad:
+        raise RestoreRefused("GENERATION_REFERENCES_INVALID", ",".join(bad))
+    missing = sum(1 for f in report.findings if f.code == refs.MISSING_BLOB)
+    return {"rows": report.rows, "recovered": report.rows - missing, "unrecoverable": missing}
+
+
+def _finalize_sqlite(path, base_dir, tracked, primary, data_dir=None):
     """Rollback-journal mode (no sidecars left behind), archived executable
     schema dropped, the skills table held to the shipped shape, Skills rebind
     and authority fence on the primary database, the invariant re-read from
@@ -883,6 +957,8 @@ def _finalize_sqlite(path, base_dir, tracked, primary):
                         official_skills_deferred_to_bootstrap=sorted(deferred),
                         user_skills_named_like_tracked_official=sorted(c["from"] for c in conflicts),
                         skills_renamed_for_bootstrap=conflicts)
+            if data_dir is not None:
+                note["generation_artifacts"] = _rebind_generation(conn, data_dir)
             # Measured, not assumed: the result itself must hold the invariant.
             if _official_rows(conn) or _untrusted_schema(conn, primary):
                 raise RestoreRefused("SKILL_AUTHORITY_UNVERIFIED", "a Skill still claims official after the fence")
@@ -1458,13 +1534,18 @@ def _stage_and_publish(plan, raw, staging, journal):
             data = _marker_bytes(data, transform)
         path = _write_staged(staging, f["rel"], data)
         if transform in ("primary_database", "sqlite"):
-            sqlite_checks[f["rel"]] = _finalize_sqlite(path, base_dir, tracked, transform == "primary_database")
+            sqlite_checks[f["rel"]] = _finalize_sqlite(path, base_dir, tracked, transform == "primary_database",
+                                                       data_dir=data_dir)
             expected[f["rel"]] = _sha256_file(path)
         else:
             expected[f["rel"]] = hashlib.sha256(data).hexdigest()
         written.append({"root": "data", "rel": f["rel"], "archive_path": f["archive_path"],
                         "sha256": expected[f["rel"]], "size": os.lstat(path).st_size})
     _checkpoint("data_staged")
+    rebind = sqlite_checks.get("memory/lumina.db", {}).get("generation_artifacts", {"rows": 0, "rebound": 0})
+    notes["generation_artifacts"] = {"rebound": rebind["rebound"],
+                                     **_verify_generation_staged(staging, data_dir, rebind["rows"])}
+    _checkpoint("generation_verified")
 
     try:
         trace = c1.write_restore_trace(staging, restore_id=restore_id,
@@ -1495,6 +1576,7 @@ def _stage_and_publish(plan, raw, staging, journal):
         "data_files": written, "install_files": install_written,
         "rebind": {"preferences": notes.get("preferences", {}),
                    "primary_database": sqlite_checks.get("memory/lumina.db", {}),
+                   "generation_artifacts": notes["generation_artifacts"],
                    "project_roots": "historical_inactive_owner_must_repick"},
         "sqlite": {rel: note.get("integrity_check") for rel, note in sqlite_checks.items()},
         "c1": {"trace": trace, "archived_c1_state": "never_restored",
@@ -1632,6 +1714,22 @@ def recover_interrupted_restore(data_dir, *, quarantine_unrecognized=False):
     return report
 
 
+def _generation_accepted(data_dir, recorded):
+    """RB-7 after publishing: every image row names its canonical path in
+    this root, every recovered image matches its row, and exactly the
+    receipt's unrecoverable rows are missing."""
+    try:
+        if not recorded["rows"] and not os.path.lexists(os.path.join(data_dir, "artifacts")):
+            return True
+        report = refs.generation_references(os.path.join(data_dir, "memory", "lumina.db"), data_dir,
+                                            verify_hashes=True)
+    except (refs.ReferenceUnavailable, KeyError, TypeError):
+        return False
+    missing = sum(1 for f in report.findings if f.code == refs.MISSING_BLOB)
+    return ({f.code for f in report.findings} <= {refs.MISSING_BLOB} and report.rows == recorded["rows"]
+            and missing == recorded["unrecoverable"])
+
+
 def verify_restored_root(data_dir, receipt):
     """Read-only acceptance of a published root against its receipt."""
     data_dir = os.path.abspath(os.fspath(data_dir))
@@ -1689,5 +1787,10 @@ def verify_restored_root(data_dir, receipt):
             values = json.loads(fh.read())
         checks["prefs_fenced"] = values.get("telegram_remote_access") is False and not any(
             t in k.lower() for k in values for t in ("api_key", "token", "secret", "password", "pin_"))
+        # W-A: Wire autonomy, its watermark and the wake listener stay absent (OFF).
+        checks["wire_settings_absent"] = not any(k in abx._DESTINATION_LOCAL_PREFS for k in values)
     checks["c1_restore_trace"] = c1.restore_trace_state(data_dir) == "absent_with_trace"
+    generation = receipt.get("rebind", {}).get("generation_artifacts")
+    if generation is not None:
+        checks["generation_references"] = _generation_accepted(data_dir, generation)
     return {"checks": checks, "passed": all(checks.values())}
