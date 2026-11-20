@@ -10,8 +10,11 @@ one inbox cursor, so either can consume the other's messages.
 This module answers one question, read-only: may the process's data root use
 the Wire seat? It allows only when the root has no restore trace, or when
 every valid restore trace has a valid, matching owner release record
-(``wire_release.json``, written by a later owner-local release slice). The
-adapter (``tools/aivengers_wire.py``) asks before any token read or socket.
+(``wire_release.json``, written only by the owner-local release in Suspension
+controls, W-B2: ``core.suspension_runtime.release_wire_seat``). The adapter
+(``tools/aivengers_wire.py``) asks before any token read or socket. The
+release record's format and the dialog's confirmation texts live here too,
+so reader and writer share one status literal.
 
 Rules (design: WB-PROPOSAL, amendment A1, erratum A1-E1):
 
@@ -40,7 +43,8 @@ import sys
 from dataclasses import dataclass
 
 __all__ = [
-    "SeatVerdict", "seat_verdict", "process_seat_verdict", "describe",
+    "SeatVerdict", "seat_verdict", "process_seat_verdict", "process_data_root", "describe",
+    "release_record_bytes", "acknowledgement_sha256", "release_acknowledgement_sha256",
     "NO_TRACE", "RELEASED", "RECOVERED_UNRELEASED", "TRACE_INVALID",
     "EVIDENCE_UNREADABLE", "OVER_CAP", "ROOT_UNKNOWN", "ROOT_MISMATCH", "GATE_ERROR",
 ]
@@ -104,8 +108,10 @@ STATUS_TEXT = {
 }
 
 REMEDY_TEXT = {
-    # W-B1 build: no in-product release exists yet. W-B2 replaces this text.
-    RECOVERED_UNRELEASED: "This version of Lumina cannot allow it yet.",
+    # W-B2: the owner-local release in Suspension controls (A1-2).
+    RECOVERED_UNRELEASED: ("Allowing a restored copy needs safe recovery from the backup, which "
+                           "this version of Lumina can't do yet. Details are in Suspension "
+                           "controls (/suspension)."),
     TRACE_INVALID: ("Restore owner-only permissions (files 600, folders 700) under "
                     "memory/suspension_evidence, and remove any extra hard link to a restore "
                     "record, or restore again from the backup. " + _DO_NOT_DELETE),
@@ -119,6 +125,41 @@ REMEDY_TEXT = {
     GATE_ERROR: "Restart Lumina. If it continues, report it.",
 }
 
+# ── W-B2 owner release: dialog texts. O-WB-3 (2026-11-19) fixed the button
+# text and the four points the confirmation must state; the sentences below
+# are the builder's, for review. ──
+# The release record binds to the sha256 of the three texts the owner is
+# shown (body, acknowledgement statement, checkbox caption). None of them
+# may claim that the original installation was checked, stopped or retired.
+
+RELEASE_BUTTON_TEXT = "Allow this copy to use the Wire seat"
+RELEASE_BODY_TEXT = (
+    "This copy of Lumina was restored from a backup. The original Lumina installation may "
+    "still be running, and Lumina cannot check whether it has been stopped or retired. If you "
+    "allow this copy, two copies could use the same Wire identity “lumina” and share one "
+    "inbox: either one can read the other's messages and mark them as seen. Allowing this copy "
+    "does not turn on Wire conversations or the Wire listener and does not connect to the "
+    "Wire; you turn those on yourself in Settings.")
+RELEASE_ACK_TEXT = (
+    "I understand Lumina cannot confirm whether the original installation is still running, "
+    "and I am responsible for keeping only one of them on the Wire.")
+RELEASE_ACK_CAPTION = "I accept this uncertainty."
+RELEASE_DONE_TEXT = (
+    "This copy may now connect as 'lumina'. The original installation was not checked. Wire "
+    "listener and Wire conversations stay off until you turn them on in Settings.")
+RELEASED_STATUS_TEXT = (
+    "This copy may use the Wire seat. The original installation was not checked.")
+
+
+def acknowledgement_sha256(body: str, statement: str, caption: str) -> str:
+    """sha256 of the exact confirmation texts, joined by newlines."""
+    return hashlib.sha256("\n".join((body, statement, caption)).encode("utf-8")).hexdigest()
+
+
+def release_acknowledgement_sha256() -> str:
+    """The acknowledgement hash of the reviewed dialog wording."""
+    return acknowledgement_sha256(RELEASE_BODY_TEXT, RELEASE_ACK_TEXT, RELEASE_ACK_CAPTION)
+
 
 @dataclass(frozen=True)
 class SeatVerdict:
@@ -130,6 +171,9 @@ class SeatVerdict:
     ignored_releases: int = 0
     #: Exception class name for GATE_ERROR (never its message).
     error_class: str | None = None
+    #: W-B2: (restore_id, trace_sha256, archive_sha256) for each unreleased trace,
+    #: in the same order as ``unreleased``.
+    unreleased_lineage: tuple = ()
 
 
 def describe(verdict: SeatVerdict) -> str:
@@ -167,7 +211,7 @@ def _parse(raw: bytes, keys: frozenset):
 
 
 def _trace_identity(raw: bytes):
-    """(restore_id, sha256) of a valid trace, else None."""
+    """(restore_id, sha256, at, archive_sha256) of a valid trace, else None."""
     d = _parse(raw, TRACE_KEYS)
     if (d is None or d["schema"] != TRACE_SCHEMA or type(d["version"]) is not int
             or d["version"] != 1 or not _is_time(d["at"])
@@ -177,7 +221,26 @@ def _trace_identity(raw: bytes):
             or d["archived_c1_state"] != "not_restored"
             or d["required_next_step"] != "owner_local_recover"):
         return None
-    return d["restore_id"], hashlib.sha256(raw).hexdigest(), d["at"]
+    return d["restore_id"], hashlib.sha256(raw).hexdigest(), d["at"], d["archive_sha256"]
+
+
+def release_record_bytes(*, at, restore_id: str, restore_trace_sha256: str,
+                         acknowledgement_sha256: str, store_incarnation: str) -> bytes:
+    """Canonical bytes of an owner release record (W-B2 writer).
+
+    ``source_installation_status`` is this module's single literal: no
+    parameter feeds it, so no caller can record that the original
+    installation was verified, stopped or retired. Raises ValueError unless
+    the result is a valid release by this module's own reader."""
+    raw = _canonical({
+        "schema": RELEASE_SCHEMA, "version": 1, "at": at, "restore_id": restore_id,
+        "restore_trace_sha256": restore_trace_sha256,
+        "source_installation_status": SOURCE_STATUS_UNVERIFIED,
+        "acknowledgement_sha256": acknowledgement_sha256,
+        "store_incarnation": store_incarnation, "ingress": RELEASE_INGRESS})
+    if len(raw) > MAX_RECORD_BYTES or _release_pair(raw) != (restore_id, restore_trace_sha256):
+        raise ValueError("not a valid wire seat release record")
+    return raw
 
 
 def _release_pair(raw: bytes):
@@ -285,6 +348,7 @@ def _scan(data_root: str) -> SeatVerdict:
         os.close(mem_fd)
     refusals: set[str] = set()
     traces: dict[tuple, float] = {}
+    archives: dict[tuple, str] = {}
     releases: set[tuple] = set()
     ignored = 0
     try:
@@ -319,6 +383,7 @@ def _scan(data_root: str) -> SeatVerdict:
                         refusals.add(TRACE_INVALID)
                     else:
                         traces[(ident[0], ident[1])] = ident[2]
+                        archives[(ident[0], ident[1])] = ident[3]
                 raw = _read_record(child_fd, RELEASE_NAME)
                 if raw is not _ABSENT:
                     pair = _release_pair(raw) if raw is not None else None
@@ -332,13 +397,15 @@ def _scan(data_root: str) -> SeatVerdict:
         os.close(ev_fd)
     unreleased = tuple(sorted((rid, sha, at) for (rid, sha), at in traces.items()
                               if (rid, sha) not in releases))
+    lineage = tuple((rid, sha, archives[(rid, sha)]) for rid, sha, _at in unreleased)
     for reason in _PRECEDENCE:
         if reason in refusals:
-            return SeatVerdict(False, reason, unreleased, ignored)
+            return SeatVerdict(False, reason, unreleased, ignored, unreleased_lineage=lineage)
     if not traces:
         return SeatVerdict(True, NO_TRACE, (), ignored)
     if unreleased:
-        return SeatVerdict(False, RECOVERED_UNRELEASED, unreleased, ignored)
+        return SeatVerdict(False, RECOVERED_UNRELEASED, unreleased, ignored,
+                           unreleased_lineage=lineage)
     return SeatVerdict(True, RELEASED, (), ignored)
 
 
@@ -350,6 +417,12 @@ def seat_verdict(data_root) -> SeatVerdict:
         return SeatVerdict(False, exc.reason)
     except Exception as exc:  # fail closed, and name the class only
         return SeatVerdict(False, GATE_ERROR, error_class=type(exc).__name__)
+
+
+def process_data_root():
+    """(realpath of this process's data root, None), or (None, reason code).
+    W-B2's writer uses it to check it writes where the gate reads."""
+    return _process_data_root()
 
 
 def _process_data_root():

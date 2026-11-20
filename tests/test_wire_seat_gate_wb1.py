@@ -507,7 +507,10 @@ def test_every_reader_outcome_has_a_table_code_text_and_remedy():
         assert text.startswith("wire locked:"), code
         if code != G.RECOVERED_UNRELEASED:
             assert "release" not in text and "allow" not in text, code
-    assert G.REMEDY_TEXT[G.RECOVERED_UNRELEASED] == "This version of Lumina cannot allow it yet."
+    # W-B2 (disclosed adaptation): E1-2(e) said W-B2 replaces the W-B1-only text.
+    assert G.REMEDY_TEXT[G.RECOVERED_UNRELEASED] == (
+        "Allowing a restored copy needs safe recovery from the backup, which this version of "
+        "Lumina can't do yet. Details are in Suspension controls (/suspension).")
     assert "hard link" in G.REMEDY_TEXT[G.TRACE_INVALID]
     assert G.describe(G.SeatVerdict(True, G.NO_TRACE)) == ""
 

@@ -19,6 +19,9 @@ a model-supplied flag, or ambient UI state.
                              suspension controls (initialize, resume,
                              recover; AGENT-RUNAWAY-SUSPEND-01). Never a
                              command, and never minted for relayed text.
+                             With the action "wire_seat_release" it is also
+                             the only authority that may release the Wire
+                             seat to a restored copy (W-B2).
 
 Before this module, Telegram's `filters.TEXT & ~filters.COMMAND` was the
 only barrier: it keys on a bot_command entity at offset 0, so a
@@ -104,6 +107,21 @@ def may_control_suspension(ingress) -> bool:
             and ingress._mint is _MINT
             and ingress.kind in (IngressKind.LOCAL_SUSPENSION_CONTROL,
                                  IngressKind.LOCAL_TEXT_SUBMISSION))
+
+
+#: The one action name that may release the Wire seat to a restored copy.
+WIRE_SEAT_RELEASE_ACTION = "wire_seat_release"
+
+
+def may_release_wire_seat(ingress) -> bool:
+    """W-B2: True only for a genuine suspension-controls envelope minted for
+    exactly the Wire seat release (the Safety controls button). Typed chat,
+    relayed Telegram text, runtime actions and every other suspension
+    action never qualify; may_control_suspension is deliberately not reused."""
+    return (type(ingress) is OperatorIngress
+            and ingress._mint is _MINT
+            and ingress.kind is IngressKind.LOCAL_SUSPENSION_CONTROL
+            and ingress.event_id == WIRE_SEAT_RELEASE_ACTION)
 
 
 def looks_like_operator_command(text) -> bool:

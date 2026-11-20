@@ -23,12 +23,15 @@ selector never leaves the desktop operator display.
 from __future__ import annotations
 
 import contextlib
+import errno
+import os
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
 
+from core import operator_ingress, wire_seat_gate as G
 from core import suspension as S
 
 
@@ -576,3 +579,227 @@ def acknowledge_unknown_scopes(*, ingress) -> None:
     _require_desktop()
     _active_store().acknowledge_unknown_scopes(ingress=ingress)
     _notify("state", status())
+
+
+# ---------------------------------------------------------------------------
+# W-B2: owner-local Wire seat release for a restored copy
+# ---------------------------------------------------------------------------
+#
+# A restored data root is Wire-locked by core/wire_seat_gate.py until a valid
+# release record matches its restore trace. This is the only writer of such a
+# record. It runs only on the Safety controls button's own envelope, after
+# the owner ticked the uncertainty acknowledgement, and only once the C1
+# store is healthy AND carries the restore lineage that C1-S2's
+# recover_from_archive writes. It starts nothing, connects to nothing,
+# reads no Wire token and changes no preference: the owner turns Wire
+# features on separately in Settings.
+
+#: C1-S2 contract (C1-SNAP-CONTRACT R-2, Tech ID-03): the verified,
+#: restore-computed lineage that recover_from_archive writes into the new
+#: store's meta inside its creating transaction. Nothing in this build writes
+#: these keys, so a release is refused here until C1-S2 exists. Today's
+#: recover_destructively is not accepted as a substitute: it records nothing
+#: that ties the new store to the restore.
+LINEAGE_RESTORE_ID_KEY = "lineage_restore_id"
+LINEAGE_ARCHIVE_SHA256_KEY = "lineage_archive_sha256"
+
+WIRE_PREFS_THAT_MUST_BE_OFF = ("wire_wake_listener", "wire_autonomy")
+
+#: os.link errors that mean "this filesystem can't hard-link here". Any other
+#: OSError (no space, quota, permission) is an ordinary write failure.
+_LINK_UNSUPPORTED_ERRNOS = frozenset(
+    e for e in (getattr(errno, n, None) for n in ("EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV",
+                                                  "EMLINK", "ENOSYS")) if e is not None)
+
+_RELEASE_TEXT = {
+    "not_authorized": "Only the button in Suspension controls on this computer can allow this copy.",
+    "not_acknowledged": "Tick the acknowledgement first. Nothing was changed.",
+    "c1_not_ready": "Finish safe recovery first. Nothing was changed.",
+    "root_mismatch": ("Lumina couldn't confirm which data folder it is using. Restart Lumina with "
+                      "its normal launcher. Nothing was changed."),
+    "not_locked": "This copy's Wire seat is not waiting for your decision. Nothing was changed.",
+    "changed": "The restore records changed while you were reviewing them. Review them again.",
+    "multiple_restores": ("This data folder holds more than one restore record. This needs "
+                          "manual review. Nothing was changed."),
+    "c1_recovery_unavailable": (
+        "This version of Lumina can't yet confirm safe recovery for a restored copy, so it "
+        "can't allow this copy to use the Wire seat. The Wire stays locked."),
+    "wire_prefs_on": ("Turn off Wire listener and Wire conversations in Settings first. "
+                      "Nothing was changed."),
+    "write_failed": "Lumina couldn't write the release record. The Wire stays locked.",
+    "link_unsupported": ("This data folder's filesystem can't publish the release safely; "
+                         "Wire stays locked."),
+    "not_visible": ("The release record was written but Lumina can't see it as valid. The "
+                    "Wire stays locked."),
+}
+
+
+class WireReleaseRefused(Exception):
+    """The Wire seat was not released. `code` is stable; `text` is plain,
+    owner-facing and safe to show."""
+
+    def __init__(self, code: str):
+        self.code = code
+        self.text = _RELEASE_TEXT[code]
+        super().__init__(self.text)
+
+
+@dataclass(frozen=True)
+class WireReleaseOutcome:
+    record: str                 # data-root-relative path of the new release record
+    restore_id: str
+    restore_trace_sha256: str
+    store_incarnation: str
+
+
+@dataclass(frozen=True)
+class _ReleasePlan:
+    data_dir: str
+    root: str
+    restore_id: str
+    trace_sha256: str
+    store_incarnation: str
+
+
+def _release_plan(expected=None) -> _ReleasePlan:
+    """Every release precondition except the envelope and acknowledgement.
+    Read-only. Raises WireReleaseRefused with the first unmet condition."""
+    with _lock:
+        snapshot = _status_locked()
+        data_dir, store = _data_dir, _store
+    if snapshot.state is not State.ACTIVE or store is None or data_dir is None:
+        raise WireReleaseRefused("c1_not_ready")
+    try:
+        if S.probe(data_dir).status is not S.StoreStatus.HEALTHY:
+            raise WireReleaseRefused("c1_not_ready")
+    except (S.SuspensionError, OSError, ValueError, RuntimeError):
+        raise WireReleaseRefused("c1_not_ready") from None
+    root, reason = G.process_data_root()
+    if reason is not None or root != os.path.realpath(data_dir):
+        raise WireReleaseRefused("root_mismatch")
+    verdict = G.seat_verdict(root)
+    if verdict.reason != G.RECOVERED_UNRELEASED:
+        raise WireReleaseRefused("not_locked")
+    pairs = tuple((rid, sha) for rid, sha, _at in verdict.unreleased)
+    if expected is not None and (type(expected) is not tuple or expected != pairs):
+        raise WireReleaseRefused("changed")
+    if len(pairs) != 1 or len(verdict.unreleased_lineage) != 1:
+        raise WireReleaseRefused("multiple_restores")
+    restore_id, trace_sha256, archive_sha256 = verdict.unreleased_lineage[0]
+    try:
+        with store._txn(write=False) as conn:
+            meta = S._meta(conn)
+    except S.SuspensionError:
+        raise WireReleaseRefused("c1_not_ready") from None
+    # store.incarnation is the value _txn just verified against this meta.
+    if (meta.get(LINEAGE_RESTORE_ID_KEY) != restore_id
+            or meta.get(LINEAGE_ARCHIVE_SHA256_KEY) != archive_sha256):
+        raise WireReleaseRefused("c1_recovery_unavailable")
+    from core import persistence  # lazy: keeps this module's import graph unchanged
+    prefs = persistence.load()
+    if any(prefs.get(key) for key in WIRE_PREFS_THAT_MUST_BE_OFF):
+        raise WireReleaseRefused("wire_prefs_on")
+    return _ReleasePlan(data_dir, root, restore_id, trace_sha256, store.incarnation)
+
+
+def wire_release_blocker(expected=None) -> Optional[WireReleaseRefused]:
+    """For the dialog: why a release would be refused right now, or None.
+    Read-only; never raises."""
+    try:
+        _release_plan(expected)
+    except WireReleaseRefused as exc:
+        return exc
+    except Exception:
+        return WireReleaseRefused("c1_not_ready")
+    return None
+
+
+def _discard_attempt(target, tmp) -> None:
+    """After a refused attempt (a crash never gets here): remove only this
+    call's own temp file and, if it is then empty, this call's own new
+    directory. If that fails, the residue is ignored by the gate."""
+    if tmp is not None:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    if target is not None:
+        with contextlib.suppress(OSError):
+            os.rmdir(target)  # refused, harmlessly, unless empty
+
+
+def _publish_wire_release(data_dir: str, record: bytes) -> str:
+    """Atomic, append-only publication (A1-1): a fresh evidence directory,
+    a private O_EXCL temp file written in full and fsynced, then a no-clobber
+    hard link to the final name. The final name only ever points at complete
+    bytes. Nothing existing is renamed, rewritten or deleted; only this call's
+    own temp file (and, after a refused attempt, its own empty directory) is
+    removed. Returns the data-root-relative record path."""
+    paths = S._paths(data_dir)
+    target = own_tmp = None
+    try:
+        S._memory_dir_identity(paths)
+        target = S._new_evidence_dir(paths, time.time())
+        tmp = os.path.join(target, f"{G.RELEASE_NAME}.{os.urandom(6).hex()}.tmp")
+        fd = os.open(tmp, S._CREATE_FLAGS, 0o600)
+        own_tmp = tmp  # only a file this call created is ever removed
+        try:
+            view = memoryview(record)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except (OSError, S.SuspensionError):
+        _discard_attempt(target, own_tmp)
+        raise WireReleaseRefused("write_failed") from None
+    final = os.path.join(target, G.RELEASE_NAME)
+    try:
+        os.link(tmp, final, follow_symlinks=False)
+    except OSError as exc:
+        _discard_attempt(target, own_tmp)
+        raise WireReleaseRefused("link_unsupported" if exc.errno in _LINK_UNSUPPORTED_ERRNOS
+                                 else "write_failed") from None
+    with contextlib.suppress(OSError):
+        os.unlink(tmp)  # if this fails the record has two links and is ignored (not_visible)
+    S._fsync_dir(target)
+    S._fsync_dir(paths.evidence)
+    S._fsync_dir(paths.memory_dir)
+    return os.path.relpath(final, paths.data_dir).replace(os.sep, "/")
+
+
+def release_wire_seat(*, ingress, expected, acknowledged_source_unverified,
+                      acknowledgement_sha256) -> WireReleaseOutcome:
+    """Allow this restored copy to use the Wire seat (W-B2, owner-local).
+
+    `expected` is the ((restore_id, trace_sha256),) the owner was shown;
+    a fresh scan must equal it. `acknowledged_source_unverified` must be the
+    literal True and `acknowledgement_sha256` the hash of the exact texts
+    the owner saw. The record says the original installation's status is
+    unverified; nothing here can say otherwise."""
+    try:
+        _require_desktop()
+    except S.NotAuthorized:
+        raise WireReleaseRefused("not_authorized") from None
+    if not operator_ingress.may_release_wire_seat(ingress):
+        raise WireReleaseRefused("not_authorized")
+    if type(expected) is not tuple:
+        raise WireReleaseRefused("changed")  # it must name what the owner was shown
+    if (acknowledged_source_unverified is not True
+            or type(acknowledgement_sha256) is not str
+            or acknowledgement_sha256 != G.release_acknowledgement_sha256()):
+        raise WireReleaseRefused("not_acknowledged")
+    plan = _release_plan(expected)
+    try:
+        record = G.release_record_bytes(
+            at=time.time(), restore_id=plan.restore_id, restore_trace_sha256=plan.trace_sha256,
+            acknowledgement_sha256=acknowledgement_sha256, store_incarnation=plan.store_incarnation)
+    except ValueError:
+        raise WireReleaseRefused("write_failed") from None
+    path = _publish_wire_release(plan.data_dir, record)
+    after = G.seat_verdict(plan.root)
+    if not after.allowed or after.reason != G.RELEASED:
+        raise WireReleaseRefused("not_visible")
+    _notify("wire_seat", after)
+    return WireReleaseOutcome(path, plan.restore_id, plan.trace_sha256, plan.store_incarnation)

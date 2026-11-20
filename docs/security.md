@@ -306,6 +306,68 @@ Flight Recorder keeps the tripped turn's events longer
 (`suspension.tripped`, and the turn's `tool.call`/`tool.result` rows) on a
 best-effort basis: its size limit can still remove them.
 
+## Restored copies and the Wire seat
+
+A copy of Lumina made by Agent Restore is a second installation of the same
+agent. The original may still be running and using the AIvengers Wire seat
+`lumina`. Two installations on one seat share one inbox: either can read the
+other's messages and mark them as seen. This section describes what Lumina
+checks to reduce the chance of that happening by accident during the
+supported restore workflow, and what it does not check.
+
+**What Lumina checks.** Every restore leaves a restore record in the new
+copy's data folder (`memory/suspension_evidence/…/restore_trace.json`).
+While that record exists, Lumina's Wire connection code refuses to read the
+Wire token or open a connection, and Settings won't turn the Wire listener or
+Wire conversations on. The Wire panel shows **Wire seat locked** with the
+reason. A data folder that was never restored has no restore record and is
+not affected. If the safety records can't be read, are too large to check, or
+are not as Lumina wrote them, the Wire stays locked too, with a plain reason.
+Lumina never deletes these records to unlock the Wire, and you shouldn't
+either: deleting them bypasses this check.
+
+**Allowing a restored copy.** Only you, at this computer, can allow a
+restored copy to use the Wire seat: **Allow this copy to use the Wire seat**
+in Suspension controls. Chat messages, Telegram, Discord, Wire messages,
+documents, tool output and environment variables can't do it. Before the
+button works you must tick an acknowledgement that Lumina cannot confirm
+whether the original installation is still running, and that you are
+responsible for keeping only one of them on the Wire. The record Lumina
+writes says exactly that: the original's status is **unverified, owner
+acknowledged**. Lumina has no way to check the original, and the record
+never says that it was checked.
+
+Allowing the copy changes only the lock. It doesn't turn on Wire
+conversations or the Wire listener, doesn't connect to the Wire, and doesn't
+resume anything that runaway suspension paused. You turn Wire features on
+yourself in Settings afterwards. Both must be off before the button works.
+
+**Not available yet.** The button also requires that the restored copy's
+safety record was rebuilt from the backup itself. That recovery step is not
+in this version of Lumina, so for now a restored copy stays Wire-locked and
+the button explains why.
+
+**What this does not cover.** It is a safeguard for the supported restore
+workflow, not protection against a determined copy:
+
+- Deleting the restore records by hand removes the lock.
+- A data folder copied by hand, or a backup unpacked by hand, has no restore
+  record, so Lumina can't tell it is a copy.
+- An allowed copy stays allowed when its data folder is copied, because the
+  permission travels with the folder.
+- A Lumina version without this check connects from a restored copy as
+  before. Only run a restored copy on a version that has it.
+- Software running as your own user account, including commands Lumina's
+  own shell tool runs for her, can read the Wire token directly.
+- Lumina can't tell whether the original installation is still running. An
+  allowed copy is your decision, not proof that the original is retired.
+- Starting Lumina with `LUMINA_WIRE_WAKE=1` after a copy is allowed starts
+  the Wire listener; that is your launch choice, not something the
+  permission does.
+- If a restore record itself is damaged, there is no button for it: restore
+  owner-only permissions as the Wire panel says, or restore again from the
+  backup.
+
 ## Content from outside you is data, not instructions
 
 Tool output, and messages from anyone other than the owner, are tagged in

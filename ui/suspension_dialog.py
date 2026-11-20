@@ -21,6 +21,11 @@ text, Telegram message or model output can reach these controls.
     and what was in flight; Resume clears exactly the incident on screen.
     Resume waits while earlier work is still running; work whose process
     died is "outcome unknown" and needs the acknowledgement checkbox.
+  * Wire seat (W-B2): a restored copy is Wire-locked (core/wire_seat_gate.py).
+    "Allow this copy to use the Wire seat" is offered only for that lock,
+    only after the owner ticks that the original installation's status is
+    unknown, and only once safe recovery of the restored copy is confirmed.
+    It starts nothing and turns nothing on.
 
 The selector shown here is for this desktop display (and, from Slice C3,
 the owner's verified Telegram /resume). It is never logged.
@@ -40,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from core import operator_ingress, suspension as S, suspension_runtime as R
 from core import suspension_permissions as P
+from core import wire_seat_gate as G
 
 
 def _when(ts: float) -> str:
@@ -174,6 +180,30 @@ class SuspensionDialog(QDialog):
             "Safe recovery rebuilds safety protection. It is not Agent Restore and does not recover "
             "chats or memories. Stop other Lumina processes using this folder before recovery.")
         content.addWidget(self.recovery_note)
+
+        # W-B2: the Wire seat of a restored copy (owner-local release only).
+        self.wire_group = QWidget()
+        wire = QVBoxLayout(self.wire_group)
+        wire.setContentsMargins(0, 0, 0, 0)
+        wire_title = _label("Wire seat")
+        wire_title.setStyleSheet("font-weight: bold;")
+        wire.addWidget(wire_title)
+        self.wire_status_label = _label()
+        wire.addWidget(self.wire_status_label)
+        self.wire_body_label = _label(G.RELEASE_BODY_TEXT)
+        wire.addWidget(self.wire_body_label)
+        self.wire_ack_group, self.wire_ack = _acknowledgement(G.RELEASE_ACK_TEXT, G.RELEASE_ACK_CAPTION)
+        self.wire_ack_label = self.wire_ack_group.layout().itemAt(0).widget()
+        self.wire_ack.toggled.connect(lambda _on: self._sync_wire_button())
+        wire.addWidget(self.wire_ack_group)
+        self.wire_blocker_label = _label()
+        wire.addWidget(self.wire_blocker_label)
+        self.wire_release_btn = QPushButton(G.RELEASE_BUTTON_TEXT)
+        self.wire_release_btn.clicked.connect(self._release_wire_seat)
+        wire.addWidget(self.wire_release_btn)
+        content.addWidget(self.wire_group)
+        self._wire_verdict = None
+        self._wire_blocker = None
         guide = QLabel('<a style="color: #7dcfff;" href="' + (Path(__file__).resolve().parents[1] / "docs/upgrading.md").as_uri()
                        + '">Upgrade and troubleshooting guide</a> (docs/upgrading.md)')
         guide.setWordWrap(True)
@@ -261,8 +291,47 @@ class SuspensionDialog(QDialog):
         self.detail_label.setVisible(bool(self._views))
         if not self._views:
             self.detail_label.setText("")
+        self._refresh_wire_seat()
         self._sync_buttons()
         self._fit_setup()
+
+    def _refresh_wire_seat(self) -> None:
+        """W-B2: show this data folder's Wire seat state. The release is
+        offered only for a restored copy waiting for the owner's decision;
+        every other lock is shown read-only with its own remedy."""
+        verdict = G.process_seat_verdict()
+        self._wire_verdict = verdict
+        self._wire_blocker = None
+        self.wire_ack.setChecked(False)  # never carried across a refresh
+        offer = verdict.reason == G.RECOVERED_UNRELEASED
+        if verdict.reason == G.RELEASED:
+            text = G.RELEASED_STATUS_TEXT
+        elif offer:
+            restores = "; ".join(f"restored {_when(at)}, restore {rid[:8]}"
+                                 for rid, _sha, at in verdict.unreleased)
+            text = f"{G.STATUS_TEXT[G.RECOVERED_UNRELEASED]} ({restores})"
+            self._wire_blocker = R.wire_release_blocker(
+                tuple((rid, sha) for rid, sha, _at in verdict.unreleased))
+        else:
+            text = G.describe(verdict)
+            if verdict.error_class:
+                detail = f"Wire seat check: {verdict.error_class}"
+                if detail not in self.technical_details.text():
+                    self._technical_error(detail)
+        self.wire_group.setVisible(verdict.reason != G.NO_TRACE)
+        self.wire_status_label.setText(text)
+        self.wire_body_label.setVisible(offer)
+        self.wire_ack_group.setVisible(offer)
+        self.wire_release_btn.setVisible(offer)
+        self.wire_blocker_label.setText(self._wire_blocker.text if self._wire_blocker else "")
+        self.wire_blocker_label.setVisible(offer and self._wire_blocker is not None)
+        self._sync_wire_button()
+
+    def _sync_wire_button(self) -> None:
+        verdict = self._wire_verdict
+        self.wire_release_btn.setEnabled(
+            verdict is not None and verdict.reason == G.RECOVERED_UNRELEASED
+            and self._wire_blocker is None and self.wire_ack.isChecked())
 
     @staticmethod
     def _memory_permissions_problem(status):
@@ -561,6 +630,29 @@ class SuspensionDialog(QDialog):
             text = f"Not resumed ({result.value}). The incident may have changed; review it again."
         self.ack_unknown.setChecked(False)
         self.result_label.setText(text)
+        self.refresh()
+
+    def _release_wire_seat(self) -> None:
+        verdict = self._wire_verdict
+        if verdict is None or verdict.reason != G.RECOVERED_UNRELEASED or not self.wire_ack.isChecked():
+            return
+        shown = G.acknowledgement_sha256(self.wire_body_label.text(), self.wire_ack_label.text(),
+                                         self.wire_ack.text())
+        try:
+            R.release_wire_seat(
+                ingress=operator_ingress.local_suspension_control("wire_seat_release"),
+                expected=tuple((rid, sha) for rid, sha, _at in verdict.unreleased),
+                acknowledged_source_unverified=self.wire_ack.isChecked(),
+                acknowledgement_sha256=shown)
+        except R.WireReleaseRefused as exc:
+            self.result_label.setText(f"Wire seat not allowed: {exc.text}")
+        except Exception as exc:
+            self.result_label.setText("Wire seat not allowed: the release could not be completed. "
+                                      "The Wire stays locked.")
+            self._technical_error(f"Wire seat release: {type(exc).__name__}")
+        else:
+            self.result_label.setText(G.RELEASE_DONE_TEXT)
+        self.wire_ack.setChecked(False)
         self.refresh()
 
     def _acknowledge_unknown_scopes(self) -> None:
