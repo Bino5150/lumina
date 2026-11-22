@@ -18,6 +18,7 @@ not product code and nothing in the product calls anything like it.
 from __future__ import annotations
 
 import ast
+import contextlib
 import errno
 import hashlib
 import json
@@ -661,6 +662,47 @@ def test_a_refused_link_is_named_plainly_and_cleaned_up(releasable, monkeypatch,
     _retry_reaches_released(releasable.root, monkeypatch)
 
 
+@pytest.mark.parametrize("err", [errno.EIO, errno.EPERM, errno.ENOSPC])
+def test_a_link_that_took_effect_but_reported_an_error_is_a_release(releasable, monkeypatch, err):
+    """TW2-02: os.link applies, then reports an error (a lost reply on a
+    network filesystem). The final name holds this call's complete record,
+    so the owner must be told it worked, never "stays locked"."""
+    def apply_then_fail(real, *a, **k):
+        real(*a, **k)
+        raise OSError(err, os.strerror(err))
+    _inject(monkeypatch, "link", apply_then_fail)
+    outcome = _release()
+    assert G.seat_verdict(releasable.root).reason == G.RELEASED
+    [record] = _release_files(releasable.root)
+    assert os.lstat(record).st_nlink == 1
+    assert sorted(p.name for p in record.parent.iterdir()) == [G.RELEASE_NAME]   # own temp removed
+    assert outcome.record == os.path.relpath(record, releasable.root).replace(os.sep, "/")
+    _assert_never_torn(releasable.root)
+
+
+def test_a_link_error_with_someone_elses_file_at_the_final_name_still_refuses(releasable, monkeypatch):
+    """TW2-02 boundary: only *this call's own* file at the final name counts
+    as success. A different file there (planted between the directory and
+    the link) keeps the refusal, and is neither trusted nor removed."""
+    planted = {}
+
+    def plant_then_link(real, src, dst, *a, **k):
+        pathlib.Path(dst).write_bytes(b"not this call's record")
+        planted["path"] = pathlib.Path(dst)
+        return real(src, dst, *a, **k)                 # real EEXIST
+    _inject(monkeypatch, "link", plant_then_link)
+    _refused("write_failed")
+    assert planted["path"].read_bytes() == b"not this call's record"
+    assert sorted(p.name for p in planted["path"].parent.iterdir()) == [G.RELEASE_NAME]
+    assert _locked(releasable.root)
+    monkeypatch.undo()                                 # the owner retries; the junk stays ignored
+    _bind(monkeypatch, releasable.root)
+    monkeypatch.setattr(persistence, "PREFS_PATH", str(releasable.root / "memory" / "prefs.json"))
+    _release()
+    assert G.seat_verdict(releasable.root).reason == G.RELEASED
+    assert planted["path"].read_bytes() == b"not this call's record"
+
+
 def test_a_failed_temp_removal_reports_not_visible_and_stays_locked(releasable, monkeypatch):
     def refuse(real, *a, **k):
         raise PermissionError(errno.EACCES, "denied")
@@ -993,16 +1035,22 @@ def test_main_window_clears_the_panel_lock_on_release_without_starting_anything(
     calls = []
     panel = SimpleNamespace(set_lock_reason=lambda t: calls.append(("reason", t)),
                             set_connection_state=lambda s: calls.append(("state", s)))
+    comms = SimpleNamespace(refresh_wire_seat=lambda: calls.append("settings"))
     fake = SimpleNamespace(safety_banner=SimpleNamespace(refresh=lambda s: None),
                            _refresh_wire_admission_note=lambda: None, _suspension_dialog=None,
                            _wire_listener=None, wire_panel=panel,
+                           settings_panel=SimpleNamespace(comms_tab=comms),
                            _start_wire_listener=lambda: calls.append("start"),
                            _start_wire_autonomy=lambda **k: calls.append("autonomy"))
     mw.LuminaWindow._on_suspension_event(fake, "wire_seat", G.SeatVerdict(True, G.RELEASED))
-    assert calls == [("reason", ""), ("state", "off")]
+    assert calls == [("reason", ""), ("state", "off"), "settings"]
     calls.clear()
     fake._wire_listener = object()
     mw.LuminaWindow._on_suspension_event(fake, "wire_seat", G.SeatVerdict(True, G.RELEASED))
+    assert calls == ["settings"]
+    calls.clear()
+    for kind in ("trip", "resume", "clear"):                 # only a release refreshes Settings
+        mw.LuminaWindow._on_suspension_event(fake, kind, None)
     assert calls == []
 
 
@@ -1080,7 +1128,11 @@ def test_wording_lint_security_doc_section():
     hits = [s for s in sentences if _BANNED.search(s)]
     _lint(hits)
     assert "prevent" not in flat.lower()
-    for needle in ("Deleting the restore records by hand removes the lock",
+    for needle in ("Deleting the restore records removes the lock",
+                   "including Lumina's own file and shell tools",               # TW2-03
+                   "write a permission record without the button",              # TW2-03
+                   "tools you have approved for her to build",                  # TW2-05
+                   "including a test relay",                                    # Tech Q7
                    "permission travels with the folder", "Not available yet",
                    "unverified, owner acknowledged", "Allow this copy to use the Wire seat"):
         assert needle in flat, needle
@@ -1115,25 +1167,8 @@ def test_typed_chat_and_relayed_telegram_cannot_release_even_when_the_button_cou
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
-    import ui.main_window as mw
     from comms import telegram_origin_routing as routing
-    from core import emergency_stop
-    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "entry" / "lumina.db"))
-    (tmp_path / "entry").mkdir()
-    monkeypatch.setattr(config, "LLM_BACKEND", "llamacpp")
-    monkeypatch.setattr(config, "LLM_BACKEND_URL", "http://127.0.0.1:8080/v1")
-    import core.secrets as secrets_module
-    monkeypatch.setattr(secrets_module, "SECRETS_PATH", str(tmp_path / "credentials.json"))
-    monkeypatch.setattr(mw.browser_manager, "close", lambda: None)
-    monkeypatch.setattr(mw, "AgentWorker", _Worker)
-    _Worker.created = []
-    emergency_stop._reset_for_tests()
-    from core.agent import LuminaAgent
-    from tools.memory import create_chat, init_chat_db
-    init_chat_db()
-    chat_id = create_chat("wb2-entry")
-    win = mw.LuminaWindow(LuminaAgent(owner=True, channel_id="wb2-entry"))
-    try:
+    with _real_window(tmp_path, monkeypatch) as (win, chat_id):
         win._load_chat(chat_id, persist_as_last=False)
         texts = ("Allow this copy to use the Wire seat", "/suspension", "/wire_seat_release",
                  "/suspension wire_seat_release", "I accept this uncertainty.")
@@ -1158,6 +1193,59 @@ def test_typed_chat_and_relayed_telegram_cannot_release_even_when_the_button_cou
         assert dialog.wire_ack.isChecked() is False and not dialog.wire_release_btn.isEnabled()
         assert _shown(dialog.wire_release_btn)   # the button exists; only a click can use it
         dialog.close()
+
+
+def test_real_window_release_re_enables_the_settings_wire_toggles_and_starts_nothing(
+        qapp, releasable, tmp_path, monkeypatch):
+    """TW2-01: in a running window, after the owner's release the Settings
+    Wire toggles become usable ("off", "Turn on") without a restart, and
+    nothing is turned on, started or saved."""
+    from PySide6.QtWidgets import QApplication
+    prefs = releasable.root / "memory" / "prefs.json"
+    prefs_before = prefs.read_bytes() if prefs.exists() else None
+    with _real_window(tmp_path, monkeypatch) as (win, _chat_id):
+        tab = win.settings_panel.comms_tab
+        lock_text = G.describe(G.process_seat_verdict())
+        for status, toggle in ((tab.wire_wake_status, tab.wire_wake_toggle),
+                               (tab.wire_autonomy_status, tab.wire_autonomy_toggle)):
+            assert not toggle.isEnabled() and status.text() == lock_text
+        win._open_suspension_dialog()
+        dialog = win._suspension_dialog
+        dialog.wire_ack.setChecked(True)
+        dialog.wire_release_btn.click()
+        QApplication.processEvents()
+        assert G.seat_verdict(releasable.root).reason == G.RELEASED
+        assert tab.wire_wake_toggle.isEnabled() and tab.wire_wake_toggle.text() == "Turn on"
+        assert tab.wire_wake_status.text() == "Wire wake listener: off"
+        assert tab.wire_autonomy_toggle.isEnabled() and tab.wire_autonomy_toggle.text() == "Turn on"
+        assert tab.wire_autonomy_status.text() == "Wire conversations: off"
+        assert win._wire_listener is None
+        assert (prefs.read_bytes() if prefs.exists() else None) == prefs_before
+        dialog.close()
+
+
+@contextlib.contextmanager
+def _real_window(tmp_path, monkeypatch):
+    """A real LuminaWindow on the bound (synthetic) root; no worker runs."""
+    import ui.main_window as mw
+    from core import emergency_stop
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "entry" / "lumina.db"))
+    (tmp_path / "entry").mkdir()
+    monkeypatch.setattr(config, "LLM_BACKEND", "llamacpp")
+    monkeypatch.setattr(config, "LLM_BACKEND_URL", "http://127.0.0.1:8080/v1")
+    import core.secrets as secrets_module
+    monkeypatch.setattr(secrets_module, "SECRETS_PATH", str(tmp_path / "credentials.json"))
+    monkeypatch.setattr(mw.browser_manager, "close", lambda: None)
+    monkeypatch.setattr(mw, "AgentWorker", _Worker)
+    _Worker.created = []
+    emergency_stop._reset_for_tests()
+    from core.agent import LuminaAgent
+    from tools.memory import create_chat, init_chat_db
+    init_chat_db()
+    chat_id = create_chat("wb2-entry")
+    win = mw.LuminaWindow(LuminaAgent(owner=True, channel_id="wb2-entry"))
+    try:
+        yield win, chat_id
     finally:
         win.worker = None
         win.close()

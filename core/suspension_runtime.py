@@ -726,6 +726,16 @@ def _discard_attempt(target, tmp) -> None:
             os.rmdir(target)  # refused, harmlessly, unless empty
 
 
+def _link_applied(tmp: str, final: str) -> bool:
+    """True only when `final` is the very file this call wrote at `tmp`
+    (same device and inode): a link that reported an error but took
+    effect. Any doubt answers False, which keeps the refusal."""
+    try:
+        return os.path.samestat(os.lstat(tmp), os.lstat(final))
+    except OSError:
+        return False
+
+
 def _publish_wire_release(data_dir: str, record: bytes) -> str:
     """Atomic, append-only publication (A1-1): a fresh evidence directory,
     a private O_EXCL temp file written in full and fsynced, then a no-clobber
@@ -758,9 +768,15 @@ def _publish_wire_release(data_dir: str, record: bytes) -> str:
     try:
         os.link(tmp, final, follow_symlinks=False)
     except OSError as exc:
-        _discard_attempt(target, own_tmp)
-        raise WireReleaseRefused("link_unsupported" if exc.errno in _LINK_UNSUPPORTED_ERRNOS
-                                 else "write_failed") from None
+        if not _link_applied(tmp, final):
+            _discard_attempt(target, own_tmp)
+            raise WireReleaseRefused("link_unsupported" if exc.errno in _LINK_UNSUPPORTED_ERRNOS
+                                     else "write_failed") from None
+        # TW2-02: the link took effect although it reported an error (e.g. a
+        # lost reply on a network filesystem). The final name holds this
+        # call's complete record, so carry on exactly as after a clean link;
+        # the caller re-verifies. The owner is never told "locked" while
+        # the record is in place.
     with contextlib.suppress(OSError):
         os.unlink(tmp)  # if this fails the record has two links and is ignored (not_visible)
     S._fsync_dir(target)

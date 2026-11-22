@@ -323,6 +323,8 @@ Wire conversations on. The Wire panel shows **Wire seat locked** with the
 reason. A data folder that was never restored has no restore record and is
 not affected. If the safety records can't be read, are too large to check, or
 are not as Lumina wrote them, the Wire stays locked too, with a plain reason.
+The lock belongs to the data folder, so it applies whichever Wire relay
+Lumina is pointed at, including a test relay.
 Lumina never deletes these records to unlock the Wire, and you shouldn't
 either: deleting them bypasses this check.
 
@@ -350,15 +352,20 @@ the button explains why.
 **What this does not cover.** It is a safeguard for the supported restore
 workflow, not protection against a determined copy:
 
-- Deleting the restore records by hand removes the lock.
+- Deleting the restore records removes the lock. That can be done by hand,
+  or by any program running as your user account, including Lumina's own
+  file and shell tools. Such a program can also write a permission record
+  without the button.
 - A data folder copied by hand, or a backup unpacked by hand, has no restore
   record, so Lumina can't tell it is a copy.
 - An allowed copy stays allowed when its data folder is copied, because the
   permission travels with the folder.
 - A Lumina version without this check connects from a restored copy as
   before. Only run a restored copy on a version that has it.
-- Software running as your own user account, including commands Lumina's
-  own shell tool runs for her, can read the Wire token directly.
+- Software running as your own user account can read the Wire token
+  directly and change these records. That includes commands Lumina's own
+  shell and file tools run for her, and tools you have approved for her to
+  build, which run inside Lumina.
 - Lumina can't tell whether the original installation is still running. An
   allowed copy is your decision, not proof that the original is retired.
 - Starting Lumina with `LUMINA_WIRE_WAKE=1` after a copy is allowed starts

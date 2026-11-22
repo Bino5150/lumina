@@ -1930,11 +1930,14 @@ class LuminaWindow(QMainWindow):
             pass
         if self._suspension_dialog is not None and self._suspension_dialog.isVisible():
             self._suspension_dialog.refresh()
-        if kind == "wire_seat" and self._wire_listener is None:
-            # W-B2: the owner released the seat. Nothing was started; only the
-            # panel's "locked" display is cleared. Wire stays off until enabled.
-            self.wire_panel.set_lock_reason("")
-            self.wire_panel.set_connection_state("off")
+        if kind == "wire_seat":
+            # W-B2: the owner released the seat. Nothing is started; only the
+            # "locked" displays are cleared. Wire stays off until enabled.
+            if self._wire_listener is None:
+                self.wire_panel.set_lock_reason("")
+                self.wire_panel.set_connection_state("off")
+            # TW2-01: Settings is built once; re-read its Wire toggles now.
+            self.settings_panel.comms_tab.refresh_wire_seat()
         if kind != "trip" or payload is None:
             return
         result = payload.result

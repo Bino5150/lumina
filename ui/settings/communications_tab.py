@@ -414,6 +414,12 @@ class CommunicationsTab(QWidget):
         toggle.setEnabled(False)
         return True
 
+    def refresh_wire_seat(self) -> None:
+        """W-B2 (TW2-01): re-read the Wire seat lock, e.g. after the owner
+        allowed this restored copy. Display only: nothing is turned on."""
+        self._refresh_wire_wake_status()
+        self._refresh_wire_autonomy_status()
+
     def _refresh_wire_autonomy_status(self) -> None:
         if bool(self._prefs.get("wire_autonomy", False)):
             self.wire_autonomy_status.setText("Wire conversations: ON")
