@@ -597,14 +597,19 @@ def _replace_private(path: str, data: bytes) -> None:
     _fsync_dir(os.path.dirname(path))
 
 
-def _connect(db_path: str) -> sqlite3.Connection:
-    """Open an EXISTING store. mode=rw: SQLite never creates a missing file."""
-    uri = "file:" + urllib.parse.quote(db_path) + "?mode=rw"
+def _connect(db_path: str, *, read_only: bool = False) -> sqlite3.Connection:
+    """Open an EXISTING store. mode=rw: SQLite never creates a missing file.
+    read_only (C1-S1 snapshot only): mode=ro, so SQLite itself refuses every
+    write, never takes the write lock and can never checkpoint on close."""
+    uri = "file:" + urllib.parse.quote(db_path) + ("?mode=ro" if read_only else "?mode=rw")
     conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_S, isolation_level=None,
                            check_same_thread=False)
     try:
         conn.execute("PRAGMA trusted_schema=OFF")
-        conn.execute("PRAGMA synchronous=FULL")
+        if read_only:
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn.execute("PRAGMA synchronous=FULL")
     except Exception:
         conn.close()
         raise
@@ -882,12 +887,19 @@ def initialize(data_dir, *, ingress, now: Optional[Callable[[], float]] = None) 
 
 def open_store(data_dir, *, now: Optional[Callable[[], float]] = None) -> "SuspensionStore":
     """Open and identity-verify an existing store. Never creates one."""
+    return _open_store(data_dir, now=now, read_only=False)
+
+
+def _open_store(data_dir, *, now: Optional[Callable[[], float]], read_only: bool) -> "SuspensionStore":
+    """read_only=True is for core.suspension_backup.capture_recovery_state()
+    only: such a handle can take a recovery_snapshot() and nothing else (every
+    write fails), and closing it can never checkpoint the store."""
     paths = _paths(data_dir)
     memory_id = _memory_dir_identity(paths)
     soul_id = _read_identity(paths)
     db_id = _db_identity(paths)
     try:
-        conn = _connect(paths.db)
+        conn = _connect(paths.db, read_only=read_only)
     except sqlite3.Error as exc:
         raise StoreFault(Fault.CORRUPT, type(exc).__name__) from None
     try:
@@ -966,7 +978,11 @@ class SuspensionStore:
             self._fault = fault
         return self._fault
 
-    def _verify_identity(self, conn) -> None:
+    def _verify_identity(self, conn, *, sticky: bool = True) -> None:
+        """sticky=False (recovery_snapshot only): a mismatch seen through the
+        snapshot's own connection refuses the snapshot but leaves this
+        handle's state alone, so a backup can never fault the handle that
+        commits trips. The handle's next own operation re-walks for itself."""
         if self._fault is not None:
             raise self._fault
         try:
@@ -984,9 +1000,10 @@ class SuspensionStore:
             if ENFORCEMENT_VERSION < int(meta.get("min_enforcement_version", "0")):
                 raise StoreFault(Fault.ENFORCEMENT_TOO_OLD)
         except StoreFault as exc:
-            raise self._set_fault(exc) from None
+            raise (self._set_fault(exc) if sticky else exc) from None
         except (sqlite3.DatabaseError, ValueError) as exc:
-            raise self._set_fault(StoreFault(Fault.CORRUPT, type(exc).__name__)) from None
+            fault = StoreFault(Fault.CORRUPT, type(exc).__name__)
+            raise (self._set_fault(fault) if sticky else fault) from None
 
     @contextlib.contextmanager
     def _txn(self, write: bool = True):
@@ -1390,6 +1407,48 @@ class SuspensionStore:
             conn.execute("UPDATE meta SET value = 'clear' WHERE key = 'unknown_scope_policy'")
             _audit(conn, self._clock(), "unknown_scopes_acknowledged")
 
+    # -- recovery snapshot (C1-S1) -------------------------------------------
+
+    def recovery_snapshot(self) -> "RecoveryState":
+        """A transactionally consistent, sanitized, portable record of this
+        store's safety state (C1-SNAP S-2..S-5 with Tech's C1-02..C1-13).
+
+        It never writes: the copy is taken through a separate mode=ro SQLite
+        connection inside one deferred read transaction, into an in-memory
+        database. It takes no write lock and not this handle's lock, so a trip
+        never waits on the store for it and is never refused or left
+        unconfirmed because of it; the record simply predates the trip. Its
+        own CPU work (deriving and sealing the record, about 0.2 s at the O-6
+        bound) does compete for Python's interpreter lock: run in the same
+        process as the trip path it measurably delays trips (p99 7.6 ms to
+        about 77 ms on a 150k-row store), run in a separate process it does
+        not. C1-S3 must therefore run it in a child process.
+        The pinned identity is re-walked through that read transaction before
+        and after the copy while this handle still holds the original file
+        open. Anything incomplete, unknown or inconsistent raises
+        RecoverySnapshotRefused; a partial record is never returned. The
+        record is derived and sanitized, never original evidence, and grants
+        nothing."""
+        if not hasattr(sqlite3.Connection, "serialize"):
+            raise RecoverySnapshotRefused("UNSUPPORTED", "needs Python 3.11 or later")
+        if self._fault is not None:
+            raise RecoverySnapshotRefused("STORE_FAULT", self._fault.detail, self._fault.fault)
+        if self._conn is None:
+            raise RecoverySnapshotRefused("STORE_CLOSED")
+        captured_at = float(self._clock())
+        copy = _capture_store_copy(self)
+        try:
+            try:
+                body = _derive_recovery_body(copy, soul_id=self.soul_id, incarnation=self.incarnation)
+                digest = hashlib.sha256(copy.serialize()).hexdigest()
+            except sqlite3.Error as exc:
+                raise RecoverySnapshotRefused("SNAPSHOT_FAILED", type(exc).__name__) from None
+        finally:
+            copy.close()
+        body["evidence_index"] = _evidence_index(self._paths, body["redactions"])
+        body["provenance"].update({"claimed_captured_at": captured_at, "digest_of_ephemeral_capture": digest})
+        return _seal_recovery_state(body)
+
 
 # ---------------------------------------------------------------------------
 # Recovery (local owner only)
@@ -1432,13 +1491,16 @@ def _preserve_evidence(paths: _Paths, now: float) -> str:
     return target
 
 
+SALVAGE_SCRATCH_NAME = "salvage-scratch"
+
+
 def _salvage(evidence_dir: str) -> dict:
     """Read what can still be read, from a scratch copy of the evidence
     (the evidence itself stays byte-identical)."""
     found = {"meta": None, "scopes": None, "runtimes": None, "in_flight": None}
     if not os.path.exists(os.path.join(evidence_dir, STORE_NAME)):
         return found
-    scratch = os.path.join(evidence_dir, "salvage-scratch")
+    scratch = os.path.join(evidence_dir, SALVAGE_SCRATCH_NAME)
     os.mkdir(scratch, 0o700)
     try:
         for name in _STORE_FILES:
@@ -1682,3 +1744,891 @@ def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(
     open_store(data_dir, now=now).close()
     return RecoveryOutcome(evidence_dir, old_incarnation, incarnation, soul_id, tuple(suspended),
                            salvage_complete, policy, unknown_leases)
+
+
+# ---------------------------------------------------------------------------
+# Recovery snapshot (C1-S1): consistent, closed-world, sanitized, portable
+# ---------------------------------------------------------------------------
+#
+# SuspensionStore.recovery_snapshot() is the only producer and
+# core.suspension_backup.capture_recovery_state() its only exporter-facing
+# entry point. Nothing wires it into an export yet (C1-S3). The record is a
+# derived, sanitized description of the safety state: it carries no raw store
+# bytes, no evidence contents, no source token, selector, suspension id,
+# lease id, runtime id, event, deferred row, credential or PIN, and no raw
+# channel identifier (owner decision O-1). Restoring it can never grant
+# anything: C1-S2 starts a new identity with every scope suspended.
+
+RECOVERY_STATE_SCHEMA = "lumina.c1_recovery_state"
+RECOVERY_STATE_VERSION = 1
+RECOVERY_STATE_LABEL = "DERIVED-SANITIZED, not original evidence"
+RECOVERY_CAPTURE_METHOD = "sqlite_backup_read_only_in_memory"
+AUDIT_CARRY_LIMIT = 10_000          # owner decision O-6
+INCIDENT_CARRY_LIMIT = 10_000
+RUNTIME_CARRY_LIMIT = 1_000
+IN_FLIGHT_CARRY_LIMIT = 10_000
+RECOVERY_STATE_MAX_BYTES = 32 * 1024 * 1024
+EVIDENCE_INDEX_MAX_ENTRIES = 4096
+EVIDENCE_INDEX_MAX_DEPTH = 4
+EVIDENCE_INDEX_MAX_BYTES = 2 * 1024 ** 3
+REDACTED = "[redacted]"
+
+SNAPSHOT_REFUSALS = frozenset({
+    "UNSUPPORTED",          # this Python can't capture in memory (needs 3.11+)
+    "STORE_FAULT",          # missing, corrupt, foreign, insecure or replaced store
+    "STORE_CLOSED",
+    "SNAPSHOT_FAILED",      # SQLite failed while copying or reading the copy
+    "SCHEMA_UNKNOWN",       # a table, column, index, trigger, meta key or version we don't know
+    "VALUE_UNKNOWN",        # a structural value outside its closed vocabulary, or torn state
+    "BOUNDARY_CHANGED",     # the evidence tree changed while it was indexed
+    "EVIDENCE_UNREADABLE",  # unreadable, symlinked, non-regular or hard-linked evidence
+    "EVIDENCE_UNBOUNDED",   # evidence tree too large or too deep
+    "OVER_CAP",             # more than the portable record may carry
+    "RECORD_INVALID",       # the record failed validate_recovery_state()
+})
+
+
+class RecoverySnapshotRefused(SuspensionError):
+    """No recovery record. Nothing was written and nothing changed."""
+
+    def __init__(self, code: str, detail: str = "", fault: Optional[Fault] = None):
+        if code not in SNAPSHOT_REFUSALS:
+            raise ValueError(f"unknown snapshot refusal {code!r}")
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
+        self.fault = fault
+
+
+@dataclass(frozen=True)
+class RecoveryState:
+    """A sealed recovery record: canonical JSON bytes and their sha256."""
+    payload: bytes = field(repr=False)
+    sha256: str
+
+    def record(self) -> dict:
+        return json.loads(self.payload.decode("utf-8"))
+
+
+# Every (table, column) of _SCHEMA and what the portable record does with it
+# (Tech C1-03). carry: copied after a type/vocabulary check. transform:
+# replaced by a derived value. drop: never carried (counted in `redactions`
+# per carried row). count: only the table's row count is carried.
+_DISPOSITION = {
+    "meta": {"key": "transform", "value": "transform"},
+    "scopes": {"scope": "transform", "execution_epoch": "carry", "state_revision": "carry",
+               "suspended": "carry", "active_incident": "drop"},
+    "incidents": {"suspension_id": "transform", "scope": "transform", "execution_epoch": "carry",
+                  "trigger": "carry", "evidence": "transform", "created_at": "carry",
+                  "leases_at_trip": "transform", "selector": "drop", "status": "carry",
+                  "requires_ack": "carry", "resume_outcome": "transform"},
+    "leases": {"lease_id": "drop", "store_incarnation": "drop", "scope": "transform",
+               "execution_epoch": "carry", "runtime_id": "drop", "kind": "carry", "name": "drop",
+               "admitted_at": "carry", "state": "count", "finished_at": "drop"},
+    "runtimes": {"runtime_id": "drop", "pid": "drop", "boot_id": "drop", "hostname": "drop",
+                 "start_ticks": "drop", "enforcement_version": "carry", "data_root": "drop",
+                 "registered_at": "carry", "heartbeat_at": "carry"},
+    "events": {"event_id": "count", "channel": "count", "suspension_id": "count", "outcome": "count",
+               "consumed_at": "count"},
+    "audit": {"seq": "carry", "at": "carry", "action": "transform", "scope": "transform",
+              "suspension_id": "transform", "detail": "transform"},
+    "deferred": {"kind": "count", "record_id": "count", "store_incarnation": "count", "scope": "count",
+                 "execution_epoch": "count", "state": "count", "created_at": "count"},
+}
+
+_META_REQUIRED = frozenset({"schema_version", "min_enforcement_version", "store_incarnation", "soul_id",
+                            "created_at", "unknown_scope_policy"})
+# Restore lineage (W-B2 D-1, written only by C1-S2). Never carried: a later
+# restore computes its own lineage from its own trace (TECH-REVIEW-WB2 §6.1).
+_META_DROPPED = re.compile(r"lineage_[a-z0-9_]{1,40}")
+_SCOPE_POLICIES = frozenset({"clear", "suspended"})
+_SCOPE_CLASSES = ("owner", "discord", "wire", "other")
+_CHANNEL_CLASSES = ("discord", "wire", "other")
+_TRIGGERS = frozenset({t.value for t in Trigger} | {RECOVERY_TRIGGER})
+_LEASE_KINDS = frozenset(k.value for k in LeaseKind)
+_LEASE_STATES = ("in_flight", "done", "orphan_acknowledged")
+_INCIDENT_STATUSES = frozenset({"active", "resumed"})
+_RESUME_RESULTS = frozenset(r.value for r in ResumeResult)
+_AUDIT_ACTIONS = frozenset({
+    "initialize", "runtime_registered", "trip_foreign_incarnation", "trip_invalid_token",
+    "late_trip_evidence", "trip_while_suspended", "trip", "scope_created_suspended", "resume",
+    "resume_refused", "unknown_scopes_acknowledged", "identity_repaired", "no_trace_recovery",
+    "destructive_recovery",
+})
+_LEASE_AT_TRIP_KEYS = frozenset({"lease_id", "kind", "name", "runtime_id"})
+_RESUME_OUTCOME_KEYS = frozenset({"result", "suspension_id", "scope", "state_revision", "live_leases",
+                                  "orphaned_leases"})
+
+# Free-text fields (incident evidence, audit detail): field-level allowlist,
+# never substring scrubbing (Tech C1-04/C1-05).
+_FREE_TEXT_MAX_ITEMS = 32
+_ENUM_VALUE = re.compile(r"[a-z][a-z0-9_]{0,47}")
+_HEX_LIKE = re.compile(r"[0-9a-f]{16,}")
+_EVIDENCE_STAMP = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
+_IDENTIFIER_KEYS = frozenset({"hostname", "host", "pid", "boot_id", "start_ticks", "data_root",
+                              "runtime_id", "lease_id", "suspension_id", "selector", "soul_id",
+                              "event_id", "token", "path", "incarnation", "old_incarnation",
+                              "new_incarnation"})
+# The keys today's writers put into incident evidence and audit detail: the
+# agent's trip evidence (core/agent.py _suspend_scope callers) and C1's own
+# audit details and recovery incidents. A key outside this set and
+# _IDENTIFIER_KEYS is dropped and counted, never carried (Sonnet S1-04): the
+# key set, not the value shape, is the trust boundary. A test pins this set
+# to the keys the code actually writes.
+_FREE_TEXT_KEYS = frozenset({
+    "trip_kind", "stale_streak", "write_stale_streak", "executed_calls", "distinct_fingerprints",
+    "refused_batches", "batch_size", "limit", "distinct_calls", "evidence_dropped",
+    "reason", "unknown_outcome_leases", "trigger", "in_flight", "channel", "result",
+    "orphans_acknowledged", "evidence", "receipt", "prior_state", "suspended_scopes",
+    "unknown_scope_policy", "salvage_complete",
+})
+PROVENANCE_ASSURANCE = "producer_claims_only"
+_EVIDENCE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,96}")
+_INCIDENT_REF = re.compile(r"i[0-9]{6,9}")
+_REDACTION_PATH = re.compile(r"[a-z_]{1,32}(\.(?:[a-z][a-z0-9_]{0,47}|\[[a-z_]{1,24}\])){1,3}")
+_SQLITE_VERSION = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){1,3}")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_MAX_INT = 2 ** 53
+
+_reference_schema_rows: Optional[list] = None
+
+
+def _schema_rows(conn) -> list:
+    return sorted(conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema").fetchall(),
+                  key=repr)
+
+
+def _expected_schema_rows() -> list:
+    """sqlite_schema of a store built from _SCHEMA exactly as _create_schema does."""
+    global _reference_schema_rows
+    if _reference_schema_rows is None:
+        conn = sqlite3.connect(":memory:", isolation_level=None)
+        try:
+            for statement in _SCHEMA.split(";\n"):
+                if statement.strip():
+                    conn.execute(statement)
+            _reference_schema_rows = _schema_rows(conn)
+        finally:
+            conn.close()
+    return list(_reference_schema_rows)
+
+
+def _snapshot_connect(db_path: str) -> sqlite3.Connection:
+    """The snapshot's own connection: read-only, so SQLite enforces S-3."""
+    return _connect(db_path, read_only=True)
+
+
+def _snapshot_copy(source: sqlite3.Connection) -> sqlite3.Connection:
+    """Copy the whole store, in one step, under `source`'s open read
+    transaction, into memory (Tech C1-10: no scratch file, no residue)."""
+    copy = sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
+    try:
+        copy.execute("PRAGMA trusted_schema=OFF")
+        source.backup(copy, pages=-1)
+    except BaseException:
+        copy.close()
+        raise
+    return copy
+
+
+def _capture_store_copy(store: "SuspensionStore") -> sqlite3.Connection:
+    try:
+        snap = _snapshot_connect(store._paths.db)
+    except sqlite3.Error as exc:
+        raise RecoverySnapshotRefused("SNAPSHOT_FAILED", type(exc).__name__) from None
+    copy = None
+    try:
+        snap.execute("BEGIN")
+        snap.execute("SELECT key, value FROM meta").fetchall()  # pins the read snapshot
+        store._verify_identity(snap, sticky=False)
+        copy = _snapshot_copy(snap)
+        store._verify_identity(snap, sticky=False)
+        snap.execute("COMMIT")
+    except StoreFault as exc:
+        if copy is not None:
+            copy.close()
+        raise RecoverySnapshotRefused("STORE_FAULT", exc.detail, exc.fault) from None
+    except sqlite3.Error as exc:
+        if copy is not None:
+            copy.close()
+        raise RecoverySnapshotRefused("SNAPSHOT_FAILED", type(exc).__name__) from None
+    except BaseException:
+        if copy is not None:
+            copy.close()
+        raise
+    finally:
+        snap.close()  # read-only: closing can never checkpoint the store
+    return copy
+
+
+def _refuse(code: str, detail: str = ""):
+    raise RecoverySnapshotRefused(code, detail)
+
+
+def _check_int(value, what: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or not minimum <= value < _MAX_INT:
+        _refuse("VALUE_UNKNOWN", f"{what} is not a valid integer")
+    return value
+
+
+def _check_time(value, what: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value < _MAX_INT:
+        _refuse("VALUE_UNKNOWN", f"{what} is not a valid time")
+    return float(value)
+
+
+def _check_vocab(value, vocab, what: str) -> str:
+    if type(value) is not str or value not in vocab:
+        _refuse("VALUE_UNKNOWN", f"{what} is outside its vocabulary")
+    return value
+
+
+def _scope_class(scope, what: str) -> str:
+    if type(scope) is not str or not _SCOPE_RE.fullmatch(scope):
+        _refuse("VALUE_UNKNOWN", f"{what} is not a valid scope")
+    if scope == OWNER_SCOPE:
+        return "owner"
+    transport = scope.split(":", 2)[1]
+    return transport if transport in ("discord", "wire") else "other"
+
+
+def _bump(redactions: dict, path: str, n: int = 1) -> None:
+    if n:
+        redactions[path] = redactions.get(path, 0) + n
+
+
+def _load_json(raw, what: str):
+    if type(raw) is not str:
+        _refuse("VALUE_UNKNOWN", f"{what} is not JSON text")
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError, MemoryError):
+        _refuse("VALUE_UNKNOWN", f"{what} is not usable JSON")
+
+
+def _free_text_value_ok(value, hostnames) -> bool:
+    if type(value) is bool or (type(value) is int and abs(value) < _MAX_INT):
+        return True
+    if type(value) is not str or value in hostnames:
+        return False
+    if value == REDACTED or _EVIDENCE_STAMP.fullmatch(value):
+        return True
+    return _ENUM_VALUE.fullmatch(value) is not None and _HEX_LIKE.fullmatch(value) is None
+
+
+def _sanitize_free_text(raw, path: str, redactions: dict, hostnames) -> dict:
+    """Field-level allowlist for a JSON object of counts and names. Only
+    keys in _FREE_TEXT_KEYS are carried, and their values only as bools,
+    integers, enum words or evidence stamps; identifier keys keep their key
+    with a REDACTED value; any other key is dropped. Every change is counted
+    by field path. Never a substring edit."""
+    value = _load_json(raw, path)
+    if type(value) is not dict:
+        _refuse("VALUE_UNKNOWN", f"{path} is not a JSON object")
+    clean = {}
+    for key in sorted(value):
+        item = value[key]
+        if len(clean) >= _FREE_TEXT_MAX_ITEMS:
+            _bump(redactions, f"{path}.[over_limit]")
+        elif type(key) is not str or not _EVIDENCE_KEY.fullmatch(key):
+            _bump(redactions, f"{path}.[invalid_key]")
+        elif key in _IDENTIFIER_KEYS:
+            clean[key] = REDACTED
+            _bump(redactions, f"{path}.{key}")
+        elif key not in _FREE_TEXT_KEYS:
+            _bump(redactions, f"{path}.[unknown_key]")
+        elif _free_text_value_ok(item, hostnames) and item != REDACTED:
+            clean[key] = item
+        else:
+            clean[key] = REDACTED
+            _bump(redactions, f"{path}.{key}")
+    return clean
+
+
+def _check_closed_world(copy: sqlite3.Connection) -> None:
+    if _schema_rows(copy) != _expected_schema_rows():
+        _refuse("SCHEMA_UNKNOWN", "the store's schema is not the one this version knows")
+    for table, columns in _DISPOSITION.items():
+        names = [row[1] for row in copy.execute(f"PRAGMA table_info({table})")]
+        if names != list(columns):
+            _refuse("SCHEMA_UNKNOWN", f"columns of {table} differ from the disposition table")
+
+
+def _derive_recovery_body(copy: sqlite3.Connection, *, soul_id: str, incarnation: str) -> dict:
+    """Everything except the evidence index, capture time and digest."""
+    if copy.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        _refuse("SNAPSHOT_FAILED", "the in-memory copy failed quick_check")
+    _check_closed_world(copy)
+    redactions: dict = {}
+    row_counts = {table: copy.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                  for table in _DISPOSITION}
+
+    # -- meta ---------------------------------------------------------------
+    meta = {}
+    for key, value in copy.execute("SELECT key, value FROM meta ORDER BY key"):
+        if key in _META_REQUIRED:
+            meta[key] = value
+        elif type(key) is str and _META_DROPPED.fullmatch(key):
+            _bump(redactions, f"meta.{key}")
+        else:
+            _refuse("SCHEMA_UNKNOWN", "unknown meta key")
+    if set(meta) != _META_REQUIRED:
+        _refuse("SCHEMA_UNKNOWN", "meta is incomplete")
+    if meta["schema_version"] != str(SCHEMA_VERSION):
+        _refuse("SCHEMA_UNKNOWN", "unknown schema version")
+    if meta["soul_id"] != soul_id or meta["store_incarnation"] != incarnation:
+        raise RecoverySnapshotRefused("STORE_FAULT", "the copy is not this store", Fault.INCARNATION_CHANGED)
+    if type(meta["min_enforcement_version"]) is not str or not meta["min_enforcement_version"].isdigit() \
+            or len(meta["min_enforcement_version"]) > 9:
+        _refuse("VALUE_UNKNOWN", "min_enforcement_version")
+    _check_vocab(meta["unknown_scope_policy"], _SCOPE_POLICIES, "unknown_scope_policy")
+    try:
+        created_at = float(meta["created_at"])
+    except (TypeError, ValueError):
+        _refuse("VALUE_UNKNOWN", "meta created_at")
+    _check_time(created_at, "meta created_at")
+    if row_counts["deferred"]:
+        _refuse("VALUE_UNKNOWN", "deferred authority is reserved and must be empty")
+    _bump(redactions, "events.[rows]", row_counts["events"])  # never carried: nothing can be replayed
+
+    # -- runtimes (hostnames are read first: exact-match redaction) ---------
+    hostnames = {h for (h,) in copy.execute("SELECT DISTINCT hostname FROM runtimes")
+                 if type(h) is str and h}
+    with contextlib.suppress(OSError):
+        hostnames.add(socket.gethostname())
+    hostnames = frozenset(hostnames)
+    runtimes = []
+    for version, registered_at, heartbeat_at in reversed(copy.execute(
+            "SELECT enforcement_version, registered_at, heartbeat_at FROM runtimes "
+            "ORDER BY registered_at DESC, rowid DESC LIMIT ?", (RUNTIME_CARRY_LIMIT,)).fetchall()):
+        runtimes.append({"enforcement_version": _check_int(version, "runtime enforcement_version"),
+                         "registered_at": _check_time(registered_at, "runtime registered_at"),
+                         "heartbeat_at": _check_time(heartbeat_at, "runtime heartbeat_at")})
+    for column, disposition in _DISPOSITION["runtimes"].items():
+        if disposition == "drop":
+            _bump(redactions, f"runtimes.{column}", len(runtimes))
+
+    # -- scopes ----------------------------------------------------------------
+    owner_scope = None
+    summary = {cls: {"scopes": 0, "suspended": 0, "in_flight": 0} for cls in _CHANNEL_CLASSES}
+    for scope, epoch, revision, suspended, active in copy.execute(
+            "SELECT scope, execution_epoch, state_revision, suspended, active_incident FROM scopes"):
+        cls = _scope_class(scope, "scope")
+        state = {"execution_epoch": _check_int(epoch, "scope execution_epoch"),
+                 "state_revision": _check_int(revision, "scope state_revision"),
+                 "suspended": bool(_check_int(suspended, "scope suspended"))}
+        if suspended not in (0, 1) or (suspended == 1) != (active is not None):
+            _refuse("VALUE_UNKNOWN", "scope suspension state is inconsistent")
+        if active is not None:
+            _bump(redactions, "scopes.active_incident")
+        if cls == "owner":
+            owner_scope = state
+        else:
+            _bump(redactions, "scopes.scope")
+            summary[cls]["scopes"] += 1
+            summary[cls]["suspended"] += suspended
+    if owner_scope is None:
+        _refuse("VALUE_UNKNOWN", "the owner scope is missing")
+
+    # -- incidents ---------------------------------------------------------------
+    rows = copy.execute("SELECT suspension_id, scope, execution_epoch, trigger, evidence, created_at, "
+                        "leases_at_trip, selector, status, requires_ack, resume_outcome FROM incidents "
+                        "ORDER BY created_at, rowid").fetchall()
+    refs = {}
+    for n, row in enumerate(rows, 1):
+        if type(row[0]) is not str or row[0] in refs:
+            _refuse("VALUE_UNKNOWN", "incident id")
+        refs[row[0]] = f"i{n:06d}"
+    active_rows = [r for r in rows if r[8] == "active"]
+    resumed_rows = [r for r in rows if r[8] != "active"]
+    if len(active_rows) > INCIDENT_CARRY_LIMIT:
+        _refuse("OVER_CAP", "more active incidents than the record may carry")
+    room = INCIDENT_CARRY_LIMIT - len(active_rows)
+    kept = set(map(id, active_rows + (resumed_rows[-room:] if room > 0 else [])))
+    incidents = []
+    active_by_class = dict.fromkeys(_SCOPE_CLASSES, 0)
+    for row in rows:
+        if id(row) not in kept:
+            continue
+        sid, scope, epoch, trigger, evidence, at, leases, _selector, status, requires_ack, outcome = row
+        cls = _scope_class(scope, "incident scope")
+        _check_vocab(status, _INCIDENT_STATUSES, "incident status")
+        if requires_ack not in (0, 1) or type(requires_ack) is not int:
+            _refuse("VALUE_UNKNOWN", "incident requires_ack")
+        if cls != "owner":
+            _bump(redactions, "incidents.scope")
+        _bump(redactions, "incidents.selector")
+        _bump(redactions, "incidents.suspension_id")
+        lease_list = _load_json(leases, "incidents.leases_at_trip")
+        if type(lease_list) is not list:
+            _refuse("VALUE_UNKNOWN", "incidents.leases_at_trip")
+        by_kind: dict = {}
+        for item in lease_list:
+            if type(item) is not dict or set(item) != _LEASE_AT_TRIP_KEYS:
+                _refuse("VALUE_UNKNOWN", "incidents.leases_at_trip entry")
+            kind = _check_vocab(item["kind"], _LEASE_KINDS, "incidents.leases_at_trip kind")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+        for key in ("lease_id", "name", "runtime_id"):
+            _bump(redactions, f"incidents.leases_at_trip.{key}", len(lease_list))
+        if status == "active":
+            if outcome is not None:
+                _refuse("VALUE_UNKNOWN", "an active incident has a resume outcome")
+            resume = None
+            active_by_class[cls] += 1
+        else:
+            record = _load_json(outcome, "incidents.resume_outcome")
+            if type(record) is not dict or set(record) != _RESUME_OUTCOME_KEYS \
+                    or type(record["live_leases"]) is not list or type(record["orphaned_leases"]) is not list:
+                _refuse("VALUE_UNKNOWN", "incidents.resume_outcome")
+            revision = record["state_revision"]
+            resume = {"result": _check_vocab(record["result"], _RESUME_RESULTS, "resume result"),
+                      "state_revision": None if revision is None else _check_int(revision, "resume revision"),
+                      "live_leases": len(record["live_leases"]),
+                      "orphaned_leases": len(record["orphaned_leases"])}
+            for key in ("suspension_id", "scope"):
+                _bump(redactions, f"incidents.resume_outcome.{key}")
+            _bump(redactions, "incidents.resume_outcome.live_leases", len(record["live_leases"]))
+            _bump(redactions, "incidents.resume_outcome.orphaned_leases", len(record["orphaned_leases"]))
+        incidents.append({
+            "ref": refs[sid], "scope_class": cls,
+            "execution_epoch": _check_int(epoch, "incident execution_epoch"),
+            "trigger": _check_vocab(trigger, _TRIGGERS, "incident trigger"),
+            "created_at": _check_time(at, "incident created_at"),
+            "status": status, "requires_ack": bool(requires_ack),
+            "evidence": _sanitize_free_text(evidence, "incidents.evidence", redactions, hostnames),
+            "leases_at_trip": {"count": len(lease_list), "by_kind": dict(sorted(by_kind.items()))},
+            "resume_outcome": resume,
+        })
+    if active_by_class["owner"] != int(owner_scope["suspended"]) or any(
+            active_by_class[cls] != summary[cls]["suspended"] for cls in _CHANNEL_CLASSES):
+        _refuse("VALUE_UNKNOWN", "active incidents and suspended scopes disagree")
+    resumed_carried = sum(1 for i in incidents if i["status"] == "resumed")
+
+    # -- leases ------------------------------------------------------------------
+    states = dict.fromkeys(_LEASE_STATES, 0)
+    for state, count in copy.execute("SELECT state, COUNT(*) FROM leases GROUP BY state"):
+        states[_check_vocab(state, _LEASE_STATES, "lease state")] = count
+    if states["in_flight"] > IN_FLIGHT_CARRY_LIMIT:
+        _refuse("OVER_CAP", "more in-flight leases than the record may carry")
+    in_flight = []
+    for scope, epoch, kind, admitted_at in copy.execute(
+            "SELECT scope, execution_epoch, kind, admitted_at FROM leases WHERE state = 'in_flight' "
+            "ORDER BY admitted_at, rowid"):
+        cls = _scope_class(scope, "lease scope")
+        if cls != "owner":
+            _bump(redactions, "leases.scope")
+            summary[cls]["in_flight"] += 1
+        in_flight.append({"scope_class": cls, "execution_epoch": _check_int(epoch, "lease execution_epoch"),
+                          "kind": _check_vocab(kind, _LEASE_KINDS, "lease kind"),
+                          "admitted_at": _check_time(admitted_at, "lease admitted_at")})
+    for column, disposition in _DISPOSITION["leases"].items():
+        if disposition == "drop":
+            _bump(redactions, f"leases.{column}", len(in_flight))
+
+    # -- audit (last AUDIT_CARRY_LIMIT rows; the live table is never touched) ----
+    audit = []
+    for seq, at, action, scope, sid, detail in reversed(copy.execute(
+            "SELECT seq, at, action, scope, suspension_id, detail FROM audit "
+            "ORDER BY seq DESC LIMIT ?", (AUDIT_CARRY_LIMIT,)).fetchall()):
+        cls = None if scope is None else _scope_class(scope, "audit scope")
+        if cls not in (None, "owner"):
+            _bump(redactions, "audit.scope")
+        ref = None
+        if sid is not None:
+            if sid not in refs:
+                _refuse("VALUE_UNKNOWN", "audit names an incident that does not exist")
+            ref = refs[sid]
+            _bump(redactions, "audit.suspension_id")
+        audit.append({"seq": _check_int(seq, "audit seq", minimum=1), "at": _check_time(at, "audit at"),
+                      "action": _check_vocab(action, _AUDIT_ACTIONS, "audit action"),
+                      "scope_class": cls, "incident_ref": ref,
+                      "detail": _sanitize_free_text(detail, "audit.detail", redactions, hostnames)})
+
+    return {
+        "schema": RECOVERY_STATE_SCHEMA, "version": RECOVERY_STATE_VERSION, "label": RECOVERY_STATE_LABEL,
+        "provenance": {
+            "claimed_source_soul_id": soul_id, "claimed_source_incarnation": incarnation,
+            "claimed_source_created_at": created_at, "schema_version": SCHEMA_VERSION,
+            "min_enforcement_version": int(meta["min_enforcement_version"]),
+            "unknown_scope_policy": meta["unknown_scope_policy"],
+            "capture_method": RECOVERY_CAPTURE_METHOD, "sqlite_version": sqlite3.sqlite_version,
+            "assurance": PROVENANCE_ASSURANCE,
+        },
+        "row_counts": row_counts,
+        "owner_scope": owner_scope,
+        "channel_summary": summary,
+        "incidents": incidents,
+        "incidents_carried": {"active": len(active_rows), "resumed": resumed_carried,
+                              "resumed_total": len(resumed_rows),
+                              "truncated": resumed_carried < len(resumed_rows)},
+        "in_flight_leases": in_flight,
+        "lease_state_counts": states,
+        "runtimes": runtimes,
+        "runtimes_carried": {"total": row_counts["runtimes"], "carried": len(runtimes),
+                             "truncated": len(runtimes) < row_counts["runtimes"]},
+        "audit": audit,
+        "audit_carried": {"total": row_counts["audit"], "carried": len(audit), "limit": AUDIT_CARRY_LIMIT,
+                          "truncated": len(audit) < row_counts["audit"],
+                          "first_seq_carried": audit[0]["seq"] if audit else None},
+        "redactions": redactions,
+    }
+
+
+# -- evidence index (C1-07) ----------------------------------------------------
+
+def _evidence_scan(paths: _Paths) -> tuple:
+    """{relpath: (kind, dev, ino, size, mtime_ns)} for the evidence tree, and
+    how many salvage-scratch directories were skipped. Unreadable is refused,
+    never reported as empty; only a genuinely absent tree is empty."""
+    try:
+        root = os.lstat(paths.evidence)
+    except FileNotFoundError:
+        return {}, 0
+    except OSError as exc:
+        _refuse("EVIDENCE_UNREADABLE", type(exc).__name__)
+    if not stat.S_ISDIR(root.st_mode):
+        _refuse("EVIDENCE_UNREADABLE", "the evidence path is not a directory")
+    entries = {"": ("dir", root.st_dev, root.st_ino, 0, root.st_mtime_ns)}
+    ignored = 0
+    pending = [(paths.evidence, "", 0)]
+    while pending:
+        path, rel, depth = pending.pop()
+        try:
+            names = sorted(os.listdir(path))
+        except FileNotFoundError:
+            _refuse("BOUNDARY_CHANGED", "an evidence directory vanished while indexing")
+        except OSError as exc:
+            _refuse("EVIDENCE_UNREADABLE", type(exc).__name__)
+        for name in names:
+            if len(entries) > EVIDENCE_INDEX_MAX_ENTRIES or depth + 1 > EVIDENCE_INDEX_MAX_DEPTH:
+                _refuse("EVIDENCE_UNBOUNDED")
+            child, child_rel = os.path.join(path, name), f"{rel}/{name}" if rel else name
+            try:
+                st = os.lstat(child)
+            except FileNotFoundError:
+                _refuse("BOUNDARY_CHANGED", "an evidence entry vanished while indexing")
+            except OSError as exc:
+                _refuse("EVIDENCE_UNREADABLE", type(exc).__name__)
+            if stat.S_ISDIR(st.st_mode) and name == SALVAGE_SCRATCH_NAME:
+                ignored += 1  # recover_destructively's transient copy; never indexed
+            elif stat.S_ISDIR(st.st_mode):
+                entries[child_rel] = ("dir", st.st_dev, st.st_ino, 0, st.st_mtime_ns)
+                pending.append((child, child_rel, depth + 1))
+            elif stat.S_ISREG(st.st_mode):
+                if st.st_nlink != 1:
+                    _refuse("EVIDENCE_UNREADABLE", "an evidence file has another hard link")
+                entries[child_rel] = ("file", st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+            else:
+                _refuse("EVIDENCE_UNREADABLE", "an evidence entry is not a regular file or directory")
+    return entries, ignored
+
+
+def _hash_evidence_file(path: str, expected: tuple) -> str:
+    try:
+        fd = os.open(path, _READ_FLAGS)
+    except FileNotFoundError:
+        _refuse("BOUNDARY_CHANGED", "an evidence file vanished while hashing")
+    except OSError as exc:
+        _refuse("EVIDENCE_UNREADABLE", type(exc).__name__)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino, st.st_size) != expected[1:4]:
+            _refuse("BOUNDARY_CHANGED", "an evidence file changed while hashing")
+        digest, total = hashlib.sha256(), 0
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+    except OSError as exc:
+        _refuse("EVIDENCE_UNREADABLE", type(exc).__name__)
+    finally:
+        os.close(fd)
+    if total != expected[3]:
+        _refuse("BOUNDARY_CHANGED", "an evidence file changed size while hashing")
+    return digest.hexdigest()
+
+
+def _evidence_index(paths: _Paths, redactions: dict) -> dict:
+    """Names, sizes and sha256 of every evidence file. Contents are never
+    carried. The tree is listed before and after hashing; any difference
+    refuses (BOUNDARY_CHANGED)."""
+    before, ignored = _evidence_scan(paths)
+    if sum(e[3] for e in before.values()) > EVIDENCE_INDEX_MAX_BYTES:
+        _refuse("EVIDENCE_UNBOUNDED")
+    files = []
+    for rel in sorted(before):
+        entry = before[rel]
+        if entry[0] != "file":
+            continue
+        digest = _hash_evidence_file(os.path.join(paths.evidence, *rel.split("/")), entry)
+        parts = []
+        for part in rel.split("/"):
+            if _EVIDENCE_NAME.fullmatch(part) and part not in (".", ".."):
+                parts.append(part)
+            else:
+                parts.append(REDACTED)
+                _bump(redactions, "evidence_index.name")
+        files.append({"path": "/".join(parts), "size": entry[3], "sha256": digest})
+    after = _evidence_scan(paths)
+    if after != (before, ignored):
+        _refuse("BOUNDARY_CHANGED", "the evidence tree changed while it was indexed")
+    return {"entries": files, "files": len(files), "dirs": sum(1 for r, e in before.items() if r and e[0] == "dir"),
+            "bytes": sum(f["size"] for f in files), "ignored_transient": ignored}
+
+
+# -- sealing and the strict parser ------------------------------------------------
+
+def _recovery_payload(record: dict) -> bytes:
+    try:
+        return json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                          ensure_ascii=True).encode("ascii")
+    except (TypeError, ValueError):
+        raise RecoverySnapshotRefused("RECORD_INVALID", "not canonical JSON") from None
+
+
+def _seal_recovery_state(record: dict) -> RecoveryState:
+    payload = _recovery_payload(record)
+    if len(payload) > RECOVERY_STATE_MAX_BYTES:
+        _refuse("OVER_CAP", "the record is larger than the portable limit")
+    validate_recovery_state(json.loads(payload.decode("ascii")))
+    return RecoveryState(payload, hashlib.sha256(payload).hexdigest())
+
+
+_TOP_KEYS = frozenset({"schema", "version", "label", "provenance", "row_counts", "owner_scope",
+                       "channel_summary", "incidents", "incidents_carried", "in_flight_leases",
+                       "lease_state_counts", "runtimes", "runtimes_carried", "audit", "audit_carried",
+                       "evidence_index", "redactions"})
+_PROVENANCE_KEYS = frozenset({"claimed_source_soul_id", "claimed_source_incarnation",
+                              "claimed_source_created_at", "schema_version", "min_enforcement_version",
+                              "unknown_scope_policy", "claimed_captured_at", "capture_method", "sqlite_version",
+                              "assurance",
+                              "digest_of_ephemeral_capture"})
+
+
+def _invalid(detail: str):
+    raise RecoverySnapshotRefused("RECORD_INVALID", detail)
+
+
+def _v_obj(value, keys, what: str) -> dict:
+    if type(value) is not dict or set(value) != set(keys):
+        _invalid(f"{what} has the wrong shape")
+    return value
+
+
+def _v_int(value, what: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or not minimum <= value < _MAX_INT:
+        _invalid(f"{what} is not a valid integer")
+    return value
+
+
+def _v_time(value, what: str) -> None:
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value < _MAX_INT:
+        _invalid(f"{what} is not a valid time")
+
+
+def _v_str(value, pattern, what: str) -> str:
+    if type(value) is not str or not pattern.fullmatch(value):
+        _invalid(f"{what} is not valid")
+    return value
+
+
+def _v_in(value, vocab, what: str):
+    if type(value) is not str or value not in vocab:
+        _invalid(f"{what} is outside its vocabulary")
+    return value
+
+
+def _v_free_text(value, what: str) -> None:
+    if type(value) is not dict or len(value) > _FREE_TEXT_MAX_ITEMS:
+        _invalid(f"{what} has the wrong shape")
+    for key, item in value.items():
+        if type(key) is not str or key not in _FREE_TEXT_KEYS | _IDENTIFIER_KEYS:
+            _invalid(f"{what} has a key outside the allowlist")
+        if key in _IDENTIFIER_KEYS and item != REDACTED:
+            _invalid(f"{what} carries an identifier value")  # Sonnet S1-02
+        if not _free_text_value_ok(item, frozenset()):
+            _invalid(f"{what} has a value outside the allowlist")
+
+
+def _v_list(value, limit: int, what: str) -> list:
+    if type(value) is not list or len(value) > limit:
+        _invalid(f"{what} is not a list within its limit")
+    return value
+
+
+def validate_recovery_state(record) -> None:
+    """Strict, closed-world check of a recovery record, for the snapshot's
+    own output and for anything that reads one later (C1-S2 restore, the
+    C1-S3 verifier). Raises RecoverySnapshotRefused("RECORD_INVALID"). A
+    record that passes is well-formed and self-consistent; its provenance
+    fields are still only claims by whoever produced it."""
+    _v_obj(record, _TOP_KEYS, "record")
+    if record["schema"] != RECOVERY_STATE_SCHEMA or type(record["version"]) is not int \
+            or record["version"] != RECOVERY_STATE_VERSION or record["label"] != RECOVERY_STATE_LABEL:
+        _invalid("unknown record schema, version or label")
+
+    prov = _v_obj(record["provenance"], _PROVENANCE_KEYS, "provenance")
+    _v_str(prov["claimed_source_soul_id"], _HEX32, "claimed_source_soul_id")
+    _v_str(prov["claimed_source_incarnation"], _HEX32, "claimed_source_incarnation")
+    _v_time(prov["claimed_source_created_at"], "claimed_source_created_at")
+    _v_time(prov["claimed_captured_at"], "claimed_captured_at")
+    if prov["assurance"] != PROVENANCE_ASSURANCE:
+        _invalid("assurance")
+    if type(prov["schema_version"]) is not int or prov["schema_version"] != SCHEMA_VERSION:
+        _invalid("schema_version")
+    _v_int(prov["min_enforcement_version"], "min_enforcement_version")
+    _v_in(prov["unknown_scope_policy"], _SCOPE_POLICIES, "unknown_scope_policy")
+    if prov["capture_method"] != RECOVERY_CAPTURE_METHOD:
+        _invalid("capture_method")
+    _v_str(prov["sqlite_version"], _SQLITE_VERSION, "sqlite_version")
+    _v_str(prov["digest_of_ephemeral_capture"], _HEX64, "digest_of_ephemeral_capture")
+
+    counts = _v_obj(record["row_counts"], _DISPOSITION, "row_counts")
+    for table in _DISPOSITION:
+        _v_int(counts[table], f"row_counts.{table}")
+    if counts["deferred"] != 0:
+        _invalid("deferred rows")
+
+    owner = _v_obj(record["owner_scope"], ("execution_epoch", "state_revision", "suspended"), "owner_scope")
+    _v_int(owner["execution_epoch"], "owner execution_epoch")
+    _v_int(owner["state_revision"], "owner state_revision")
+    if type(owner["suspended"]) is not bool:
+        _invalid("owner suspended")
+    summary = _v_obj(record["channel_summary"], _CHANNEL_CLASSES, "channel_summary")
+    for cls in _CHANNEL_CLASSES:
+        item = _v_obj(summary[cls], ("scopes", "suspended", "in_flight"), f"channel_summary.{cls}")
+        for key in item:
+            _v_int(item[key], f"channel_summary.{cls}.{key}")
+        if item["suspended"] > item["scopes"]:
+            _invalid("channel_summary suspended exceeds scopes")
+    if 1 + sum(summary[c]["scopes"] for c in _CHANNEL_CLASSES) != counts["scopes"]:
+        _invalid("scope counts disagree")
+
+    incidents = _v_list(record["incidents"], INCIDENT_CARRY_LIMIT, "incidents")
+    seen_refs, active_by_class, resumed = set(), dict.fromkeys(_SCOPE_CLASSES, 0), 0
+    for inc in incidents:
+        _v_obj(inc, ("ref", "scope_class", "execution_epoch", "trigger", "created_at", "status",
+                     "requires_ack", "evidence", "leases_at_trip", "resume_outcome"), "incident")
+        if _v_str(inc["ref"], _INCIDENT_REF, "incident ref") in seen_refs:
+            _invalid("duplicate incident ref")
+        seen_refs.add(inc["ref"])
+        cls = _v_in(inc["scope_class"], _SCOPE_CLASSES, "incident scope_class")
+        _v_int(inc["execution_epoch"], "incident execution_epoch")
+        _v_in(inc["trigger"], _TRIGGERS, "incident trigger")
+        _v_time(inc["created_at"], "incident created_at")
+        status = _v_in(inc["status"], _INCIDENT_STATUSES, "incident status")
+        if type(inc["requires_ack"]) is not bool:
+            _invalid("incident requires_ack")
+        _v_free_text(inc["evidence"], "incident evidence")
+        leases = _v_obj(inc["leases_at_trip"], ("count", "by_kind"), "leases_at_trip")
+        _v_int(leases["count"], "leases_at_trip count")
+        if type(leases["by_kind"]) is not dict or not set(leases["by_kind"]) <= _LEASE_KINDS \
+                or sum(_v_int(n, "leases_at_trip by_kind", minimum=1)
+                       for n in leases["by_kind"].values()) != leases["count"]:
+            _invalid("leases_at_trip by_kind")
+        outcome = inc["resume_outcome"]
+        if status == "active":
+            if outcome is not None:
+                _invalid("an active incident has a resume outcome")
+            active_by_class[cls] += 1
+        else:
+            resumed += 1
+            _v_obj(outcome, ("result", "state_revision", "live_leases", "orphaned_leases"), "resume_outcome")
+            _v_in(outcome["result"], _RESUME_RESULTS, "resume result")
+            if outcome["state_revision"] is not None:
+                _v_int(outcome["state_revision"], "resume state_revision")
+            _v_int(outcome["live_leases"], "resume live_leases")
+            _v_int(outcome["orphaned_leases"], "resume orphaned_leases")
+    carried = _v_obj(record["incidents_carried"], ("active", "resumed", "resumed_total", "truncated"),
+                     "incidents_carried")
+    if (_v_int(carried["active"], "incidents_carried.active") != sum(active_by_class.values())
+            or _v_int(carried["resumed"], "incidents_carried.resumed") != resumed
+            or _v_int(carried["resumed_total"], "incidents_carried.resumed_total") < resumed
+            or carried["active"] + carried["resumed_total"] != counts["incidents"]
+            or carried["truncated"] is not (carried["resumed_total"] > resumed)):
+        _invalid("incidents_carried disagrees with the incidents")
+    if active_by_class["owner"] != int(owner["suspended"]) or any(
+            active_by_class[c] != summary[c]["suspended"] for c in _CHANNEL_CLASSES):
+        _invalid("active incidents and suspended scopes disagree")
+
+    states = _v_obj(record["lease_state_counts"], _LEASE_STATES, "lease_state_counts")
+    if sum(_v_int(states[s], f"lease_state_counts.{s}") for s in _LEASE_STATES) != counts["leases"]:
+        _invalid("lease counts disagree")
+    leases = _v_list(record["in_flight_leases"], IN_FLIGHT_CARRY_LIMIT, "in_flight_leases")
+    if len(leases) != states["in_flight"]:
+        _invalid("in-flight lease count disagrees")
+    in_flight_by_class = dict.fromkeys(_SCOPE_CLASSES, 0)
+    for lease in leases:
+        _v_obj(lease, ("scope_class", "execution_epoch", "kind", "admitted_at"), "in-flight lease")
+        in_flight_by_class[_v_in(lease["scope_class"], _SCOPE_CLASSES, "lease scope_class")] += 1
+        _v_int(lease["execution_epoch"], "lease execution_epoch")
+        _v_in(lease["kind"], _LEASE_KINDS, "lease kind")
+        _v_time(lease["admitted_at"], "lease admitted_at")
+    if any(in_flight_by_class[c] != summary[c]["in_flight"] for c in _CHANNEL_CLASSES):
+        _invalid("channel in-flight counts disagree")
+
+    runtimes = _v_list(record["runtimes"], RUNTIME_CARRY_LIMIT, "runtimes")
+    for runtime in runtimes:
+        _v_obj(runtime, ("enforcement_version", "registered_at", "heartbeat_at"), "runtime")
+        _v_int(runtime["enforcement_version"], "runtime enforcement_version")
+        _v_time(runtime["registered_at"], "runtime registered_at")
+        _v_time(runtime["heartbeat_at"], "runtime heartbeat_at")
+    rc = _v_obj(record["runtimes_carried"], ("total", "carried", "truncated"), "runtimes_carried")
+    if (_v_int(rc["total"], "runtimes_carried.total") != counts["runtimes"]
+            or _v_int(rc["carried"], "runtimes_carried.carried") != len(runtimes)
+            or len(runtimes) != min(counts["runtimes"], RUNTIME_CARRY_LIMIT)
+            or rc["truncated"] is not (counts["runtimes"] > len(runtimes))):
+        _invalid("runtimes_carried disagrees")
+
+    audit = _v_list(record["audit"], AUDIT_CARRY_LIMIT, "audit")
+    previous = 0
+    for row in audit:
+        _v_obj(row, ("seq", "at", "action", "scope_class", "incident_ref", "detail"), "audit row")
+        if _v_int(row["seq"], "audit seq", minimum=1) <= previous:
+            _invalid("audit rows out of order")
+        previous = row["seq"]
+        _v_time(row["at"], "audit at")
+        _v_in(row["action"], _AUDIT_ACTIONS, "audit action")
+        if row["scope_class"] is not None:
+            _v_in(row["scope_class"], _SCOPE_CLASSES, "audit scope_class")
+        if row["incident_ref"] is not None:
+            _v_str(row["incident_ref"], _INCIDENT_REF, "audit incident_ref")
+        _v_free_text(row["detail"], "audit detail")
+    ac = _v_obj(record["audit_carried"], ("total", "carried", "limit", "truncated", "first_seq_carried"),
+                "audit_carried")
+    if ac["first_seq_carried"] is not None:
+        _v_int(ac["first_seq_carried"], "audit_carried.first_seq_carried", minimum=1)
+    if (_v_int(ac["total"], "audit_carried.total") != counts["audit"]
+            or _v_int(ac["carried"], "audit_carried.carried") != len(audit)
+            or _v_int(ac["limit"], "audit_carried.limit") != AUDIT_CARRY_LIMIT
+            or len(audit) != min(counts["audit"], AUDIT_CARRY_LIMIT)
+            or ac["truncated"] is not (counts["audit"] > len(audit))
+            or ac["first_seq_carried"] != (audit[0]["seq"] if audit else None)):
+        _invalid("audit_carried disagrees")
+
+    index = _v_obj(record["evidence_index"], ("entries", "files", "dirs", "bytes", "ignored_transient"),
+                   "evidence_index")
+    entries = _v_list(index["entries"], EVIDENCE_INDEX_MAX_ENTRIES, "evidence_index entries")
+    total = 0
+    for entry in entries:
+        _v_obj(entry, ("path", "size", "sha256"), "evidence entry")
+        if type(entry["path"]) is not str or len(entry["path"].split("/")) > EVIDENCE_INDEX_MAX_DEPTH or any(
+                part != REDACTED and (part in (".", "..") or not _EVIDENCE_NAME.fullmatch(part))
+                for part in entry["path"].split("/")):
+            _invalid("evidence entry path")
+        total += _v_int(entry["size"], "evidence entry size")
+        _v_str(entry["sha256"], _HEX64, "evidence entry sha256")
+    _v_int(index["dirs"], "evidence_index dirs")
+    _v_int(index["ignored_transient"], "evidence_index ignored_transient")
+    if (_v_int(index["files"], "evidence_index files") != len(entries)
+            or _v_int(index["bytes"], "evidence_index bytes") != total or total > EVIDENCE_INDEX_MAX_BYTES):
+        _invalid("evidence_index totals disagree")
+
+    redactions = record["redactions"]
+    if type(redactions) is not dict:
+        _invalid("redactions")
+    for path, count in redactions.items():
+        _v_str(path, _REDACTION_PATH, "redaction path")
+        _v_int(count, "redaction count", minimum=1)

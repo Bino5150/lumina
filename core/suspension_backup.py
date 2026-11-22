@@ -25,6 +25,12 @@ restored root probes ABSENT_WITH_TRACE (owner Recover), never
 ABSENT_NO_TRACE (first-run Initialize). It only adds a restriction: it never
 creates or opens a store, never writes the identity pin, never copies
 archived C1 state, and needs no owner envelope because it grants nothing.
+
+capture_recovery_state() (C1-S1) is the exporter's only way to C1's
+consistent safety-state snapshot. It still opens nothing itself: C1 opens
+the store read-only and copies it into memory (SuspensionStore.
+recovery_snapshot()), and this module brackets that with the exclusion
+boundary check. It writes nothing anywhere. Nothing calls it yet (C1-S3).
 """
 from __future__ import annotations
 
@@ -228,6 +234,29 @@ def verify_exclusion_unchanged(data_dir, exclusion: C1Exclusion) -> None:
     if (now.data_root != exclusion.data_root or now.memory_dir != exclusion.memory_dir
             or _stable_view(now) != _stable_view(exclusion)):
         raise ExclusionUnavailable("BOUNDARY_CHANGED")
+
+
+def capture_recovery_state(data_dir) -> "_c1.RecoveryState":
+    """C1's sanitized recovery record for `data_dir` (C1-SNAP S-1..S-5).
+
+    The boundary is observed before the capture and re-verified after it
+    while C1's read-only handle still holds the store open, so a store, pin
+    or evidence directory that changed identity in between refuses
+    (BOUNDARY_CHANGED) instead of being labelled current. Raises
+    ExclusionUnavailable or core.suspension.RecoverySnapshotRefused; never
+    returns a partial record. The record is not original evidence, carries
+    no raw store bytes and grants nothing."""
+    exclusion = describe_exclusions(data_dir)
+    try:
+        store = _c1._open_store(data_dir, now=None, read_only=True)
+    except _c1.StoreFault as exc:
+        raise _c1.RecoverySnapshotRefused("STORE_FAULT", exc.detail, exc.fault) from None
+    try:
+        state = store.recovery_snapshot()
+        verify_exclusion_unchanged(data_dir, exclusion)
+    finally:
+        store.close()
+    return state
 
 
 RESTORE_TRACE_NAME = "restore_trace.json"
