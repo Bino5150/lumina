@@ -71,7 +71,8 @@ class _AgentBackupWorker(QThread):
             receipt = agent_backup_export.confirm_export_result(self.destination, manifest, receipt)
             self.completed.emit(receipt)
         except agent_backup_export.ExportUnavailable as exc:
-            self.failed.emit(str(exc))
+            # Owner words only: a refusal code never reaches the dialog (TS3-10).
+            self.failed.emit(agent_backup_export.owner_message(exc))
         except Exception:
             # Product errors cannot echo archive payloads, credential-like
             # preference values, or arbitrary exception representations.
@@ -163,8 +164,10 @@ class MemoryTab(QWidget):
         self.verified_backup_btn = _btn("Verified Agent Backup...", self.c, accent=True)
         self.verified_backup_btn.setObjectName("verified_agent_backup")
         self.verified_backup_btn.setToolTip(
-            "Checks complete export coverage before writing. Safety-state support is pending; "
-            "this workflow refuses incomplete full-backup claims.")
+            "Writes a new archive only when every required part of Lumina's state, including a sanitized "
+            "record of its safety-suspension state, is captured and verified; otherwise it writes nothing. "
+            "Full recovery is not proven until a restore is. Closing Settings does not cancel it; "
+            "quitting waits for it to finish.")
         self.verified_backup_btn.clicked.connect(self._export_agent_backup)
         exports.addWidget(self.verified_backup_btn)
         self.incomplete_export_btn = _btn("Incomplete State Export...", self.c)
@@ -276,25 +279,13 @@ class MemoryTab(QWidget):
         QMessageBox.critical(self, "Agent Backup unavailable", message)
 
     def _agent_backup_completed(self, receipt):
-        # Current contract cannot establish full coverage or Restore acceptance.
-        # The worker re-verifies the exact file and checks receipt claims first.
-        marker = receipt["semantic_coverage"]["knowledge_pack_installation_marker"]
-        durability = ("confirmed" if receipt["publication"].get("directory_fsynced")
-                      else "not confirmed; best effort only")
-        QMessageBox.warning(
-            self, "Incomplete State Export",
-            f"Incomplete State Export written to:\n{receipt['destination']}\n\n"
-            "Archive integrity and structure: PASS\n"
-            f"SHA-256: {receipt['archive_sha256']}\n"
-            f"Verified members: {receipt['member_count']}\n"
-            f"Verified SQLite snapshots: {receipt['database_snapshots_verified']}\n"
-            "Semantic state coverage: INCOMPLETE\n"
-            f"Knowledge Pack installation marker: {marker}\n"
-            "C1 store / soul identity / safety evidence: OMITTED\n"
-            "C1 enforcement compatibility: UNPROVEN\n"
-            "Full recovery acceptance: NOT PROVEN; not a complete Restore input\n"
-            f"Directory durability: {durability}\n"
-            "Not encrypted. Ordinary content may contain secrets. Preserve prior verified backups.")
+        # The worker re-verifies the exact file and checks receipt claims first;
+        # this dialog only renders the derived, confirmed receipt.
+        title, text = agent_backup_export.owner_receipt_text(receipt)
+        if receipt.get("export_kind") == "verified_agent_backup":
+            QMessageBox.information(self, title, text)
+        else:
+            QMessageBox.warning(self, title, text)
 
     def _render(self, rows: list):
         self.table.setRowCount(0)

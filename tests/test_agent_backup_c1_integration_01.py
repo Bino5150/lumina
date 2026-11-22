@@ -81,12 +81,31 @@ def test_real_exclusion_exports_without_opening_protected_state(source, monkeypa
     payloads = read_zip(destination)
     assert b'C1-SELECTOR-NEVER-ARCHIVE' not in b''.join(payloads.values())
     assert not any('suspension' in n or 'soul_identity' in n for n in payloads)
-    with pytest.raises(ex.ExportUnavailable, match='suspension'):
-        ex.export_verified_agent_backup(str(data), str(source[1]), str(destination.with_name('full.zip')))
-    assert not destination.with_name('full.zip').exists()
+    full = destination.with_name('full.zip')
+    if state == 'active':
+        # C1-S3a (disclosed edit): a valid store now yields a Verified backup.
+        # The os.open tripwire above still holds: only the child process
+        # opens C1, never this one. The selector canary stays out of it.
+        _m, full_receipt = ex.export_verified_agent_backup(
+            str(data), str(source[1]), str(full),
+            credentials_path=NO_CREDENTIALS, identity_trailers_path=NO_IDENTITY_TRAILERS)
+        assert full_receipt['full_agent_coverage'] is True
+        assert full_receipt['restorable_verified'] is False
+        assert b'C1-SELECTOR-NEVER-ARCHIVE' not in b''.join(read_zip(full).values())
+    else:
+        with pytest.raises(ex.ExportUnavailable, match='suspension'):
+            ex.export_verified_agent_backup(str(data), str(source[1]), str(full))
+        assert not full.exists()
     if state == 'unreadable':
         (data / 'memory' / S.STORE_NAME).chmod(0o600)
-    assert protected_hashes(data) == before
+    if state == 'active':
+        # The child's read-only SQLite open may leave -wal/-shm (C1-06, S1-08);
+        # the store, pin and evidence keep their exact bytes and inodes.
+        def without_sidecars(h):
+            return {k: v for k, v in h.items() if not k.endswith(('-wal', '-shm'))}
+        assert without_sidecars(protected_hashes(data)) == without_sidecars(before)
+    else:
+        assert protected_hashes(data) == before
 
 
 def test_describe_refusal_precedes_any_capture(source, monkeypatch):

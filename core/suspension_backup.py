@@ -30,7 +30,9 @@ capture_recovery_state() (C1-S1) is the exporter's only way to C1's
 consistent safety-state snapshot. It still opens nothing itself: C1 opens
 the store read-only and copies it into memory (SuspensionStore.
 recovery_snapshot()), and this module brackets that with the exclusion
-boundary check. It writes nothing anywhere. Nothing calls it yet (C1-S3).
+boundary check. It writes nothing anywhere. The Verified Agent Backup
+(C1-S3) runs it, and observe_store_incarnation(), only in a short-lived
+child process (core/agent_backup_c1_child.py), never in the agent's own.
 """
 from __future__ import annotations
 
@@ -257,6 +259,37 @@ def capture_recovery_state(data_dir) -> "_c1.RecoveryState":
     finally:
         store.close()
     return state
+
+
+def observe_store_incarnation(data_dir) -> tuple:
+    """(soul_id, store_incarnation) of the store at `data_dir`, read through
+    C1's identity-verified read-only open and bracketed by the exclusion
+    boundary like capture_recovery_state() (C1-S3 A-3). An exporter compares
+    it with a record's claimed provenance just before publication, so a store
+    replaced after the capture (even at a reused inode number) is refused.
+    Raises ExclusionUnavailable or core.suspension.RecoverySnapshotRefused."""
+    exclusion = describe_exclusions(data_dir)
+    try:
+        store = _c1._open_store(data_dir, now=None, read_only=True)
+    except _c1.StoreFault as exc:
+        raise _c1.RecoverySnapshotRefused("STORE_FAULT", exc.detail, exc.fault) from None
+    try:
+        identity = (store.soul_id, store.incarnation)
+        verify_exclusion_unchanged(data_dir, exclusion)
+    finally:
+        store.close()
+    return identity
+
+
+# The exporter's strict parser and canonical form for a recovery record
+# (C1-S3 A-5). Thin names only: the exporter never imports core.suspension.
+validate_recovery_state = _c1.validate_recovery_state
+canonical_recovery_payload = _c1._recovery_payload
+RecoverySnapshotRefused = _c1.RecoverySnapshotRefused
+SNAPSHOT_REFUSALS = _c1.SNAPSHOT_REFUSALS
+RECOVERY_STATE_MAX_BYTES = _c1.RECOVERY_STATE_MAX_BYTES
+RECOVERY_STATE_SCHEMA = _c1.RECOVERY_STATE_SCHEMA
+RECOVERY_STATE_VERSION = _c1.RECOVERY_STATE_VERSION
 
 
 RESTORE_TRACE_NAME = "restore_trace.json"

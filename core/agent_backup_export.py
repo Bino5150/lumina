@@ -1,4 +1,5 @@
-"""Verified-export candidate, format 2.2; no Restore or live C1 snapshot API.
+"""Agent Backup export formats 2.2 (Incomplete State Export) and 2.3
+(Verified Agent Backup); no Restore and no live C1 state.
 
 Format 2.2 (AGENT-BACKUP-RESTORE-PHASE-B S3) adds, for new exports only:
 generated-image blobs and their manifest sidecars as hash-bound members,
@@ -6,14 +7,23 @@ checked row by row against the archived database; the data-root inventory
 and its owner-declared exclusions (D1-D4) in export_observations; and the
 installation-local preference count. 2.0 and 2.1 stay readable unchanged.
 
+Format 2.3 (C1-S3a, C1S3-AMENDMENT-A1) is the Verified Agent Backup. It is
+2.2 plus one hash-bound member, C1's sanitized recovery record, captured in
+a child process (core/agent_backup_c1_child.py) so the agent's own process
+never does that work. It runs every 2.2 check (A-1) and then the C1 ones.
+The verifier alone derives its coverage from the archived bytes, and an
+archive with any coverage blocker can never verify as 2.3, so a verified 2.3
+archive is a Verified backup by construction. The record is derived,
+sanitized history, never live safety state; restoring 2.3 is not supported
+by this build (S3b), and "Verified" never means "restorable".
+
 The old v1 builder/verifier remain unchanged by default. The small private v2
 hooks in agent_backup reuse its collectors, immutable capture, ZIP grammar,
 resource limits, publication and rollback. This module owns only the new policy.
 
-Production full export fails closed until C1 supplies a reviewed snapshot
-contract. Explicitly acknowledged Incomplete State Export uses major 2, a new
+Explicitly acknowledged Incomplete State Export uses major 2, a new
 destination, and separate coverage/compatibility/acceptance evidence. Neither
-this format nor integrity PASS authorizes Restore or runtime grants.
+format nor integrity PASS authorizes Restore or runtime grants.
 """
 from __future__ import annotations
 
@@ -23,23 +33,62 @@ import io
 import json
 import os
 import re
+import selectors
+import signal
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 import zipfile
 
 from core import agent_backup as ab
+from core import agent_backup_c1_child as c1_child
 from core import agent_backup_inventory as inv
 from core import agent_backup_references as refs
 from core import suspension_backup as c1
 from core.test_isolation import refuse_if_production_path
 
 V21 = {"major": 2, "minor": 1}
-VERSION = {"major": 2, "minor": 2}
+VERSION = {"major": 2, "minor": 2}             # Incomplete State Export
+VERIFIED_VERSION = {"major": 2, "minor": 3}    # Verified Agent Backup
+# Formats Restore may read. 2.3 is deliberately absent until S3b gives
+# restore its per-format plan and receipt values (TS3-05, amendment A-1).
 READ_VERSIONS = ({"major": 2, "minor": 0}, V21, VERSION)
+# Formats this verifier reads.
+VERIFY_VERSIONS = READ_VERSIONS + (VERIFIED_VERSION,)
+C1_ARCHIVE_PREFIX = "state/c1/"
 # Namespace the 2.x verifier accepts beyond v1's (v1 itself never does).
-EXTRA_ARCHIVE_PREFIXES = (inv.GENERATION_ARCHIVE_PREFIX,)
+EXTRA_ARCHIVE_PREFIXES = (inv.GENERATION_ARCHIVE_PREFIX, C1_ARCHIVE_PREFIX)
+C1_MEMBER_ID = "state.c1.recovery_state"
+C1_MEMBER_POLICY = {
+    "archive_path": C1_ARCHIVE_PREFIX + "recovery_state.json", "state_class": "REQUIRED_AGENT_STATE",
+    "content_kind": "json", "required": True, "portable": "PORTABLE",
+    "restore_policy": "history_only_never_live_c1_state",
+}
+C1_OBSERVATION_FIELDS = frozenset({
+    "status", "record_sha256", "record_schema", "record_version", "claimed_source_incarnation",
+    "audit_truncated", "incidents_truncated", "runtimes_truncated", "redaction_total"})
+C1_EXCLUSION_V2_CONSTANTS = {
+    "schema": c1.SCHEMA, "version": 2, "status": "present_excluded", "raw_store": "excluded",
+    "sanitized_record": "see_c1_recovery", "enforcement_compatibility": "unproven",
+    "restore_fence": "c1_trace_and_owner_recover_required",
+}
+C1_LIMITATIONS = (
+    "snapshot_predates_later_trips_recovery_or_replacement",
+    "process_local_unconfirmed_trips_not_included",
+    "captured_at_is_a_claimed_lower_bound",
+    "unknown_evidence_keys_dropped_and_counted",
+    "restore_starts_every_scope_suspended",
+    "members_captured_at_different_times",
+)
+_HEX32 = re.compile(r"[0-9a-f]{32}")
+_C1_OBSERVATION_CACHE_MAX = 4
+_c1_observation_cache: dict = {}
+_c1_observation_lock = threading.Lock()
 GENERATION_BLOB_POLICY = {
     "state_class": "REQUIRED_AGENT_STATE", "content_kind": "binary", "required": True,
     "portable": "PORTABLE_WITH_REBIND",
@@ -114,8 +163,97 @@ _DESTINATION_LOCAL_PREFS = frozenset({
 })
 
 
+_CODE_SHAPE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
+
+
 class ExportUnavailable(ab.AgentBackupError):
-    """Coverage is unavailable; no production artifact is published."""
+    """Coverage is unavailable; no production artifact is published.
+
+    `code` is for tests and diagnostics. Verified-export refusals carry owner
+    words as their message; owner_message() turns any older code-only
+    message into owner words too (TS3-10)."""
+
+    def __init__(self, message, *, code=None, detail=None):
+        super().__init__(message)
+        self.code = code if code is not None else (message if type(message) is str
+                                                   and _CODE_SHAPE.fullmatch(message) else None)
+        self.detail = detail
+
+
+# Owner words for every refusal code (TS3-10, amendment A-7). Never echoes a
+# raw code, a path or an archive payload.
+_NOT_WRITTEN = " No archive was written. Existing files are preserved."
+_INCOMPLETE_HINT = (" Incomplete State Export remains available and says exactly what it leaves out.")
+OWNER_MESSAGES = {
+    "C1_STATE_ABSENT": (
+        "Verified Agent Backup was not written: this data folder has no safety-suspension state "
+        "to capture. Missing state is never proof of a first installation." + _NOT_WRITTEN + _INCOMPLETE_HINT),
+    "C1_SNAPSHOT_CHILD_FAILED": (
+        "Verified Agent Backup was not written: the separate process that captures the "
+        "safety-suspension state did not finish cleanly." + _NOT_WRITTEN),
+    "C1_SNAPSHOT_REFUSED": (
+        "Verified Agent Backup was not written: the safety-suspension state could not be captured "
+        "consistently. It may be damaged, written by a newer version, changing, or larger than a "
+        "backup may carry." + _NOT_WRITTEN + _INCOMPLETE_HINT),
+    "C1_SNAPSHOT_BOUNDARY": (
+        "Verified Agent Backup was not written: the safety-suspension files changed or could not be "
+        "observed while they were being captured. Try again." + _NOT_WRITTEN),
+    "C1_SNAPSHOT_STORE_TOO_LARGE": (
+        "Verified Agent Backup was not written: the safety-suspension store is larger than a backup "
+        "may copy." + _NOT_WRITTEN + _INCOMPLETE_HINT),
+    "C1_SNAPSHOT_CHILD_LIMITS_UNAVAILABLE": (
+        "Verified Agent Backup was not written: this system could not give the safety-suspension "
+        "capture its time and memory limits, so it was not run." + _NOT_WRITTEN),
+    "C1_SNAPSHOT_STORE_REPLACED": (
+        "Verified Agent Backup was not written: the safety-suspension store was replaced while the "
+        "backup was being made. Try again." + _NOT_WRITTEN),
+    "C1_SNAPSHOT_RECORD_INVALID": (
+        "Verified Agent Backup was not written: the captured safety-suspension record failed its "
+        "strict check." + _NOT_WRITTEN),
+    "C1_EXCLUSION": (
+        "Agent Backup was not written: the protected safety-suspension files changed or could not be "
+        "observed while the backup was being made. Try again." + _NOT_WRITTEN),
+    "C1_PROTECTED": (
+        "Agent Backup was not written: a source pointed into the protected safety-suspension files, "
+        "which a backup never copies." + _NOT_WRITTEN),
+    "EXPORT_FAILED": (
+        "Agent Backup failed validation or publication. No verified success was recorded. Keep any "
+        "prior backup and recovery evidence."),
+}
+BLOCKER_WORDS = {
+    "suspension": "the safety-suspension state was not captured",
+    "installation_marker": "the Knowledge Pack installation record is missing",
+    "unclassified_preferences": "some preferences are of a kind this version does not recognise",
+    "generation_artifacts": "some generated images or their records are missing or changed",
+    "inventory": "some files in the data folder still need a backup decision, or the folder could not be listed",
+}
+
+
+def _owner_words(code):
+    if code in OWNER_MESSAGES:
+        return OWNER_MESSAGES[code]
+    for prefix, key in (("C1_SNAPSHOT_EXCLUSION_", "C1_SNAPSHOT_BOUNDARY"),
+                        ("C1_SNAPSHOT_", "C1_SNAPSHOT_REFUSED"),
+                        ("C1_EXCLUSION_", "C1_EXCLUSION"), ("C1_PROTECTED_", "C1_PROTECTED")):
+        if code.startswith(prefix):
+            return OWNER_MESSAGES[key]
+    return OWNER_MESSAGES["EXPORT_FAILED"]
+
+
+def owner_message(exc):
+    """What the owner sees for a refused export: owner words, never a code."""
+    text = str(exc)
+    head = text.split(":", 1)[0]
+    if _CODE_SHAPE.fullmatch(head):
+        return _owner_words(head)
+    return text
+
+
+def _blocked_message(blockers):
+    absence = (" Missing state is never proof of a first installation."
+               if {"suspension", "installation_marker"} & set(blockers) else "")
+    return ("Verified Agent Backup was not written because "
+            + "; ".join(BLOCKER_WORDS[b] for b in blockers) + "." + absence + _NOT_WRITTEN + _INCOMPLETE_HINT)
 
 
 def _json_bytes(value):
@@ -126,6 +264,224 @@ def _same_contract(actual, expected):
     # JSON booleans and integers are different policy values even though Python
     # equality treats False == 0 and True == 1 as equal.
     return _json_bytes(actual) == _json_bytes(expected)
+
+
+def _v22_family(version):
+    """2.2 and 2.3 share every 2.2 rule; 2.3 adds the C1 ones (TS3-01, A-1).
+    The only place a verifier rule names either version."""
+    return _same_contract(version, VERSION) or _same_contract(version, VERIFIED_VERSION)
+
+
+def _is_verified_format(version):
+    return _same_contract(version, VERIFIED_VERSION)
+
+
+# -- C1 recovery record: one path from bytes to an observation (A-5, TS3-11) --
+
+class C1RecordInvalid(ValueError):
+    """The bytes are not one strict, canonical, valid C1 recovery record."""
+
+
+def _c1_record_facts(raw):
+    """(observation json, soul_id, incarnation) for exact record bytes, from
+    the full strict check: strict parse, validate_recovery_state and exact
+    canonical equality. Results are kept under the bytes' full sha256 only,
+    so a repeat can only answer for bytes that already passed (A-4)."""
+    if type(raw) is not bytes or not raw or len(raw) > c1.RECOVERY_STATE_MAX_BYTES:
+        raise C1RecordInvalid("record size")
+    digest = hashlib.sha256(raw).hexdigest()
+    with _c1_observation_lock:
+        cached = _c1_observation_cache.get(digest)
+    if cached is not None:
+        return cached
+    try:
+        record = ab._strict_json_loads(raw)
+        c1.validate_recovery_state(record)
+        canonical = c1.canonical_recovery_payload(record)
+    except (c1.RecoverySnapshotRefused, ValueError, TypeError, KeyError, RecursionError,
+            MemoryError, UnicodeError) as exc:
+        raise C1RecordInvalid(type(exc).__name__) from None
+    if canonical != raw:
+        raise C1RecordInvalid("not the canonical form")
+    prov = record["provenance"]
+    observation = {
+        "status": "captured_sanitized", "record_sha256": digest,
+        "record_schema": record["schema"], "record_version": record["version"],
+        "claimed_source_incarnation": prov["claimed_source_incarnation"],
+        "audit_truncated": record["audit_carried"]["truncated"],
+        "incidents_truncated": record["incidents_carried"]["truncated"],
+        "runtimes_truncated": record["runtimes_carried"]["truncated"],
+        "redaction_total": sum(record["redactions"].values()),
+    }
+    facts = (_json_bytes(observation), prov["claimed_source_soul_id"], prov["claimed_source_incarnation"])
+    with _c1_observation_lock:
+        while len(_c1_observation_cache) >= _C1_OBSERVATION_CACHE_MAX:
+            _c1_observation_cache.pop(next(iter(_c1_observation_cache)))
+        _c1_observation_cache[digest] = facts
+    return facts
+
+
+def c1_observation_from_bytes(raw):
+    """The c1_recovery observation derived from exact record bytes. Builder
+    and verifier both use this; neither writes observation fields by hand."""
+    return json.loads(_c1_record_facts(raw)[0])
+
+
+def _valid_c1_observation(value):
+    return (type(value) is dict and set(value) == C1_OBSERVATION_FIELDS
+            and value["status"] == "captured_sanitized"
+            and type(value["record_sha256"]) is str and ab._SHA256_RE.fullmatch(value["record_sha256"]) is not None
+            and value["record_schema"] == c1.RECOVERY_STATE_SCHEMA
+            and _same_contract(value["record_version"], c1.RECOVERY_STATE_VERSION)
+            and type(value["claimed_source_incarnation"]) is str
+            and _HEX32.fullmatch(value["claimed_source_incarnation"]) is not None
+            and all(type(value[k]) is bool for k in ("audit_truncated", "incidents_truncated",
+                                                     "runtimes_truncated"))
+            and _nonneg_int(value["redaction_total"]))
+
+
+# -- the C1 child process (G-1, G-2; A-2) -------------------------------------
+
+_CODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _child_command(mode, data_dir):
+    exe = sys.executable
+    if type(exe) is not str or not exe or not os.path.isabs(exe):
+        raise OSError("no usable interpreter")
+    return [exe, "-E", "-s", "-B", "-m", "core.agent_backup_c1_child", mode, os.fspath(data_dir)]
+
+
+def _child_env():
+    env = {"PATH": os.defpath, "LANG": "C.UTF-8"}
+    if os.environ.get("LUMINA_TESTING") == "1":
+        env["LUMINA_TESTING"] = "1"   # keeps the test-isolation refusals live in the child
+    return env
+
+
+def _child_failed(detail):
+    return ExportUnavailable(OWNER_MESSAGES["C1_SNAPSHOT_CHILD_FAILED"],
+                             code="C1_SNAPSHOT_CHILD_FAILED", detail=detail)
+
+
+def _kill_child(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _await_exit_unreaped(proc, deadline):
+    """Wait for the child to exit without reaping it, so its pid (and with it
+    its process group id) stays reserved until the group has been killed
+    (Sonnet S3A-01). False on timeout."""
+    if not hasattr(os, "waitid"):
+        try:
+            proc.wait(timeout=max(0.05, deadline - time.monotonic()))
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+    while True:
+        if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+
+
+def _run_c1_child(mode, data_dir, *, timeout, cap):
+    """(exit code, stdout bytes) of one bounded child run. Raises
+    ExportUnavailable on a spawn failure, timeout, overflow or signal. On
+    every path the child's whole process group is killed while the child is
+    still unreaped, then the child is reaped, before this returns or raises."""
+    try:
+        proc = subprocess.Popen(
+            _child_command(mode, data_dir), cwd=_CODE_ROOT, env=_child_env(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            close_fds=True, start_new_session=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise _child_failed("spawn") from None
+    failure = None
+    out = bytearray()
+    try:
+        deadline = time.monotonic() + timeout
+        fd = proc.stdout.fileno()
+        with selectors.DefaultSelector() as selector:
+            selector.register(fd, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = "timeout"
+                    break
+                if not selector.select(remaining):
+                    continue
+                chunk = os.read(fd, 1 << 16)
+                if not chunk:
+                    break
+                out += chunk
+                if len(out) > cap:
+                    failure = "overflow"
+                    break
+        if failure is None and not _await_exit_unreaped(proc, deadline):
+            failure = "timeout"
+    finally:
+        _kill_child(proc)          # the whole group: no grandchild outlives the call
+        proc.wait()
+        proc.stdout.close()
+    if failure is not None:
+        raise _child_failed(failure)
+    if proc.returncode < 0:
+        raise _child_failed("signal")
+    return proc.returncode, bytes(out)
+
+
+def _child_code_line(out, allowed):
+    if len(out) > c1_child.CODE_LINE_MAX_BYTES or not out.endswith(b"\n") or out.count(b"\n") != 1:
+        return None
+    try:
+        code = out[:-1].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return code if code in allowed else None
+
+
+def _child_result(mode, returncode, out):
+    """Map one child result to its bytes or a refusal (closed sets only)."""
+    if returncode == c1_child.EXIT_OK:
+        if mode == "capture" and out:
+            return out
+        if mode == "incarnation" and len(out) <= c1_child.INCARNATION_LINE_MAX_BYTES:
+            parts = out[:-1].split(b" ") if out.endswith(b"\n") else []
+            if len(parts) == 2 and all(_HEX32.fullmatch(p.decode("ascii", "replace")) for p in parts):
+                return tuple(p.decode("ascii") for p in parts)
+        raise _child_failed("garbage")
+    for exit_code, allowed, prefix in (
+            (c1_child.EXIT_REFUSED, c1.SNAPSHOT_REFUSALS, "C1_SNAPSHOT_"),
+            (c1_child.EXIT_BOUNDARY, c1.REFUSALS, "C1_SNAPSHOT_EXCLUSION_"),
+            (c1_child.EXIT_LIMIT, c1_child.LIMIT_CODES - {"USAGE"}, "C1_SNAPSHOT_")):
+        if returncode == exit_code:
+            code = _child_code_line(out, allowed)
+            if code is None:
+                raise _child_failed("garbage")
+            raise ExportUnavailable(_owner_words(prefix + code), code=prefix + code)
+    raise _child_failed("exit")
+
+
+def _capture_c1_record(data_dir):
+    """C1's canonical record bytes, captured by the child process."""
+    returncode, out = _run_c1_child("capture", data_dir, timeout=c1_child.CAPTURE_TIMEOUT_S,
+                                    cap=c1.RECOVERY_STATE_MAX_BYTES)
+    return _child_result("capture", returncode, out)
+
+
+def _observe_c1_incarnation(data_dir):
+    returncode, out = _run_c1_child("incarnation", data_dir, timeout=c1_child.INCARNATION_TIMEOUT_S,
+                                    cap=c1_child.INCARNATION_LINE_MAX_BYTES)
+    return _child_result("incarnation", returncode, out)
 
 
 def _bounded_history(value, *, max_bytes=256 * 1024):
@@ -230,18 +586,33 @@ class C1CaptureBoundary(dict):
             raise ExportUnavailable("C1_EXCLUSION_" + exc.code) from exc
 
 
-def _valid_c1_record(record):
+def c1_exclusion_record_v2(record_v1):
+    """The 2.3 exclusion record (TS3-07, A-9): the raw store is excluded and
+    the sanitized record is described by c1_recovery. It never says
+    `snapshot_captured`, which in v1 means the raw store."""
+    return {**C1_EXCLUSION_V2_CONSTANTS, "observed_at": record_v1["observed_at"],
+            "warnings": list(record_v1["warnings"])}
+
+
+def _valid_c1_record(record, *, v2=False):
     # Archive declarations carry no runtime authority. Pin the owned record's
     # exact shape and constants; do not re-observe the destination while reading.
+    # v1 pairs with 2.0-2.2 and v2 with 2.3 only (A-9).
     if type(record) is not dict:
         return False
-    expected = {"schema": c1.SCHEMA, "version": c1.VERSION,
-                "snapshot_captured": False, "enforcement_compatibility": "unproven",
-                "c1_schema_version": "unknown", "suspended_at_capture": "unknown",
-                "restore_fence": "c1_trace_and_owner_recover_required"}
+    if v2:
+        expected = dict(C1_EXCLUSION_V2_CONSTANTS)
+        expected.pop("status")
+    else:
+        expected = {"schema": c1.SCHEMA, "version": c1.VERSION,
+                    "snapshot_captured": False, "enforcement_compatibility": "unproven",
+                    "c1_schema_version": "unknown", "suspended_at_capture": "unknown",
+                    "restore_fence": "c1_trace_and_owner_recover_required"}
     if set(record) != set(expected) | {"status", "observed_at", "warnings"}:
         return False
     if any(not _same_contract(record[k], v) for k, v in expected.items()):
+        return False
+    if v2 and record["status"] != "present_excluded":
         return False
     if (type(record["status"]) is not str or record["status"] not in {"absent_unknown", "present_excluded"}
             or type(record["observed_at"]) is not str
@@ -425,8 +796,10 @@ def _observe_inventory(data_dir):
             report.exclusion_receipt())
 
 
-def prepare_export_members(members, data_dir, staging_root, forbidden, warnings, budget):
-    """Transform already-captured bytes, then add one bound control member."""
+def prepare_export_members(members, data_dir, staging_root, forbidden, warnings, budget, *, verified=False):
+    """Transform already-captured bytes, then add one bound control member.
+    A Verified export then captures C1's record as the last collection
+    step (A-3), in the child process, and adds it as one bound member."""
     members = [dict(m) for m in members]
     counts = {"omitted": 0, "unclassified": 0, "destination_local": 0}
     for member in members:
@@ -449,30 +822,47 @@ def prepare_export_members(members, data_dir, staging_root, forbidden, warnings,
         members, data_dir, staging_root, forbidden, warnings, budget)
     members.extend(generation)
     inventory_observation, exclusions = _observe_inventory(data_dir)
-    return members, {"suspension": ("unavailable_present" if forbidden.exclusion.status == "present_excluded"
-                                      else "unavailable_no_trace"),
-                     "c1_exclusion": forbidden.exclusion.manifest_record(),
-                     "installation_marker": payload["source_status"],
-                     "prefs_omitted_count": counts["omitted"],
-                     "prefs_unclassified_count": counts["unclassified"],
-                     "prefs_installation_local_count": counts["destination_local"],
-                     "generation_artifacts": generation_observation,
-                     "inventory": inventory_observation,
-                     "declared_exclusions": exclusions}
+    observations = {"suspension": ("unavailable_present" if forbidden.exclusion.status == "present_excluded"
+                                   else "unavailable_no_trace"),
+                    "c1_exclusion": forbidden.exclusion.manifest_record(),
+                    "installation_marker": payload["source_status"],
+                    "prefs_omitted_count": counts["omitted"],
+                    "prefs_unclassified_count": counts["unclassified"],
+                    "prefs_installation_local_count": counts["destination_local"],
+                    "generation_artifacts": generation_observation,
+                    "inventory": inventory_observation,
+                    "declared_exclusions": exclusions}
+    if verified:
+        if forbidden.exclusion.status != "present_excluded":
+            raise ExportUnavailable(OWNER_MESSAGES["C1_STATE_ABSENT"], code="C1_STATE_ABSENT")
+        record = _capture_c1_record(data_dir)
+        budget.charge(len(record), "C1 recovery record")
+        try:
+            observation = c1_observation_from_bytes(record)
+        except C1RecordInvalid:
+            raise ExportUnavailable(OWNER_MESSAGES["C1_SNAPSHOT_RECORD_INVALID"],
+                                    code="C1_SNAPSHOT_RECORD_INVALID") from None
+        members.append({"logical_id": C1_MEMBER_ID, **C1_MEMBER_POLICY, "data": record,
+                        "staged_path": None})
+        observations["suspension"] = "captured_sanitized"
+        observations["c1_exclusion"] = c1_exclusion_record_v2(observations["c1_exclusion"])
+        observations["c1_recovery"] = observation
+    return members, observations
 
 
-def apply_export_contract(manifest, observations):
-    manifest["format_version"] = dict(VERSION)
-    manifest["compatibility"]["min_supported_format_version"] = dict(VERSION)
-    manifest["compatibility"]["max_known_format_version"] = dict(VERSION)
+def apply_export_contract(manifest, observations, *, verified=False):
+    version = VERIFIED_VERSION if verified else VERSION
+    manifest["format_version"] = dict(version)
+    manifest["compatibility"]["min_supported_format_version"] = dict(version)
+    manifest["compatibility"]["max_known_format_version"] = dict(version)
     manifest["recovery_contract"] = copy.deepcopy(RECOVERY_CONTRACT)
     manifest["historical_claims"] = copy.deepcopy(HISTORICAL_CLAIMS)
     manifest["extensions"] = {"version": 1, "records": {}}
     manifest["required_features"] = []
     manifest["export_observations"] = dict(observations)
     manifest["c1_exclusion"] = manifest["export_observations"].pop("c1_exclusion")
-    # Explicitly content-only until the C1 owner supplies a snapshot contract.
-    manifest["backup_mode"] = "incomplete_state_export"
+    # 2.2 stays content-only; 2.3 says Verified, which its verifier must prove.
+    manifest["backup_mode"] = "verified_agent_backup" if verified else "incomplete_state_export"
     manifest["coverage"] = _coverage(manifest)
 
 
@@ -614,12 +1004,35 @@ def _generation_rows(db_bytes):
 
 
 def validate_export_archive(manifest, zf):
-    """2.2 cross-member rules, from the archived bytes themselves: every
-    captured blob matches its row's sha256 and size in the archived
+    """2.2-family cross-member rules, from the archived bytes themselves:
+    every captured blob matches its row's sha256 and size in the archived
     database, the observation counts match the members, and "complete"
-    means every row's blob is in the archive."""
-    if type(manifest) is not dict or not _same_contract(manifest.get("format_version"), VERSION):
+    means every row's blob is in the archive. 2.3 runs all of that (A-1)
+    and then derives the C1 observation from the archived record."""
+    if type(manifest) is not dict or not _v22_family(manifest.get("format_version")):
         return []
+    errors = _generation_crosscheck(manifest, zf)
+    if _is_verified_format(manifest.get("format_version")):
+        errors.extend(_c1_crosscheck(manifest, zf))
+    return errors
+
+
+def _c1_crosscheck(manifest, zf):
+    try:
+        found = [m for m in manifest["members"] if type(m) is dict and m.get("logical_id") == C1_MEMBER_ID]
+        if len(found) != 1:
+            return ["EXPORT_C1_MEMBER_MISSING_OR_DUPLICATE"]
+        derived = c1_observation_from_bytes(zf.read(found[0]["archive_path"]))
+    except C1RecordInvalid:
+        return ["EXPORT_C1_RECORD_INVALID"]
+    except Exception:
+        return ["EXPORT_C1_CROSSCHECK_UNAVAILABLE"]
+    if not _same_contract(derived, manifest["export_observations"].get("c1_recovery")):
+        return ["EXPORT_C1_OBSERVATION_MISMATCH"]
+    return []
+
+
+def _generation_crosscheck(manifest, zf):
     try:
         members = [m for m in manifest["members"] if type(m) is dict]
         blobs = {}
@@ -663,7 +1076,8 @@ def validate_export_schema(manifest):
                       "source_data_root", "backup_mode", "hash_algorithm", "compatibility", "members",
                       "regenerate", "exclusions", "warnings", "recovery_contract", "export_observations", "coverage"}
     version = manifest.get("format_version")
-    v22 = _same_contract(version, VERSION)
+    v22 = _v22_family(version)          # 2.2 and 2.3 (A-1)
+    v23 = _is_verified_format(version)
     modern = v22 or _same_contract(version, V21)
     if modern:
         errors.extend(_validate_v21_control_records(manifest))
@@ -679,12 +1093,15 @@ def validate_export_schema(manifest):
             errors.append("EXPORT_REQUIRED_FEATURES_INVALID")
     # Earlier 2.0/2.1 historical exports predate the exclusion interface.
     # Keep them readable; every newly built export includes the exact record.
+    if v23 and "c1_exclusion" not in manifest:
+        errors.append("EXPORT_C1_EXCLUSION_INVALID")
     if "c1_exclusion" in manifest:
         expected_roots.add("c1_exclusion")
-        if not _valid_c1_record(manifest["c1_exclusion"]):
+        if not _valid_c1_record(manifest["c1_exclusion"], v2=v23):
             errors.append("EXPORT_C1_EXCLUSION_INVALID")
         else:
-            expected_observation = ("unavailable_present" if manifest["c1_exclusion"]["status"] == "present_excluded"
+            expected_observation = ("captured_sanitized" if v23 else
+                                    "unavailable_present" if manifest["c1_exclusion"]["status"] == "present_excluded"
                                     else "unavailable_no_trace")
             declared_observations = manifest.get("export_observations")
             if (type(declared_observations) is not dict
@@ -695,9 +1112,10 @@ def validate_export_schema(manifest):
     try:
         if not _same_contract(manifest.get("coverage"), _coverage(manifest)):
             errors.append("EXPORT_COVERAGE_CONTRACT_MISMATCH")
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, AttributeError):
         errors.append("EXPORT_COVERAGE_CONTRACT_INVALID")
-    if not any(_same_contract(version, v) for v in READ_VERSIONS) or manifest.get("backup_mode") != "incomplete_state_export":
+    if (not any(_same_contract(version, v) for v in VERIFY_VERSIONS)
+            or manifest.get("backup_mode") != ("verified_agent_backup" if v23 else "incomplete_state_export")):
         errors.append("EXPORT_FORMAT_OR_MODE_UNSUPPORTED")
     if not _same_contract(manifest.get("recovery_contract"), RECOVERY_CONTRACT):
         errors.append("EXPORT_RECOVERY_POLICY_MISMATCH")
@@ -705,14 +1123,30 @@ def validate_export_schema(manifest):
     expected = {"suspension", "installation_marker", "prefs_omitted_count", "prefs_unclassified_count"}
     if v22:
         expected |= _V22_OBSERVATIONS
+    if v23:
+        expected |= {"c1_recovery"}
     if type(observations) is not dict or set(observations) != expected:
         errors.append("EXPORT_COVERAGE_OBSERVATIONS_INVALID")
-    elif (observations["suspension"] not in {"unavailable_present", "unavailable_no_trace"}
+    elif (observations["suspension"] not in ({"captured_sanitized"} if v23
+                                             else {"unavailable_present", "unavailable_no_trace"})
           or observations["installation_marker"] not in {"present", "missing_unknown"}
           or any(type(observations[k]) is not int or observations[k] < 0
                  for k in ("prefs_omitted_count", "prefs_unclassified_count"))
-          or (v22 and not _valid_v22_observations(observations))):
+          or (v22 and not _valid_v22_observations(observations))
+          or (v23 and not _valid_c1_observation(observations["c1_recovery"]))):
         errors.append("EXPORT_COVERAGE_OBSERVATIONS_INVALID")
+    elif v23:
+        # A 2.3 archive is Verified by construction: any blocker refuses it.
+        if coverage_blockers(manifest):
+            errors.append("EXPORT_VERIFIED_MODE_WITH_BLOCKERS")
+    listed = manifest.get("members") if type(manifest.get("members")) is list else []
+    c1_members = [m for m in listed if type(m) is dict
+                  and (m.get("logical_id") == C1_MEMBER_ID
+                       or (type(m.get("archive_path")) is str and m["archive_path"].startswith(C1_ARCHIVE_PREFIX)))]
+    if not v23 and c1_members:
+        errors.append("EXPORT_C1_MEMBER_UNEXPECTED")
+    if v23:
+        errors.extend(_c1_member_errors(c1_members, observations))
     compat = manifest.get("compatibility")
     if type(compat) is not dict or any(not _same_contract(compat.get(k), version) for k in
                                       ("min_supported_format_version", "max_known_format_version")):
@@ -730,6 +1164,9 @@ def validate_export_schema(manifest):
         errors.extend(_generation_member_errors(manifest.get("members")))
         base["members"] = [m for m in base["members"]
                            if not (type(m) is dict and generation_member_kind(m.get("logical_id")))]
+    if v23:
+        base["members"] = [m for m in base["members"]
+                           if not (type(m) is dict and m.get("logical_id") == C1_MEMBER_ID)]
     for member in base["members"]:
         if type(member) is not dict:
             continue
@@ -766,6 +1203,22 @@ def validate_export_schema(manifest):
                 or type(m.get("sha256")) is not str or not ab._SHA256_RE.fullmatch(m["sha256"])):
             errors.append("EXPORT_INSTALLATION_MEMBER_INVALID")
     return errors
+
+
+def _c1_member_errors(c1_members, observations):
+    """Exactly one C1 member with its exact policy, bound to the observation."""
+    if len(c1_members) != 1:
+        return ["EXPORT_C1_MEMBER_MISSING_OR_DUPLICATE"]
+    m = c1_members[0]
+    observation = observations.get("c1_recovery") if type(observations) is dict else None
+    if (set(m) != {"logical_id", "sha256", "size", *C1_MEMBER_POLICY}
+            or m.get("logical_id") != C1_MEMBER_ID
+            or any(not _same_contract(m.get(k), v) for k, v in C1_MEMBER_POLICY.items())
+            or not _nonneg_int(m.get("size")) or m["size"] == 0
+            or type(m.get("sha256")) is not str or not ab._SHA256_RE.fullmatch(m["sha256"])
+            or type(observation) is not dict or m["sha256"] != observation.get("record_sha256")):
+        return ["EXPORT_C1_MEMBER_INVALID"]
+    return []
 
 
 def historical_recovery_contract(manifest, *, owner_designated=False):
@@ -808,11 +1261,20 @@ def validate_export_payload(member, raw, manifest):
                                        or not _manifest_names(raw, generation_member_kind(
                                            member.get("logical_id"))[1])):
                 return ["EXPORT_GENERATION_PAYLOAD_INVALID"]
+        elif member.get("logical_id") == C1_MEMBER_ID:
+            if not _is_verified_format(manifest.get("format_version")):
+                return ["EXPORT_C1_MEMBER_UNEXPECTED"]
+            try:
+                derived = c1_observation_from_bytes(raw)
+            except C1RecordInvalid:
+                return ["EXPORT_C1_RECORD_INVALID"]
+            if not _same_contract(derived, manifest["export_observations"].get("c1_recovery")):
+                return ["EXPORT_C1_OBSERVATION_MISMATCH"]
         elif member.get("logical_id") == "state.preferences.prefs_json":
             cleaned, _, unknown = _scrub_preferences(raw)
             if ab._strict_json_loads(cleaned) != ab._strict_json_loads(raw) or unknown:
                 return ["EXPORT_PREFS_SECURITY_POLICY_VIOLATION"]
-    except (ValueError, UnicodeError, ab.AgentBackupError):
+    except (ValueError, UnicodeError, KeyError, TypeError, AttributeError, ab.AgentBackupError):
         return ["EXPORT_PAYLOAD_POLICY_INVALID"]
     return []
 
@@ -860,6 +1322,11 @@ def classify_input(path):
         if any(_same_contract(manifest.get("format_version"), v) for v in READ_VERSIONS):
             return {"kind": "agent_export_v2", "verification": "not_performed", "full_agent_coverage": False,
                     "coverage_blockers": ["suspension"]}
+        if _is_verified_format(manifest.get("format_version")):
+            # A hint only: nothing here was verified, and this build cannot
+            # restore 2.3 yet (S3b), so no coverage is claimed either way.
+            return {"kind": "agent_export_v2_verified", "verification": "not_performed",
+                    "full_agent_coverage": False, "coverage_blockers": ["verification_not_performed"]}
     return {"kind": "unsupported", "verification": "not_performed", "full_agent_coverage": False,
             "coverage_blockers": ["unknown_format"]}
 
@@ -889,18 +1356,32 @@ def verify_export(source, resident_bytes_hint=0):
         return {"valid": False, "errors": ["EXPORT_INPUT_INVALID"], "manifest": None}
 
 
+def _c1_safety_coverage(manifest, observations):
+    if _is_verified_format(manifest.get("format_version")):
+        record = observations["c1_recovery"]
+        return {"status": "captured_sanitized" if record["status"] == "captured_sanitized" else "unavailable",
+                "source_observation": observations["suspension"],
+                "record": copy.deepcopy(record), "raw_store": "excluded",
+                "label": "derived_sanitized_producer_claims", "live_state": "never_restored_as_live",
+                "enforcement_compatibility": "unproven", "limitations": list(C1_LIMITATIONS),
+                "exclusion": copy.deepcopy(manifest["c1_exclusion"])}
+    return {"status": "unavailable", "source_observation": observations["suspension"],
+            "omitted": ["C1 store", "soul identity", "evidence", "incidents", "epochs", "replay state"],
+            "enforcement_compatibility": "unproven",
+            **({"exclusion": copy.deepcopy(manifest["c1_exclusion"])}
+               if "c1_exclusion" in manifest else {})}
+
+
 def _coverage(manifest):
     observations = manifest["export_observations"]
     families = sorted({m["logical_id"] for m in manifest["members"]})
     return {
-        "semantic_coverage": {"status": "incomplete", "captured_members": families,
+        "semantic_coverage": {"status": ("required_state_captured" if _is_verified_format(manifest.get("format_version"))
+                                         else "incomplete"),
+                              "captured_members": families,
                               "knowledge_pack_installation_marker": observations["installation_marker"],
                               "unclassified_preferences_omitted": observations["prefs_unclassified_count"]},
-        "c1_safety_coverage": {"status": "unavailable", "source_observation": observations["suspension"],
-                               "omitted": ["C1 store", "soul identity", "evidence", "incidents", "epochs", "replay state"],
-                               "enforcement_compatibility": "unproven",
-                               **({"exclusion": copy.deepcopy(manifest["c1_exclusion"])}
-                                  if "c1_exclusion" in manifest else {})},
+        "c1_safety_coverage": _c1_safety_coverage(manifest, observations),
         "recovery_acceptance": {"status": "not_proven", "restore_input_accepted": False},
         **({"generation_artifacts": copy.deepcopy(observations["generation_artifacts"]),
             "inventory": copy.deepcopy(observations["inventory"]),
@@ -910,12 +1391,19 @@ def _coverage(manifest):
     }
 
 
-def _receipt(result):
-    report = verify_export(io.BytesIO(result.built_data))
-    if not report["valid"]:
-        raise ab.AgentBackupError("EXPORT_BUILT_BYTES_INVALID")
-    observations = report["manifest"]["export_observations"]
-    blockers = ["suspension"]
+def coverage_blockers(manifest):
+    """The one blockers function: the publication gate, _receipt and
+    confirm_export_result all call it (TS3-11, A-6). It reads a manifest the
+    verifier already accepted (or, at the gate's first call, the builder's
+    own pre-serialization manifest). 2.2 never covers C1, so "suspension"
+    always blocks it; 2.3 clears it only through its c1_recovery observation."""
+    observations = manifest["export_observations"]
+    blockers = []
+    record = observations.get("c1_recovery")
+    if not (_is_verified_format(manifest.get("format_version")) and type(record) is dict
+            and record.get("status") == "captured_sanitized"
+            and observations["suspension"] == "captured_sanitized"):
+        blockers.append("suspension")
     if observations["installation_marker"] != "present":
         blockers.append("installation_marker")
     if observations["prefs_unclassified_count"]:
@@ -926,19 +1414,116 @@ def _receipt(result):
         if (observations["inventory"]["status"] != "observed"
                 or observations["inventory"]["blocking_entries"]):
             blockers.append("inventory")
-    return {**_coverage(report["manifest"]),
-            "historical_claims": copy.deepcopy(report["manifest"].get("historical_claims")),
+    return blockers
+
+
+def _derived_claims(manifest):
+    """(export_kind, full_agent_coverage, blockers) for a verified manifest."""
+    blockers = coverage_blockers(manifest)
+    verified = _is_verified_format(manifest.get("format_version"))
+    return ("verified_agent_backup" if verified else "incomplete_state_export",
+            verified and not blockers, blockers)
+
+
+def _receipt(result):
+    report = verify_export(io.BytesIO(result.built_data))
+    if not report["valid"]:
+        raise ab.AgentBackupError("EXPORT_BUILT_BYTES_INVALID")
+    manifest = report["manifest"]
+    observations = manifest["export_observations"]
+    export_kind, full, blockers = _derived_claims(manifest)
+    return {**_coverage(manifest),
+            "historical_claims": copy.deepcopy(manifest.get("historical_claims")),
             "archive_integrity": {"status": "PASS", "scope": "structure_hashes_sqlite"},
-            "export_kind": "incomplete_state_export",
+            "export_kind": export_kind,
             "verification": "PASS", "destination": result.dest_path,
             "archive_sha256": hashlib.sha256(result.built_data).hexdigest(),
-            "archive_size": len(result.built_data), "format_version": dict(VERSION),
+            "archive_size": len(result.built_data), "format_version": dict(manifest["format_version"]),
             "member_count": report["validated_member_count"],
             "database_snapshots_verified": len(report["verified_sqlite_members"]),
-            "full_agent_coverage": False, "restorable_verified": False,
+            "full_agent_coverage": full, "restorable_verified": False,
             "coverage_blockers": blockers, "prefs_omitted_count": observations["prefs_omitted_count"],
             "publication": result.publication_observation,
-            "warnings": report["manifest"]["warnings"]}
+            "warnings": manifest["warnings"]}
+
+
+def verified_publication_gate(manifest):
+    """Refuse a Verified export with any coverage blocker, before anything is
+    published. Runs on the builder's manifest (to stop early, in owner words)
+    and again on the verified built manifest (the binding check)."""
+    if not _is_verified_format(manifest.get("format_version")):
+        raise ExportUnavailable(OWNER_MESSAGES["EXPORT_FAILED"], code="VERIFIED_FORMAT_MISSING")
+    blockers = coverage_blockers(manifest)
+    if blockers:
+        raise ExportUnavailable(_blocked_message(blockers), code="VERIFIED_BLOCKED", detail=tuple(blockers))
+
+
+def recheck_c1_incarnation(data_dir, built_manifest, built_data):
+    """Re-read the live store's identity in the child just before
+    publication and refuse unless it is the one the archived record claims
+    (TS3-03 option a, A-3). The capture is still one point in time; this
+    only proves the store at publication is the same incarnation."""
+    with zipfile.ZipFile(io.BytesIO(built_data)) as zf:
+        found = [m for m in built_manifest["members"] if m.get("logical_id") == C1_MEMBER_ID]
+        if len(found) != 1:
+            raise ExportUnavailable(OWNER_MESSAGES["C1_SNAPSHOT_RECORD_INVALID"],
+                                    code="C1_SNAPSHOT_RECORD_INVALID")
+        raw = zf.read(found[0]["archive_path"])
+    try:
+        _observation, soul_id, incarnation = _c1_record_facts(raw)
+    except C1RecordInvalid:
+        raise ExportUnavailable(OWNER_MESSAGES["C1_SNAPSHOT_RECORD_INVALID"],
+                                code="C1_SNAPSHOT_RECORD_INVALID") from None
+    if _observe_c1_incarnation(data_dir) != (soul_id, incarnation):
+        raise ExportUnavailable(OWNER_MESSAGES["C1_SNAPSHOT_STORE_REPLACED"], code="C1_SNAPSHOT_STORE_REPLACED")
+
+
+def owner_receipt_text(receipt):
+    """(title, text) the owner sees for a confirmed export receipt (Qt-free,
+    so its wording lint runs everywhere). Every line is derived
+    from the receipt; nothing here claims more than the verifier derived
+    (C1-S3 A-7: never "restorable", members captured at different times)."""
+    durability = ("confirmed" if receipt["publication"].get("directory_fsynced")
+                  else "not confirmed; best effort only")
+    if receipt.get("export_kind") == "verified_agent_backup" and receipt.get("full_agent_coverage") is True:
+        record = receipt["c1_safety_coverage"]["record"]
+        truncated = [name for name, key in (("audit history", "audit_truncated"),
+                                            ("resumed incidents", "incidents_truncated"),
+                                            ("runtime records", "runtimes_truncated")) if record[key]]
+        return "Verified Agent Backup", (
+            f"Verified Agent Backup written to:\n{receipt['destination']}\n\n"
+            "Archive integrity and structure: PASS\n"
+            f"SHA-256: {receipt['archive_sha256']}\n"
+            f"Verified members: {receipt['member_count']}\n"
+            f"Verified SQLite snapshots: {receipt['database_snapshots_verified']}\n"
+            "Coverage checks: no blockers (safety-suspension state, installation record, preferences, "
+            "generated images, data-folder inventory)\n"
+            "C1 safety state: sanitized history record included (raw store excluded); "
+            "not restored as live safety state\n"
+            f"Safety record: {record['redaction_total']} identifying values removed; "
+            + ("oldest " + ", ".join(truncated) + " not carried (declared)" if truncated
+               else "nothing truncated") + "\n"
+            "C1 enforcement compatibility: UNPROVEN\n"
+            "Members were captured at different times; this is not one point-in-time snapshot. "
+            "Later safety trips are not included.\n"
+            "Full recovery: NOT PROVEN until a restore is verified; restoring this format is not "
+            "yet supported by this build. A restore always starts every scope suspended.\n"
+            f"Directory durability: {durability}\n"
+            "Not encrypted. Ordinary content may contain secrets. Preserve prior backups.")
+    marker = receipt["semantic_coverage"]["knowledge_pack_installation_marker"]
+    return "Incomplete State Export", (
+        f"Incomplete State Export written to:\n{receipt['destination']}\n\n"
+        "Archive integrity and structure: PASS\n"
+        f"SHA-256: {receipt['archive_sha256']}\n"
+        f"Verified members: {receipt['member_count']}\n"
+        f"Verified SQLite snapshots: {receipt['database_snapshots_verified']}\n"
+        "Semantic state coverage: INCOMPLETE\n"
+        f"Knowledge Pack installation marker: {marker}\n"
+        "C1 store / soul identity / safety evidence: OMITTED\n"
+        "C1 enforcement compatibility: UNPROVEN\n"
+        "Full recovery acceptance: NOT PROVEN; not a complete Restore input\n"
+        f"Directory durability: {durability}\n"
+        "Not encrypted. Ordinary content may contain secrets. Preserve prior verified backups.")
 
 
 def build_review_export_with_receipt(data_dir, base_dir, destination, **kwargs):
@@ -957,14 +1542,23 @@ def build_review_export_with_receipt(data_dir, base_dir, destination, **kwargs):
     return result.manifest, _receipt(result)
 
 
-def export_verified_agent_backup(data_dir, base_dir, destination):
-    """Owner UI entry point; never publish incomplete coverage as full."""
-    raise ExportUnavailable(
-        "Verified Agent Backup is unavailable: suspension snapshot coverage has no "
-        "approved C1 contract. Missing state is not proof of "
-        "a first installation. No archive was written. Backup Memory (Legacy) remains "
-        "available with its partial-coverage limitations. The separate Incomplete State Export "
-        "requires deliberate owner acknowledgement and a new destination.")
+def export_verified_agent_backup(data_dir, base_dir, destination, *,
+                                identity_trailers_path=None, credentials_path=None):
+    """Owner UI entry point (OD-1). Publishes a format-2.3 archive only when
+    every coverage condition is derived true from its own verified bytes;
+    any blocker refuses and nothing is written. Verified never means
+    restorable: full recovery stays not proven until a restore is."""
+    refuse_if_production_path(data_dir)
+    try:
+        exclusion = c1.describe_exclusions(data_dir)
+    except c1.ExclusionUnavailable as exc:
+        raise ExportUnavailable(_owner_words("C1_EXCLUSION_" + exc.code), code="C1_EXCLUSION_" + exc.code) from exc
+    if exclusion.status != "present_excluded":
+        raise ExportUnavailable(OWNER_MESSAGES["C1_STATE_ABSENT"], code="C1_STATE_ABSENT")
+    result = ab._build_agent_backup_core(
+        data_dir, base_dir, destination, identity_trailers_path=identity_trailers_path,
+        credentials_path=credentials_path, _export_v2=True, _export_verified=True)
+    return result.manifest, _receipt(result)
 
 
 def confirm_export_result(destination, manifest, receipt):
@@ -977,13 +1571,15 @@ def confirm_export_result(destination, manifest, receipt):
     report = verify_export(io.BytesIO(raw))
     if (not report["valid"] or not _same_contract(report["manifest"], manifest)
             or receipt.get("destination") != destination
-            or not _same_contract(receipt.get("format_version"), VERSION)
+            or not _v22_family(report["manifest"].get("format_version"))
+            or not _same_contract(receipt.get("format_version"), report["manifest"].get("format_version"))
             or receipt.get("verification") != "PASS"
             or receipt.get("archive_sha256") != hashlib.sha256(raw).hexdigest()
             or receipt.get("archive_size") != len(raw)):
         raise ab.AgentBackupError("EXPORT_RECEIPT_NOT_BOUND_TO_ARTIFACT")
     # Derive coverage; a caller cannot launder a full-coverage claim in a dict.
-    if receipt.get("full_agent_coverage") is not False or receipt.get("restorable_verified") is not False:
+    export_kind, full, blockers = _derived_claims(report["manifest"])
+    if receipt.get("full_agent_coverage") is not full or receipt.get("restorable_verified") is not False:
         raise ab.AgentBackupError("EXPORT_UNSUPPORTED_SUCCESS_CLAIM")
     expected = _coverage(report["manifest"])
     if (any(not _same_contract(receipt.get(k), v) for k, v in expected.items())
@@ -991,7 +1587,8 @@ def confirm_export_result(destination, manifest, receipt):
             or receipt.get("member_count") != report["validated_member_count"]
             or receipt.get("database_snapshots_verified") != len(report["verified_sqlite_members"])
             or receipt.get("archive_integrity") != {"status": "PASS", "scope": "structure_hashes_sqlite"}
-            or receipt.get("export_kind") != "incomplete_state_export"):
+            or not _same_contract(receipt.get("coverage_blockers"), blockers)
+            or receipt.get("export_kind") != export_kind):
         raise ab.AgentBackupError("EXPORT_RECEIPT_COVERAGE_MISMATCH")
     confirmed = dict(receipt)
     publication = receipt.get("publication", {})
@@ -1006,7 +1603,8 @@ def confirm_export_result(destination, manifest, receipt):
     return confirmed
 
 
-def preflight_incomplete(data_dir, destination):
+def preflight_incomplete(data_dir, destination, *, verified=False):
+    label = "Verified Agent Backup" if verified else "Incomplete State Export"
     refuse_if_production_path(data_dir)
     if os.environ.get("LUMINA_TESTING") == "1":
         live_release = os.path.expanduser("~/.local/share/lumina-release")
@@ -1015,11 +1613,14 @@ def preflight_incomplete(data_dir, destination):
             if real == live_release or real.startswith(live_release + os.sep):
                 raise ExportUnavailable("Synthetic tests refuse the live release data root.")
     if os.path.lexists(destination):
-        raise ExportUnavailable("Incomplete State Export needs a new destination. Existing files are preserved.")
+        raise ExportUnavailable(label + " needs a new destination. Existing files are preserved.")
     try:
-        return c1.describe_exclusions(data_dir)
+        exclusion = c1.describe_exclusions(data_dir)
     except c1.ExclusionUnavailable as exc:
         raise ExportUnavailable("C1_EXCLUSION_" + exc.code) from exc
+    if verified and exclusion.status != "present_excluded":
+        raise ExportUnavailable(OWNER_MESSAGES["C1_STATE_ABSENT"], code="C1_STATE_ABSENT")
+    return exclusion
 
 
 def export_incomplete_state(data_dir, base_dir, destination, *, owner_acknowledged=False,

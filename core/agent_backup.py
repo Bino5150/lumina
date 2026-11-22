@@ -4652,7 +4652,8 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
                               identity_trailers_path: str | None = None,
                               baseline_hashes_path: str | None = None,
                               credentials_path: str | None = None, *,
-                              _export_v2: bool = False) -> "_BuiltArchiveResult":
+                              _export_v2: bool = False,
+                              _export_verified: bool = False) -> "_BuiltArchiveResult":
     """Collects a full Agent Backup archive at dest_path and returns a
     _BuiltArchiveResult binding the manifest to the exact archive bytes
     this call published (Section 15-18, A2F6; single-snapshot capture and
@@ -4695,10 +4696,12 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
     unattested state.
     """
     _reject_unsafe_destination(dest_path, data_dir, base_dir, identity_trailers_path)
+    if _export_verified and not _export_v2:
+        raise ValueError("a Verified export is an export-format (v2) build")
     c1_exclusion = None
     if _export_v2:
         from core.agent_backup_export import preflight_incomplete
-        c1_exclusion = preflight_incomplete(data_dir, dest_path)
+        c1_exclusion = preflight_incomplete(data_dir, dest_path, verified=_export_verified)
 
     if baseline_hashes_path is None:
         baseline_hashes_path = _default_baseline_hashes_path(base_dir)
@@ -4736,7 +4739,8 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
         if _export_v2:
             from core.agent_backup_export import prepare_export_members
             members, export_observations = prepare_export_members(
-                members, data_dir, staging_root, forbidden_identities, warnings, budget)
+                members, data_dir, staging_root, forbidden_identities, warnings, budget,
+                verified=_export_verified)
 
         # AGENT-BACKUP-RESTORE-A2F10 (Section 8-10, part of B1): fail
         # BEFORE ever attempting to build the ZIP if the physical entry
@@ -4838,9 +4842,13 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
 
         if _export_v2:
             from core.agent_backup_export import apply_export_contract
-            apply_export_contract(manifest, export_observations)
+            apply_export_contract(manifest, export_observations, verified=_export_verified)
             from core.agent_backup_export import EXTRA_ARCHIVE_PREFIXES
             _validate_namespace(public_members, EXTRA_ARCHIVE_PREFIXES)
+            if _export_verified:
+                # C1-S3 A-6: stop early, in owner words, before any ZIP work.
+                from core.agent_backup_export import verified_publication_gate
+                verified_publication_gate(manifest)
         else:
             _validate_namespace(public_members)
 
@@ -4947,7 +4955,14 @@ def _build_agent_backup_core(data_dir: str, base_dir: str, dest_path: str,
         # simultaneously resident -- the prior-destination verification
         # below is charged for both, not just its own compressed bytes.
         if _export_v2:
-            # Incomplete exports have no overwrite or rollback authority.
+            if _export_verified:
+                # C1-S3: the binding gate runs on the verified built manifest,
+                # then the child re-reads the live store's incarnation as
+                # the last step before publication (A-3, A-6).
+                from core.agent_backup_export import recheck_c1_incarnation, verified_publication_gate
+                verified_publication_gate(built_manifest)
+                recheck_c1_incarnation(data_dir, built_manifest, built_data)
+            # Export-format archives have no overwrite or rollback authority.
             # Atomic no-clobber publication also closes the preflight race.
             from core.agent_backup_export import publish_new_export
             publication_observation = publish_new_export(

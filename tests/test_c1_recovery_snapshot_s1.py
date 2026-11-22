@@ -1142,6 +1142,9 @@ def test_the_audit_vocabulary_equals_every_action_the_code_writes():
 
 
 def test_no_product_code_calls_the_snapshot_yet():
+    # C1-S3a (disclosed edit): the Verified export is now the one caller. The
+    # capture is named only by the child-process module, and the strict
+    # parser only by the exporter, both through core.suspension_backup.
     names = ("capture_recovery_state", "recovery_snapshot", "validate_recovery_state", "_open_store")
     hits = {}
     for path in REPO.rglob("*.py"):
@@ -1152,7 +1155,8 @@ def test_no_product_code_calls_the_snapshot_yet():
         found = [n for n in names if n in text]
         if found:
             hits[rel] = found
-    assert hits == {}
+    assert hits == {"core/agent_backup_c1_child.py": ["capture_recovery_state"],
+                    "core/agent_backup_export.py": ["validate_recovery_state"]}
 
 
 def test_the_exporter_entry_point_adds_no_import():
