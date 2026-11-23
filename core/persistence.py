@@ -88,3 +88,35 @@ def update(mapping: dict) -> bool:
         prefs = load()
         prefs.update(mapping)
         return save(prefs)
+
+
+def set_if_unset(key_set, mapping: dict) -> str:
+    """C1-S2 (PS-4): write `mapping` only if none of `key_set` is present,
+    checked and written in ONE critical section, from a STRICT read.
+
+    Unlike load(), an unreadable or corrupt prefs.json is never treated as
+    empty: it answers "unreadable" and writes nothing, so a set-once value
+    can never be replaced because the file couldn't be read. An absent file
+    is empty. Returns "set", "already_set", "unreadable" or "write_failed"."""
+    refuse_if_production_path(PREFS_PATH)
+    keys = frozenset(key_set)
+    with _update_lock:
+        try:
+            with open(PREFS_PATH, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            current = {}
+        except OSError:
+            return "unreadable"
+        else:
+            try:
+                current = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                return "unreadable"
+            if type(current) is not dict:
+                return "unreadable"
+        if any(k in current for k in keys):
+            return "already_set"
+        # Exactly what was read plus `mapping`: no defaults are injected, so a
+        # set-once write never adds keys an export would have to classify.
+        return "set" if save({**current, **mapping}) else "write_failed"

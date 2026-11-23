@@ -21,6 +21,12 @@ text, Telegram message or model output can reach these controls.
     and what was in flight; Resume clears exactly the incident on screen.
     Resume waits while earlier work is still running; work whose process
     died is "outcome unknown" and needs the acknowledgement checkbox.
+  * Recover from this restore (C1-S2): on a restored copy waiting for recovery
+    the owner sets up a new owner PIN (never the original installation's),
+    reviews what the restore receipt says, and recovers with the PIN and two
+    acknowledgements. Plain Recover is not offered there, and on any restored
+    copy channels can't be allowed to start unsuspended: each is resumed on
+    its own.
   * Wire seat (W-B2): a restored copy is Wire-locked (core/wire_seat_gate.py).
     "Allow this copy to use the Wire seat" is offered only for that lock,
     only after the owner ticks that the original installation's status is
@@ -39,13 +45,55 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QDialog, QLabel, QListWidget, QListWidgetItem, QPushButton,
+    QButtonGroup, QCheckBox, QDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton,
     QRadioButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget, QMessageBox,
 )
 
 from core import operator_ingress, suspension as S, suspension_runtime as R
 from core import suspension_permissions as P
 from core import wire_seat_gate as G
+
+
+# ── C1-S2 owner texts (module constants so tests can lint them) ──
+ARCHIVE_TITLE_TEXT = "Recover from this restore"
+ARCHIVE_INTRO_TEXT = (
+    "This data folder was restored from a backup. Your chats, memories and other data are already "
+    "here and stay readable whatever you choose below. Recovering from this restore starts a new "
+    "safety identity for this copy: every channel starts suspended for your review, and nothing "
+    "is turned on automatically.")
+PIN_SETUP_TEXT = (
+    "Set an owner PIN for this restored copy. You never need the original installation's PIN: "
+    "a PIN is never put in a backup. It is stored hashed in this copy's settings. It is also the "
+    "PIN that unlocks sensitive tools on a non-owner channel such as Discord: you send it to "
+    "Lumina in that conversation and she passes it to the PIN check. Send it only to unlock "
+    "those tools and only where no one else can read it, never in a shared channel or in "
+    "passing: a PIN sent in a chat stays in that chat's history. It can't be changed or reset "
+    "in this version. If you forget it before "
+    "recovering, restore the backup again into a new folder: nothing from the backup is lost. "
+    "After recovery it only guards those non-owner tools; your data and your own use of Lumina "
+    "never need it. Use at least 6 characters; a 6-digit number is fine. Credentials and your PIN "
+    "are not in an Agent Backup: enter credentials again after recovery.")
+PIN_UNREADABLE_TEXT = (
+    "This copy's settings file can't be read, so an owner PIN can't be set or checked safely. "
+    "Your backup is unaffected: restore it again into a new folder.")
+ARCHIVE_ACK_RUNTIMES_TEXT = "No other Lumina process is using this folder, or it may be ignored."
+ARCHIVE_ACK_PRIOR_TEXT = (
+    "The backup is a past point in time. Anything that happened on the original installation "
+    "since then is unknown, and every channel starts suspended for my review.")
+ARCHIVE_ACK_NO_LINK_TEXT = (
+    "This copy's restore receipt can't be matched to its restore record. It will recover safely, "
+    "but it will never be able to use the Wire seat. Restoring the backup again into a new folder "
+    "is the way to get a copy that can.")
+RESTORED_CHANNELS_TEXT = (
+    "This is a restored copy: every channel first seen starts suspended. Resume each one on its own.")
+RECORD_STATUS_TEXT = {
+    "kept_as_inactive_history": ("The restore receipt says the backup's safety record was kept. It is "
+                                 "checked again before use and can only add restrictions."),
+    "not_restored_owner_skipped": "The restore receipt says no safety record was kept (skipped at restore).",
+    "not_restored_record_unavailable": ("The restore receipt says no safety record was kept (the "
+                                        "backup's record was damaged)."),
+    None: "This backup's format carries no safety record.",
+}
 
 
 def _when(ts: float) -> str:
@@ -181,6 +229,60 @@ class SuspensionDialog(QDialog):
             "chats or memories. Stop other Lumina processes using this folder before recovery.")
         content.addWidget(self.recovery_note)
 
+        # C1-S2: Recover from this restore (restored copy awaiting recovery).
+        self.archive_group = QWidget()
+        archive = QVBoxLayout(self.archive_group)
+        archive.setContentsMargins(0, 0, 0, 0)
+        archive_title = _label(ARCHIVE_TITLE_TEXT)
+        archive_title.setStyleSheet("font-weight: bold;")
+        archive.addWidget(archive_title)
+        archive.addWidget(_label(ARCHIVE_INTRO_TEXT))
+        self.archive_review_label = _label()
+        archive.addWidget(self.archive_review_label)
+        self.pin_setup_group = QWidget()
+        pin_setup = QVBoxLayout(self.pin_setup_group)
+        pin_setup.setContentsMargins(0, 0, 0, 0)
+        pin_setup.addWidget(_label(PIN_SETUP_TEXT))
+        self.pin_entry = QLineEdit()
+        self.pin_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pin_entry.setPlaceholderText("New owner PIN")
+        self.pin_confirm_entry = QLineEdit()
+        self.pin_confirm_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pin_confirm_entry.setPlaceholderText("Repeat the PIN")
+        self.set_pin_btn = QPushButton("Set owner PIN")
+        self.set_pin_btn.clicked.connect(self._set_owner_pin)
+        for widget in (self.pin_entry, self.pin_confirm_entry, self.set_pin_btn):
+            pin_setup.addWidget(widget)
+        archive.addWidget(self.pin_setup_group)
+        self.pin_unreadable_label = _label(PIN_UNREADABLE_TEXT)
+        archive.addWidget(self.pin_unreadable_label)
+        self.archive_pin_entry = QLineEdit()
+        self.archive_pin_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.archive_pin_entry.setPlaceholderText("Owner PIN")
+        archive.addWidget(self.archive_pin_entry)
+        self.archive_ack_runtimes_group, self.archive_ack_runtimes = _acknowledgement(
+            ARCHIVE_ACK_RUNTIMES_TEXT, "I confirm.")
+        self.archive_ack_prior_group, self.archive_ack_prior = _acknowledgement(
+            ARCHIVE_ACK_PRIOR_TEXT, "I accept this paused start.")
+        self.archive_ack_no_link_group, self.archive_ack_no_link = _acknowledgement(
+            ARCHIVE_ACK_NO_LINK_TEXT, "I accept that this copy can't use the Wire seat.")
+        for group in (self.archive_ack_runtimes_group, self.archive_ack_prior_group,
+                      self.archive_ack_no_link_group):
+            archive.addWidget(group)
+        for box in (self.archive_ack_runtimes, self.archive_ack_prior, self.archive_ack_no_link):
+            box.toggled.connect(lambda _on: self._sync_buttons())
+        self.archive_pin_entry.textChanged.connect(lambda _text: self._sync_buttons())
+        self.archive_recover_btn = QPushButton(ARCHIVE_TITLE_TEXT)
+        self.archive_recover_btn.clicked.connect(self._recover_from_archive)
+        archive.addWidget(self.archive_recover_btn)
+        content.addWidget(self.archive_group)
+        self._archive_inputs = None
+        self._archive_awaiting = False
+        self._pin_state = "unset"
+        self.restored_channels_label = _label(RESTORED_CHANNELS_TEXT)
+        content.addWidget(self.restored_channels_label)
+        self._restored = False
+
         # W-B2: the Wire seat of a restored copy (owner-local release only).
         self.wire_group = QWidget()
         wire = QVBoxLayout(self.wire_group)
@@ -291,9 +393,39 @@ class SuspensionDialog(QDialog):
         self.detail_label.setVisible(bool(self._views))
         if not self._views:
             self.detail_label.setText("")
+        self._refresh_archive_recovery()
         self._refresh_wire_seat()
         self._sync_buttons()
         self._fit_setup()
+
+    def _refresh_archive_recovery(self) -> None:
+        """C1-S2: what this copy needs. Read-only; the backend re-checks all."""
+        data_dir = self._status.data_dir
+        try:
+            self._restored = bool(data_dir) and G.is_restored_root(data_dir)
+        except Exception:
+            self._restored = True       # unknown counts as restored
+        self._archive_awaiting = R.awaiting_archive_recovery()
+        self._archive_inputs = None
+        if not self._archive_awaiting:
+            return
+        from core import agent_backup_restore as restore_engine
+        from core import pin_gate
+        self._pin_state = pin_gate.owner_pin_state()
+        try:
+            self._archive_inputs = restore_engine.archive_recovery_inputs(data_dir)
+        except Exception as exc:
+            self._archive_inputs = None
+            self._technical_error(f"Restore receipt: {type(exc).__name__}")
+        inputs = self._archive_inputs
+        if inputs is not None and inputs.receipt_paired:
+            lines = [f"Restore {inputs.restore_id[:8]} · backup {inputs.archive_sha256[:12]}",
+                     RECORD_STATUS_TEXT.get(inputs.receipt_record_status,
+                                            "The restore receipt's safety record entry can't be read; "
+                                            "it will not be used.")]
+        else:
+            lines = ["The restore receipt can't be matched to this copy's restore record."]
+        self.archive_review_label.setText("\n".join(lines))
 
     def _refresh_wire_seat(self) -> None:
         """W-B2: show this data folder's Wire seat state. The release is
@@ -472,10 +604,34 @@ class SuspensionDialog(QDialog):
         self.ack_runtimes_group.setVisible(recovering and not absent_clean)
         self.unknown_scopes_group.setVisible(recovering and not absent_clean)
         self.recovery_note.setVisible(recovering)
+        # C1-S2 (D1-2, TA2-05): a restored copy awaiting recovery offers only
+        # Recover from this restore; the PIN setup exists only there.
+        awaiting = self._archive_awaiting
+        paired = self._archive_inputs is not None and self._archive_inputs.receipt_paired
+        self.archive_group.setVisible(awaiting)
+        self.pin_setup_group.setVisible(awaiting and self._pin_state == "unset")
+        self.pin_unreadable_label.setVisible(awaiting and self._pin_state not in ("set", "unset"))
+        self.archive_pin_entry.setVisible(awaiting and self._pin_state == "set")
+        for group in (self.archive_ack_runtimes_group, self.archive_ack_prior_group):
+            group.setVisible(awaiting and self._pin_state == "set")
+        self.archive_ack_no_link_group.setVisible(awaiting and self._pin_state == "set" and not paired)
+        self.archive_recover_btn.setVisible(awaiting and self._pin_state == "set")
+        self.archive_recover_btn.setEnabled(
+            awaiting and self._pin_state == "set" and bool(self.archive_pin_entry.text())
+            and self.archive_ack_runtimes.isChecked() and self.archive_ack_prior.isChecked()
+            and (paired or self.archive_ack_no_link.isChecked()))
+        if awaiting:
+            for widget in (self.recover_btn, self.ack_runtimes_group, self.unknown_scopes_group):
+                widget.hide()
+        # A2-4: on any restored copy, channels are never allowed an unpaused
+        # start; the backend refuses it too, this only explains it.
+        if self._restored:
+            self.unknown_scopes_group.hide()
+        self.restored_channels_label.setVisible(self._restored)
         self.resume_btn.setVisible(status.state is R.State.ACTIVE)
         self.resume_btn.setEnabled(bool(self._views) and self.incidents.currentRow() >= 0)
         self.ack_unknown_group.setVisible(status.state is R.State.ACTIVE and bool(self._views))
-        self.ack_scopes_btn.setVisible(status.state is R.State.ACTIVE and any(
+        self.ack_scopes_btn.setVisible(status.state is R.State.ACTIVE and not self._restored and any(
             v.trigger == S.RECOVERY_TRIGGER for v in self._views))
         self.result_label.setVisible(bool(self.result_label.text()))
         self.permission_group.setVisible(self._permission_pending)
@@ -604,6 +760,67 @@ class SuspensionDialog(QDialog):
         else:
             self.result_label.setText(
                 f"Recovered. Evidence kept in {outcome.evidence_dir}. Suspended for your review: {scopes}.")
+        self.refresh()
+
+    def _clear_pin_entries(self) -> None:
+        for entry in (self.pin_entry, self.pin_confirm_entry, self.archive_pin_entry):
+            entry.clear()
+
+    def _set_owner_pin(self) -> None:
+        pin, confirm = self.pin_entry.text(), self.pin_confirm_entry.text()
+        self._clear_pin_entries()      # PS-5: cleared on every outcome
+        try:
+            R.set_owner_pin(ingress=operator_ingress.local_suspension_control("owner_pin_setup"),
+                            pin=pin, confirm=confirm)
+        except R.OwnerPinRefused as exc:
+            self.result_label.setText(f"PIN not set: {exc.text}")
+        except Exception as exc:
+            self.result_label.setText("PIN not set: Lumina couldn't save the PIN. Nothing was changed.")
+            self._technical_error(f"Owner PIN setup: {type(exc).__name__}")
+        else:
+            self.result_label.setText("Owner PIN set. Enter it below to recover from this restore.")
+        del pin, confirm
+        self.refresh()
+
+    def _recover_from_archive(self) -> None:
+        pin = self.archive_pin_entry.text()
+        self._clear_pin_entries()
+        inputs = self._archive_inputs
+        if inputs is None or not self._archive_awaiting:
+            self.result_label.setText("Nothing was changed: review this copy again.")
+            self.refresh()
+            return
+        try:
+            outcome = R.recover_from_archive(
+                ingress=operator_ingress.local_suspension_control("recover_from_archive"),
+                pin=pin, inputs=inputs,
+                acknowledge_unreadable_runtimes=self.archive_ack_runtimes.isChecked(),
+                acknowledge_prior_state_since_archive=self.archive_ack_prior.isChecked(),
+                acknowledge_no_lineage=self.archive_ack_no_link.isChecked())
+        except R.RecoverFromArchiveRefused as exc:
+            self.result_label.setText(f"Not recovered: {exc.text}")
+        except S.RecoveryBlocked as exc:
+            self.result_label.setText(f"Not recovered: {exc.reason}. Nothing was changed.")
+        except S.SuspensionError as exc:
+            if not self._permission_failure(exc):
+                self.result_label.setText("Not recovered: the recovery could not be completed. "
+                                          "Review Suspension controls again.")
+                self._technical_error(f"Recover from this restore: {type(exc).__name__}")
+        except Exception as exc:          # TR1-01: never a silent failure in the slot
+            self.result_label.setText("Not recovered: the recovery could not be completed. "
+                                      "Review Suspension controls again.")
+            self._technical_error(f"Recover from this restore: {type(exc).__name__}")
+        else:
+            link = ("" if outcome.lineage_written else
+                    " This copy has no confirmed link to its restore, so it can't use the Wire seat.")
+            self.result_label.setText(
+                "Safety protection is running again with a new identity. Your own work and every "
+                "channel start suspended: review and resume each one. Full recovery is not proven "
+                "yet: also re-pair Chrome Companion, enter credentials again (they are not in an "
+                "Agent Backup), and decide about the Wire seat." + link)
+        del pin
+        for box in (self.archive_ack_runtimes, self.archive_ack_prior, self.archive_ack_no_link):
+            box.setChecked(False)
         self.refresh()
 
     def _resume(self) -> None:

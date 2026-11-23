@@ -21,7 +21,10 @@ a model-supplied flag, or ambient UI state.
                              command, and never minted for relayed text.
                              With the action "wire_seat_release" it is also
                              the only authority that may release the Wire
-                             seat to a restored copy (W-B2).
+                             seat to a restored copy (W-B2); with
+                             "recover_from_archive" or "owner_pin_setup",
+                             the only authority for C1-S2's restore-specific
+                             Recover and owner PIN enrollment.
 
 Before this module, Telegram's `filters.TEXT & ~filters.COMMAND` was the
 only barrier: it keys on a bot_command entity at offset 0, so a
@@ -122,6 +125,37 @@ def may_release_wire_seat(ingress) -> bool:
             and ingress._mint is _MINT
             and ingress.kind is IngressKind.LOCAL_SUSPENSION_CONTROL
             and ingress.event_id == WIRE_SEAT_RELEASE_ACTION)
+
+
+#: C1-S2: the one action name that may run "Recover from this restore"
+#: (core.suspension.recover_from_archive), minted only by its Suspension
+#: controls button. Typed chat never qualifies (TC2-05).
+RECOVER_FROM_ARCHIVE_ACTION = "recover_from_archive"
+
+#: C1-S2 (PS-2): the one action name that may enroll the owner PIN on a
+#: restored copy awaiting recovery, minted only by its Suspension controls
+#: button.
+OWNER_PIN_SETUP_ACTION = "owner_pin_setup"
+
+
+def _suspension_button(ingress, action: str) -> bool:
+    return (type(ingress) is OperatorIngress
+            and ingress._mint is _MINT
+            and ingress.kind is IngressKind.LOCAL_SUSPENSION_CONTROL
+            and ingress.event_id == action)
+
+
+def may_recover_from_archive(ingress) -> bool:
+    """C1-S2: True only for the Suspension controls envelope minted for
+    exactly "Recover from this restore". may_control_suspension is
+    deliberately not reused: it also admits typed desktop chat."""
+    return _suspension_button(ingress, RECOVER_FROM_ARCHIVE_ACTION)
+
+
+def may_set_owner_pin(ingress) -> bool:
+    """C1-S2 (PS-2): True only for the Suspension controls envelope minted
+    for exactly the owner PIN setup button."""
+    return _suspension_button(ingress, OWNER_PIN_SETUP_ACTION)
 
 
 def looks_like_operator_command(text) -> bool:

@@ -495,22 +495,26 @@ def test_an_unexpected_failure_refuses_with_the_class_name_only(tmp_path, monkey
 
 
 def test_every_reader_outcome_has_a_table_code_text_and_remedy():
-    refusals = {G.RECOVERED_UNRELEASED, G.TRACE_INVALID, G.EVIDENCE_UNREADABLE, G.OVER_CAP,
-                G.ROOT_UNKNOWN, G.ROOT_MISMATCH, G.GATE_ERROR}
+    # C1-S2 A2-7 (disclosed edit): TRACE_MISSING joins the table, and the
+    # do-not-delete sentence now says deleting never unlocks (A2-7, TA2-09).
+    refusals = {G.RECOVERED_UNRELEASED, G.TRACE_INVALID, G.TRACE_MISSING, G.EVIDENCE_UNREADABLE,
+                G.OVER_CAP, G.ROOT_UNKNOWN, G.ROOT_MISMATCH, G.GATE_ERROR}
     assert set(G.STATUS_TEXT) == refusals == set(G.REMEDY_TEXT)
     assert set(G._PRECEDENCE) | {G.RECOVERED_UNRELEASED, G.GATE_ERROR} == refusals
-    dont = "Do not delete the restore records to unlock the Wire; that bypasses this check."
-    for code in (G.TRACE_INVALID, G.EVIDENCE_UNREADABLE, G.OVER_CAP):
+    dont = ("Do not delete anything under memory/suspension_evidence or restore_history: "
+            "deleting restore records never unlocks the Wire and can lock it for good.")
+    for code in (G.TRACE_INVALID, G.TRACE_MISSING, G.EVIDENCE_UNREADABLE, G.OVER_CAP):
         assert dont in G.REMEDY_TEXT[code], code
     for code in refusals:
         text = G.describe(G.SeatVerdict(False, code)).lower()
         assert text.startswith("wire locked:"), code
         if code != G.RECOVERED_UNRELEASED:
             assert "release" not in text and "allow" not in text, code
-    # W-B2 (disclosed adaptation): E1-2(e) said W-B2 replaces the W-B1-only text.
+    # C1-S2 TA2-02 (disclosed edit): state-neutral; the gate can't see the
+    # C1 store, so it names no control and points to Suspension controls.
     assert G.REMEDY_TEXT[G.RECOVERED_UNRELEASED] == (
-        "Allowing a restored copy needs safe recovery from the backup, which this version of "
-        "Lumina can't do yet. Details are in Suspension controls (/suspension).")
+        "Open Suspension controls (/suspension) to see what this copy needs before it can use "
+        "the Wire.")
     assert "hard link" in G.REMEDY_TEXT[G.TRACE_INVALID]
     assert G.describe(G.SeatVerdict(True, G.NO_TRACE)) == ""
 

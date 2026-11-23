@@ -92,15 +92,20 @@ def _recover():
 
 
 def _synthetic_c1s2_lineage(root, restore_id, archive_sha256):
-    """TEST-ONLY stand-in for C1-S2: the two lineage meta rows that
-    recover_from_archive is specified to write in its creating transaction.
-    Nothing in the product writes these keys."""
+    """TEST-ONLY stand-in for C1-S2 on a plain-Recover root: the lineage meta
+    rows the release compares, as core.suspension.recover_from_archive writes
+    them in its creating transaction (C1-S2 disclosed edit: the trace hash,
+    recorded at Recover and compared at release, A2-3, joins the two keys).
+    Only recover_from_archive writes these keys in the product."""
+    trace = G.single_trace(root)
+    trace_sha256 = trace.trace_sha256 if trace is not None else "0" * 64
     conn = sqlite3.connect(os.path.join(root, "memory", S.STORE_NAME))
     try:
         with conn:
             conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", [
                 (R.LINEAGE_RESTORE_ID_KEY, restore_id),
-                (R.LINEAGE_ARCHIVE_SHA256_KEY, archive_sha256)])
+                (R.LINEAGE_ARCHIVE_SHA256_KEY, archive_sha256),
+                (R.LINEAGE_TRACE_SHA256_KEY, trace_sha256)])
     finally:
         conn.close()
 
@@ -214,14 +219,34 @@ def test_production_path_after_a_real_recover_refuses_until_c1s2(restored):
 
 
 def test_no_product_code_writes_the_c1s2_lineage_keys():
-    hits = []
+    """C1-S2 (disclosed edit, TC2-07c): every lineage_* key has exactly one
+    writer, core.suspension.recover_from_archive, allowed by FUNCTION (AST),
+    not by file. recover_destructively and every other function never name
+    a lineage key; the runtime only reads them."""
+    literal_users = []
     for rel in _product_py():
-        text = (REPO / rel).read_text(encoding="utf-8")
-        if "lineage_restore_id" in text or "lineage_archive_sha256" in text:
-            hits.append(rel)
-    assert hits == ["core/suspension_runtime.py"]  # the reader's constants only
-    tree = ast.parse((REPO / "core" / "suspension_runtime.py").read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
+        tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))
+        if any(isinstance(n, ast.Constant) and isinstance(n.value, str)
+               and n.value.startswith("lineage_") for n in ast.walk(tree)):
+            literal_users.append(rel)
+    assert literal_users == ["core/suspension.py"]
+    core = ast.parse((REPO / "core" / "suspension.py").read_text(encoding="utf-8"))
+    keys = {t.id for node in core.body if isinstance(node, ast.Assign) for t in node.targets
+            if isinstance(t, ast.Name) and t.id.startswith("LINEAGE_") and t.id.endswith("_KEY")}
+    assert {"LINEAGE_RESTORE_ID_KEY", "LINEAGE_ARCHIVE_SHA256_KEY", "LINEAGE_TRACE_SHA256_KEY"} <= keys
+    users = set()
+    for fn in ast.walk(core):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if any(isinstance(n, ast.Name) and n.id in keys for n in ast.walk(fn)):
+                users.add(fn.name)
+    # _restored_root only READS lineage (a restored copy is never cleared).
+    assert users == {"recover_from_archive", "_restored_root"}, users
+    for fn in ast.walk(core):
+        if isinstance(fn, ast.FunctionDef) and fn.name == "_restored_root":
+            assert not any(isinstance(n, ast.Constant) and isinstance(n.value, str)
+                           and re.search(r"\b(INSERT|UPDATE|REPLACE)\b", n.value) for n in ast.walk(fn))
+    runtime = ast.parse((REPO / "core" / "suspension_runtime.py").read_text(encoding="utf-8"))
+    for node in ast.walk(runtime):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             assert not re.search(r"\b(INSERT|UPDATE|REPLACE)\b", node.value), node.value
 

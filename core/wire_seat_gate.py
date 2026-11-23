@@ -21,10 +21,17 @@ Rules (design: WB-PROPOSAL, amendment A1, erratum A1-E1):
 * Anything about the evidence that cannot be checked refuses, with a stable
   reason code and a plain remedy. Unreadable never means "no trace".
 * An invalid restore trace refuses (``TRACE_INVALID``).
+* A second, independent restore marker (C1-S2 amendment A2-7): every restore
+  also leaves ``restore_history/<restore_id>/`` (with its ``receipt.json``).
+  A marked restore with no valid trace and no valid release refuses
+  (``TRACE_MISSING``), so deleting the trace never unlocks the Wire. The
+  marker is checked by lstat only: its receipt is never opened or parsed.
 * An invalid release record is "not a release": it never allows and never
   blocks a later valid release. Pairing is by content only, the exact
   ``(restore_id, sha256(trace bytes))``; where a release sits does not matter.
-* Only the two exact record names are ever opened. Nothing is cached.
+* Only the two exact record names under ``suspension_evidence`` are ever
+  opened; ``restore_history`` is listed and lstat'ed, never read. Nothing is
+  cached.
 
 It writes nothing, follows no symlink, imports only the standard library,
 and never imports ``core.suspension``. The record formats it shares with the
@@ -45,13 +52,19 @@ from dataclasses import dataclass
 __all__ = [
     "SeatVerdict", "seat_verdict", "process_seat_verdict", "process_data_root", "describe",
     "release_record_bytes", "acknowledgement_sha256", "release_acknowledgement_sha256",
-    "NO_TRACE", "RELEASED", "RECOVERED_UNRELEASED", "TRACE_INVALID",
+    "NO_TRACE", "RELEASED", "RECOVERED_UNRELEASED", "TRACE_INVALID", "TRACE_MISSING",
     "EVIDENCE_UNREADABLE", "OVER_CAP", "ROOT_UNKNOWN", "ROOT_MISMATCH", "GATE_ERROR",
+    "SingleTrace", "single_trace", "is_restored_root",
 ]
 
 DATA_DIR_ENV = "LUMINA_DATA_DIR"
 MEMORY_DIRNAME = "memory"
 EVIDENCE_DIRNAME = "suspension_evidence"
+#: The restore engine's per-restore folder and its receipt's name (pinned
+#: equal to the engine's by test). Its presence is the second restore
+#: marker; nothing in it is ever opened here.
+MARKER_DIRNAME = "restore_history"
+MARKER_RECEIPT_NAME = "receipt.json"
 
 TRACE_NAME = "restore_trace.json"
 TRACE_SCHEMA = "lumina.c1_restore_trace"
@@ -76,6 +89,7 @@ NO_TRACE = "no_trace"
 RELEASED = "released"
 RECOVERED_UNRELEASED = "recovered_unreleased"
 TRACE_INVALID = "trace_invalid"
+TRACE_MISSING = "trace_missing"
 EVIDENCE_UNREADABLE = "evidence_unreadable"
 OVER_CAP = "over_cap"
 ROOT_UNKNOWN = "root_unknown"
@@ -84,7 +98,8 @@ GATE_ERROR = "gate_error"
 
 #: Refusal precedence, strongest first (A1-E1 E1-2). GATE_ERROR replaces any
 #: of them when the scan itself fails.
-_PRECEDENCE = (ROOT_UNKNOWN, ROOT_MISMATCH, EVIDENCE_UNREADABLE, OVER_CAP, TRACE_INVALID)
+_PRECEDENCE = (ROOT_UNKNOWN, ROOT_MISMATCH, EVIDENCE_UNREADABLE, OVER_CAP, TRACE_INVALID,
+               TRACE_MISSING)
 
 _HEX32 = re.compile(r"[0-9a-f]{32}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -95,11 +110,13 @@ _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 # ── owner-facing texts (module constants so the wording lint covers them) ──
 
-_DO_NOT_DELETE = "Do not delete the restore records to unlock the Wire; that bypasses this check."
+_DO_NOT_DELETE = ("Do not delete anything under memory/suspension_evidence or restore_history: "
+                  "deleting restore records never unlocks the Wire and can lock it for good.")
 
 STATUS_TEXT = {
     RECOVERED_UNRELEASED: "Wire locked: this is a restored copy.",
     TRACE_INVALID: "Wire locked: a restore record in this data folder can't be checked.",
+    TRACE_MISSING: "Wire locked: this copy was restored, but its restore record is missing.",
     EVIDENCE_UNREADABLE: "Wire locked: Lumina can't read its safety evidence folder.",
     OVER_CAP: "Wire locked: the safety evidence folder is too large to check.",
     ROOT_UNKNOWN: "Wire locked: Lumina couldn't confirm which data folder it is using.",
@@ -108,16 +125,18 @@ STATUS_TEXT = {
 }
 
 REMEDY_TEXT = {
-    # W-B2: the owner-local release in Suspension controls (A1-2).
-    RECOVERED_UNRELEASED: ("Allowing a restored copy needs safe recovery from the backup, which "
-                           "this version of Lumina can't do yet. Details are in Suspension "
-                           "controls (/suspension)."),
+    # State-neutral (C1-S2 TA2-02): the gate can't see the C1 store, so it
+    # names no control; Suspension controls shows the step for this state.
+    RECOVERED_UNRELEASED: ("Open Suspension controls (/suspension) to see what this copy needs "
+                           "before it can use the Wire."),
     TRACE_INVALID: ("Restore owner-only permissions (files 600, folders 700) under "
                     "memory/suspension_evidence, and remove any extra hard link to a restore "
                     "record, or restore again from the backup. " + _DO_NOT_DELETE),
     EVIDENCE_UNREADABLE: ("Make sure memory/ is a real folder, not a link, and restore "
-                          "owner-only permissions on memory/suspension_evidence "
-                          "(folders 700, files 600). " + _DO_NOT_DELETE),
+                          "owner-only permissions on memory/suspension_evidence and "
+                          "restore_history (folders 700, files 600). " + _DO_NOT_DELETE),
+    TRACE_MISSING: ("Restore the backup again into a new folder. Nothing from the backup is lost; "
+                    "changes you made in this copy are not carried over. " + _DO_NOT_DELETE),
     OVER_CAP: ("This needs manual review. Lumina will not remove evidence by itself. "
                + _DO_NOT_DELETE),
     ROOT_UNKNOWN: "Restart Lumina with its normal launcher.",
@@ -331,82 +350,185 @@ def _exists_nofollow(path: str) -> bool:
     return True
 
 
-def _scan(data_root: str) -> SeatVerdict:
-    memory = os.path.join(data_root, MEMORY_DIRNAME)
-    if not _exists_nofollow(memory):
-        return SeatVerdict(True, NO_TRACE)
-    mem_fd = _open_dir(memory, private=False)
+def _scan_evidence(ev_fd: int, c: dict) -> None:
+    """Valid traces and releases under ``suspension_evidence``; only the two
+    exact record names are ever opened."""
     try:
+        names = os.listdir(ev_fd)
+    except OSError:
+        raise _Refuse(EVIDENCE_UNREADABLE) from None
+    if len(names) > MAX_EVIDENCE_CHILDREN:
+        raise _Refuse(OVER_CAP)
+    for name in sorted(names):
         try:
-            os.stat(EVIDENCE_DIRNAME, dir_fd=mem_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return SeatVerdict(True, NO_TRACE)
+            cst = os.stat(name, dir_fd=ev_fd, follow_symlinks=False)
         except OSError:
-            raise _Refuse(EVIDENCE_UNREADABLE) from None
-        ev_fd = _open_dir(EVIDENCE_DIRNAME, dir_fd=mem_fd)
-    finally:
-        os.close(mem_fd)
-    refusals: set[str] = set()
-    traces: dict[tuple, float] = {}
-    archives: dict[tuple, str] = {}
-    releases: set[tuple] = set()
-    ignored = 0
+            c["refusals"].add(EVIDENCE_UNREADABLE)
+            continue
+        if stat.S_ISLNK(cst.st_mode):
+            # A linked child could hide a trace; it is never followed.
+            c["refusals"].add(EVIDENCE_UNREADABLE)
+            continue
+        if not stat.S_ISDIR(cst.st_mode):
+            continue  # C1 writes only directories here; a stray file holds no record
+        try:
+            child_fd = _open_dir(name, dir_fd=ev_fd)
+        except _Refuse as exc:
+            c["refusals"].add(exc.reason)
+            continue
+        try:
+            raw = _read_record(child_fd, TRACE_NAME)
+            if raw is not _ABSENT:
+                ident = _trace_identity(raw) if raw is not None else None
+                if ident is None:
+                    c["refusals"].add(TRACE_INVALID)
+                else:
+                    key = (ident[0], ident[1])
+                    c["traces"][key] = ident[2]
+                    c["archives"][key] = ident[3]
+                    c["where"].setdefault(key, []).append(name)
+            raw = _read_record(child_fd, RELEASE_NAME)
+            if raw is not _ABSENT:
+                pair = _release_pair(raw) if raw is not None else None
+                if pair is None:
+                    c["ignored"] += 1
+                else:
+                    c["releases"].add(pair)
+        finally:
+            os.close(child_fd)
+
+
+def _scan_markers(data_root: str, c: dict) -> None:
+    """The second restore marker (A2-7): each private ``restore_history/<hex32>``
+    folder names one restore. Listed and lstat'ed only: ``receipt.json`` is
+    never opened or parsed. A folder without its receipt still marks the
+    restore; anything that is not a plain private marker refuses."""
+    path = os.path.join(data_root, MARKER_DIRNAME)
+    if not _exists_nofollow(path):
+        return
+    hist_fd = _open_dir(path)
     try:
         try:
-            names = os.listdir(ev_fd)
+            names = os.listdir(hist_fd)
         except OSError:
             raise _Refuse(EVIDENCE_UNREADABLE) from None
         if len(names) > MAX_EVIDENCE_CHILDREN:
             raise _Refuse(OVER_CAP)
         for name in sorted(names):
-            try:
-                cst = os.stat(name, dir_fd=ev_fd, follow_symlinks=False)
-            except OSError:
-                refusals.add(EVIDENCE_UNREADABLE)
+            if not _HEX32.fullmatch(name):
+                c["refusals"].add(EVIDENCE_UNREADABLE)
                 continue
-            if stat.S_ISLNK(cst.st_mode):
-                # A linked child could hide a trace; it is never followed.
-                refusals.add(EVIDENCE_UNREADABLE)
-                continue
-            if not stat.S_ISDIR(cst.st_mode):
-                continue  # C1 writes only directories here; a stray file holds no record
             try:
-                child_fd = _open_dir(name, dir_fd=ev_fd)
+                child_fd = _open_dir(name, dir_fd=hist_fd)
             except _Refuse as exc:
-                refusals.add(exc.reason)
+                c["refusals"].add(exc.reason)
                 continue
+            c["markers"].add(name)
             try:
-                raw = _read_record(child_fd, TRACE_NAME)
-                if raw is not _ABSENT:
-                    ident = _trace_identity(raw) if raw is not None else None
-                    if ident is None:
-                        refusals.add(TRACE_INVALID)
-                    else:
-                        traces[(ident[0], ident[1])] = ident[2]
-                        archives[(ident[0], ident[1])] = ident[3]
-                raw = _read_record(child_fd, RELEASE_NAME)
-                if raw is not _ABSENT:
-                    pair = _release_pair(raw) if raw is not None else None
-                    if pair is None:
-                        ignored += 1
-                    else:
-                        releases.add(pair)
+                try:
+                    rst = os.stat(MARKER_RECEIPT_NAME, dir_fd=child_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    c["refusals"].add(EVIDENCE_UNREADABLE)
+                    continue
+                if (not stat.S_ISREG(rst.st_mode) or rst.st_nlink != 1
+                        or rst.st_uid != os.getuid() or rst.st_mode & 0o077):
+                    c["refusals"].add(EVIDENCE_UNREADABLE)
             finally:
                 os.close(child_fd)
     finally:
-        os.close(ev_fd)
+        os.close(hist_fd)
+
+
+def _collect(data_root: str) -> dict:
+    c = {"refusals": set(), "traces": {}, "archives": {}, "where": {}, "releases": set(),
+         "markers": set(), "ignored": 0}
+    memory = os.path.join(data_root, MEMORY_DIRNAME)
+    if _exists_nofollow(memory):
+        mem_fd = _open_dir(memory, private=False)
+        ev_fd = None
+        try:
+            try:
+                os.stat(EVIDENCE_DIRNAME, dir_fd=mem_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise _Refuse(EVIDENCE_UNREADABLE) from None
+            else:
+                ev_fd = _open_dir(EVIDENCE_DIRNAME, dir_fd=mem_fd)
+        finally:
+            os.close(mem_fd)
+        if ev_fd is not None:
+            try:
+                _scan_evidence(ev_fd, c)
+            finally:
+                os.close(ev_fd)
+    # The marker lives outside memory/, so it is checked even when memory/ or
+    # its evidence folder is gone: that absence is exactly what it catches.
+    _scan_markers(data_root, c)
+    return c
+
+
+def _verdict(c: dict) -> SeatVerdict:
+    traces, releases, refusals = c["traces"], c["releases"], set(c["refusals"])
     unreleased = tuple(sorted((rid, sha, at) for (rid, sha), at in traces.items()
                               if (rid, sha) not in releases))
-    lineage = tuple((rid, sha, archives[(rid, sha)]) for rid, sha, _at in unreleased)
+    lineage = tuple((rid, sha, c["archives"][(rid, sha)]) for rid, sha, _at in unreleased)
+    accounted = {rid for rid, _sha in traces} | {rid for rid, _sha in releases}
+    if c["markers"] - accounted:
+        refusals.add(TRACE_MISSING)  # a marked restore whose trace is gone, never released
     for reason in _PRECEDENCE:
         if reason in refusals:
-            return SeatVerdict(False, reason, unreleased, ignored, unreleased_lineage=lineage)
-    if not traces:
-        return SeatVerdict(True, NO_TRACE, (), ignored)
+            return SeatVerdict(False, reason, unreleased, c["ignored"], unreleased_lineage=lineage)
+    if not traces and not c["markers"]:
+        return SeatVerdict(True, NO_TRACE, (), c["ignored"])
     if unreleased:
-        return SeatVerdict(False, RECOVERED_UNRELEASED, unreleased, ignored,
+        return SeatVerdict(False, RECOVERED_UNRELEASED, unreleased, c["ignored"],
                            unreleased_lineage=lineage)
-    return SeatVerdict(True, RELEASED, (), ignored)
+    return SeatVerdict(True, RELEASED, (), c["ignored"])
+
+
+def _scan(data_root: str) -> SeatVerdict:
+    return _verdict(_collect(data_root))
+
+
+@dataclass(frozen=True)
+class SingleTrace:
+    """The one restore trace of a root awaiting recovery, read once (C1-S2
+    TC2-07b): its identity and sha256 come from the same bytes."""
+    restore_id: str
+    trace_sha256: str
+    archive_sha256: str
+    at: float
+    relpath: str  # data-root-relative, as the restore receipt records it
+
+
+def single_trace(data_root):
+    """The single valid, unreleased restore trace of a root that the gate
+    reports as RECOVERED_UNRELEASED, else None. Any refusal, a second trace,
+    or two folders holding the same trace bytes gives None. Never raises."""
+    try:
+        root = os.fspath(data_root)
+        c = _collect(root)
+        verdict = _verdict(c)
+    except Exception:
+        return None
+    if verdict.reason != RECOVERED_UNRELEASED or len(c["traces"]) != 1 or len(verdict.unreleased) != 1:
+        return None
+    (key, at), = c["traces"].items()
+    where = c["where"].get(key, [])
+    if len(where) != 1:
+        return None
+    return SingleTrace(key[0], key[1], c["archives"][key], at,
+                       f"{MEMORY_DIRNAME}/{EVIDENCE_DIRNAME}/{where[0]}/{TRACE_NAME}")
+
+
+def is_restored_root(data_root) -> bool:
+    """True unless the gate finds no restore evidence at all (NO_TRACE). A
+    released, unreleased, missing-trace, invalid, unreadable or failed scan
+    all count as restored: unknown fails closed (C1-S2 A2-4)."""
+    return seat_verdict(data_root).reason != NO_TRACE
 
 
 def seat_verdict(data_root) -> SeatVerdict:

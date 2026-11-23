@@ -364,13 +364,19 @@ def _product_py():
 _ENGINE = {"core/agent_backup_restore.py", "core/agent_backup_restore_intake.py",
            "core/agent_backup_restore_cockpit.py"}
 _MAY_IMPORT_ENGINE = _ENGINE | {"ui/settings/restore_cockpit.py"}
+# C1-S2 (disclosed edits): the Suspension dialog imports the engine only to
+# read this restore's receipt for "Recover from this restore"
+# (archive_recovery_inputs); the Wire gate names the history folder only to
+# lstat it as the second restore marker (A2-7). Neither names the record.
+_C1S2_DIALOG = "ui/suspension_dialog.py"
+_C1S2_GATE = "core/wire_seat_gate.py"
 _NAME_ALLOWLIST = {
-    "agent_backup_restore": _MAY_IMPORT_ENGINE,
+    "agent_backup_restore": _MAY_IMPORT_ENGINE | {_C1S2_DIALOG},
     "HISTORY_DIRNAME": {"core/agent_backup_restore.py", "core/agent_backup_restore_cockpit.py"},
     "C1_HISTORY_NAME": {"core/agent_backup_restore.py"},
     # The inventory names the folder only to classify it as known and never
     # captured by an export (pre-existing; it reads no content).
-    "restore_history": _ENGINE | {"core/agent_backup_inventory.py"},
+    "restore_history": _ENGINE | {"core/agent_backup_inventory.py", _C1S2_GATE},
     "archived_c1_record": {"core/agent_backup_restore.py", "core/agent_backup_restore_intake.py"},
     # The export names the archive member path; nothing else names the file.
     "recovery_state.json": {"core/agent_backup_export.py", "core/agent_backup_restore.py"},
@@ -416,13 +422,17 @@ def _violations(found):
 def test_only_the_restore_engine_names_the_history_record():
     """No runtime, safety-enforcement, Wire or C1-recovery module imports the
     restore engine or names the history folder, the record or its receipt
-    entry, however indirectly. C1-S2 (the reader that would bind receipt and
-    trace) is not built."""
+    entry, however indirectly. C1-S2's reader is the engine's own
+    archive_recovery_inputs; the dialog and the gate are the two disclosed
+    additions above, and neither names the record or its receipt entry."""
     files = _product_py()
     rels = {p.relative_to(REPO).as_posix() for p in files}
     assert {"core/suspension.py", "core/wire_seat_gate.py", "main.py"} <= rels and len(rels) > 100
     found = _name_users(REPO, files)
     assert _violations(found) == {}
+    for rel in (_C1S2_GATE, _C1S2_DIALOG):
+        for token in ("archived_c1_record", "recovery_state.json", "C1_HISTORY_NAME"):
+            assert rel not in found[token], (rel, token)
     assert found["C1_HISTORY_NAME"] == {"core/agent_backup_restore.py"}
     assert '"restore_history": (UNCAPTURED_KNOWN' in (REPO / "core/agent_backup_inventory.py").read_text()
 

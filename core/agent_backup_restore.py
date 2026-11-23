@@ -1867,6 +1867,81 @@ def _generation_accepted(data_dir, recorded):
             and missing == recorded["unrecoverable"])
 
 
+# C1-S2: the restore engine's half of "Recover from this restore". It reads
+# this restore's own receipt (and, when the receipt says it was kept, the C1
+# history record) and hands C1 plain values. It decides nothing: C1
+# re-derives the trace and re-validates the record (plan §1.2, D1-1, A2-2).
+_RECEIPT_READ_CAP = 32 * 1024 * 1024
+
+
+def _read_nofollow(data_dir, rel, cap):
+    """Bytes of data_dir/rel if it is a regular file reached without any
+    link and at most `cap` bytes, else None. Read-only."""
+    state, st = _lstat_chain(data_dir, rel)
+    if state != "file" or st.st_size > cap:
+        return None
+    try:
+        fd = os.open(os.path.join(data_dir, rel),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode):
+            return None
+        with os.fdopen(os.dup(fd), "rb") as fh:
+            data = fh.read(cap + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return data if len(data) <= cap else None
+
+
+def archive_recovery_inputs(data_dir):
+    """Read-only. The receipt of the one restore that C1's trace names,
+    paired both ways (restore id, archive sha256, trace path) and checked
+    against its own digest; and the kept C1 history record's bytes with the
+    sha256 the receipt recorded. A missing, unreadable, invalid or unpaired
+    receipt gives receipt_paired=False and nothing else (A-11.2). The
+    receipt's class and verification claims are never used (TS3B-06)."""
+    from core import wire_seat_gate as gate   # stdlib-only reader of the trace
+    data_dir = os.path.abspath(os.fspath(data_dir))
+    unpaired = c1.ArchiveRecoveryInputs(False, None, None, None, None, None, None)
+    trace = gate.single_trace(data_dir)
+    if trace is None:
+        return unpaired
+    rid = trace.restore_id
+    raw = _read_nofollow(data_dir, f"{HISTORY_DIRNAME}/{rid}/{RECEIPT_NAME}", _RECEIPT_READ_CAP)
+    if raw is None:
+        return unpaired
+    try:
+        receipt = ab._strict_json_loads(raw)
+        archive_sha256 = receipt["archive"]["archive_sha256"]
+        trace_rel = receipt["c1"]["trace"]
+        intact = (type(receipt) is dict and receipt.get("schema") == RECEIPT_SCHEMA
+                  and receipt.get("version") == VERSION and receipt.get("restore_id") == rid
+                  and receipt.get("receipt_digest") == _digest(
+                      {k: v for k, v in receipt.items() if k != "receipt_digest"}))
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+        return unpaired
+    if not intact or archive_sha256 != trace.archive_sha256 or trace_rel != trace.relpath:
+        return unpaired
+    entry = receipt["c1"].get("archived_c1_record") if type(receipt["c1"]) is dict else None
+    if entry is None:
+        return c1.ArchiveRecoveryInputs(True, rid, archive_sha256, trace_rel, None, None, None)
+    status = entry.get("status") if type(entry) is dict else None
+    if type(status) is not str:
+        status = "unreadable"                     # C1 turns any unknown status into invalid_at_recover
+    record_bytes = record_sha = None
+    if status == "kept_as_inactive_history":
+        expected = f"{HISTORY_DIRNAME}/{rid}/c1/{C1_HISTORY_NAME}"
+        if entry.get("path") == expected and type(entry.get("sha256")) is str:
+            record_bytes = _read_nofollow(data_dir, expected, c1.RECOVERY_STATE_MAX_BYTES)
+            record_sha = entry["sha256"]
+    return c1.ArchiveRecoveryInputs(True, rid, archive_sha256, trace_rel, status, record_bytes, record_sha)
+
+
 def verify_restored_root(data_dir, receipt):
     """Read-only acceptance of a published root against its receipt."""
     data_dir = os.path.abspath(os.fspath(data_dir))

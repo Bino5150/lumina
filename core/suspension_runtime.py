@@ -594,14 +594,14 @@ def acknowledge_unknown_scopes(*, ingress) -> None:
 # reads no Wire token and changes no preference: the owner turns Wire
 # features on separately in Settings.
 
-#: C1-S2 contract (C1-SNAP-CONTRACT R-2, Tech ID-03): the verified,
-#: restore-computed lineage that recover_from_archive writes into the new
-#: store's meta inside its creating transaction. Nothing in this build writes
-#: these keys, so a release is refused here until C1-S2 exists. Today's
-#: recover_destructively is not accepted as a substitute: it records nothing
-#: that ties the new store to the restore.
-LINEAGE_RESTORE_ID_KEY = "lineage_restore_id"
-LINEAGE_ARCHIVE_SHA256_KEY = "lineage_archive_sha256"
+#: C1-S2 (C1-SNAP-CONTRACT R-2, Tech ID-03): the restore-computed lineage
+#: that only core.suspension.recover_from_archive writes, inside the new
+#: store's creating transaction. recover_destructively is not accepted as a
+#: substitute: it records nothing that ties the new store to the restore.
+#: The trace hash is recorded at Recover and compared here at release (A2-3).
+LINEAGE_RESTORE_ID_KEY = S.LINEAGE_RESTORE_ID_KEY
+LINEAGE_ARCHIVE_SHA256_KEY = S.LINEAGE_ARCHIVE_SHA256_KEY
+LINEAGE_TRACE_SHA256_KEY = S.LINEAGE_TRACE_SHA256_KEY
 
 WIRE_PREFS_THAT_MUST_BE_OFF = ("wire_wake_listener", "wire_autonomy")
 
@@ -621,9 +621,18 @@ _RELEASE_TEXT = {
     "changed": "The restore records changed while you were reviewing them. Review them again.",
     "multiple_restores": ("This data folder holds more than one restore record. This needs "
                           "manual review. Nothing was changed."),
+    "c1_recovery_interrupted": (
+        "Recovery was interrupted. Try Repair identity in Suspension controls first. If it says "
+        "the store is damaged, use Recover; this copy will then not be able to use the Wire seat, "
+        "and you would restore the backup again into a new folder if you need that."),
     "c1_recovery_unavailable": (
-        "This version of Lumina can't yet confirm safe recovery for a restored copy, so it "
-        "can't allow this copy to use the Wire seat. The Wire stays locked."),
+        "This copy has no confirmed link to its restore, so it can't use the Wire seat. Restore "
+        "the backup again into a new folder if that matters: nothing from the backup is lost; "
+        "changes made in this copy are not carried over."),
+    "c1_trace_changed": (
+        "The restore record changed after this copy was recovered, so the Wire stays locked. "
+        "Restore the backup again into a new folder if you need the Wire: nothing from the "
+        "backup is lost; changes made in this copy are not carried over."),
     "wire_prefs_on": ("Turn off Wire listener and Wire conversations in Settings first. "
                       "Nothing was changed."),
     "write_failed": "Lumina couldn't write the release record. The Wire stays locked.",
@@ -668,6 +677,9 @@ def _release_plan(expected=None) -> _ReleasePlan:
         snapshot = _status_locked()
         data_dir, store = _data_dir, _store
     if snapshot.state is not State.ACTIVE or store is None or data_dir is None:
+        if snapshot.state is State.FAULT and snapshot.fault in (S.Fault.IDENTITY_MISSING,
+                                                                S.Fault.IDENTITY_INVALID):
+            raise WireReleaseRefused("c1_recovery_interrupted")  # TA2-01: Repair first
         raise WireReleaseRefused("c1_not_ready")
     try:
         if S.probe(data_dir).status is not S.StoreStatus.HEALTHY:
@@ -695,6 +707,10 @@ def _release_plan(expected=None) -> _ReleasePlan:
     if (meta.get(LINEAGE_RESTORE_ID_KEY) != restore_id
             or meta.get(LINEAGE_ARCHIVE_SHA256_KEY) != archive_sha256):
         raise WireReleaseRefused("c1_recovery_unavailable")
+    # A2-3: the trace hash recorded at Recover must still be this trace's.
+    # After the compare above, so a missing lineage keeps its own refusal.
+    if meta.get(LINEAGE_TRACE_SHA256_KEY) != trace_sha256:
+        raise WireReleaseRefused("c1_trace_changed")
     from core import persistence  # lazy: keeps this module's import graph unchanged
     prefs = persistence.load()
     if any(prefs.get(key) for key in WIRE_PREFS_THAT_MUST_BE_OFF):
@@ -819,3 +835,149 @@ def release_wire_seat(*, ingress, expected, acknowledged_source_unverified,
         raise WireReleaseRefused("not_visible")
     _notify("wire_seat", after)
     return WireReleaseOutcome(path, plan.restore_id, plan.trace_sha256, plan.store_incarnation)
+
+
+# ---------------------------------------------------------------------------
+# C1-S2: Recover from this restore, and owner PIN enrollment (desktop only)
+# ---------------------------------------------------------------------------
+
+#: The pin_gate channel used only for Recover from this restore. Unique, so
+#: no submit_pin bucket can ever pre-verify it (TC2-05).
+RECOVER_PIN_CHANNEL = "suspension_recover_from_archive"
+
+_RECOVER_TEXT = {
+    "not_authorized": ("Only the Recover from this restore button in Suspension controls can do "
+                       "this. Nothing was changed."),
+    "pin_not_set": "Set up your owner PIN first. Nothing was changed.",
+    "pin_unreadable": ("This copy's settings file can't be read, so the PIN can't be checked. "
+                       "Your backup is unaffected: restore it again into a new folder."),
+    "pin_wrong": "That PIN is not correct. Nothing was changed.",
+    "pin_locked": "Too many wrong PINs. Try again in about 15 minutes. Nothing was changed.",
+}
+
+
+class RecoverFromArchiveRefused(Exception):
+    """Recover from this restore did not start. `code` is stable; `text` is
+    plain and safe to show. It never contains the PIN."""
+
+    def __init__(self, code: str):
+        self.code = code
+        self.text = _RECOVER_TEXT[code]
+        super().__init__(self.text)
+
+
+def awaiting_archive_recovery() -> bool:
+    """D1-2: a recognized restored copy awaiting recovery. Its C1 store is
+    absent with a trace, and the Wire gate finds exactly one valid,
+    unreleased restore trace. Read-only; never raises."""
+    with _lock:
+        data_dir = _data_dir
+    if data_dir is None:
+        return False
+    try:
+        if S.probe(data_dir).status is not S.StoreStatus.ABSENT_WITH_TRACE:
+            return False
+    except Exception:
+        return False
+    return G.single_trace(data_dir) is not None
+
+
+def recover_from_archive(*, ingress, pin, inputs, acknowledge_unreadable_runtimes=False,
+                         acknowledge_prior_state_since_archive=False,
+                         acknowledge_no_lineage=False) -> S.ArchiveRecoveryOutcome:
+    """Recover from this restore (C1-S2). The owner PIN is verified HERE, in
+    the same call that acts, and the verification is reset on every outcome
+    (TA2-03): no verified flag outlives this function."""
+    try:
+        _require_desktop()
+    except S.NotAuthorized:
+        raise RecoverFromArchiveRefused("not_authorized") from None
+    if not operator_ingress.may_recover_from_archive(ingress):
+        raise RecoverFromArchiveRefused("not_authorized")
+    from core import pin_gate   # lazy: keeps this module's import graph unchanged
+    try:
+        state = pin_gate.owner_pin_state()
+        if state == "unset":
+            raise RecoverFromArchiveRefused("pin_not_set")
+        if state != "set":
+            raise RecoverFromArchiveRefused("pin_unreadable")
+        if pin_gate.is_locked_out(RECOVER_PIN_CHANNEL)[0]:
+            raise RecoverFromArchiveRefused("pin_locked")
+        try:
+            (pin if type(pin) is str else "").encode("utf-8")
+        except UnicodeEncodeError:            # SC2-03: never a raw error
+            raise RecoverFromArchiveRefused("pin_wrong") from None
+        ok, _message = pin_gate.verify_pin(pin if type(pin) is str else "",
+                                           channel_id=RECOVER_PIN_CHANNEL)
+        if not ok:
+            state = pin_gate.owner_pin_state()    # TR1-01: changed since the check above
+            if state != "set":
+                raise RecoverFromArchiveRefused("pin_not_set" if state == "unset" else "pin_unreadable")
+            raise RecoverFromArchiveRefused(
+                "pin_locked" if pin_gate.is_locked_out(RECOVER_PIN_CHANNEL)[0] else "pin_wrong")
+        with _lock:
+            _close_locked()
+        try:
+            return S.recover_from_archive(
+                _data_dir, ingress=ingress, inputs=inputs,
+                acknowledge_unreadable_runtimes=acknowledge_unreadable_runtimes,
+                acknowledge_prior_state_since_archive=acknowledge_prior_state_since_archive,
+                acknowledge_no_lineage=acknowledge_no_lineage)
+        finally:
+            _reopen_after_owner_action()
+    finally:
+        pin_gate.reset_verification(RECOVER_PIN_CHANNEL)
+
+
+_PIN_SETUP_TEXT = {
+    "not_authorized": ("Only the Set owner PIN button in Suspension controls can set the PIN. "
+                       "Nothing was changed."),
+    "not_awaiting_recovery": ("PIN setup is offered only on a restored copy waiting for recovery. "
+                              "Nothing was changed."),
+    "invalid": "Enter the PIN in both boxes. Nothing was changed.",
+    "mismatch": "The two entries don't match. Nothing was changed.",
+    "too_short": "Use at least 6 characters; a 6-digit number is fine. Nothing was changed.",
+    "too_long": "Use at most 128 characters. Nothing was changed.",
+    "whitespace": "Remove spaces at the start or end. Nothing was changed.",
+    "already_set": ("An owner PIN is already set for this copy, and it can't be changed in this "
+                    "version. Nothing was changed."),
+    "unreadable": ("This copy's settings file can't be read, so a PIN can't be set safely. Your "
+                   "backup is unaffected: restore it again into a new folder."),
+    "write_failed": "Lumina couldn't save the PIN. Nothing was changed.",
+}
+
+
+class OwnerPinRefused(Exception):
+    """Owner PIN setup did not happen. `code` is stable; `text` is plain and
+    safe to show. It never contains the PIN."""
+
+    def __init__(self, code: str):
+        self.code = code
+        self.text = _PIN_SETUP_TEXT[code]
+        super().__init__(self.text)
+
+
+def set_owner_pin(*, ingress, pin, confirm) -> None:
+    """Enroll the owner PIN once, on a restored copy awaiting recovery only
+    (A2-1, A2-R1, TA2-05). The function checks the envelope and the state
+    itself, not only the widget. It never marks any channel verified."""
+    try:
+        _require_desktop()
+    except S.NotAuthorized:
+        raise OwnerPinRefused("not_authorized") from None
+    if not operator_ingress.may_set_owner_pin(ingress):
+        raise OwnerPinRefused("not_authorized")
+    if not awaiting_archive_recovery():
+        raise OwnerPinRefused("not_awaiting_recovery")
+    from core import pin_gate
+    problem = pin_gate.pin_input_problem(pin, confirm)
+    if problem:
+        raise OwnerPinRefused(problem)
+    state = pin_gate.owner_pin_state()
+    if state == "set":
+        raise OwnerPinRefused("already_set")
+    if state != "unset":
+        raise OwnerPinRefused("unreadable")
+    result = pin_gate.set_initial_owner_pin(pin)
+    if result != "set":
+        raise OwnerPinRefused(result if result in _PIN_SETUP_TEXT else "write_failed")

@@ -290,6 +290,9 @@ SNAPSHOT_REFUSALS = _c1.SNAPSHOT_REFUSALS
 RECOVERY_STATE_MAX_BYTES = _c1.RECOVERY_STATE_MAX_BYTES
 RECOVERY_STATE_SCHEMA = _c1.RECOVERY_STATE_SCHEMA
 RECOVERY_STATE_VERSION = _c1.RECOVERY_STATE_VERSION
+# C1-S2 (TC2-07a): defined in core.suspension so recover_from_archive can
+# check its exact type; the restore engine builds it through this name.
+ArchiveRecoveryInputs = _c1.ArchiveRecoveryInputs
 
 
 RESTORE_TRACE_NAME = "restore_trace.json"

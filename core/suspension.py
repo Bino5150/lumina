@@ -86,6 +86,7 @@ from enum import Enum
 from typing import Callable, Optional
 
 from core import operator_ingress
+from core import wire_seat_gate as _gate   # stdlib-only; never imports this module
 from core.test_isolation import refuse_if_production_path
 
 
@@ -869,6 +870,10 @@ def initialize(data_dir, *, ingress, now: Optional[Callable[[], float]] = None) 
     if traces:
         raise RecoveryBlocked("prior suspension state exists here; use recovery, not initialization",
                               traces)
+    if _restored_root(paths):
+        # C1-S2 TA2-04: a restored copy whose evidence folder was deleted
+        # must not pass for a first launch.
+        raise RecoveryBlocked(RESTORED_INITIALIZE_TEXT)
     soul_id, incarnation = secrets.token_hex(16), secrets.token_hex(16)
     # O_EXCL: losing a race with a concurrent initializer fails, never adopts.
     _write_new_private(paths.db, b"")
@@ -1401,9 +1406,13 @@ class SuspensionStore:
                                       "ORDER BY seq").fetchall())
 
     def acknowledge_unknown_scopes(self, *, ingress) -> None:
-        """End the post-recovery 'unknown scopes start suspended' policy."""
+        """End the post-recovery 'unknown scopes start suspended' policy.
+        Never on a restored copy (C1-S2 A2-4, U1): there every channel first
+        seen starts suspended and is resumed on its own."""
         _require_local_owner(ingress)
         with self._txn() as conn:
+            if _restored_root(self._paths, _meta(conn)):
+                raise RecoveryBlocked(RESTORED_UNKNOWN_SCOPES_TEXT)
             conn.execute("UPDATE meta SET value = 'clear' WHERE key = 'unknown_scope_policy'")
             _audit(conn, self._clock(), "unknown_scopes_acknowledged")
 
@@ -1655,6 +1664,9 @@ def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(
     _require_local_owner(ingress)
     clock = now or time.time
     paths = _paths(data_dir)
+    if acknowledge_unknown_scopes and _restored_root(paths):
+        # C1-S2 A2-4, U2: never an unpaused start for channels on a restored copy.
+        raise RecoveryBlocked(RESTORED_UNKNOWN_SCOPES_TEXT)
     _memory_dir_identity(paths)
     status = probe(data_dir).status
     if status is StoreStatus.HEALTHY:
@@ -1705,6 +1717,11 @@ def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(
     else:
         suspended = [OWNER_SCOPE]
     policy = "suspended" if not salvage_complete and not acknowledge_unknown_scopes else "clear"
+    if _restored_root(paths, old_meta):
+        # C1-S2 SC2-01: on a restored copy every channel first seen starts
+        # suspended, even when the old store salvages completely (a crash
+        # before the identity pin, or a pin lost after Recover).
+        policy = "suspended"
 
     for name in _STORE_FILES:
         with contextlib.suppress(FileNotFoundError):
@@ -1744,6 +1761,258 @@ def recover_destructively(data_dir, *, ingress, acknowledged_runtimes=frozenset(
     open_store(data_dir, now=now).close()
     return RecoveryOutcome(evidence_dir, old_incarnation, incarnation, soul_id, tuple(suspended),
                            salvage_complete, policy, unknown_leases)
+
+
+# ---------------------------------------------------------------------------
+# Recover from this restore (C1-S2)
+# ---------------------------------------------------------------------------
+#
+# A restored copy (Agent Restore) holds a restore trace and no C1 state. Its
+# owner recovers it with recover_from_archive(): a new safety identity, the
+# owner scope suspended for an acknowledged review, every channel first seen
+# afterwards suspended, and verified lineage to the restore in the new
+# store's meta, all inside the creating transaction. The archived C1 record
+# (kept by C1-S3b as inactive history) is re-validated here and can only ADD
+# a restriction (one owner-acknowledged "outcome unknown" incident for work
+# that was in flight at capture); it never grants, resumes or copies a string
+# into live state. Lineage is written only when the restore trace and the
+# restore receipt pair both ways; otherwise the store is the safe baseline
+# and the Wire seat stays locked (W-B2 compares the lineage at release).
+#
+# Design: reports/.../c1s2/ plan, addendum D1, amendment A2, A2-R1-PIN, and
+# Tech's TC2/TA2 conditions.
+
+#: The lineage keys. Only recover_from_archive writes them (pinned by an
+#: AST test); C1-S1 snapshots drop every lineage_* key (_META_DROPPED), so a
+#: backup of a recovered copy never carries them forward.
+LINEAGE_RESTORE_ID_KEY = "lineage_restore_id"
+LINEAGE_ARCHIVE_SHA256_KEY = "lineage_archive_sha256"
+LINEAGE_TRACE_SHA256_KEY = "lineage_trace_sha256"
+LINEAGE_RECORD_STATUS_KEY = "lineage_record_status"
+LINEAGE_RECORD_SHA256_KEY = "lineage_record_sha256"
+LINEAGE_CLAIMED_SOURCE_SOUL_KEY = "lineage_claimed_source_soul_id"
+LINEAGE_CLAIMED_SOURCE_INCARNATION_KEY = "lineage_claimed_source_incarnation"
+
+#: What the receipt said about the archived C1 record, as Recover found it.
+RECORD_ADOPTED = "adopted"
+RECORD_SKIPPED_AT_RESTORE = "skipped_at_restore"
+RECORD_UNAVAILABLE_AS_RECORDED = "unavailable_as_recorded"
+RECORD_INVALID_AT_RECOVER = "invalid_at_recover"
+RECORD_NOT_IN_ARCHIVE = "not_in_archive"           # formats before 2.3 carry no record
+RECORD_NOT_CONSIDERED = "not_considered"           # receipt unpaired: nothing is read
+RECORD_STATUSES = frozenset({RECORD_ADOPTED, RECORD_SKIPPED_AT_RESTORE, RECORD_UNAVAILABLE_AS_RECORDED,
+                             RECORD_INVALID_AT_RECOVER, RECORD_NOT_IN_ARCHIVE, RECORD_NOT_CONSIDERED})
+
+_RECEIPT_RECORD_STATUS = {
+    "kept_as_inactive_history": None,               # decided by re-validation
+    "not_restored_owner_skipped": RECORD_SKIPPED_AT_RESTORE,
+    "not_restored_record_unavailable": RECORD_UNAVAILABLE_AS_RECORDED,
+    None: RECORD_NOT_IN_ARCHIVE,
+}
+
+ARCHIVE_RECOVERY_RECEIPT_NAME = "archive_recovery.json"
+_ARCHIVE_RECOVERY_SCHEMA = "lumina.c1_archive_recovery"
+#: Single literals no parameter feeds (TC2-07d): the record can never claim
+#: a full recovery, whatever the caller passes.
+ARCHIVE_RECOVERY_SAFETY_STATE = "recovered_new_identity_every_scope_starts_suspended"
+FULL_RECOVERY_NOT_PROVEN = "not_proven"
+OWNER_STEPS_REMAINING = ("review_and_resume_each_scope", "re_pair_chrome_companion",
+                         "re_enter_credentials", "decide_wire_seat_release")
+LINEAGE_WRITTEN = "written"
+LINEAGE_NOT_WRITTEN = "not_written_receipt_unpaired"
+
+RESTORED_UNKNOWN_SCOPES_TEXT = (
+    "A restored copy starts every new channel suspended. Resume each channel on its own in "
+    "Suspension controls.")
+RESTORED_INITIALIZE_TEXT = (
+    "This data folder was restored from a backup, so it can't be set up as a first launch. "
+    "Restore the backup again into a new folder: nothing from the backup is lost; changes "
+    "made in this copy are not carried over.")
+
+
+@dataclass(frozen=True)
+class ArchiveRecoveryInputs:
+    """What the restore engine read from this restore's receipt, as plain
+    values (no paths). Every field is the receipt's claim; recover_from_archive
+    re-derives the trace itself and re-validates the record bytes before
+    relying on any of it."""
+    receipt_paired: bool
+    restore_id: Optional[str]
+    archive_sha256: Optional[str]
+    trace_relpath: Optional[str]
+    receipt_record_status: Optional[str]   # the receipt's archived_c1_record.status, or None
+    record_bytes: Optional[bytes]
+    record_sha256: Optional[str]
+
+
+@dataclass(frozen=True)
+class ArchiveRecoveryOutcome:
+    evidence_dir: str
+    soul_id: str
+    new_incarnation: str
+    lineage_written: bool
+    record_status: str
+    unknown_outcome_leases: int
+    suspended_scopes: tuple = (OWNER_SCOPE,)
+    unknown_scope_policy: str = "suspended"
+    full_recovery: str = FULL_RECOVERY_NOT_PROVEN
+
+
+def _restored_root(paths: _Paths, meta: Optional[dict] = None) -> bool:
+    """A restored copy (A2-4): its store carries restore lineage, or the
+    Wire gate finds any restore evidence (a trace, a release, a restore
+    marker) or can't read it. Unknown counts as restored."""
+    if meta is not None and LINEAGE_RESTORE_ID_KEY in meta:
+        return True
+    return _gate.is_restored_root(paths.data_dir)
+
+
+def _no_duplicate_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
+def _reject_constant(name):
+    raise ValueError(f"non-finite constant {name}")
+
+
+def _adopt_archived_record(inputs: ArchiveRecoveryInputs):
+    """(record_status, record or None). Adopted only when the receipt said
+    the record was kept, the bytes are within the cap, their sha256 is the
+    receipt's, they are the record's exact canonical bytes and today's
+    validator accepts them (A-11.4). Anything else is the baseline; nothing
+    is ever partly adopted (R-6)."""
+    status = inputs.receipt_record_status
+    if status not in _RECEIPT_RECORD_STATUS:
+        return RECORD_INVALID_AT_RECOVER, None
+    if _RECEIPT_RECORD_STATUS[status] is not None:
+        return _RECEIPT_RECORD_STATUS[status], None
+    raw, sha = inputs.record_bytes, inputs.record_sha256
+    if (type(raw) is not bytes or len(raw) > RECOVERY_STATE_MAX_BYTES or type(sha) is not str
+            or hashlib.sha256(raw).hexdigest() != sha):
+        return RECORD_INVALID_AT_RECOVER, None
+    try:
+        record = json.loads(raw.decode("ascii"), object_pairs_hook=_no_duplicate_keys,
+                            parse_constant=_reject_constant)
+        if _recovery_payload(record) != raw:
+            return RECORD_INVALID_AT_RECOVER, None
+        validate_recovery_state(record)
+    except (ValueError, TypeError, UnicodeError, RecursionError, RecoverySnapshotRefused):
+        return RECORD_INVALID_AT_RECOVER, None
+    return RECORD_ADOPTED, record
+
+
+def recover_from_archive(data_dir, *, ingress, inputs, acknowledge_unreadable_runtimes: bool,
+                         acknowledge_prior_state_since_archive: bool,
+                         acknowledge_no_lineage: bool = False,
+                         now: Optional[Callable[[], float]] = None) -> ArchiveRecoveryOutcome:
+    """Recover from this restore (C1-S2): owner-local, Suspension controls
+    button only. Builds a brand-new store for a restored copy that has not
+    been recovered yet (probe ABSENT_WITH_TRACE, exactly one valid,
+    unreleased restore trace). Never adopts archived authority, never
+    resumes anything, never enables any channel."""
+    if not operator_ingress.may_recover_from_archive(ingress):
+        raise NotAuthorized("Recover from this restore needs its Suspension controls button")
+    if type(inputs) is not ArchiveRecoveryInputs:
+        raise TypeError("inputs must be ArchiveRecoveryInputs")
+    clock = now or time.time
+    paths = _paths(data_dir)
+    _memory_dir_identity(paths)
+    if probe(data_dir).status is not StoreStatus.ABSENT_WITH_TRACE:
+        raise RecoveryBlocked("Recover from this restore is only for a restored copy that has not "
+                              "been recovered yet")
+    trace = _gate.single_trace(paths.data_dir)
+    if trace is None:
+        raise RecoveryBlocked("this copy does not hold exactly one readable restore record waiting "
+                              "for recovery")
+    if acknowledge_unreadable_runtimes is not True or acknowledge_prior_state_since_archive is not True:
+        raise RecoveryBlocked("acknowledge that other Lumina processes and anything after the backup "
+                              "are unknown, then recover")
+    paired = (inputs.receipt_paired is True and inputs.restore_id == trace.restore_id
+              and inputs.archive_sha256 == trace.archive_sha256
+              and inputs.trace_relpath == trace.relpath)
+    if not paired and acknowledge_no_lineage is not True:
+        raise RecoveryBlocked("this copy's restore receipt can't be matched to its restore record; "
+                              "acknowledge that it will never be able to use the Wire seat")
+    record_status, record = _adopt_archived_record(inputs) if paired else (RECORD_NOT_CONSIDERED, None)
+    in_flight = record["in_flight_leases"] if record is not None else []
+    by_class = {cls: 0 for cls in _SCOPE_CLASSES}
+    for lease in in_flight:
+        by_class[lease["scope_class"]] += 1
+    unknown = len(in_flight)
+    lineage = {}
+    if paired:
+        lineage = {LINEAGE_RESTORE_ID_KEY: trace.restore_id,
+                   LINEAGE_ARCHIVE_SHA256_KEY: trace.archive_sha256,
+                   LINEAGE_TRACE_SHA256_KEY: trace.trace_sha256,
+                   LINEAGE_RECORD_STATUS_KEY: record_status}
+        if record is not None:
+            lineage[LINEAGE_RECORD_SHA256_KEY] = inputs.record_sha256
+            for key, field_name in ((LINEAGE_CLAIMED_SOURCE_SOUL_KEY, "claimed_source_soul_id"),
+                                    (LINEAGE_CLAIMED_SOURCE_INCARNATION_KEY, "claimed_source_incarnation")):
+                claimed = record["provenance"][field_name]
+                if type(claimed) is str and _HEX32.fullmatch(claimed):
+                    lineage[key] = claimed
+
+    at = clock()
+    soul_id, incarnation = secrets.token_hex(16), secrets.token_hex(16)
+    # The recovery receipt goes first, in its own evidence directory, so a
+    # crash from here on still probes ABSENT_WITH_TRACE (recover again).
+    receipt_dir = _new_evidence_dir(paths, at)
+    _write_new_private(os.path.join(receipt_dir, ARCHIVE_RECOVERY_RECEIPT_NAME), _canonical({
+        "schema": _ARCHIVE_RECOVERY_SCHEMA, "version": 1, "at": at,
+        "soul_id": soul_id, "store_incarnation": incarnation,
+        "safety_state": ARCHIVE_RECOVERY_SAFETY_STATE,
+        "lineage": LINEAGE_WRITTEN if paired else LINEAGE_NOT_WRITTEN,
+        "restore_id": trace.restore_id, "archive_sha256": trace.archive_sha256,
+        "trace_sha256": trace.trace_sha256, "record": record_status,
+        "record_sha256": inputs.record_sha256 if record is not None else None,
+        "unknown_outcome_in_flight": unknown, "in_flight_by_scope_class": by_class,
+        "every_scope_starts_suspended": True,
+        "full_recovery": FULL_RECOVERY_NOT_PROVEN,
+        "owner_steps_remaining": list(OWNER_STEPS_REMAINING)}))
+    _fsync_dir(receipt_dir)
+    _fsync_dir(paths.memory_dir)
+    if STORE_NAME in _traces(paths) or IDENTITY_NAME in _traces(paths):
+        raise RecoveryBlocked("suspension state appeared while recovering; review it again")
+
+    def populate(conn) -> None:
+        # Inside the creating transaction (ID-02): a committed store always
+        # has its lineage, its owner suspension and its audit row.
+        if lineage:
+            conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", sorted(lineage.items()))
+        sid = _insert_incident(conn, now=at, scope=OWNER_SCOPE, epoch=1, trigger=RECOVERY_TRIGGER,
+                               evidence={"reason": "restored_archive_prior_state_unknown",
+                                         "unknown_outcome_leases": unknown},
+                               leases=[], requires_ack=True)
+        conn.execute("UPDATE scopes SET execution_epoch = 1, state_revision = 1, suspended = 1, "
+                     "active_incident = ? WHERE scope = ?", (sid, OWNER_SCOPE))
+        _audit(conn, at, "restored_from_archive",
+               detail={"evidence": "archive_recovery", "receipt": os.path.basename(receipt_dir),
+                       "new_incarnation": incarnation, "prior_state": "unknown",
+                       "suspended_scopes": 1, "unknown_scope_policy": "suspended"})
+
+    try:
+        _write_new_private(paths.db, b"")
+    except FileExistsError:
+        raise RecoveryBlocked("a suspension store appeared while recovering; review it again") from None
+    conn = _connect(paths.db)
+    try:
+        _create_schema(conn, now=at, soul_id=soul_id, incarnation=incarnation,
+                       unknown_scope_policy="suspended", populate=populate)
+    finally:
+        conn.close()
+    try:
+        _write_new_private(paths.identity, _identity_bytes(soul_id))
+    except FileExistsError:
+        raise RecoveryBlocked("an identity pin appeared while recovering; review it again") from None
+    _fsync_dir(paths.memory_dir)
+    open_store(data_dir, now=now).close()
+    return ArchiveRecoveryOutcome(receipt_dir, soul_id, incarnation, paired, record_status, unknown)
 
 
 # ---------------------------------------------------------------------------
@@ -1854,6 +2123,8 @@ _AUDIT_ACTIONS = frozenset({
     "late_trip_evidence", "trip_while_suspended", "trip", "scope_created_suspended", "resume",
     "resume_refused", "unknown_scopes_acknowledged", "identity_repaired", "no_trace_recovery",
     "destructive_recovery",
+    # C1-S2 (A2-5): appended only; every earlier record still validates.
+    "restored_from_archive",
 })
 _LEASE_AT_TRIP_KEYS = frozenset({"lease_id", "kind", "name", "runtime_id"})
 _RESUME_OUTCOME_KEYS = frozenset({"result", "suspension_id", "scope", "state_revision", "live_leases",
