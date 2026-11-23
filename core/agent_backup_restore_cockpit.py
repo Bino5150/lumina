@@ -38,8 +38,15 @@ RECEIPT_READ_LIMIT = 16 * 1024 * 1024
 
 # What the engine's restore class means, in words that claim no more than it
 # guarantees.
+# Pre-2.3 mapping by intake kind alone. class_for() is what the cockpit uses:
+# a verified format 2.3 archive is the Verified Agent Backup class (C1-S3b).
 CLASS_FOR_KIND = {ri.VERIFIED: ar.INCOMPLETE, ri.SELECTIVE: ar.SELECTIVE, ri.LEGACY: ar.LEGACY}
 CLASS_TEXT = {
+    ar.VERIFIED: (
+        "Verified Agent Backup recovery",
+        "A verified Agent Backup (format 2.3). Its sanitized C1 safety-state record is kept only as inactive "
+        "history; it is never restored as live safety state, and every scope starts suspended until "
+        "owner-local Recover. Full recovery is NOT PROVEN."),
     ar.INCOMPLETE: (
         "Incomplete State Export recovery",
         "A structurally verified Incomplete State Export. Its coverage is incomplete (C1 safety state "
@@ -58,7 +65,7 @@ CLASS_TEXT = {
 BANNER = (
     "Isolated recovery writes a NEW folder you choose. It does not restore into, replace or modify the "
     "running Lumina, its data folder or any known Lumina production folder (those are refused). It is "
-    "not production disaster recovery and cannot produce a Verified Agent Backup.")
+    "not production disaster recovery, and a recovered folder is never proof of a full recovery.")
 
 TRUST_NOTE = (
     "A valid checksum shows an archive is intact, not where it came from. Recover only a backup you made "
@@ -331,16 +338,42 @@ _C1_SOURCE = {
 }
 
 
+def class_for(intake):
+    """The engine's restore class for an intake, or None when rejected."""
+    kind = intake.get("kind")
+    if kind not in CLASS_FOR_KIND:
+        return None
+    return ar._restore_class(kind, intake.get("format"))
+
+
+def _verified_text(verified, *, plan=False):
+    """One line from the engine's own verified_agent_backup value."""
+    if verified == ar.VERIFIED_AGENT_BACKUP_V23:
+        return ("Verified Agent Backup: verified archive, not a proven recovery. Its C1 safety record is "
+                "history only, nothing recovers live safety state from it, and full recovery is NOT PROVEN")
+    if verified == ar.VERIFIED_AGENT_BACKUP_V23_FAILED:
+        return "Verified Agent Backup: no; this format 2.3 archive FAILED verification"
+    if plan:
+        return "Verified Agent Backup: unavailable (C1 snapshot contract absent); this recovery is not one"
+    return "Verified Agent Backup: not available (C1 snapshot contract absent)"
+
+
 def intake_warnings(intake):
     """Coverage, exclusions, unknown history, damage and compatibility, as
     plain sentences. Nothing here is reassurance."""
     out = []
-    kind = intake.get("kind")
-    restore_class = CLASS_FOR_KIND.get(kind)
+    restore_class = class_for(intake)
+    v23 = intake.get("format") == ri.FORMAT_V23
     if restore_class:
         out.append(f"Recovery class: {CLASS_TEXT[restore_class][0]}. {CLASS_TEXT[restore_class][1]}")
-    out.append("Verified Agent Backup is unavailable: no archive can carry a C1 safety-state snapshot yet, "
-               "so no recovery from it is labelled one.")
+    if not v23:
+        out.append("Verified Agent Backup is unavailable: this archive format cannot carry a C1 safety-state "
+                   "snapshot, so no recovery from it is labelled one.")
+    elif restore_class == ar.VERIFIED:
+        out.append("This archive is a Verified Agent Backup: its verifier found no coverage blocker. "
+                   "That is not proof of origin or of a successful full recovery.")
+    else:
+        out.append("This format 2.3 archive FAILED verification, so it is not a Verified Agent Backup.")
     verification = intake.get("verification") or {}
     status = verification.get("status")
     if status == "PASS":
@@ -360,9 +393,28 @@ def intake_warnings(intake):
         out.append(_INSTALL_HISTORY.get(cov["installation_history"],
                                         "Installation history: unrecognised value "
                                         + safe_text(cov["installation_history"], 60)))
-    out.append("C1 safety state is not captured and is never restored. After recovery C1 must be "
-               "established by owner-local Recover (the owner starts suspended).")
-    if "c1_at_source" in cov:
+    if cov.get("c1_safety_state") == "record_intact_in_unverified_archive_history_only":
+        out.append("The archive's C1 safety-state record checks out on its own, but the archive FAILED "
+                   "verification. If you choose it, it is kept only as inactive history under restore_history/ "
+                   "and is never restored as live safety state. After recovery C1 must be established by "
+                   "owner-local Recover (the owner starts suspended).")
+    elif cov.get("c1_safety_state") == "captured_sanitized_history_only":
+        out.append("A sanitized C1 safety-state record is included. It is kept only as inactive history under "
+                   "restore_history/ and is never restored as live safety state. After recovery C1 must be "
+                   "established by owner-local Recover (the owner starts suspended).")
+    elif cov.get("c1_safety_state") == "record_unavailable_damaged":
+        out.append("The archive's C1 safety-state record is damaged and is not recovered. C1 safety state is "
+                   "never restored; after recovery C1 must be established by owner-local Recover (the owner "
+                   "starts suspended).")
+    else:
+        out.append("C1 safety state is not captured and is never restored. After recovery C1 must be "
+                   "established by owner-local Recover (the owner starts suspended).")
+    if v23 and cov.get("c1_at_source") == "present_excluded":
+        out.append("C1 state at the source: present; the raw store was excluded"
+                   + (" and only the sanitized record was captured."
+                      if cov.get("c1_safety_state") == "captured_sanitized_history_only"
+                      else ", and the archive's sanitized record is not usable as verified."))
+    elif "c1_at_source" in cov:
         out.append(_C1_SOURCE.get(cov["c1_at_source"],
                                   "C1 state at the source: unrecognised value " + safe_text(cov["c1_at_source"], 60)))
     if cov.get("c1_safety_state") == "evidence_only":
@@ -401,7 +453,7 @@ def intake_warnings(intake):
 def summarize_intake(intake):
     """JSON-safe view of one intake for the dialog."""
     kind = intake.get("kind")
-    restore_class = CLASS_FOR_KIND.get(kind)
+    restore_class = class_for(intake)
     units = []
     for unit in intake.get("units", []):
         reasons = [f"{safe_text(s['archive_path'], 100)}: {damage_text(s['reason'])}" for s in unit["skipped"]]
@@ -462,7 +514,7 @@ def render_plan_text(plan, warnings=()):
         f"Plan digest: {plan['plan_digest']}",
         f"Status: {'READY for your approval' if ready else 'NEEDS YOUR DECISION on install-folder conflicts'}",
         f"Recovery class: {cls[0]}",
-        "Verified Agent Backup: unavailable (C1 snapshot contract absent); this recovery is not one",
+        _verified_text(plan.get("verified_agent_backup"), plan=True),
         f"Archive SHA-256: {archive['archive_sha256']}  ({human_bytes(archive['archive_size'])}, "
         f"{safe_text(archive['format'], 60)}, verification {safe_text((archive.get('verification') or {}).get('status'), 30)})",
         f"New data folder: {safe_text(dest['data_dir'], 400)}  "
@@ -837,6 +889,11 @@ def describe_checks(verification):
         "wire_settings_absent": "Wire autonomy and the wake listener are absent (off)",
         "generation_references": "Every image path is in this folder and every recovered image matches its record",
         "c1_restore_trace": "C1 restore trace present (first-run Initialize refused)",
+        "c1_history_record": "The C1 safety record is kept only as inactive history, unchanged and still valid",
+        # Absence, when the receipt says no record was placed (TS3B-01): never "kept".
+        "c1_history_skipped_by_owner": "No C1 history record was kept, as you chose; none is present",
+        "c1_history_unavailable_as_recorded":
+            "No C1 history record was kept (the archive's record was damaged); none is present",
     }
     lines = [f"[{'PASS' if ok else 'FAIL'}] {names.get(key, safe_text(key, 60))}"
              for key, ok in (verification.get("checks") or {}).items()]
@@ -851,7 +908,7 @@ def describe_success(result):
     lines = [
         "ISOLATED RECOVERY PUBLISHED AND VERIFIED" if result["ok"] else "PUBLISHED - VERIFICATION FAILED",
         f"Recovery class: {cls}",
-        "Verified Agent Backup: not available (C1 snapshot contract absent)",
+        _verified_text(receipt.get("verified_agent_backup")),
         f"New data folder: {safe_text(result['data_dir'], 400)}",
         f"Receipt: {safe_text(result['receipt_path'], 400)}",
         f"Receipt state: {safe_text(receipt.get('state'), 60)} (nothing resumed, replayed or activated)",

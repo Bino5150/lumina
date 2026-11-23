@@ -181,8 +181,8 @@ class MemoryTab(QWidget):
         self.isolated_recovery_btn.setObjectName("isolated_archive_recovery")
         self.isolated_recovery_btn.setToolTip(
             "Inspect a backup archive and recover it into a NEW folder. Does not change the running "
-            "Lumina, never writes into a live or production folder, and cannot produce a Verified "
-            "Agent Backup.")
+            "Lumina and never writes into a live or production folder. Recovering a Verified Agent "
+            "Backup archive is not proof of a full recovery.")
         self.isolated_recovery_btn.clicked.connect(self._open_recovery_cockpit)
         exports.addWidget(self.isolated_recovery_btn)
         exports.addStretch()

@@ -35,10 +35,14 @@ restored; the published root carries a C1 restore trace, so C1 probes
 ABSENT_WITH_TRACE and the owner must Recover (owner suspended, fresh identity)
 before anything is admitted.
 
-No archive format captures a C1 snapshot, so no restore here is a Verified
-Agent Backup: a verified A2/export archive restores as an Incomplete State
-Export, a damaged one only as owner-selected Selective Recovery, a
-manifestless ZIP as Legacy Recovery.
+A verified format 2.3 archive restores as a Verified Agent Backup (C1-S3b).
+Its sanitized C1 record is re-validated and placed only at
+restore_history/<restore_id>/c1/recovery_state.json, with its sha256 in the
+receipt (deviation D-S3b-1: receipt, not trace). Nothing reads that file as
+state: C1 still probes ABSENT_WITH_TRACE and the owner must still Recover,
+and archived authority never becomes active authority. Any other verified
+A2/export archive restores as an Incomplete State Export, a damaged one only
+as owner-selected Selective Recovery, a manifestless ZIP as Legacy Recovery.
 
 Linux only (the publishing rename is renameat2 RENAME_NOREPLACE).
 """
@@ -86,7 +90,32 @@ JOURNAL_READ_LIMIT = 16 * 1024 * 1024
 INCOMPLETE = "incomplete_state_export"
 SELECTIVE = "selective_recovery"
 LEGACY = "legacy_recovery"
+VERIFIED = "verified_agent_backup"     # a verified format 2.3 archive (C1-S3b)
+# What every pre-2.3 format says (unchanged): none of them can carry C1.
 VERIFIED_AGENT_BACKUP = {"available": False, "reason": "c1_snapshot_contract_absent"}
+# A verified 2.3 archive (TS3-05): what is true, and no more. The record is
+# history; nothing recovers C1 from the archive, and full recovery is unproven.
+VERIFIED_AGENT_BACKUP_V23 = {
+    "available": True, "archive_verified": True,
+    "c1_record": "captured_sanitized_history_only",
+    "live_c1_state_restored": False, "recover_from_archive": "absent",
+    "full_recovery": "not_proven"}
+# A 2.3 archive that failed whole-archive verification is not one.
+VERIFIED_AGENT_BACKUP_V23_FAILED = {"available": False, "reason": "archive_failed_verification"}
+C1_HISTORY_NAME = "recovery_state.json"
+# C1-S2 hand-off (C1S3-AMENDMENT-A1 A-11, TS3-06). Nothing here reads the
+# kept record. Before anything ever does, C1-S2 must:
+#   1. bind receipt and trace by (restore_id, archive_sha256), both ways;
+#   2. fall back to the R-6 baseline if the receipt is missing, invalid or
+#      unpaired;
+#   3. when the trace and its reader change together, move the record's
+#      sha256 into the trace (the receipt keeps a copy);
+#   4. re-run validate_recovery_state at Recover;
+#   5. never copy archived strings into a live incident, audit detail or
+#      operator view.
+# The receipt's own fields (archive_verified included) are its claims, not
+# proof: C1-S2 re-derives them from the archive and trace before relying on
+# any of them.
 
 CHOICES = ("recover", "recover_keep_destination", "skip")
 
@@ -263,6 +292,9 @@ def _placement(archive_path, restore_id):
         # Legacy intake never offers one, so its handling is unchanged.
         raise RestoreRefused("MEMBER_INVALID", "owner side copy (D2) is never restored")
     history = f"{HISTORY_DIRNAME}/{restore_id}"
+    if archive_path == abx.C1_MEMBER_POLICY["archive_path"]:
+        # TS3-06: inactive history only, under this restore's own folder.
+        return "data", f"{history}/c1/{C1_HISTORY_NAME}", "c1_history"
     if archive_path.startswith(inv.GENERATION_ARCHIVE_PREFIX):
         # Generated images: only the exact derived layout, into the data
         # root's own artifacts/generation tree, byte for byte.
@@ -328,8 +360,21 @@ def _member_bytes(z, name):
 # Plan
 # --------------------------------------------------------------------------
 
-def _restore_class(kind):
+def _restore_class(kind, fmt=None):
+    """The restore class, chosen on purpose (TS3-05): only a verified format
+    2.3 archive is a Verified Agent Backup; every other verified archive is
+    an Incomplete State Export. The W-B trace reader accepts either label."""
+    if kind == ri.VERIFIED and fmt == ri.FORMAT_V23:
+        return VERIFIED
     return {ri.VERIFIED: INCOMPLETE, ri.SELECTIVE: SELECTIVE, ri.LEGACY: LEGACY}[kind]
+
+
+def _verified_agent_backup(intake):
+    if intake.get("format") != ri.FORMAT_V23:
+        return dict(VERIFIED_AGENT_BACKUP)
+    if intake["kind"] == ri.VERIFIED:
+        return dict(VERIFIED_AGENT_BACKUP_V23)
+    return dict(VERIFIED_AGENT_BACKUP_V23_FAILED)
 
 
 def _resolve_selection(intake, units, selection):
@@ -444,8 +489,8 @@ def plan_restore(archive_path, data_dir, base_dir, *, selection=None, restore_id
         "status": "needs_owner_conflict_choice" if conflicts_open else "ready",
         "archive": {k: intake[k] for k in ("archive_sha256", "archive_size", "kind", "format",
                                             "verification", "intake_digest")},
-        "restore_class": _restore_class(intake["kind"]),
-        "verified_agent_backup": dict(VERIFIED_AGENT_BACKUP),
+        "restore_class": _restore_class(intake["kind"], intake["format"]),
+        "verified_agent_backup": _verified_agent_backup(intake),
         "coverage": intake["coverage"],
         "destination": {"data_dir": data_dir, "parent_identity": parent_identity, **destination,
                         "install_dir": base_dir, "install_identity": base_identity},
@@ -461,6 +506,8 @@ def plan_restore(archive_path, data_dir, base_dir, *, selection=None, restore_id
                    "telegram_remote_access": "forced_off",
                    "official_skill_trust": "destination_bootstrap_only"},
     }
+    if intake["format"] == ri.FORMAT_V23:
+        plan["safety"]["archived_c1_record"] = "inactive_history_only_never_live_c1_state"
     plan["plan_digest"] = _digest(plan)
     return plan
 
@@ -1502,6 +1549,91 @@ def restore_isolated(plan, archive_path, *, approved_plan_digest):
     return receipt
 
 
+def _c1_history_note(data, plan):
+    """Re-validate the archived C1 record before it is staged (TS3-06):
+    the same strict path the verifier uses (strict parse,
+    validate_recovery_state, exact canonical bytes), and the same sha256 the
+    archive's own observation declared. Nothing here installs, merges or
+    trusts it: the bytes are history and go only where nothing reads them."""
+    try:
+        observation = abx.c1_observation_from_bytes(data)
+    except abx.C1RecordInvalid:
+        raise RestoreRefused("MEMBER_INVALID", "C1 history record fails validation") from None
+    declared = (plan.get("coverage") or {}).get("c1_record") or {}
+    if observation["record_sha256"] != declared.get("sha256"):
+        raise RestoreRefused("MEMBER_INVALID", "C1 history record is not the archive's declared record")
+    return {k: observation[k] for k in ("record_sha256", "record_schema", "record_version",
+                                        "claimed_source_incarnation")}
+
+
+def _c1_history_receipt(plan, written, note):
+    """The receipt's account of format 2.3's C1 record. Its sha256 is of the
+    staged file, computed at restore time; the trace is unchanged (D-S3b-1).
+    The receipt detects accidents and binds nothing: C1-S2 must bind it to
+    the trace both ways before any use (amendment A-11)."""
+    placed = [f for f in written if f["archive_path"] == abx.C1_MEMBER_POLICY["archive_path"]]
+    if not placed:
+        unit = next((u for u in plan["units"] if u["unit"] == ri.C1_UNIT), None)
+        if unit is not None and unit["choice"] == "skip":
+            return {"status": "not_restored_owner_skipped"}
+        return {"status": "not_restored_record_unavailable"}
+    (f,) = placed
+    return {"status": "kept_as_inactive_history", "archive_verified": plan["archive"]["kind"] == ri.VERIFIED,
+            "path": f["rel"], "sha256": f["sha256"], "size": f["size"],
+            "record_schema": note["record_schema"], "record_version": note["record_version"],
+            "claimed_source_incarnation": note["claimed_source_incarnation"],
+            "archive_member": f["archive_path"], "archive_sha256": plan["archive"]["archive_sha256"],
+            "provenance": "archive_declared_producer_claims_revalidated_at_restore",
+            "authority": "none_history_only", "consulted_by_runtime": False,
+            "deviation": "D-S3b-1_sha256_in_receipt_not_trace"}
+
+
+# The acceptance check's name follows the receipt's own account of what was done (TS3B-01).
+# When no record was placed, the words for "kept ... unchanged and still valid" would be false, so
+# absence is checked under its own names. Every other receipt, a malformed one included, is
+# checked under c1_history_record, which only a record kept exactly as recorded can pass.
+_C1_NOT_PLACED_CHECK = {
+    "not_restored_owner_skipped": "c1_history_skipped_by_owner",
+    "not_restored_record_unavailable": "c1_history_unavailable_as_recorded",
+}
+
+
+def _c1_history_check_name(receipt):
+    c1_block = receipt.get("c1")
+    record = c1_block.get("archived_c1_record") if type(c1_block) is dict else None
+    status = record.get("status") if type(record) is dict else None
+    return _C1_NOT_PLACED_CHECK.get(status, "c1_history_record") if type(status) is str else "c1_history_record"
+
+
+def _c1_history_accepted(data_dir, receipt):
+    """Read-only: the kept record is where the receipt says, under this
+    restore's own history folder, with the recorded bytes, and still a valid
+    record by today's validator."""
+    c1_block = receipt.get("c1")
+    record = c1_block.get("archived_c1_record") if type(c1_block) is dict else None
+    if type(record) is not dict:
+        return False                      # a 2.3 receipt must account for its record (S3B-03)
+    expected = f"{HISTORY_DIRNAME}/{receipt['restore_id']}/c1/{C1_HISTORY_NAME}"
+    if record.get("status") != "kept_as_inactive_history":
+        # Not placed: then nothing may be at the history path either.
+        return (record.get("status") in ("not_restored_owner_skipped", "not_restored_record_unavailable")
+                and _lstat_chain(data_dir, expected)[0] == "absent"
+                and not os.path.lexists(os.path.join(data_dir, os.path.dirname(expected))))
+    if record.get("path") != expected or _lstat_chain(data_dir, expected)[0] != "file":
+        return False
+    try:
+        fd = os.open(os.path.join(data_dir, expected), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    with os.fdopen(fd, "rb") as fh:
+        data = fh.read(c1.RECOVERY_STATE_MAX_BYTES + 1)
+    try:
+        observation = abx.c1_observation_from_bytes(data)
+    except abx.C1RecordInvalid:
+        return False
+    return observation["record_sha256"] == record.get("sha256") == hashlib.sha256(data).hexdigest()
+
+
 def _stage_and_publish(plan, raw, staging, journal):
     dest = plan["destination"]
     data_dir, base_dir, restore_id = dest["data_dir"], dest["install_dir"], plan["restore_id"]
@@ -1532,6 +1664,8 @@ def _stage_and_publish(plan, raw, staging, journal):
             data, notes["preferences"] = _prefs_bytes(data, base_dir, personas_after)
         elif transform in ("marker_v2", "marker_legacy"):
             data = _marker_bytes(data, transform)
+        elif transform == "c1_history":
+            notes["c1_record"] = _c1_history_note(data, plan)
         path = _write_staged(staging, f["rel"], data)
         if transform in ("primary_database", "sqlite"):
             sqlite_checks[f["rel"]] = _finalize_sqlite(path, base_dir, tracked, transform == "primary_database",
@@ -1563,6 +1697,11 @@ def _stage_and_publish(plan, raw, staging, journal):
         if f["root"] == "install":
             install_written.append({"rel": f["rel"], "archive_path": f["archive_path"],
                                     "action": f["action"], "sha256": f["sha256"], "size": f["size"]})
+    c1_block = {"trace": trace, "archived_c1_state": "never_restored",
+                "required_next_step": "owner_local_recover",
+                "first_run_initialize": "refused_trace_present"}
+    if plan["archive"]["format"] == ri.FORMAT_V23:
+        c1_block["archived_c1_record"] = _c1_history_receipt(plan, written, notes.get("c1_record"))
     receipt = {
         "schema": RECEIPT_SCHEMA, "version": VERSION, "restore_id": restore_id,
         "state": "published_execution_fenced", "created_at": _now(),
@@ -1579,9 +1718,7 @@ def _stage_and_publish(plan, raw, staging, journal):
                    "generation_artifacts": notes["generation_artifacts"],
                    "project_roots": "historical_inactive_owner_must_repick"},
         "sqlite": {rel: note.get("integrity_check") for rel, note in sqlite_checks.items()},
-        "c1": {"trace": trace, "archived_c1_state": "never_restored",
-               "required_next_step": "owner_local_recover",
-               "first_run_initialize": "refused_trace_present"},
+        "c1": c1_block,
         "fence": {"telegram_remote_access": False, "custom_tools_loaded": False,
                   "custom_tool_approvals_active": False, "pending_actions_replayed": False,
                   "credentials_imported": False, "project_roots_bound": False,
@@ -1790,6 +1927,14 @@ def verify_restored_root(data_dir, receipt):
         # W-A: Wire autonomy, its watermark and the wake listener stay absent (OFF).
         checks["wire_settings_absent"] = not any(k in abx._DESTINATION_LOCAL_PREFS for k in values)
     checks["c1_restore_trace"] = c1.restore_trace_state(data_dir) == "absent_with_trace"
+    # Every 2.3 receipt is checked (S3B-03): the format decides, not the
+    # presence of the receipt's own key. A receipt too malformed to say either
+    # fails this check or skips it; it never raises (TS3B-03), and a pre-2.3
+    # receipt behaves exactly as before.
+    archive_block, c1_block = receipt.get("archive"), receipt.get("c1")
+    if ((type(archive_block) is dict and archive_block.get("format") == ri.FORMAT_V23)
+            or (type(c1_block) is dict and "archived_c1_record" in c1_block)):
+        checks[_c1_history_check_name(receipt)] = _c1_history_accepted(data_dir, receipt)
     generation = receipt.get("rebind", {}).get("generation_artifacts")
     if generation is not None:
         checks["generation_references"] = _generation_accepted(data_dir, generation)

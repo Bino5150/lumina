@@ -14,7 +14,9 @@ supplies the writer fence, rollback journal and C1 restore reconciliation.
 Four input classes:
 
 - verified_agent_backup: the strict A2 v1 verifier or the v2 export verifier
-  passed the exact captured bytes.
+  passed the exact captured bytes. Only a verified format 2.3 archive is a
+  Verified Agent Backup; its sanitized C1 record is offered as inactive
+  history only (C1-S3b), never as live safety state.
 - selective_recovery_candidates: the manifest, ZIP grammar and namespace are
   sound, but one or more declared members are damaged or missing. Only
   members that independently validate are offered, with dependency closure;
@@ -102,6 +104,8 @@ ACTIVATION_GATE = (
 )
 
 _V1 = {"major": 1, "minor": 0}
+FORMAT_V23 = "agent_export_v2.3"     # the Verified Agent Backup (C1-S3b)
+C1_UNIT = "c1_recovery_state"
 _A2_PREFIXES = ("state/", "overlay/", "metadata/")
 _FILE_SETS = {"skills", "personas", "avatars", "voices", "tool_profiles", "custom_tools",
               "audit_and_pending_actions"}
@@ -132,6 +136,10 @@ _UNIT_POLICY = {
                                                          "pending actions are never replayed"),
     "provenance_metadata": ("informational", "Identity trailers and baseline hashes; never credentials or "
                                              "authority"),
+    # C1-S3b (TS3-06): format 2.3's sanitized safety-state record. Placed
+    # only under restore_history/<restore_id>/c1/, where nothing reads it.
+    C1_UNIT: ("historical_inactive", "Sanitized safety-state record kept as history; never installed as "
+                                     "live safety state; Recover still starts every scope suspended"),
 }
 
 # Members that need the primary database to mean anything once restored.
@@ -286,7 +294,8 @@ def _unit_of(logical_id):
              "overlay.projects.projectlist": "project_list",
              abx.MARKER_ID: "knowledge_pack_installation",
              "metadata.identity_trailers": "provenance_metadata",
-             "metadata.shipped_baseline_hashes": "provenance_metadata"}
+             "metadata.shipped_baseline_hashes": "provenance_metadata",
+             abx.C1_MEMBER_ID: C1_UNIT}
     if logical_id in fixed:
         return fixed[logical_id]
     if logical_id.startswith("state.custom_tools."):
@@ -408,6 +417,7 @@ def _intake_manifest_archive(raw, z, infos):
         raise _Refused("MANIFEST_INVALID") from None
     fmt = _format_of(manifest)
     v1 = fmt == "agent_backup_v1"
+    v23 = fmt == FORMAT_V23
     report = (ab.verify_agent_backup(io.BytesIO(raw), resident_bytes_hint=len(raw)) if v1
               else abx.verify_export(io.BytesIO(raw), resident_bytes_hint=len(raw)))
     names = {i.filename for i in infos} - {"manifest.json"}
@@ -460,6 +470,8 @@ def _intake_manifest_archive(raw, z, infos):
                              if "generation_artifacts" in observations else "not_captured_by_format"),
         "source_overlays": "captured",
     }
+    if v23:
+        coverage.update(_v23_coverage(manifest, members, report))
     provenance = "archive_declared_hash_consistent"
     units = _apply_overrides(_assemble_units(members, provenance, notes))
     if marker != "present":
@@ -479,6 +491,47 @@ def _intake_manifest_archive(raw, z, infos):
         "members": members, "units": units, "coverage": coverage,
         "full_restore_eligible": False,
     }
+
+
+def _v23_coverage(manifest, members, report):
+    """Format 2.3's own coverage values (TS3-05), each derived here rather
+    than assumed. 2.0-2.2 keep their values byte for byte.
+
+    Verified means the export verifier passed these exact bytes, and that
+    verifier refuses any 2.3 archive with a coverage blocker; the blockers
+    are recomputed here anyway and a non-empty set fails closed. The C1
+    record is described only when its member independently validated (its
+    hash, strict canonical parse, validate_recovery_state, and equality with
+    the manifest's observation, through validate_export_payload)."""
+    c1_members = [m for m in members if m["logical_id"] == abx.C1_MEMBER_ID]
+    record_ok = len(c1_members) == 1 and c1_members[0]["state"] == "valid"
+    if report["valid"]:
+        blockers = abx.coverage_blockers(report["manifest"])
+        if blockers or not record_ok:
+            raise _Refused("ARCHIVE_INTEGRITY_FAILED",
+                           "verified 2.3 archive with a coverage blocker or an unusable C1 record")
+    else:
+        blockers = ["archive_failed_verification"]
+    out = {"format_coverage": "verified_agent_backup" if report["valid"]
+           else "verified_agent_backup_failed_verification",
+           # S3B-06: an intact record in an archive that failed verification
+           # is still offered as history (it validated on its own), but says so.
+           "c1_safety_state": ("record_unavailable_damaged" if not record_ok
+                               else "captured_sanitized_history_only" if report["valid"]
+                               else "record_intact_in_unverified_archive_history_only"),
+           "coverage_blockers": blockers}
+    if record_ok:
+        observation = manifest["export_observations"]["c1_recovery"]
+        out["c1_record"] = {
+            "archive_path": abx.C1_MEMBER_POLICY["archive_path"],
+            "sha256": observation["record_sha256"],
+            "record_schema": observation["record_schema"],
+            "record_version": observation["record_version"],
+            "claimed_source_incarnation": observation["claimed_source_incarnation"],
+            "provenance": "archive_declared_producer_claims",
+            "restore_policy": "inactive_history_never_live_c1_state",
+        }
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -755,15 +808,18 @@ def preview_recovery(intake, data_dir, base_dir=None):
             blockers.append("bootstrap_hold_installation_history_unknown")
         if any(u["destination_effect"] == "blocked_unsafe_destination_path" for u in units):
             blockers.append("unsafe_destination_path")
+        safety = {"c1": destination_c1,
+                  "archived_c1_state": "never_restored_as_live_files",
+                  "always_excluded": list(_ALWAYS_EXCLUDED),
+                  "executable_authority": "historical_inactive_reapproval_required",
+                  "telegram_remote_access": "forced_off",
+                  "quiescence": "not_evaluated_in_preview"}
+        if intake.get("format") == FORMAT_V23:
+            safety["archived_c1_record"] = "inactive_history_only_never_live_c1_state"
         preview.update(status="preview", units=units,
                        units_not_in_archive=copy.deepcopy(intake.get("units_not_in_archive", [])),
                        destination={"data": data_root, "base": base_root, "observed": observed},
-                       safety={"c1": destination_c1,
-                               "archived_c1_state": "never_restored_as_live_files",
-                               "always_excluded": list(_ALWAYS_EXCLUDED),
-                               "executable_authority": "historical_inactive_reapproval_required",
-                               "telegram_remote_access": "forced_off",
-                               "quiescence": "not_evaluated_in_preview"})
+                       safety=safety)
         preview["activation"]["blockers"] = blockers
     except _Refused as refusal:
         preview.update(status="refused", units=[], units_not_in_archive=[],

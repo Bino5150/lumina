@@ -1155,8 +1155,24 @@ def test_no_product_code_calls_the_snapshot_yet():
         found = [n for n in names if n in text]
         if found:
             hits[rel] = found
+    # C1-S3b (disclosed edit): the restore engine and its intake name the
+    # validator in their documentation and in the C1-S2 hand-off (A-11 item 4)
+    # but never call it; they reach it only through the exporter's
+    # c1_observation_from_bytes. Pinned below: no call, no import.
     assert hits == {"core/agent_backup_c1_child.py": ["capture_recovery_state"],
-                    "core/agent_backup_export.py": ["validate_recovery_state"]}
+                    "core/agent_backup_export.py": ["validate_recovery_state"],
+                    "core/agent_backup_restore.py": ["validate_recovery_state"],
+                    "core/agent_backup_restore_intake.py": ["validate_recovery_state"]}
+    for rel in ("core/agent_backup_restore.py", "core/agent_backup_restore_intake.py"):
+        tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+            n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)} | {
+            a.name for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names} | {
+            # S3B-18: getattr(c1, "validate_recovery_state") names it only as a string
+            n.value.strip() for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        assert not used & set(names), (rel, sorted(used & set(names)))
+        # S3B-18: a star import would bring the names in without naming them.
+        assert not [a for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names if a.name == "*"], rel
 
 
 def test_the_exporter_entry_point_adds_no_import():

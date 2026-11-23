@@ -198,7 +198,9 @@ def test_initial_state_is_inert_and_truthful(dlg):
     assert not dlg.preview_btn.isEnabled() and not dlg.recover_btn.isEnabled()
     assert not dlg.approve_check.isEnabled() and not dlg.reinspect_btn.isEnabled()
     assert dlg.banner.text() == cp.BANNER and "NEW folder" in cp.BANNER
-    assert "not production disaster recovery" in cp.BANNER and "cannot produce a Verified Agent Backup" in cp.BANNER
+    # C1-S3b (S3B-02): a verified 2.3 archive now restores as the Verified Agent
+    # Backup class, so the banner no longer says no recovery can be one.
+    assert "not production disaster recovery" in cp.BANNER and "never proof of a full recovery" in cp.BANNER
     everything = " | ".join([b.text() for b in dlg.findChildren(QPushButton)]
                             + [c.text() for c in dlg.findChildren(QCheckBox)]
                             + [l.text() for l in dlg.findChildren(QLabel)])

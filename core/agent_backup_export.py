@@ -14,8 +14,9 @@ never does that work. It runs every 2.2 check (A-1) and then the C1 ones.
 The verifier alone derives its coverage from the archived bytes, and an
 archive with any coverage blocker can never verify as 2.3, so a verified 2.3
 archive is a Verified backup by construction. The record is derived,
-sanitized history, never live safety state; restoring 2.3 is not supported
-by this build (S3b), and "Verified" never means "restorable".
+sanitized history, never live safety state. Restore (C1-S3b) reads 2.3 into
+an isolated root and keeps the record only as inactive history; "Verified"
+never means "restorable".
 
 The old v1 builder/verifier remain unchanged by default. The small private v2
 hooks in agent_backup reuse its collectors, immutable capture, ZIP grammar,
@@ -55,11 +56,11 @@ from core.test_isolation import refuse_if_production_path
 V21 = {"major": 2, "minor": 1}
 VERSION = {"major": 2, "minor": 2}             # Incomplete State Export
 VERIFIED_VERSION = {"major": 2, "minor": 3}    # Verified Agent Backup
-# Formats Restore may read. 2.3 is deliberately absent until S3b gives
-# restore its per-format plan and receipt values (TS3-05, amendment A-1).
-READ_VERSIONS = ({"major": 2, "minor": 0}, V21, VERSION)
-# Formats this verifier reads.
-VERIFY_VERSIONS = READ_VERSIONS + (VERIFIED_VERSION,)
+# Formats Restore may read. C1-S3b adds 2.3, with its own per-format plan
+# and receipt values (TS3-05); the C1 record restores as history only.
+READ_VERSIONS = ({"major": 2, "minor": 0}, V21, VERSION, VERIFIED_VERSION)
+# Formats this verifier reads: the same set.
+VERIFY_VERSIONS = READ_VERSIONS
 C1_ARCHIVE_PREFIX = "state/c1/"
 # Namespace the 2.x verifier accepts beyond v1's (v1 itself never does).
 EXTRA_ARCHIVE_PREFIXES = (inv.GENERATION_ARCHIVE_PREFIX, C1_ARCHIVE_PREFIX)
@@ -1319,14 +1320,17 @@ def classify_input(path):
         if manifest.get("format_version") == {"major": 1, "minor": 0}:
             return {"kind": "agent_backup_v1", "verification": "not_performed", "full_agent_coverage": False,
                     "coverage_blockers": ["installation_marker", "suspension", "prefs_policy"]}
-        if any(_same_contract(manifest.get("format_version"), v) for v in READ_VERSIONS):
-            return {"kind": "agent_export_v2", "verification": "not_performed", "full_agent_coverage": False,
-                    "coverage_blockers": ["suspension"]}
         if _is_verified_format(manifest.get("format_version")):
-            # A hint only: nothing here was verified, and this build cannot
-            # restore 2.3 yet (S3b), so no coverage is claimed either way.
+            # First, before the READ_VERSIONS family that now includes it
+            # (TS3-05): a hint only. Nothing here was verified, so no coverage
+            # and no blocker is claimed either way; only the verifier derives them.
             return {"kind": "agent_export_v2_verified", "verification": "not_performed",
                     "full_agent_coverage": False, "coverage_blockers": ["verification_not_performed"]}
+        if any(_same_contract(manifest.get("format_version"), v) for v in READ_VERSIONS):
+            # 2.0-2.2 (2.3 returned above): these formats cannot carry C1
+            # state at all, so "suspension" is a fact of the format.
+            return {"kind": "agent_export_v2", "verification": "not_performed", "full_agent_coverage": False,
+                    "coverage_blockers": ["suspension"]}
     return {"kind": "unsupported", "verification": "not_performed", "full_agent_coverage": False,
             "coverage_blockers": ["unknown_format"]}
 
@@ -1506,8 +1510,8 @@ def owner_receipt_text(receipt):
             "C1 enforcement compatibility: UNPROVEN\n"
             "Members were captured at different times; this is not one point-in-time snapshot. "
             "Later safety trips are not included.\n"
-            "Full recovery: NOT PROVEN until a restore is verified; restoring this format is not "
-            "yet supported by this build. A restore always starts every scope suspended.\n"
+            "Full recovery: NOT PROVEN until a restore is verified. An isolated restore keeps the "
+            "safety record only as inactive history; owner-local Recover then starts every scope suspended.\n"
             f"Directory durability: {durability}\n"
             "Not encrypted. Ordinary content may contain secrets. Preserve prior backups.")
     marker = receipt["semantic_coverage"]["knowledge_pack_installation_marker"]

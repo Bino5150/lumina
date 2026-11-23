@@ -200,13 +200,14 @@ def test_incomplete_export_stays_2_2_without_any_c1_member(vsource, tmp_path):
 
 
 def test_versions_record_version_and_the_restore_boundary_are_pinned(vsource):
-    assert ex.READ_VERSIONS == ({"major": 2, "minor": 0}, {"major": 2, "minor": 1}, {"major": 2, "minor": 2})
-    assert ex.VERIFY_VERSIONS == ex.READ_VERSIONS + ({"major": 2, "minor": 3},)
+    # C1-S3b moved the restore boundary: Restore now reads 2.3 (TS3-05).
+    assert ex.READ_VERSIONS == ({"major": 2, "minor": 0}, {"major": 2, "minor": 1}, {"major": 2, "minor": 2},
+                                {"major": 2, "minor": 3})
+    assert ex.VERIFY_VERSIONS == ex.READ_VERSIONS
     assert c1.RECOVERY_STATE_SCHEMA == "lumina.c1_recovery_state" and c1.RECOVERY_STATE_VERSION == 1
     verified(vsource)
-    # S3a is an older restore engine for 2.3: intake refuses it (A-1, S3b).
     intake = ri.intake_archive(str(vsource[2]))
-    assert intake["kind"] == ri.REJECTED and intake["refusal"]["code"] == "FORMAT_UNSUPPORTED"
+    assert intake["kind"] == ri.VERIFIED and intake["format"] == "agent_export_v2.3"
     hint = ex.classify_input(str(vsource[2]))
     assert hint == {"kind": "agent_export_v2_verified", "verification": "not_performed",
                     "full_agent_coverage": False, "coverage_blockers": ["verification_not_performed"]}
@@ -835,8 +836,14 @@ def test_hostile_2_3_archives_never_verify(vsource, tmp_path, name, mutate, expe
     hostile = rebuild(vsource[2], tmp_path / f"{name}.zip", mutate)
     errors = errors_of(hostile)
     assert expected in errors, errors
+    # S3A-05, made real by C1-S3b: intake never calls a hostile 2.3 archive
+    # verified; it is rejected, or Selective only when damaged members explain it.
     intake = ri.intake_archive(str(hostile))
-    assert intake["kind"] == ri.REJECTED
+    assert intake["kind"] in (ri.REJECTED, ri.SELECTIVE)
+    if intake["kind"] == ri.SELECTIVE:
+        assert any(m["state"] != "valid" for m in intake["members"])
+        assert intake["verification"]["status"] == "FAILED"
+        assert intake["coverage"]["format_coverage"] == "verified_agent_backup_failed_verification"
 
 
 def _manifest_and_files(path):
@@ -1204,8 +1211,8 @@ def test_the_verified_receipt_text_says_only_what_was_derived(vsource):
                  "not restored as live safety state",
                  "C1 enforcement compatibility: UNPROVEN",
                  "Members were captured at different times; this is not one point-in-time snapshot.",
-                 "Full recovery: NOT PROVEN until a restore is verified; restoring this format is not "
-                 "yet supported by this build.",
+                 "Full recovery: NOT PROVEN until a restore is verified. An isolated restore keeps the "
+                 "safety record only as inactive history; owner-local Recover then starts every scope suspended.",
                  "Not encrypted.", "Preserve prior backups."):
         assert line in text
     assert receipt["archive_sha256"] in text
