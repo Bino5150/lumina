@@ -196,7 +196,10 @@ def test_no_arbitrary_prefs_authority_or_secret_can_pass_unknown_key(source):
     p.write_text(json.dumps(prefs))
     _, receipt = build_review(source)
     assert b"UNKNOWN-SENTINEL" not in b"".join(read_zip(source[2]).values())
-    assert "unclassified_preferences" in receipt["coverage_blockers"]
+    # F-DR-4 (owner direction 2026-11-24): an unfamiliar key is left out and
+    # counted, never archived, and no longer a reason to refuse a backup.
+    assert "unclassified_preferences" not in receipt["coverage_blockers"]
+    assert receipt["semantic_coverage"]["unclassified_preferences_omitted"] == 1
 
 
 def incomplete(source, **kwargs):

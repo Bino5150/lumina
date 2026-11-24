@@ -619,15 +619,8 @@ def _drop_marker(data):
     (data / "knowledge_packs_installed.json").unlink()
 
 
-def _unknown_pref(data):
-    prefs = json.loads((data / "memory" / "prefs.json").read_text())
-    prefs["mystery_pref_from_the_future"] = 1
-    (data / "memory" / "prefs.json").write_text(json.dumps(prefs))
-
-
 @pytest.mark.parametrize("blocker,setup", [
     ("installation_marker", _drop_marker),
-    ("unclassified_preferences", _unknown_pref),
     ("inventory", None),
 ])
 def test_each_blocker_alone_refuses_in_owner_words_before_any_zip_work(vsource, monkeypatch, blocker, setup):
@@ -791,10 +784,6 @@ def _drop_obs(manifest, files):
     del manifest["export_observations"]["c1_recovery"]
 
 
-def _unclassified(manifest, files):
-    manifest["export_observations"]["prefs_unclassified_count"] = 1
-
-
 def _inventory_blocking(manifest, files):
     manifest["export_observations"]["inventory"]["blocking_entries"] = 1
 
@@ -828,7 +817,6 @@ def _member_policy(manifest, files):
     ("mode_incomplete", _mode, "EXPORT_FORMAT_OR_MODE_UNSUPPORTED"),
     ("suspension_observation", _suspension_obs, "EXPORT_C1_OBSERVATION_MISMATCH"),
     ("observation_missing", _drop_obs, "EXPORT_COVERAGE_OBSERVATIONS_INVALID"),
-    ("blocker_prefs", _unclassified, "EXPORT_VERIFIED_MODE_WITH_BLOCKERS"),
     ("blocker_inventory", _inventory_blocking, "EXPORT_VERIFIED_MODE_WITH_BLOCKERS"),
 ])
 def test_hostile_2_3_archives_never_verify(vsource, tmp_path, name, mutate, expected):
@@ -856,7 +844,6 @@ def _manifest_and_files(path):
     ("two_members", _two_members, "EXPORT_C1_MEMBER_MISSING_OR_DUPLICATE"),
     ("member_policy", _member_policy, "EXPORT_C1_MEMBER_INVALID"),
     ("observation_sha", _set_obs("record_sha256", "0" * 64), "EXPORT_C1_MEMBER_INVALID"),
-    ("blocker_prefs", _unclassified, "EXPORT_VERIFIED_MODE_WITH_BLOCKERS"),
 ])
 def test_each_c1_rule_holds_in_the_schema_hook_alone(vsource, tmp_path, name, mutate, schema_code):
     verified(vsource)

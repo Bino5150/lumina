@@ -258,6 +258,21 @@ def run_cli(persona_name: str = None, tools_override: str = None):
         process_manager.shutdown_all()
 
 
+def _startup_tts_backend(tts_loader, enabled):
+    """F-DR-1 -- a voice engine this machine lacks (for example a restored
+    copy whose preferences name chatterbox where torch isn't installed) must
+    never stop Lumina from starting: start without voice and say why. Voice
+    can be chosen again in Settings."""
+    if not enabled:
+        return None
+    try:
+        return tts_loader.get_tts_backend()
+    except Exception as exc:
+        print(f"[TTS] Voice backend unavailable, starting without voice: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
 def run_gui():
     """Full PySide6 GUI mode."""
     from PySide6.QtWidgets import QApplication
@@ -302,7 +317,7 @@ def run_gui():
     import importlib
     tts_loader = importlib.import_module("tts.loader")
     from stt.whisper_bridge import WhisperBridge
-    tts = tts_loader.get_tts_backend() if config.TTS_ENABLED else None
+    tts = _startup_tts_backend(tts_loader, config.TTS_ENABLED)
     # FE-16: this used to hardcode base/cpu regardless of what the Settings
     # tab persisted (STT_MODEL/STT_DEVICE), and never checked STT_ENABLED.
     stt = WhisperBridge(model_size=config.STT_MODEL, device=config.STT_DEVICE) if config.STT_ENABLED else None

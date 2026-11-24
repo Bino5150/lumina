@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timezone
 import zipfile
 
@@ -136,16 +137,71 @@ RECOVERY_CONTRACT = {
 }
 _PREFS_POLICY = "restore_content_preserve_destination_security_rebind_locally"
 
-# Reviewed portable-content keys only. Unknown keys never cross an authority
-# boundary by default. No endpoint/owner/PIN credential values are archived here.
+# Ordinary preferences (F-DR-4, owner direction 2026-11-24): a Verified backup
+# preserves every ordinary setting this version knows, so a recovered copy keeps
+# its voice, persona, avatar, model, limit and display choices. Backing a
+# setting up never activates it: a recovered copy starts with every scope
+# suspended until the owner recovers C1 and resumes it (C1-S2), Telegram is
+# forced off, Wire settings stay installation-local, and credentials, PINs and
+# owner bindings are never archived. Settings naming things the new machine may
+# lack (a voice engine, an avatar file, a model endpoint) are kept as values and
+# degrade at use. tests/test_f_dr_4_prefs_classification.py keeps every key the
+# product reads or writes classified here.
 _TEXT_PREFS = frozenset({
     "human_bio", "human_profile_curated", "human_bio_public", "last_persona",
     "tts_backend", "tts_voice", "tts_device", "stt_backend", "stt_model",
     "stt_device", "reasoning_effort", "theme", "language", "user_name",
+    "agent_name", "system_prompt", "avatar_path", "user_avatar_path",
+    "voicebox_profile", "voicebox_instruct", "chatterbox_voice", "chatterbox_ref_dir",
+    "chatterbox_device", "supertonic_voice", "elevenlabs_voice_id", "elevenlabs_model",
+    "elevenlabs_output_format", "llm_backend", "custom_default_model", "omniroute_default_model",
 })
-_BOOL_PREFS = frozenset({"tts_enabled", "stt_enabled", "spellcheck_enabled"})
-_NUMBER_PREFS = frozenset({"window_width", "window_height", "tts_speed",
-                           "tts_pitch", "tts_volume", "last_chat_id"})
+_BOOL_PREFS = frozenset({
+    "tts_enabled", "stt_enabled", "spellcheck_enabled", "show_think_blocks",
+    "subagents_enabled", "background_tasks_enabled", "dream_sweep_enabled",
+    "human_profile_curation_enabled", "context_compaction_enabled", "backend_endpoints_migrated",
+})
+# Checked before the secret-name rule: these four are numeric limits whose
+# names contain "token", not credentials.
+_NUMBER_PREFS = frozenset({
+    "window_width", "window_height", "tts_speed", "tts_pitch", "tts_volume", "last_chat_id",
+    "max_tool_iterations", "max_tool_calls_per_response", "max_tool_calls_per_turn",
+    "max_turn_minutes", "max_subagent_depth", "no_progress_read_only_warn",
+    "no_progress_read_only_trip", "no_progress_write_warn", "no_progress_write_trip",
+    "dream_idle_minutes", "dream_min_tokens", "tool_budget_tokens", "response_reserve_tokens",
+    "context_compaction_batch_tokens",
+})
+# Endpoints are kept, except one that carries a credential in its URL (user
+# info, or a key/token-like query parameter): that whole setting is dropped as
+# a security field.
+_ENDPOINT_PREFS = frozenset({"tts_host", "voicebox_host", "chatterbox_host", "supertonic_host",
+                             "llm_backend_url"})
+# Structured settings: plain JSON (objects, lists, strings, numbers, booleans,
+# null) within the bounds below. A value outside them is left out and counted,
+# never archived.
+_STRUCTURED_PREFS = {
+    "disabled_tools": list, "multimodal_disabled_providers": list, "multimodal_routes": dict,
+    "backend_endpoints": dict, "backend_models": dict, "backend_provider_routing": dict,
+    "backend_reasoning": dict, "backend_context": dict,
+    # FE-09 moved provider keys out of this block; what remains is each
+    # provider's model choice. A block still holding a key-like field is
+    # dropped whole as a security field.
+    "cloud_credentials": dict,
+}
+_PREF_VALUE_MAX_BYTES = 256 * 1024
+_PREF_JSON_MAX_DEPTH = 6
+_SECRET_NAME_PARTS = ("api_key", "token", "secret", "password")
+# Nested field names and values that may hold a credential (review L1). Names
+# are compared as lower-case words (camelCase, hyphens and underscores split)
+# and as one joined string, so accessToken, x-api-key and client_secret all
+# match; plural "tokens" (context and budget sizes) is not a credential word.
+_SECRET_WORDS = frozenset({"key", "token", "auth", "authorization", "pass", "passwd", "password",
+                           "passphrase", "pin", "secret", "sig", "signature", "bearer", "cookie",
+                           "session", "credential", "credentials"})
+_SECRET_JOINED = ("apikey", "accesstoken", "refreshtoken", "authtoken", "idtoken", "privatekey",
+                  "clientsecret", "secretkey", "password", "passwd")
+_SECRET_VALUE = re.compile(r"(?i)^(?:bearer\s+\S|sk-|sk_|rk_|pk_live_|xox[abpr]-|ghp_|gho_|github_pat_"
+                           r"|aiza|glpat-|hf_|eyj[a-z0-9_-]{8,}\.)")
 _DROP_PREFS = frozenset({
     "pin_hash", "pin_salt", "telegram_remote_access",
     "telegram_remote_access_on_since", "telegram_remote_access_off_reason",
@@ -224,7 +280,6 @@ OWNER_MESSAGES = {
 BLOCKER_WORDS = {
     "suspension": "the safety-suspension state was not captured",
     "installation_marker": "the Knowledge Pack installation record is missing",
-    "unclassified_preferences": "some preferences are of a kind this version does not recognise",
     "generation_artifacts": "some generated images or their records are missing or changed",
     "inventory": "some files in the data folder still need a backup decision, or the folder could not be listed",
 }
@@ -634,10 +689,110 @@ def _scrub_preferences(raw):
     return data, counts["omitted"], counts["unclassified"]
 
 
+def _name_words(name):
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    words = [w for w in re.split(r"[^a-z0-9]+", spaced.lower()) if w]
+    return words, "".join(words)
+
+
+def _url_carries_secret(value) -> bool:
+    """User info, or a query parameter named like a credential (review L3:
+    parameter names, not substrings of the whole query)."""
+    try:
+        parts = urllib.parse.urlsplit(value)
+        params = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    except ValueError:
+        return True
+    return "@" in parts.netloc or any(_secret_like_name(k) for k, _v in params)
+
+
+def _endpoint_ok(value) -> bool:
+    """An endpoint a recovered copy may keep: http(s) with a host (review L2)."""
+    try:
+        parts = urllib.parse.urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
+def _secret_like_name(name) -> bool:
+    """A field name that may hold a credential."""
+    words, joined = _name_words(name)
+    return bool(_SECRET_WORDS.intersection(words)) or any(j in joined for j in _SECRET_JOINED)
+
+
+def _nested_secret(value) -> bool:
+    """A key-like field name, or a string shaped like a known credential
+    (sk-…, a bearer header, a JWT…), anywhere inside a structured setting."""
+    if type(value) is dict:
+        return any(_secret_like_name(k) or _nested_secret(v) for k, v in value.items())
+    if type(value) is list:
+        return any(_nested_secret(v) for v in value)
+    return type(value) is str and _SECRET_VALUE.match(value.strip()) is not None
+
+
+def _inert_json(value, depth=0) -> bool:
+    if depth > _PREF_JSON_MAX_DEPTH:
+        return False
+    if value is None or type(value) in (str, bool, int):
+        return True
+    if type(value) is float:
+        return value == value and value not in (float("inf"), float("-inf"))
+    if type(value) is list:
+        return all(_inert_json(v, depth + 1) for v in value)
+    if type(value) is dict:
+        return all(type(k) is str and _inert_json(v, depth + 1) for k, v in value.items())
+    return False
+
+
+def _pref_disposition(key, value):
+    """keep, security (left out: a credential or owner authority), local
+    (installation-local Wire state), or unclassified (left out and counted).
+    Raises EXPORT_PREFS_TYPE_INVALID for a known scalar of the wrong type."""
+    if key in _DESTINATION_LOCAL_PREFS:
+        return "local"
+    if key in _DROP_PREFS:
+        return "security"
+    if key in _ENDPOINT_PREFS:
+        if not (type(value) is str or value is None):
+            raise ab.AgentBackupError("EXPORT_PREFS_TYPE_INVALID")
+        if value and _url_carries_secret(value):
+            return "security"
+        return "keep" if not value or _endpoint_ok(value) else "unclassified"
+    if key in _TEXT_PREFS:
+        valid = type(value) is str or value is None
+    elif key in _BOOL_PREFS:
+        valid = type(value) is bool
+    elif key in _NUMBER_PREFS:
+        valid = type(value) in (int, float) or value is None
+    elif key in _STRUCTURED_PREFS:
+        if type(value) is not _STRUCTURED_PREFS[key] or not _inert_json(value):
+            return "unclassified"
+        if _nested_secret(value):
+            return "security"
+        if key == "backend_endpoints":
+            if any(type(v) is not str for v in value.values()):
+                return "unclassified"
+            if any(v and _url_carries_secret(v) for v in value.values()):
+                return "security"
+            if not all(_endpoint_ok(v) for v in value.values() if v):
+                return "unclassified"
+        return "keep"
+    elif any(part in key.lower() for part in _SECRET_NAME_PARTS):
+        return "security"
+    else:
+        return "unclassified"
+    if not valid:
+        raise ab.AgentBackupError("EXPORT_PREFS_TYPE_INVALID")
+    return "keep"
+
+
 def _scrub_preferences_counts(raw):
     """Scrubbed bytes and counts. `omitted` counts every key left out;
     `unclassified` and `destination_local` are the parts of it that were
-    unknown and installation-local respectively."""
+    unrecognized (or outside the structured bounds) and installation-local
+    respectively. An unrecognized key is left out and counted, never archived
+    and never a reason to refuse the backup (F-DR-4)."""
     try:
         prefs = ab._strict_json_loads(raw)
     except (ValueError, UnicodeError) as exc:
@@ -646,29 +801,15 @@ def _scrub_preferences_counts(raw):
         raise ab.AgentBackupError("EXPORT_PREFS_INVALID")
     result, omitted, unknown, local = {}, 0, 0, 0
     for key, value in prefs.items():
-        lower = key.lower()
-        if key in _DESTINATION_LOCAL_PREFS:
-            omitted += 1
-            local += 1
+        disposition = _pref_disposition(key, value)
+        if disposition == "keep" and len(_json_bytes(value)) > _PREF_VALUE_MAX_BYTES:
+            disposition = "unclassified"
+        if disposition == "keep":
+            result[key] = value
             continue
-        if key in _DROP_PREFS or any(t in lower for t in ("api_key", "token", "secret", "password")):
-            omitted += 1
-            continue
-        if key in _TEXT_PREFS:
-            valid = type(value) is str or value is None
-        elif key in _BOOL_PREFS:
-            valid = type(value) is bool
-        elif key in _NUMBER_PREFS:
-            valid = type(value) in (int, float) or value is None
-        elif key == "disabled_tools":
-            valid = type(value) is list and all(type(x) is str for x in value)
-        else:
-            omitted += 1
-            unknown += 1
-            continue
-        if not valid:
-            raise ab.AgentBackupError("EXPORT_PREFS_TYPE_INVALID")
-        result[key] = value
+        omitted += 1
+        unknown += disposition == "unclassified"
+        local += disposition == "local"
     # A recovered file cannot re-enable communications. PIN/owner setup is a
     # destination-local requirement, not an archived owner credential.
     result["telegram_remote_access"] = False
@@ -1410,8 +1551,6 @@ def coverage_blockers(manifest):
         blockers.append("suspension")
     if observations["installation_marker"] != "present":
         blockers.append("installation_marker")
-    if observations["prefs_unclassified_count"]:
-        blockers.append("unclassified_preferences")
     if "generation_artifacts" in observations:
         if observations["generation_artifacts"]["status"] != "complete":
             blockers.append("generation_artifacts")
