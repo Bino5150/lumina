@@ -62,13 +62,11 @@ class _AgentBackupWorker(QThread):
 
     def run(self):
         try:
-            if self.incomplete:
-                manifest, receipt = agent_backup_export.export_incomplete_state(
-                    self.data_dir, self.base_dir, self.destination, owner_acknowledged=True)
-            else:
-                manifest, receipt = agent_backup_export.export_verified_agent_backup(
-                    self.data_dir, self.base_dir, self.destination)
-            receipt = agent_backup_export.confirm_export_result(self.destination, manifest, receipt)
+            # F-DR-5: each export runs in its own short-lived process, so a
+            # second backup in one session works (see run_owner_export).
+            receipt = agent_backup_export.run_owner_export(
+                "incomplete" if self.incomplete else "verified",
+                self.data_dir, self.base_dir, self.destination)
             self.completed.emit(receipt)
         except agent_backup_export.ExportUnavailable as exc:
             # Owner words only: a refusal code never reaches the dialog (TS3-10).

@@ -27,6 +27,11 @@ def tab(source, monkeypatch):
                             messages.append((_kind, title, text)))
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(source[2]), ""))
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    # These tests inject builder behavior in this process; run the worker's
+    # export in-process so they reach it. The real child process is covered
+    # by tests/test_f_dr_5_repeat_export.py.
+    from core import agent_backup_export as export
+    monkeypatch.setattr(export, "run_owner_export", export._owner_export_in_process)
     yield widget, messages, app
     worker = getattr(widget, "_backup_worker", None)
     if worker is not None:
@@ -167,7 +172,7 @@ def blocked(*args, **kwargs):
     assert release.wait(3)
     completed.set()
     raise agent_backup_export.ExportUnavailable('synthetic refusal')
-agent_backup_export.export_incomplete_state = blocked
+agent_backup_export.run_owner_export = blocked
 QMessageBox.question = lambda *a, **k: QMessageBox.Yes
 QMessageBox.critical = lambda *a, **k: None
 QFileDialog.getSaveFileName = lambda *a, **k: ('/unused/synthetic-only.zip', '')

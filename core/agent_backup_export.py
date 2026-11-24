@@ -1766,6 +1766,62 @@ def preflight_incomplete(data_dir, destination, *, verified=False):
     return exclusion
 
 
+def _owner_export_in_process(mode, data_dir, base_dir, destination, *,
+                             credentials_path=None, identity_trailers_path=None):
+    """The Settings export and its re-observation, unchanged: what the owner's
+    button has always run. Returns the confirmed receipt."""
+    paths = {k: v for k, v in (("credentials_path", credentials_path),
+                               ("identity_trailers_path", identity_trailers_path)) if v is not None}
+    if mode == "incomplete":
+        manifest, receipt = export_incomplete_state(
+            data_dir, base_dir, destination, owner_acknowledged=True, **paths)
+    elif mode == "verified":
+        manifest, receipt = export_verified_agent_backup(data_dir, base_dir, destination, **paths)
+    else:
+        raise ValueError(f"unknown export mode {mode!r}")
+    return confirm_export_result(destination, manifest, receipt)
+
+
+OWNER_EXPORT_CHILD = "core.agent_backup_export_child"
+
+
+def run_owner_export(mode, data_dir, base_dir, destination):
+    """F-DR-5: run one owner export in a fresh child process (see
+    core/agent_backup_export_child.py for why), so the SQLite connection
+    identity proof never meets a descriptor parked by an earlier export in
+    the running application. The credentials and identity-trailer paths are
+    resolved here exactly as the in-process call resolves them and passed on
+    explicitly, so the child excludes the same credentials store.
+
+    Returns the confirmed receipt. Raises ExportUnavailable (owner words)
+    for a refusal and AgentBackupError for any other failure; the builder's
+    own all-or-nothing publication is unchanged, so a failure publishes
+    nothing."""
+    if mode not in ("verified", "incomplete"):
+        raise ValueError(f"unknown export mode {mode!r}")
+    credentials_path = (os.environ.get("LUMINA_SECRETS_PATH")
+                        or os.path.expanduser("~/.config/lumina/credentials.json"))
+    identity_trailers_path = os.path.expanduser("~/.config/lumina/identity_trailers.json")
+    code_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # The child runs from the code root: hand it absolute paths (review C1).
+    # Same interpreter and site configuration as this process (review C2).
+    paths = [os.path.abspath(str(p)) for p in (data_dir, base_dir, destination)]
+    proc = subprocess.run(
+        [sys.executable, "-B", "-m", OWNER_EXPORT_CHILD, mode, *paths,
+         credentials_path, identity_trailers_path],
+        cwd=code_root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        reply = json.loads(proc.stdout.decode("utf-8")) if proc.stdout else None
+    except (ValueError, UnicodeError):
+        reply = None
+    if proc.returncode == 0 and type(reply) is dict and type(reply.get("receipt")) is dict:
+        return reply["receipt"]
+    if (proc.returncode == 3 and type(reply) is dict and type(reply.get("refused")) is str):
+        code = reply.get("code")
+        raise ExportUnavailable(reply["refused"], code=code if type(code) is str else None)
+    raise ab.AgentBackupError("EXPORT_CHILD_FAILED")
+
+
 def export_incomplete_state(data_dir, base_dir, destination, *, owner_acknowledged=False,
                             identity_trailers_path=None, credentials_path=None):
     """Owner UI only. Explicit new-format partial export; never a full backup.
