@@ -1409,7 +1409,7 @@ def test_the_pin_setup_text_describes_how_submit_pin_unlocks_tools():
     that conversation (tools/pin.py submit_pin). The text says so, and warns
     about shared channels and chat history instead of forbidding the one use."""
     from tools.pin import register_pin_tools
-    from ui import suspension_dialog as D
+    D = _dialog_texts()
     registry = SimpleNamespace(tools={})
     registry.register = lambda name, fn, **kw: registry.tools.__setitem__(name, kw["description"])
     register_pin_tools(registry)
@@ -1421,8 +1421,35 @@ def test_the_pin_setup_text_describes_how_submit_pin_unlocks_tools():
     assert "never in a shared channel" in text and "stays in that chat's history" in text
 
 
-def _all_owner_texts():
+def _dialog_texts():
+    """The Suspension window's owner texts, read from ui/suspension_dialog.py's
+    source. That module imports Qt, which CI's `test` job does not install, and
+    these wording guards must still block there (test_dialog_texts_read_from_
+    source_match_the_module pins that the source reading stays exact)."""
+    tree = ast.parse((REPO / "ui" / "suspension_dialog.py").read_text(encoding="utf-8"))
+    texts = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id.isupper()):
+            try:
+                texts[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                continue
+    return SimpleNamespace(**texts)
+
+
+def test_dialog_texts_read_from_source_match_the_module():
+    pytest.importorskip("PySide6")
     from ui import suspension_dialog as D
+    read = vars(_dialog_texts())
+    names = ("ARCHIVE_TITLE_TEXT", "ARCHIVE_INTRO_TEXT", "PIN_SETUP_TEXT", "PIN_UNREADABLE_TEXT",
+             "ARCHIVE_ACK_RUNTIMES_TEXT", "ARCHIVE_ACK_PRIOR_TEXT", "ARCHIVE_ACK_NO_LINK_TEXT",
+             "RESTORED_CHANNELS_TEXT", "RECORD_STATUS_TEXT")
+    assert all(read[n] == getattr(D, n) for n in names)
+
+
+def _all_owner_texts():
+    D = _dialog_texts()
     texts = (list(G.STATUS_TEXT.values()) + list(G.REMEDY_TEXT.values())
              + list(R._RELEASE_TEXT.values()) + list(R._RECOVER_TEXT.values())
              + list(R._PIN_SETUP_TEXT.values())
@@ -1450,7 +1477,7 @@ def test_no_owner_text_claims_a_completed_or_full_recovery():
 
 
 def test_credentials_texts_promise_no_credentials_backup():
-    from ui import suspension_dialog as D
+    D = _dialog_texts()
     assert "Credentials and your PIN are not in an Agent Backup" in D.PIN_SETUP_TEXT
     assert not any("Credentials Backup" in t for t in _all_owner_texts())
 

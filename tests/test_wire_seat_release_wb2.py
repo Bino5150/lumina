@@ -1055,7 +1055,20 @@ def test_dialog_shows_other_locks_read_only(qapp, dialog, releasable):
     assert d.wire_status_label.text() == G.describe(G.SeatVerdict(False, G.TRACE_INVALID))
 
 
+def test_the_main_window_release_branch_starts_nothing_structurally():
+    """Qt-free pin (CI's `test` job has no PySide6): the wire_seat branch of
+    LuminaWindow._on_suspension_event only clears displays and refreshes
+    Settings; it never starts the listener or autonomy."""
+    tree = ast.parse((REPO / "ui" / "main_window.py").read_text(encoding="utf-8"))
+    handler = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_on_suspension_event")
+    branch = next(n for n in ast.walk(handler) if isinstance(n, ast.If) and "wire_seat" in ast.unparse(n.test))
+    called = {ast.unparse(c.func) for c in ast.walk(branch) if isinstance(c, ast.Call)}
+    assert called == {"self.wire_panel.set_lock_reason", "self.wire_panel.set_connection_state",
+                      "self.settings_panel.comms_tab.refresh_wire_seat"}, called
+
+
 def test_main_window_clears_the_panel_lock_on_release_without_starting_anything():
+    pytest.importorskip("PySide6")
     import ui.main_window as mw
     calls = []
     panel = SimpleNamespace(set_lock_reason=lambda t: calls.append(("reason", t)),
